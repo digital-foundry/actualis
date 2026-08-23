@@ -142,6 +142,14 @@ class TestCommandHead(unittest.TestCase):
     def test_plain_command(self):
         self.assertEqual(af.command_head("grep -rn foo src/"), "grep")
 
+    def test_newline_delimited_loop(self):
+        """Regression: a `for` loop with newlines and no `;` reported `for`."""
+        self.assertEqual(af.command_head("for f in *.py\ndo\n  ruff check $f\ndone"), "ruff")
+
+    def test_line_continuation_is_not_a_command(self):
+        """Regression: a trailing backslash was counted as the program."""
+        self.assertEqual(af.command_head("curl -sS \\\n  -X POST https://x"), "curl")
+
     def test_bare_cd_still_reports_cd(self):
         self.assertEqual(af.command_head("cd /tmp"), "cd")
 

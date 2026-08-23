@@ -281,7 +281,10 @@ def command_head(cmd: str) -> str | None:
     `VAR=x cd path && for f in *.py; do tool $f; done`, and naively taking the
     first token reports `VAR=x` or `for`, which tells you nothing about what ran.
     """
-    for segment in re.split(r"&&|\|\||;|\|", cmd.strip()):
+    # Newlines delimit segments too: a `for … \n do …` loop has no `;` at all,
+    # and without splitting on them the whole loop reads as one segment starting
+    # with `for`, which then reports `for` as the program.
+    for segment in re.split(r"&&|\|\||;|\||\n", cmd.strip()):
         tokens = segment.split()
         if not tokens:
             continue
@@ -296,6 +299,8 @@ def command_head(cmd: str) -> str | None:
                 continue                      # environment assignment
             if tok in _BODY_KEYWORDS or tok in _PREFIX_WORDS:
                 continue                      # `do tool …`, `sudo tool …`
+            if tok == "\\":
+                continue                      # line continuation, not a program
             if tok in _TAKES_PATH_ARG:
                 skip_next = True              # `cd /some/path && real-cmd`
                 continue
