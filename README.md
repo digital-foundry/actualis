@@ -44,12 +44,21 @@ SHELL AUDIT ──────────────────────�
 
 ## Install
 
-There isn't one. It's a single file with no dependencies beyond Python 3.9+.
+No dependencies beyond Python 3.9+. Either run the file directly:
 
 ```sh
-curl -O https://.../agentfleet.py
 python3 agentfleet.py
 ```
+
+Or install it as a command:
+
+```sh
+uv tool install .      # or: pipx install .
+agentfleet
+```
+
+`uv tool install` copies the code, so re-run it with `--force` after pulling to
+pick up changes.
 
 ## Usage
 
@@ -64,6 +73,42 @@ python3 agentfleet.py --json           # machine-readable
 python3 agentfleet.py --top 25         # show more projects
 python3 agentfleet.py --agent codex    # one agent only (claude | codex | all)
 ```
+
+### All options
+
+| flag | effect |
+|---|---|
+| `--days N` | only the last N days |
+| `--project SUBSTR` | only projects whose name contains SUBSTR |
+| `--top N` | how many projects and tickets to list (default 12) |
+| `--agent {all,claude,codex}` | which agents to include (default all) |
+| `--root DIR` | read one specific transcript directory instead of discovering them |
+| `--bash` | shell audit only |
+| `--coach` | findings and actions only |
+| `--share` | postable summary with nothing identifying in it |
+| `--json` | machine-readable ([schema](docs/json.md)) |
+| `--watch` | live monitor; alert on new secrets and risky commands |
+| `--interval SEC` | `--watch` poll interval, default 4 |
+| `--quiet` | `--watch`: notify on secrets only, not every flagged command |
+| `--no-redact` | **do not** redact credentials from output; unsafe to share |
+| `--version` | print version |
+
+### What the report contains
+
+`FLEET` totals and sources · `TOKENS` broken out by cache bucket with the
+multiplier applied to each · `BY AGENT` · `BY MODEL` · `CACHE EFFICIENCY` ·
+`BY TICKET` · `TOOL CALLS` · `SUBAGENTS` · `SHELL AUDIT` · `COACH`.
+
+## Documentation
+
+| | |
+|---|---|
+| [docs/findings.md](docs/findings.md) | every coach finding `AF001`–`AF011`: what it means, when it fires, what to do |
+| [docs/secrets.md](docs/secrets.md) | which credential types are detected, and what is deliberately not flagged |
+| [docs/json.md](docs/json.md) | `--json` schema |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | ground rules, and the CLA note that keeps dual licensing possible |
+| [SECURITY.md](SECURITY.md) | what counts as a vulnerability, and how to report one |
+| [CHANGELOG.md](CHANGELOG.md) | what changed |
 
 ## Cost per ticket
 
@@ -102,6 +147,8 @@ telemetry, no account, and no population — it works on day one with one user, 
 it keeps the no-network promise intact.
 
 Findings are earned. On a fleet with nothing notable, the coach prints nothing.
+
+Full reference: [docs/findings.md](docs/findings.md).
 
 ## Cache efficiency
 
@@ -254,6 +301,8 @@ run of this tool surfaced a live deployment token sitting in plaintext in a save
 session. Since the output of a reporting tool gets pasted into issues, dropped into
 chat, and screenshotted, redaction is the default and `--no-redact` is an explicit
 opt-out that prints a warning.
+
+Full list of what is and is not detected: [docs/secrets.md](docs/secrets.md).
 
 Redaction covers `KEY=value` for secret-shaped names, ~25 known token prefixes
 (`ghp_`, `sk-ant-`, `AKIA`, `vcp_`, `glpat-`, …), `Authorization:` headers, and

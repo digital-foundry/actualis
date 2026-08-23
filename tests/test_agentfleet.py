@@ -585,6 +585,49 @@ class TestWatch(unittest.TestCase):
         af.notify("t", 'msg with "quotes" and $vars')
 
 
+class TestDocumentation(unittest.TestCase):
+    """Docs drift silently. These fail the build instead."""
+
+    SRC = (ROOT / "agentfleet.py").read_text()
+
+    def test_every_finding_id_is_documented(self):
+        import re
+        ids = sorted(set(re.findall(r'"(AF\d{3})"', self.SRC)))
+        doc = (ROOT / "docs" / "findings.md").read_text()
+        self.assertTrue(ids)
+        for fid in ids:
+            with self.subTest(fid=fid):
+                self.assertIn(f"## {fid.lower()}", doc.lower(),
+                              f"{fid} has no section in docs/findings.md")
+
+    def test_every_flag_is_documented(self):
+        import re
+        flags = sorted(set(re.findall(r'ap\.add_argument\("(--[a-z-]+)"', self.SRC)))
+        readme = (ROOT / "README.md").read_text()
+        for flag in flags:
+            with self.subTest(flag=flag):
+                self.assertIn(f"`{flag}", readme, f"{flag} is not in the README")
+
+    def test_every_secret_type_is_documented(self):
+        import re
+        kinds = sorted(set(re.findall(
+            r'"(?:critical|high)",\s*"([A-Za-z0-9 /]+)",\s*re\.compile', self.SRC)))
+        doc = (ROOT / "docs" / "secrets.md").read_text()
+        self.assertTrue(kinds)
+        for k in kinds:
+            with self.subTest(kind=k):
+                self.assertIn(k, doc)
+
+    def test_expected_docs_exist_and_are_not_stubs(self):
+        for rel in ["README.md", "LICENSE", "CHANGELOG.md", "CONTRIBUTING.md",
+                    "SECURITY.md", "docs/findings.md", "docs/secrets.md",
+                    "docs/json.md"]:
+            with self.subTest(rel=rel):
+                f = ROOT / rel
+                self.assertTrue(f.exists(), f"{rel} missing")
+                self.assertGreater(len(f.read_text()), 400, f"{rel} looks like a stub")
+
+
 class TestRoots(unittest.TestCase):
 
     def test_discovers_multiple_roots(self):
