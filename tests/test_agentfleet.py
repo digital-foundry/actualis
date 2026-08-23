@@ -492,6 +492,73 @@ class TestSubagents(unittest.TestCase):
         self.assertIn("AF011", {x.id for x in af.coach(f)})
 
 
+class TestShareLeakage(unittest.TestCase):
+    """--share output is meant to be posted publicly. The only thing that
+    matters about it is that nothing identifying can reach it."""
+
+    SECRETS = ["ACME-CLASSIFIED-MERGER", "feat/9999-project-tigerclaw",
+               "/Users/someone/private/repo", "sk_live_leakcanary1234567",
+               "internal-db.corp.example.com", "#9999"]
+
+    def _share_output(self):
+        import io, contextlib
+        f = af.Fleet()
+        ts = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        for i in range(20):
+            f.add_usage("ACME-CLASSIFIED-MERGER", "claude-opus-5",
+                        {"output_tokens": 1_000_000, "cache_read_input_tokens": 9_000_000},
+                        ts, "feat/9999-project-tigerclaw")
+            f.add_usage(f"other-{i}", "claude-opus-5",
+                        {"output_tokens": 10_000, "cache_read_input_tokens": 90_000},
+                        ts, f"fix/{100 + i}-thing")
+        f.add_tool("ACME-CLASSIFIED-MERGER", "Bash",
+                   {"command": "psql postgresql://u:hunter2pass@internal-db.corp.example.com/x "
+                               "&& export K=sk_live_leakcanary1234567 "
+                               "&& cat /Users/someone/private/repo/.env"}, ts)
+        f.add_subagent({"resolvedModel": "claude-sonnet-5", "status": "completed",
+                        "totalDurationMs": 1000, "totalTokens": 10,
+                        "toolStats": {"bashCount": 40}, "usage": {"output_tokens": 1}}, ts)
+        f.permission_modes.update({"auto": 900, "default": 100})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            af.render_share(f, af.C(False))
+        return buf.getvalue()
+
+    def test_no_identifying_string_survives(self):
+        out = self._share_output()
+        for needle in self.SECRETS:
+            with self.subTest(needle=needle):
+                self.assertNotIn(needle, out)
+
+    def test_no_secret_fingerprints_leak(self):
+        """Even a hash is an identifier that could be correlated."""
+        f = af.Fleet()
+        f.add_tool("p", "Bash", {"command": "K=sk_live_abcdefghijklmnopqrst"}, None)
+        fps = list(f.secrets)
+        self.assertTrue(fps)
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            af.render_share(f, af.C(False))
+        for fp in fps:
+            self.assertNotIn(fp, buf.getvalue())
+
+    def test_no_paths_or_slashed_identifiers(self):
+        out = self._share_output()
+        for line in out.splitlines():
+            if "agentfleet" in line or "list price" in line:
+                continue
+            self.assertNotIn("/Users", line)
+            self.assertNotIn("://", line)
+
+    def test_still_reports_the_useful_shape(self):
+        out = self._share_output()
+        for want in ["agentfleet", "median cost per ticket", "shell commands",
+                     "unsupervised", "credentials"]:
+            with self.subTest(want=want):
+                self.assertIn(want, out)
+
+
 class TestWatch(unittest.TestCase):
 
     def test_extracts_claude_code_commands(self):

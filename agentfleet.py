@@ -1171,7 +1171,7 @@ def coach(fleet: "Fleet") -> list[Finding]:
         blind = sub_bash / (fleet.bash_total + sub_bash) * 100
         if blind >= 10:
             out.append(Finding(
-                "AF011", "high", "A fifth of shell activity is invisible to the audit",
+                "AF011", "high", "Shell activity is partly invisible to the audit",
                 f"{num(sub_bash)} shell commands ran inside {num(fleet.sub_calls)} "
                 f"subagent runs, {blind:.0f}% of all shell activity. Their command text "
                 f"is never written to the parent transcript.",
@@ -1675,6 +1675,91 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
     print()
 
 
+def render_share(fleet: "Fleet", c: C) -> None:
+    """A postable summary containing nothing that identifies you.
+
+    Emits shapes only: totals, rates, distributions, and generic finding titles.
+    Never a project name, branch, ticket id, path, command, or fingerprint.
+    Everything printed here is derived from counts, and the leak test in
+    tests/ asserts that identifying strings cannot reach this output.
+    """
+    tok = sum(fleet.tokens.values())
+    ctx = Counter()
+    for t in fleet.tokens_by_project.values():
+        ctx.update(t)
+    hit = cache_hit_rate(ctx)
+    saved = sum(fleet.cache_uncached.values()) - sum(fleet.cache_actual.values())
+
+    projects = sorted(fleet.cost_by_project.values(), reverse=True)
+    conc = (projects[0] / fleet.total_cost * 100) if projects and fleet.total_cost else 0
+
+    modes = sum(fleet.permission_modes.values())
+    unsup = sum(v for k, v in fleet.permission_modes.items()
+                if "auto" in k.lower() or "bypass" in k.lower())
+    unsup_pct = (unsup / modes * 100) if modes else 0
+
+    sub_bash = fleet.sub_tools.get("bashCount", 0)
+    blind = (sub_bash / (fleet.bash_total + sub_bash) * 100) if (fleet.bash_total + sub_bash) else 0
+
+    tools_total = sum(fleet.tools.values())
+    bash_pct = (fleet.bash_total / tools_total * 100) if tools_total else 0
+
+    crit = sum(1 for e in fleet.secrets.values() if e["priority"] == "critical")
+    rotate = sum(1 for e in fleet.secrets.values() if e["priority"] != "low")
+
+    tickets = sorted(fleet.cost_by_ticket.values())
+    med_ticket = _median(tickets) if tickets else 0.0
+
+    b = c.bold
+    o = c.off
+    d = c.dim
+
+    print(f"\n{b}  agentfleet{o} {d}· what my coding agents cost and did{o}\n")
+    print(f"  {fleet.active_days} active days   "
+          f"{len(fleet.cost_by_agent)} agent(s)   "
+          f"{num(fleet.messages)} messages   {num(tok)} tokens")
+    print()
+    print(f"  {b}{money(fleet.total_cost)}{o} at API list price"
+          + (f"   ·   {money(fleet.total_cost / fleet.active_days)}/active day"
+             if fleet.active_days > 1 else ""))
+    if saved > 0:
+        print(f"  {b}{hit:.1f}%{o} of input context from cache, saving "
+              f"{b}{money(saved)}{o} against sending it uncached")
+    if conc >= 25:
+        print(f"  {b}{conc:.0f}%{o} of spend in a single project")
+    if tickets:
+        print(f"  {b}{money(med_ticket)}{o} median cost per ticket, "
+              f"over {num(len(tickets))} tickets")
+    print()
+    plural = "" if fleet.bash_total == 1 else "s"
+    print(f"  {b}{num(fleet.bash_total)}{o} shell command{plural}   "
+          f"{d}{bash_pct:.0f}% of all tool calls{o}")
+    if modes:
+        print(f"  {b}{unsup_pct:.0f}%{o} of turns ran unsupervised")
+    if sub_bash:
+        print(f"  {b}{blind:.0f}%{o} of shell activity happened inside subagents, "
+              f"where the commands are not recorded")
+    if fleet.secrets:
+        print(f"  {b}{num(len(fleet.secrets))}{o} distinct credentials found in command "
+              f"history   {d}{num(crit)} critical, {num(rotate)} worth rotating{o}")
+
+    if fleet.msgs_by_model:
+        print(f"\n  {d}models{o}  " + "   ".join(
+            f"{m} {n / sum(fleet.msgs_by_model.values()) * 100:.0f}%"
+            for m, n in fleet.msgs_by_model.most_common(4) if m != "<synthetic>"))
+
+    findings = coach(fleet)
+    if findings:
+        print(f"\n  {d}coach{o}   " + "  ".join(f.id for f in findings))
+        for f in findings[:4]:
+            print(f"    {d}{f.id}  {f.title}{o}")
+
+    print(f"\n  {d}Generated locally by agentfleet. No project names, branches,")
+    print(f"  paths, commands or identifiers are included in this summary.")
+    print(f"  Costs are Anthropic and OpenAI list prices; a subscription bills a")
+    print(f"  flat fee, so read this as consumption.{o}\n")
+
+
 def to_json(fleet: Fleet, raw: bool = False) -> dict:
     return {
         "version": __version__,
@@ -1775,6 +1860,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--top", type=int, default=12, metavar="N", help="projects to list (default 12)")
     ap.add_argument("--bash", action="store_true", help="shell audit only")
     ap.add_argument("--coach", action="store_true", help="coaching findings only")
+    ap.add_argument("--share", action="store_true",
+                    help="postable summary with nothing identifying in it")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--watch", action="store_true",
                     help="live monitor: alert on new secrets and risky commands")
@@ -1830,6 +1917,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         json.dump(to_json(fleet, raw=args.no_redact), sys.stdout, indent=2)
         print()
+    elif args.share:
+        render_share(fleet, C(use_color()))
     elif args.coach:
         render_coach(coach(fleet), C(use_color()))
     else:

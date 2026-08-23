@@ -162,6 +162,35 @@ written to the parent transcript. Subagents inherit the parent's permissions but
 not its visibility. The shell audit says so explicitly rather than reporting a
 number that looks complete.
 
+## Sharing a summary
+
+`--share` prints a postable summary containing nothing that identifies you: no
+project names, branches, ticket ids, paths, commands, or fingerprints. Only
+totals, rates, distributions, and generic finding titles.
+
+```
+  agentfleet · what my coding agents cost and did
+
+  47 active days   2 agent(s)   142,781 messages   64,208,473,022 tokens
+
+  $46,192.82 at API list price   ·   $982.83/active day
+  98.1% of input context from cache, saving $274,101.80 against sending it uncached
+  81% of spend in a single project
+  $28.89 median cost per ticket, over 166 tickets
+
+  48,875 shell commands   73% of all tool calls
+  92% of turns ran unsupervised
+  21% of shell activity happened inside subagents, where commands are not recorded
+  72 distinct credentials found in command history   25 critical, 70 worth rotating
+
+  coach   AF004  AF003  AF005  AF011  AF001  AF007  AF008  AF009
+```
+
+The test suite plants identifying strings — a project name, a branch, a path, a
+live-shaped key, an internal hostname — and asserts that none of them can reach
+this output. Secret fingerprints are excluded too, since a hash is still an
+identifier that could be correlated.
+
 ## Privacy
 
 Nothing leaves your machine. No network calls, no telemetry, no analytics, no
