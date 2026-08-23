@@ -498,6 +498,11 @@ class Fleet:
         self.msgs_by_model: Counter = Counter()
         self.cost_by_project: dict[str, float] = defaultdict(float)
         self.cost_by_day: dict[str, float] = defaultdict(float)
+        self.tokens_by_project: dict[str, Counter] = defaultdict(Counter)
+        self.msgs_by_project: Counter = Counter()
+        self.denials_by_project: Counter = Counter()
+        self.bash_by_project: Counter = Counter()
+        self.effort_mix: Counter = Counter()
         self.tokens = Counter()  # input/output/cache_w_1h/cache_w_5m/cache_read
         self.tools: Counter = Counter()
         self.bash_total = 0
@@ -554,6 +559,10 @@ class Fleet:
         self.tokens["cache_w_1h"] += w1h
         self.tokens["cache_w_5m"] += w5m
         self.tokens["cache_read"] += rd
+        pt = self.tokens_by_project[project]
+        pt["input"] += inp; pt["output"] += out
+        pt["cache_w"] += w1h + w5m; pt["cache_read"] += rd
+        self.msgs_by_project[project] += 1
 
         if ts:
             self.cost_by_day[ts.date().isoformat()] += cost
@@ -682,6 +691,7 @@ class Fleet:
         if not cmd:
             return
         self.bash_total += 1
+        self.bash_by_project[project] += 1
         head = command_head(cmd)
         if head:
             self.bash_first_token[head[:40]] += 1
@@ -777,6 +787,10 @@ class Fleet:
                     denial = rec.get("toolDenialKind")
                     if denial:
                         self.denials[denial] += 1
+                        self.denials_by_project[project] += 1
+                    eff = rec.get("effort")
+                    if eff:
+                        self.effort_mix[str(eff)] += 1
 
                     msg = rec.get("message")
                     if not isinstance(msg, dict):
@@ -816,6 +830,203 @@ class Fleet:
         weekly rate by five, understating a real burn rate.
         """
         return len([d for d, v in self.cost_by_day.items() if v > 0]) or 1
+
+
+# --------------------------------------------------------------------------
+# Coach
+#
+# The report says what happened. The coach says what to do about it, which is
+# the difference between a dashboard and a tool that changes behaviour.
+#
+# Findings carry stable IDs so they can be documented, suppressed, and quoted
+# ("I keep getting AF002"). The model is ShellCheck, not a mascot: personality
+# comes from being specific, and a cost report that talks like a cartoon is a
+# report nobody forwards to their CFO.
+#
+# Benchmarks are computed against YOURSELF — project against project, week
+# against week. That delivers most of the value of comparative benchmarking
+# with none of the telemetry, and keeps the no-network promise intact.
+# --------------------------------------------------------------------------
+
+MIN_PROJECT_COST = 25.0     # ignore noise projects in comparisons
+MIN_PROJECT_MSGS = 200
+
+
+class Finding:
+    __slots__ = ("id", "severity", "title", "evidence", "action", "impact")
+
+    def __init__(self, fid, severity, title, evidence, action, impact=None):
+        self.id, self.severity, self.title = fid, severity, title
+        self.evidence, self.action, self.impact = evidence, action, impact
+
+
+def _median(xs: list[float]) -> float:
+    if not xs:
+        return 0.0
+    xs = sorted(xs)
+    mid = len(xs) // 2
+    return xs[mid] if len(xs) % 2 else (xs[mid - 1] + xs[mid]) / 2
+
+
+def coach(fleet: "Fleet") -> list[Finding]:
+    """Observations worth acting on, ranked. Empty list is a valid answer."""
+    out: list[Finding] = []
+    total = fleet.total_cost
+
+    # --- AF001 spend concentration -----------------------------------------
+    projects = sorted(fleet.cost_by_project.items(), key=lambda kv: -kv[1])
+    if projects and total > 0:
+        name, cost = projects[0]
+        share = cost / total * 100
+        if share >= 50 and len(projects) > 2:
+            out.append(Finding(
+                "AF001", "info", "Spend is concentrated in one project",
+                f"{name} is {share:.0f}% of all spend ({money(cost)} of {money(total)}) "
+                f"across {len(projects)} projects.",
+                "Not a problem by itself, but it means fleet-wide averages describe "
+                "one project. Read per-project numbers, not the total."))
+
+    # --- AF002 cache efficiency vs your own median -------------------------
+    ratios: dict[str, float] = {}
+    for proj, t in fleet.tokens_by_project.items():
+        tot = sum(t.values())
+        if tot > 1_000_000 and fleet.cost_by_project.get(proj, 0) >= MIN_PROJECT_COST:
+            ratios[proj] = t["cache_read"] / tot * 100
+    if len(ratios) >= 3:
+        med = _median(list(ratios.values()))
+        for proj, r in sorted(ratios.items(), key=lambda kv: kv[1]):
+            if r < med - 15 and r < 90:
+                waste = fleet.cost_by_project.get(proj, 0) * ((med - r) / 100) * 0.5
+                out.append(Finding(
+                    "AF002", "high", "Cache efficiency below your own median",
+                    f"{proj} reads {r:.0f}% of tokens from cache; your median project "
+                    f"is {med:.0f}%. Something in that project changes the prompt "
+                    f"prefix on most requests.",
+                    "Look for a timestamp, a random id, or unsorted JSON early in the "
+                    "context. Stable content must come first.",
+                    f"~{money(waste)} of avoidable spend at current volume"))
+
+    # --- AF003 unsupervised execution --------------------------------------
+    auto = sum(v for k, v in fleet.permission_modes.items()
+               if "auto" in k.lower() or "bypass" in k.lower())
+    modes = sum(fleet.permission_modes.values())
+    if modes > 500:
+        pct = auto / modes * 100
+        if pct >= 75:
+            out.append(Finding(
+                "AF003", "high", "Most agent activity is unsupervised",
+                f"{pct:.0f}% of {num(modes)} recorded turns ran in an auto or bypass "
+                f"permission mode, across {num(fleet.bash_total)} shell commands.",
+                "Defensible for throughput, but it means the permission system is not "
+                "the control you may think it is. Pair it with deny rules for paths "
+                "that should never be touched."))
+
+    # --- AF004 outstanding critical secrets --------------------------------
+    crit = [(fp, e) for fp, e in fleet.secrets.items() if e["priority"] == "critical"]
+    if crit:
+        kinds = Counter(k for _, e in crit for k in e["kinds"])
+        out.append(Finding(
+            "AF004", "critical", "Critical credentials sit in plaintext history",
+            f"{len(crit)} distinct critical secrets across "
+            f"{len({p for _, e in crit for p in e['projects']})} projects. "
+            f"Most common: {', '.join(k for k, _ in kinds.most_common(3))}.",
+            "Rotate these first, then decide a retention policy for transcripts. "
+            "Rotation fixes exposure; it does not clean the archive."))
+
+    # --- AF005 how long a secret has been sitting there --------------------
+    dated = [(fp, e) for fp, e in fleet.secrets.items()
+             if e["first"] and e["priority"] != "low"]
+    if dated and fleet.last_ts:
+        oldest_fp, oldest = min(dated, key=lambda kv: kv[1]["first"])
+        try:
+            age = (fleet.last_ts.date() - datetime.fromisoformat(oldest["first"]).date()).days
+        except ValueError:
+            age = 0
+        if age >= 30:
+            out.append(Finding(
+                "AF005", "high", "A credential has been exposed for a long time",
+                f"{', '.join(sorted(oldest['kinds']))} ({oldest_fp}) first appeared "
+                f"{oldest['first']}, {age} days ago, and was used {oldest['uses']} times.",
+                "Age matters more than count. Anything unrotated since then should be "
+                "treated as compromised, not merely exposed."))
+
+    # --- AF006 agent friction, project vs your own median ------------------
+    rates = {p: fleet.denials_by_project[p] / m * 100
+             for p, m in fleet.msgs_by_project.items()
+             if m >= MIN_PROJECT_MSGS}
+    if len(rates) >= 3:
+        med = _median(list(rates.values()))
+        for proj, r in sorted(rates.items(), key=lambda kv: -kv[1]):
+            if r > max(med * 3, 1.0):
+                out.append(Finding(
+                    "AF006", "info", "The agent is being corrected more here",
+                    f"{proj} rejects or blocks {r:.1f}% of turns; your median project "
+                    f"is {med:.1f}%.",
+                    "Usually a context problem rather than a model problem. A CLAUDE.md "
+                    "in that project describing its conventions is the cheapest fix."))
+
+    # --- AF007 week-over-week trend ----------------------------------------
+    days = sorted(fleet.cost_by_day.items())
+    if len(days) >= 14:
+        last7 = sum(v for _, v in days[-7:])
+        prev7 = sum(v for _, v in days[-14:-7])
+        if prev7 > 50:
+            change = (last7 - prev7) / prev7 * 100
+            if abs(change) >= 40:
+                direction = "up" if change > 0 else "down"
+                out.append(Finding(
+                    "AF007", "info", f"Spend is {direction} sharply week over week",
+                    f"Last 7 active days {money(last7)} versus {money(prev7)} the week "
+                    f"before, {change:+.0f}%.",
+                    "Worth knowing which project moved before it becomes a surprise."))
+
+    # --- AF008 effort mix --------------------------------------------------
+    if fleet.effort_mix:
+        tot_e = sum(fleet.effort_mix.values())
+        premium = sum(v for k, v in fleet.effort_mix.items() if k in ("high", "xhigh", "max"))
+        if tot_e > 200 and premium / tot_e > 0.95:
+            out.append(Finding(
+                "AF008", "info", "Every task runs at premium reasoning effort",
+                f"{premium / tot_e * 100:.0f}% of {num(tot_e)} turns ran at high effort "
+                f"or above.",
+                "Correct for hard work and wasteful for mechanical edits. Dropping "
+                "routine turns to low or medium effort is the cheapest available saving."))
+
+    order = {"critical": 0, "high": 1, "info": 2}
+    out.sort(key=lambda f: order.get(f.severity, 9))
+    return out
+
+
+def render_coach(findings: list[Finding], c: C) -> None:
+    rule(c, "COACH")
+    if not findings:
+        print(f"  {c.ok}Nothing worth flagging.{c.off} "
+              f"{c.dim}Cache efficiency, supervision, secrets and trend all look "
+              f"unremarkable.{c.off}")
+        return
+    for f in findings:
+        col = (c.red if f.severity == "critical"
+               else c.yellow if f.severity == "high" else c.cyan)
+        print(f"\n  {col}{f.id}{c.off}  {c.bold}{f.title}{c.off}")
+        for line in _wrap(f.evidence, 84):
+            print(f"        {line}")
+        if f.impact:
+            print(f"        {c.yellow}{f.impact}{c.off}")
+        for line in _wrap("→ " + f.action, 84):
+            print(f"        {c.dim}{line}{c.off}")
+    print()
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    words, lines, cur = text.split(), [], ""
+    for w in words:
+        if len(cur) + len(w) + 1 > width:
+            lines.append(cur); cur = w
+        else:
+            cur = f"{cur} {w}".strip()
+    if cur:
+        lines.append(cur)
+    return lines
 
 
 # --------------------------------------------------------------------------
@@ -1001,6 +1212,7 @@ class C:
         self.yellow = "\033[33m" if on else ""
         self.green = "\033[32m" if on else ""
         self.cyan = "\033[36m" if on else ""
+        self.ok = "\033[32m" if on else ""
         self.off = "\033[0m" if on else ""
 
 
@@ -1161,6 +1373,9 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
             print(f"    {line[:150]}")
             print(f"      {c.dim}{f['project'][:66]}{c.off}")
 
+    if not bash_only:
+        render_coach(coach(fleet), c)
+
     if fleet.unknown_models:
         print(f"\n  {c.yellow}▲{c.off} unpriced models seen, billed at Opus-tier rates: "
               f"{', '.join(fleet.unknown_models)}")
@@ -1205,6 +1420,9 @@ def to_json(fleet: Fleet, raw: bool = False) -> dict:
                 {**f, "evidence": redact(f["evidence"])} for f in fleet.flags
             ],
         },
+        "coach": [{"id": f.id, "severity": f.severity, "title": f.title,
+                   "evidence": f.evidence, "action": f.action, "impact": f.impact}
+                  for f in coach(fleet)],
         "secret_exposures": fleet.secret_exposures,
         "secrets": [
             {"priority": e["priority"], "types": sorted(e["kinds"]), "id": fp,
@@ -1234,6 +1452,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--project", metavar="SUBSTR", help="only projects matching SUBSTR")
     ap.add_argument("--top", type=int, default=12, metavar="N", help="projects to list (default 12)")
     ap.add_argument("--bash", action="store_true", help="shell audit only")
+    ap.add_argument("--coach", action="store_true", help="coaching findings only")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--watch", action="store_true",
                     help="live monitor: alert on new secrets and risky commands")
@@ -1289,6 +1508,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         json.dump(to_json(fleet, raw=args.no_redact), sys.stdout, indent=2)
         print()
+    elif args.coach:
+        render_coach(coach(fleet), C(use_color()))
     else:
         render(fleet, C(use_color()), bash_only=args.bash, top=args.top, raw=args.no_redact)
     return 0

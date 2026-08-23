@@ -300,6 +300,48 @@ class TestCodex(unittest.TestCase):
         self.assertTrue(any(x["severity"] == "high" for x in f.flags))
 
 
+class TestCoach(unittest.TestCase):
+    """Findings must be earned. A coach that always says something says nothing."""
+
+    def test_silent_on_an_unremarkable_fleet(self):
+        f = af.Fleet()
+        f.add_usage("p", "claude-opus-5", {"output_tokens": 1000}, None)
+        self.assertEqual(af.coach(f), [])
+
+    def test_critical_secret_raises_af004(self):
+        f = af.Fleet()
+        f.add_tool("p", "Bash", {"command": "K=sk_live_abcdefghijklmnopqrst"}, None)
+        self.assertIn("AF004", {x.id for x in af.coach(f)})
+
+    def test_concentration_needs_more_than_two_projects(self):
+        f = af.Fleet()
+        for p in ("a", "b"):
+            f.add_usage(p, "claude-opus-5", {"output_tokens": 1_000_000}, None)
+        self.assertNotIn("AF001", {x.id for x in af.coach(f)})
+
+    def test_cache_check_benchmarks_against_your_own_median(self):
+        """No fleet-wide constant: a project is only flagged relative to the
+        user's own other projects, which needs no telemetry."""
+        f = af.Fleet()
+        for p in ("good1", "good2", "good3"):
+            f.add_usage(p, "claude-opus-5",
+                        {"cache_read_input_tokens": 99_000_000, "input_tokens": 1_000_000}, None)
+        f.add_usage("bad", "claude-opus-5",
+                    {"cache_read_input_tokens": 40_000_000, "input_tokens": 60_000_000}, None)
+        hits = [x for x in af.coach(f) if x.id == "AF002"]
+        self.assertTrue(hits)
+        self.assertIn("bad", hits[0].evidence)
+
+    def test_findings_are_ordered_by_severity(self):
+        f = af.Fleet()
+        f.add_tool("p", "Bash", {"command": "K=sk_live_abcdefghijklmnopqrst"}, None)
+        for p in ("a", "b", "c"):
+            f.add_usage(p, "claude-opus-5", {"output_tokens": 10_000_000}, None)
+        f.add_usage("a", "claude-opus-5", {"output_tokens": 400_000_000}, None)
+        sev = [x.severity for x in af.coach(f)]
+        self.assertEqual(sev, sorted(sev, key=lambda s: {"critical": 0, "high": 1, "info": 2}[s]))
+
+
 class TestWatch(unittest.TestCase):
 
     def test_extracts_claude_code_commands(self):
