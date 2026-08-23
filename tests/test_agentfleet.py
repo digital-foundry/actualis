@@ -300,6 +300,30 @@ class TestCodex(unittest.TestCase):
         self.assertTrue(any(x["severity"] == "high" for x in f.flags))
 
 
+class TestWatch(unittest.TestCase):
+
+    def test_extracts_claude_code_commands(self):
+        rec = {"message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": {"command": "ls -la"}},
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "/x"}},
+        ]}}
+        self.assertEqual(af._commands_in(rec), ["ls -la"])
+
+    def test_extracts_codex_commands(self):
+        rec = {"payload": {"type": "function_call", "name": "shell_command",
+                           "arguments": '{"command": "git status", "workdir": "/x"}'}}
+        self.assertEqual(af._commands_in(rec), ["git status"])
+
+    def test_malformed_records_are_survivable(self):
+        for rec in [{}, {"message": None}, {"payload": {"name": "shell_command",
+                                                        "arguments": "not json"}}]:
+            with self.subTest(rec=rec):
+                self.assertEqual(af._commands_in(rec), [])
+
+    def test_notify_never_raises(self):
+        af.notify("t", 'msg with "quotes" and $vars')
+
+
 class TestRoots(unittest.TestCase):
 
     def test_discovers_multiple_roots(self):

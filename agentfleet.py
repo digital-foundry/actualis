@@ -819,6 +819,160 @@ class Fleet:
 
 
 # --------------------------------------------------------------------------
+# Watch mode
+#
+# A prototype of the menu-bar app, in the terminal. Whatever the status line
+# shows here is what a tray icon would show. Holds no state on disk: it starts
+# at end-of-file and only reports what happens from now on, so running it is
+# not a decision you have to undo.
+# --------------------------------------------------------------------------
+
+def notify(title: str, message: str) -> None:
+    """Best-effort native notification. Never raises, never blocks for long."""
+    import subprocess
+    try:
+        if sys.platform == "darwin":
+            script = (f"display notification {json.dumps(message)} "
+                      f"with title {json.dumps(title)}")
+            subprocess.run(["osascript", "-e", script], timeout=5,
+                           capture_output=True, check=False)
+        elif sys.platform.startswith("linux"):
+            subprocess.run(["notify-send", title, message], timeout=5,
+                           capture_output=True, check=False)
+        elif sys.platform == "win32":
+            ps = (f"[Windows.UI.Notifications.ToastNotificationManager, "
+                  f"Windows.UI.Notifications, ContentType=WindowsRuntime] > $null; "
+                  f"Write-Output {json.dumps(title + ': ' + message)}")
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps], timeout=5,
+                           capture_output=True, check=False)
+    except Exception:
+        pass  # a missing notifier must never take the watcher down
+
+
+def _jsonl_files(roots: list[Path], codex: list[Path]) -> list[Path]:
+    out: list[Path] = []
+    for r in roots:
+        try:
+            out.extend(f for d in r.iterdir() if d.is_dir() for f in d.glob("*.jsonl"))
+        except OSError:
+            continue
+    for r in codex:
+        try:
+            out.extend(r.rglob("rollout-*.jsonl"))
+        except OSError:
+            continue
+    return out
+
+
+def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
+          quiet: bool, raw: bool) -> int:
+    import time
+
+    offsets: dict[Path, int] = {}
+    for f in _jsonl_files(roots, codex):
+        try:
+            offsets[f] = f.stat().st_size      # start at EOF: history is not news
+        except OSError:
+            pass
+
+    seen_secrets: set[str] = set()
+    cmds = flagged = crit = 0
+    started = datetime.now(timezone.utc)
+
+    srcs = ", ".join(str(r) for r in (roots + codex))
+    print(f"{c.bold}agentfleet watch{c.off} {c.dim}· {len(offsets)} files · every "
+          f"{interval:g}s · ctrl-c to stop{c.off}")
+    print(f"{c.dim}watching {srcs}{c.off}")
+    print(f"{c.dim}Starting from now. Existing history is not replayed.{c.off}\n")
+
+    try:
+        while True:
+            for f in _jsonl_files(roots, codex):
+                try:
+                    size = f.stat().st_size
+                except OSError:
+                    continue
+                start = offsets.get(f)
+                if start is None:
+                    offsets[f] = 0 if size < 1_000_000 else size   # new file: read it
+                    start = offsets[f]
+                if size < start:                 # truncated or rotated
+                    start = 0
+                if size == start:
+                    continue
+                try:
+                    with f.open("r", encoding="utf-8", errors="replace") as fh:
+                        fh.seek(start)
+                        chunk = fh.read()
+                        offsets[f] = fh.tell()
+                except OSError:
+                    continue
+
+                project = pretty_project(f.parent.name)
+                for line in chunk.splitlines():
+                    if '"tool_use"' not in line and '"function_call"' not in line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if not isinstance(rec, dict):
+                        continue
+                    for command in _commands_in(rec):
+                        cmds += 1
+                        for pri, kind, fp in classify_secrets(command):
+                            if fp in seen_secrets or pri == "low":
+                                continue
+                            seen_secrets.add(fp)
+                            crit += 1
+                            msg = f"{kind} in {project}"
+                            print(f"\r{c.red}▲ SECRET{c.off}  {msg}  {c.dim}{fp}{c.off}"
+                                  + " " * 20)
+                            notify("agentfleet: credential exposed", msg)
+                        hits = audit_command(command)
+                        high = [h for h in hits if h[0] == "high"]
+                        if high:
+                            flagged += 1
+                            cats = ",".join(sorted({h[1] for h in high}))
+                            line_txt = high[0][2] if raw else redact(high[0][2])
+                            print(f"\r{c.yellow}▲ {cats}{c.off}  {line_txt[:88]}"
+                                  f"  {c.dim}{project[:28]}{c.off}" + " " * 10)
+                            if not quiet:
+                                notify(f"agentfleet: {cats}", line_txt[:120])
+
+            mins = (datetime.now(timezone.utc) - started).total_seconds() / 60
+            print(f"\r{c.dim}  {mins:5.1f}m · {cmds} commands · "
+                  f"{flagged} flagged · {crit} secrets{c.off}", end="", flush=True)
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print(f"\r{' ' * 72}\r", end="")
+        print(f"{c.bold}stopped{c.off} after {mins:.1f}m · {cmds} commands · "
+              f"{flagged} flagged · {crit} distinct secrets")
+        return 0
+
+
+def _commands_in(rec: dict) -> list[str]:
+    """Every shell command in one transcript record, across both agent formats."""
+    out: list[str] = []
+    msg = rec.get("message")
+    if isinstance(msg, dict) and isinstance(msg.get("content"), list):
+        for b in msg["content"]:
+            if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Bash":
+                cmd = (b.get("input") or {}).get("command")
+                if cmd:
+                    out.append(cmd)
+    payload = rec.get("payload")
+    if isinstance(payload, dict) and payload.get("name") == "shell_command":
+        try:
+            args = json.loads(payload.get("arguments") or "{}")
+        except (json.JSONDecodeError, ValueError):
+            args = {}
+        if args.get("command"):
+            out.append(args["command"])
+    return out
+
+
+# --------------------------------------------------------------------------
 # Rendering
 # --------------------------------------------------------------------------
 
@@ -1068,6 +1222,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--top", type=int, default=12, metavar="N", help="projects to list (default 12)")
     ap.add_argument("--bash", action="store_true", help="shell audit only")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--watch", action="store_true",
+                    help="live monitor: alert on new secrets and risky commands")
+    ap.add_argument("--interval", type=float, default=4.0, metavar="SEC",
+                    help="--watch poll interval (default 4)")
+    ap.add_argument("--quiet", action="store_true",
+                    help="--watch: notify on secrets only, not every flagged command")
     ap.add_argument("--agent", choices=["all", "claude", "codex"], default="all",
                     help="which agents to include (default: all)")
     ap.add_argument("--no-redact", action="store_true",
@@ -1079,6 +1239,15 @@ def main(argv: list[str] | None = None) -> int:
     since = None
     if args.days:
         since = datetime.now(timezone.utc) - timedelta(days=args.days)
+
+    if args.watch:
+        if args.root:
+            w_roots, w_codex = [Path(args.root).expanduser()], []
+        else:
+            w_roots = transcript_roots() if args.agent in ("all", "claude") else []
+            w_codex = codex_roots() if args.agent in ("all", "codex") else []
+        return watch(w_roots, w_codex, max(args.interval, 0.5),
+                     C(use_color()), args.quiet, args.no_redact)
 
     fleet = Fleet()
     progress = not args.json and sys.stderr.isatty()
