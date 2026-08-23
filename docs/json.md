@@ -65,3 +65,28 @@ that and prints a warning.
 `cost_floor_usd` is **a floor, not a total**, and is deliberately excluded from
 `cost_usd`. The parent transcript records only each run's final message, so
 cumulative subagent spend cannot be recovered and is not estimated.
+
+# MCP tools
+
+`agentfleet --mcp` speaks JSON-RPC over stdio. Register it with:
+
+```sh
+claude mcp add agentfleet -- agentfleet --mcp
+```
+
+| tool | returns |
+|---|---|
+| `fleet_summary` | window, spend, cache hit rate, top projects, unsupervised share |
+| `ticket_cost` | cost for one ticket, or the most expensive ones |
+| `exposed_secrets` | rotation list: priority, types, fingerprint, dates |
+| `coach_findings` | `AF001`–`AF011` with evidence and actions |
+| `shell_audit` | counts by category, permission modes, the subagent blind spot |
+
+**What it deliberately does not return.** Everything here is read by a model and
+written back into a transcript that this tool then scans, so the surface is
+narrow by design: aggregates, types, `sha256[:8]` fingerprints and counts. Never
+a secret value, never raw command text. Tests assert both.
+
+Both the retired `initialize` handshake and the stateless 2026-07-28 style are
+answered, since clients in the wild vary. The scan is cached for the life of the
+process.

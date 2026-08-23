@@ -1430,6 +1430,251 @@ def _commands_in(rec: dict) -> list[str]:
 
 
 # --------------------------------------------------------------------------
+# MCP server
+#
+# Lets the agent query its own cost and exposure mid-session: "what did this
+# ticket cost", "do I have credentials exposed". Speaks JSON-RPC over stdio, so
+# there is no port, no daemon, and no new trust surface.
+#
+# Implemented against the standard library rather than the MCP SDK. A tool whose
+# entire pitch is "one auditable file, no supply chain" cannot take a dependency
+# to talk a line-delimited JSON protocol.
+#
+# Compatibility: the 2026-07-28 revision made the protocol stateless and retired
+# the initialize handshake, but older clients still send it. Answering both is a
+# superset and costs nothing.
+#
+# SECURITY: everything returned here is read by a model and written back into a
+# transcript, which this tool then scans. So it returns aggregates, types,
+# fingerprints and counts — never a secret value, and never raw command text.
+# --------------------------------------------------------------------------
+
+MCP_PROTOCOL_VERSIONS = ["2026-07-28", "2025-06-18", "2025-03-26", "2024-11-05"]
+
+MCP_TOOLS = [
+    {
+        "name": "fleet_summary",
+        "description": "Overall coding-agent activity: spend, tokens, cache efficiency, "
+                       "top projects, and how much ran unsupervised.",
+        "inputSchema": {"type": "object", "properties": {
+            "days": {"type": "integer", "description": "only the last N days"},
+            "project": {"type": "string", "description": "filter to projects matching this"},
+        }},
+    },
+    {
+        "name": "ticket_cost",
+        "description": "What a ticket cost in agent time and money, derived from branch "
+                       "names. Omit `ticket` to list the most expensive.",
+        "inputSchema": {"type": "object", "properties": {
+            "ticket": {"type": "string", "description": "e.g. '#412' or 'PROJ-456'"},
+            "limit": {"type": "integer", "description": "how many to list, default 15"},
+        }},
+    },
+    {
+        "name": "exposed_secrets",
+        "description": "Credentials found in the agent's own command history, as a "
+                       "rotation list. Returns type, priority, an 8-char fingerprint and "
+                       "dates. Never returns a secret value.",
+        "inputSchema": {"type": "object", "properties": {
+            "priority": {"type": "string", "enum": ["critical", "high", "low", "all"]},
+        }},
+    },
+    {
+        "name": "coach_findings",
+        "description": "Things worth acting on, benchmarked against this user's own "
+                       "history: cache efficiency, unsupervised execution, stale "
+                       "credentials, cost outliers.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "shell_audit",
+        "description": "Summary of shell commands the agents ran: counts by risk "
+                       "category, permission modes, and how much is invisible because it "
+                       "happened inside subagents. Returns counts, not command text.",
+        "inputSchema": {"type": "object", "properties": {
+            "project": {"type": "string"},
+        }},
+    },
+]
+
+
+class _MCPCache:
+    """A scan takes ~80s over a large fleet, so hold it for the process lifetime."""
+
+    def __init__(self) -> None:
+        self._store: dict[tuple, Fleet] = {}
+
+    def fleet(self, days: int | None = None, project: str | None = None) -> Fleet:
+        key = (days, project)
+        if key not in self._store:
+            f = Fleet()
+            since = (datetime.now(timezone.utc) - timedelta(days=days)) if days else None
+            roots = transcript_roots()
+            if roots:
+                f.scan(roots, since, project, progress=False)
+            croots = codex_roots()
+            if croots:
+                f.roots.extend(croots)
+                f.scan_codex(croots, since, project)
+            self._store[key] = f
+        return self._store[key]
+
+
+def _mcp_call(name: str, args: dict, cache: _MCPCache) -> dict:
+    days = args.get("days")
+    project = args.get("project")
+    f = cache.fleet(days if isinstance(days, int) else None,
+                    project if isinstance(project, str) else None)
+
+    if name == "fleet_summary":
+        ctx = Counter()
+        for t in f.tokens_by_project.values():
+            ctx.update(t)
+        modes = sum(f.permission_modes.values())
+        unsup = sum(v for k, v in f.permission_modes.items()
+                    if "auto" in k.lower() or "bypass" in k.lower())
+        top = sorted(f.cost_by_project.items(), key=lambda kv: -kv[1])[:8]
+        return {
+            "window": {"from": f.first_ts.isoformat() if f.first_ts else None,
+                       "to": f.last_ts.isoformat() if f.last_ts else None,
+                       "active_days": f.active_days},
+            "messages": f.messages,
+            "cost_usd_list_price": round(f.total_cost, 2),
+            "cost_note": "provider list prices; a subscription bills a flat fee, so read "
+                         "this as consumption rather than a bill",
+            "cache_hit_rate_pct": round(cache_hit_rate(ctx), 1),
+            "cache_saved_usd": round(sum(f.cache_uncached.values())
+                                     - sum(f.cache_actual.values()), 2),
+            "by_agent": {k: round(v, 2) for k, v in f.cost_by_agent.items()},
+            "top_projects": [{"project": p, "cost_usd": round(c, 2)} for p, c in top],
+            "shell_commands": f.bash_total,
+            "unsupervised_pct": round(unsup / modes * 100, 1) if modes else None,
+        }
+
+    if name == "ticket_cost":
+        want = args.get("ticket")
+        rows = sorted(f.cost_by_ticket.items(), key=lambda kv: -kv[1])
+        if want:
+            key = want if want.startswith("#") or "-" in want else f"#{want}"
+            match = [(t, c) for t, c in rows if t.lower() == key.lower()]
+            if not match:
+                return {"found": False, "ticket": want,
+                        "hint": "branch names must carry the issue number for this to work"}
+            t, c = match[0]
+            return {"found": True, "ticket": t, "cost_usd": round(c, 2),
+                    "messages": f.msgs_by_ticket[t],
+                    "branches": sorted(f.branches_by_ticket[t]),
+                    "active_days": len(set(f.dates_by_ticket.get(t, [])))}
+        lim = args.get("limit") if isinstance(args.get("limit"), int) else 15
+        med = _median(list(f.cost_by_ticket.values())) if f.cost_by_ticket else 0
+        return {"ticket_count": len(rows), "median_ticket_usd": round(med, 2),
+                "unattributed_usd": round(f.cost_by_branch.get("trunk", 0)
+                                          + f.cost_by_branch.get("detached HEAD", 0), 2),
+                "tickets": [{"ticket": t, "cost_usd": round(c, 2),
+                             "branches": len(f.branches_by_ticket[t])} for t, c in rows[:lim]]}
+
+    if name == "exposed_secrets":
+        want = args.get("priority", "all")
+        rank = {"critical": 0, "high": 1, "low": 2}
+        rows = sorted(f.secrets.items(), key=lambda kv: (rank.get(kv[1]["priority"], 9),
+                                                         -kv[1]["uses"]))
+        if want in rank:
+            rows = [r for r in rows if r[1]["priority"] == want]
+        return {
+            "distinct_secrets": len(rows),
+            "worth_rotating": sum(1 for _, e in rows if e["priority"] != "low"),
+            "note": "fingerprints are sha256[:8]; values are never stored or returned",
+            "secrets": [{"priority": e["priority"], "types": sorted(e["kinds"]),
+                         "fingerprint": fp, "uses": e["uses"],
+                         "first_seen": e["first"], "last_seen": e["last"],
+                         "projects": sorted(e["projects"])} for fp, e in rows[:50]],
+        }
+
+    if name == "coach_findings":
+        return {"findings": [{"id": x.id, "severity": x.severity, "title": x.title,
+                              "evidence": x.evidence, "action": x.action,
+                              "impact": x.impact} for x in coach(f)]}
+
+    if name == "shell_audit":
+        sub = f.sub_tools.get("bashCount", 0)
+        total = f.bash_total + sub
+        return {
+            "shell_commands": f.bash_total,
+            "invisible_in_subagents": sub,
+            "invisible_pct": round(sub / total * 100, 1) if total else 0,
+            "invisible_note": "subagent command text is never written to the parent "
+                              "transcript, so it cannot be audited",
+            "flagged_by_category": dict(f.flag_counts),
+            "permission_modes": dict(f.permission_modes),
+            "denials": dict(f.denials),
+            "most_run": dict(f.bash_first_token.most_common(15)),
+            "note": "counts only; command text is deliberately not returned, because "
+                    "anything returned here is written back into a transcript",
+        }
+
+    raise ValueError(f"unknown tool: {name}")
+
+
+def mcp_serve() -> int:
+    """JSON-RPC over stdio. Nothing but protocol may be written to stdout."""
+    cache = _MCPCache()
+    out = sys.stdout
+
+    def send(obj: dict) -> None:
+        out.write(json.dumps(obj) + "\n")
+        out.flush()
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        method, rid = req.get("method"), req.get("id")
+
+        # Notifications carry no id and get no reply.
+        if rid is None and str(method or "").startswith("notifications/"):
+            continue
+
+        try:
+            if method == "initialize":
+                asked = (req.get("params") or {}).get("protocolVersion")
+                result = {
+                    "protocolVersion": asked if asked in MCP_PROTOCOL_VERSIONS
+                                       else MCP_PROTOCOL_VERSIONS[0],
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "agentfleet", "version": __version__},
+                }
+            elif method in ("tools/list", "server/discover"):
+                result = {"tools": MCP_TOOLS, "ttlMs": 3_600_000, "cacheScope": "session"}
+            elif method == "tools/call":
+                params = req.get("params") or {}
+                payload = _mcp_call(params.get("name"), params.get("arguments") or {}, cache)
+                result = {"content": [{"type": "text",
+                                       "text": json.dumps(payload, indent=2)}],
+                          "structuredContent": payload,
+                          "isError": False}
+            elif method == "ping":
+                result = {}
+            else:
+                if rid is not None:
+                    send({"jsonrpc": "2.0", "id": rid,
+                          "error": {"code": -32601, "message": f"method not found: {method}"}})
+                continue
+        except Exception as exc:                      # never take the server down
+            if rid is not None:
+                send({"jsonrpc": "2.0", "id": rid,
+                      "error": {"code": -32603, "message": f"{type(exc).__name__}: {exc}"}})
+            continue
+
+        if rid is not None:
+            send({"jsonrpc": "2.0", "id": rid, "result": result})
+    return 0
+
+
+# --------------------------------------------------------------------------
 # Rendering
 # --------------------------------------------------------------------------
 
@@ -1906,6 +2151,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--top", type=int, default=12, metavar="N", help="projects to list (default 12)")
     ap.add_argument("--bash", action="store_true", help="shell audit only")
     ap.add_argument("--coach", action="store_true", help="coaching findings only")
+    ap.add_argument("--mcp", action="store_true",
+                    help="run as an MCP server over stdio so an agent can query itself")
     ap.add_argument("--share", action="store_true",
                     help="postable summary with nothing identifying in it")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
@@ -1926,6 +2173,9 @@ def main(argv: list[str] | None = None) -> int:
     since = None
     if args.days:
         since = datetime.now(timezone.utc) - timedelta(days=args.days)
+
+    if args.mcp:
+        return mcp_serve()
 
     if args.watch:
         if args.root:

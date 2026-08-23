@@ -91,6 +91,7 @@ python3 agentfleet.py --agent codex    # one agent only (claude | codex | all)
 | `--interval SEC` | `--watch` poll interval, default 4 |
 | `--quiet` | `--watch`: notify on secrets only, not every flagged command |
 | `--no-redact` | **do not** redact credentials from output; unsafe to share |
+| `--mcp` | run as an MCP server over stdio ([below](#ask-the-agent-about-itself)) |
 | `--version` | print version |
 
 ### What the report contains
@@ -237,6 +238,31 @@ The test suite plants identifying strings — a project name, a branch, a path, 
 live-shaped key, an internal hostname — and asserts that none of them can reach
 this output. Secret fingerprints are excluded too, since a hash is still an
 identifier that could be correlated.
+
+## Ask the agent about itself
+
+`--mcp` runs an MCP server over stdio, so the agent producing the data can query
+it mid-session: *"what did this ticket cost?"*, *"do I have credentials
+exposed?"*
+
+```sh
+claude mcp add agentfleet -- agentfleet --mcp
+```
+
+Five tools: `fleet_summary`, `ticket_cost`, `exposed_secrets`, `coach_findings`,
+`shell_audit`.
+
+No port, no daemon, no network — stdio only, and the same read-only local scan
+as everything else. Implemented against the standard library rather than the MCP
+SDK, because a tool whose pitch is "one auditable file, no supply chain" cannot
+take a dependency to speak line-delimited JSON.
+
+**Everything it returns is written back into a transcript** that this tool then
+scans, so the surface is deliberately narrow: aggregates, types, fingerprints and
+counts. Never a secret value, and never raw command text.
+
+The scan is cached for the life of the process, since a large fleet takes about a
+minute to read.
 
 ## Privacy
 
