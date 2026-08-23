@@ -310,6 +310,37 @@ The cost pipeline was cross-checked against an independent `jq` implementation o
 the same transcripts: 135,508 messages / $44,397.88 on the first root, matching to
 the cent. Do the same before trusting any number here that matters to you.
 
+## Running it in the background (macOS)
+
+`--watch` tails the transcripts and raises a native notification when an agent
+runs a command carrying a new credential. To keep it running without a terminal,
+install the LaunchAgent:
+
+```sh
+mkdir -p ~/Library/LaunchAgents
+sed "s|__AGENTFLEET__|$(command -v agentfleet)|; s|__HOME__|$HOME|" \
+  packaging/com.digitalfoundry.agentfleet.watch.plist \
+  > ~/Library/LaunchAgents/com.digitalfoundry.agentfleet.watch.plist
+launchctl bootstrap gui/$(id -u) \
+  ~/Library/LaunchAgents/com.digitalfoundry.agentfleet.watch.plist
+```
+
+Check it, read it, stop it:
+
+```sh
+launchctl print gui/$(id -u)/com.digitalfoundry.agentfleet.watch | head -20
+tail -f ~/Library/Logs/agentfleet-watch.log
+launchctl bootout gui/$(id -u)/com.digitalfoundry.agentfleet.watch
+```
+
+It is a LaunchAgent rather than a LaunchDaemon on purpose: it must run inside
+your logged-in session for notifications to post at all, and it should hold
+exactly your permissions and no more. Only events are logged — the heartbeat is
+suppressed when stdout is not a terminal — so the log stays small.
+
+If notifications do not appear, allow them for **Script Editor** in
+System Settings → Notifications. `osascript` posts under that identity.
+
 ## License
 
 AGPL-3.0-or-later. Copyright (C) 2026 Digital Foundry Solutions, LLC.

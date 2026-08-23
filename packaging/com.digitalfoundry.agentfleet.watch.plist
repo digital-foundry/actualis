@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  agentfleet watch, as a macOS LaunchAgent.
+
+  Runs the live monitor in the background so new credential exposures raise a
+  native notification without a terminal open.
+
+  A LaunchAgent, deliberately, not a LaunchDaemon: it must run inside your
+  logged-in GUI session or osascript cannot post a notification, and it should
+  have exactly your permissions and no more.
+
+  Install:
+    mkdir -p ~/Library/LaunchAgents
+    sed "s|__AGENTFLEET__|$(command -v agentfleet)|; s|__HOME__|$HOME|" \
+      packaging/com.digitalfoundry.agentfleet.watch.plist \
+      > ~/Library/LaunchAgents/com.digitalfoundry.agentfleet.watch.plist
+    launchctl bootstrap gui/$(id -u) \
+      ~/Library/LaunchAgents/com.digitalfoundry.agentfleet.watch.plist
+
+  Status / logs / stop:
+    launchctl print gui/$(id -u)/com.digitalfoundry.agentfleet.watch | head -20
+    tail -f ~/Library/Logs/agentfleet-watch.log
+    launchctl bootout gui/$(id -u)/com.digitalfoundry.agentfleet.watch
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.digitalfoundry.agentfleet.watch</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__AGENTFLEET__</string>
+        <string>--watch</string>
+        <!-- secrets only; drop --quiet to also be told about risky commands -->
+        <string>--quiet</string>
+        <string>--interval</string>
+        <string>10</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if it dies, but never on a clean exit, so `bootout` sticks. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- If it fails on startup, retry slowly instead of hot-looping. -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <!-- Only events are logged: the heartbeat is suppressed when stdout is not
+         a terminal, so this file stays small. -->
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/agentfleet-watch.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/agentfleet-watch.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+
+    <!-- launchd does not inherit your shell PATH. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Background priority: this is a poller, it should never compete. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>Nice</key>
+    <integer>5</integer>
+</dict>
+</plist>
