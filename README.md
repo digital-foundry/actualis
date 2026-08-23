@@ -312,12 +312,21 @@ the cent. Do the same before trusting any number here that matters to you.
 
 ## License
 
-GPL-3.0-or-later. Copyright (C) 2026 Digital Foundry Solutions, LLC.
+AGPL-3.0-or-later. Copyright (C) 2026 Digital Foundry Solutions, LLC.
 
-Running this tool places no obligation on you: use it internally, in a company,
-on client work, however you like. The copyleft only applies if you **distribute a
-modified version**, in which case that version has to carry the same freedoms.
+**Running this tool places no obligation on you.** Use it privately, inside a
+company, on client work, however you like. Running is not distributing, and the
+copyleft never touches your code, your projects, or your data — none of which
+this tool transmits anywhere in the first place.
 
-Note the deliberate gap: GPL-3.0 does not reach a hosted service. Someone can
-take this, modify it, and run it as a SaaS without publishing anything. AGPL-3.0
-is the variant that closes that.
+Two situations do carry an obligation, and both are deliberate:
+
+- **Distributing a modified version** means shipping its source under the same
+  licence.
+- **Running a modified version as a network service** means offering that source
+  to its users (AGPL section 13). This is the clause GPL-3.0 lacks, and the
+  reason for choosing AGPL: the plausible future product here is a multi-machine
+  server, and AGPL is what stops someone taking this, closing it, and hosting it.
+
+Copyright is held by a single entity, so a commercial licence for anyone who
+cannot accept those terms remains available without a contributor agreement.
