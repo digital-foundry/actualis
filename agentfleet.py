@@ -751,9 +751,12 @@ class Fleet:
     def _scan_codex_file(self, path: Path, since: datetime | None,
                          project_filter: str | None) -> None:
         try:
-            self.bytes_scanned += path.stat().st_size
+            st = path.stat()
         except OSError:
             return
+        if since is not None and st.st_mtime < (since.timestamp() - 3600):
+            return
+        self.bytes_scanned += st.st_size
         self.files_scanned += 1
 
         cwd = model = None
@@ -931,8 +934,14 @@ class Fleet:
 
     def _scan_file(self, path: Path, project: str, since: datetime | None) -> None:
         try:
-            size = path.stat().st_size
+            st = path.stat()
+            size = st.st_size
         except OSError:
+            return
+        # A file not written since the cutoff cannot hold a record after it.
+        # An hour of slack absorbs clock skew and copied timestamps. On a real
+        # fleet this turns --days 1 from reading 1,784 files into reading 7.
+        if since is not None and st.st_mtime < (since.timestamp() - 3600):
             return
         self.files_scanned += 1
         self.bytes_scanned += size

@@ -385,6 +385,18 @@ The cost pipeline was cross-checked against an independent `jq` implementation o
 the same transcripts: 38,204 messages / $12,480.55 on the first root, matching to
 the cent. Do the same before trusting any number here that matters to you.
 
+## Menu bar app (macOS)
+
+```sh
+cd tray && ./build.sh && open agentfleet.app
+```
+
+The badge counts **unrotated critical credentials**, not spend — a menu bar
+number earns its place by being actionable at a glance, and spend is not. One
+Swift file, ~150 KB, native AppKit, no Electron and no webview. It is a thin
+shell over `--json`; all measurement stays in the CLI. See
+[tray/README.md](tray/README.md).
+
 ## Running it in the background (macOS)
 
 `--watch` tails the transcripts and raises a native notification when an agent

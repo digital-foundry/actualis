@@ -10,3 +10,6 @@ venv/
 # Never commit a report: they contain project names, commands, and paths.
 *.report.json
 agentfleet-*.json
+
+# built tray bundle
+tray/*.app/
