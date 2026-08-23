@@ -373,6 +373,10 @@ _NOT_SECRET_NAMES = re.compile(
     r"|[a-z_]*_(?:enc|encrypted|hash|hashed|digest|fingerprint)"
     r"|(?:encrypted|hashed)_[a-z_]*"
     r"|[a-z_]*token_(?:id|type|name|expiry|expires[a-z_]*)"
+    # A bare plural names a COLLECTION (a list of prefixes, a count), not one
+    # credential. Caught in the wild: this file's own regex literal listing
+    # secret-ish words tripped the scanner while it was being edited.
+    r"|_?(?:tokens|secrets|keys|passwords|credentials|api_keys)"
     r")$")
 
 

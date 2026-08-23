@@ -174,6 +174,18 @@ class TestSecretClassifier(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertEqual(af.classify_secrets(cmd), [], cmd)
 
+    def test_bare_plurals_are_collections_not_secrets(self):
+        """Caught by the live watcher: a variable named TOKENS holds a list of
+        prefixes, not a credential."""
+        for cmd in ["TOKENS=abcdefghijklmnop", "SECRETS=abcdefghijklmnop",
+                    "KEYS=abcdefghijklmnop", "_TOKENS=abcdefghijklmnop"]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(af.classify_secrets(cmd), [], cmd)
+
+    def test_singular_named_secret_still_fires(self):
+        self.assertTrue(af.classify_secrets("TOKEN=abcdefghijklmnop"))
+        self.assertTrue(af.classify_secrets("API_KEY=abcdefghijklmnop"))
+
     def test_placeholders_are_not_secrets(self):
         for cmd in ["TOKEN=$GITHUB_TOKEN", "SECRET=your_secret_here",
                     "PASSWORD=changeme1234", "API_KEY=placeholder1234"]:
