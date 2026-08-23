@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentfleet"
+version = "0.1.0"
+description = "What your coding agents cost, and what they actually did."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "Digital Foundry Solutions, LLC" }]
+keywords = ["claude", "claude-code", "ai-agents", "cost", "observability", "audit"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Quality Assurance",
+  "Topic :: System :: Monitoring",
+]
+# No runtime dependencies, deliberately. This tool reads your session history;
+# it should be auditable in one sitting and installable without a supply chain.
+dependencies = []
+
+[project.scripts]
+agentfleet = "agentfleet:main"
+
+[project.urls]
+Homepage = "https://github.com/digitalfoundry-aw/agentfleet"
+Issues = "https://github.com/digitalfoundry-aw/agentfleet/issues"
+
+[tool.hatch.build.targets.wheel]
+include = ["agentfleet.py"]
+
+[tool.hatch.build.targets.sdist]
+include = ["agentfleet.py", "README.md", "LICENSE", "tests/"]

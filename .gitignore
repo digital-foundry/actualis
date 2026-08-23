@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+.venv/
+venv/
+
+# Never commit a report: they contain project names, commands, and paths.
+*.report.json
+agentfleet-*.json
