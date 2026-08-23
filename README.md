@@ -20,16 +20,16 @@ across **Claude Code** and **Codex**, in one report.
 $ agentfleet
 
 FLEET ──────────────────────────────────────────────────────────────
-  window        2026-05-04 → 2026-08-22  (31 days)
+  window        2026-05-04 → 2026-06-04  (31 days)
   transcripts   168 files, 0.4 GB
   messages      38,204
   cost          $12,480.55 notional, at API list price
-  per week      $1,934.20   ·  annualized $100,578.00
+  per active day $402.60   ·  per week $2,818.20   ·  31 active days of 31
 
 BY PROJECT ─────────────────────────────────────────────────────────
-    $37,462.22   81.4% ███████████████████████████ web-app
-     $1,622.47   11.1% ███ api-service
-       $412.66    0.7%  data-pipeline
+    $10,159.17   81.4% ███████████████████████████ web-app
+     $1,385.34   11.1% ███ api-service
+       $87.36    0.7%  data-pipeline
 
   ▲ 81% of all spend is one project: web-app
 
@@ -123,7 +123,7 @@ BY TICKET  (top 5 of 58)
     $1,102.40  #310         1,240      2  fix/310-session-timeout
     $980.25  #907         1,206      2  feat/907-export-queue
 
-  $21,288.90 across 58 tickets (12 spanning several branches) · $13,088.85 on trunk
+  $8,140.20 across 58 tickets (12 spanning several branches) · $3,890.15 on trunk
 ```
 
 One ticket often spans several branches, so grouping by ticket rather than branch
@@ -220,7 +220,7 @@ totals, rates, distributions, and generic finding titles.
 
   31 active days   2 agent(s)   38,204 messages   17,540,882,110 tokens
 
-  $12,480.55 at API list price   ·   $623.02/active day
+  $12,480.55 at API list price   ·   $402.60/active day
   98.1% of input context from cache, saving $71,905.40 against sending it uncached
   81% of spend in a single project
   $41.20 median cost per ticket, over 58 tickets
