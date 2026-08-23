@@ -128,6 +128,64 @@ class TestAuditRules(unittest.TestCase):
         self.assertNotIn("STAGE=/tmp/stage", evidence[0])
 
 
+class TestSecretClassifier(unittest.TestCase):
+    """'792 commands contained credentials' is alarming and useless. The
+    classifier turns it into a rotation list."""
+
+    def kinds(self, cmd):
+        return {k for _, k, _ in af.classify_secrets(cmd)}
+
+    def test_identifies_by_type(self):
+        self.assertIn("Stripe key", self.kinds("export K=sk_live_abcdefghijklmnopqrst"))
+        self.assertIn("AWS access key", self.kinds("AKIAIOSFODNN7EXAMPLE"))
+        self.assertIn("GitHub PAT", self.kinds("gh auth --with-token ghp_abcdefghijklmnopqrst"))
+
+    def test_same_value_yields_one_fingerprint(self):
+        a = af.classify_secrets("TOKEN=ghp_abcdefghijklmnopqrst")
+        b = af.classify_secrets("OTHER=ghp_abcdefghijklmnopqrst")
+        self.assertEqual({fp for _, _, fp in a}, {fp for _, _, fp in b})
+
+    def test_never_returns_the_secret(self):
+        secret = "ghp_supersecretvalue123456"
+        for _, _, fp in af.classify_secrets(f"TOKEN={secret}"):
+            self.assertNotIn(secret, fp)
+            self.assertEqual(len(fp), 8)
+
+    def test_localhost_password_is_low_priority(self):
+        got = af.classify_secrets("psql postgresql://u:devpassword@127.0.0.1:5432/db")
+        self.assertTrue(any(p == "low" for p, _, _ in got))
+
+    def test_remote_password_is_critical(self):
+        got = af.classify_secrets("psql postgresql://u:realpassword@db.prod.example.com/x")
+        self.assertTrue(any(p == "critical" for p, _, _ in got))
+
+    def test_critical_name_escalates(self):
+        """A var named STRIPE_SECRET_KEY is critical whatever its value looks like."""
+        got = af.classify_secrets("STRIPE_SECRET_KEY=abcdefghijklmnop")
+        self.assertTrue(any(p == "critical" for p, _, _ in got))
+        got = af.classify_secrets("BOARD_TOKEN=abcdefghijklmnop")
+        self.assertTrue(all(p != "critical" for p, _, _ in got))
+
+    def test_token_counters_are_not_secrets(self):
+        """Regression: output_tokens / token_hash / *_enc are field names."""
+        for cmd in ["output_tokens=1234567890123", "input_tokens=99999999999",
+                    "token_hash=abcdef1234567890", "api_key_enc=abcdef1234567890",
+                    "encrypted_password=abcdef1234567890", "max_tokens=64000000"]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(af.classify_secrets(cmd), [], cmd)
+
+    def test_placeholders_are_not_secrets(self):
+        for cmd in ["TOKEN=$GITHUB_TOKEN", "SECRET=your_secret_here",
+                    "PASSWORD=changeme1234", "API_KEY=placeholder1234"]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(af.classify_secrets(cmd), [], cmd)
+
+    def test_worst_priority_wins_across_names(self):
+        f = af.Fleet()
+        f.add_tool("p", "Bash", {"command": "BOARD_TOKEN=sk_live_abcdefghijklmnop"}, None)
+        self.assertTrue(any(e["priority"] == "critical" for e in f.secrets.values()))
+
+
 class TestCommandHead(unittest.TestCase):
 
     def test_skips_env_assignments(self):

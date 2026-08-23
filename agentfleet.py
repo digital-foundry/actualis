@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -274,6 +275,111 @@ _TAKES_PATH_ARG = {"cd", "pushd", "popd"}
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 
 
+# --------------------------------------------------------------------------
+# Secret classification
+#
+# "792 commands contained credentials" is alarming and useless. What you need
+# is the distinct-secret count, the type, and an order to rotate in. Secrets
+# are identified by sha256 prefix so the same value seen 200 times counts once
+# and the value itself is never stored, printed, or written to JSON.
+#
+# Priority: critical = money or database god-mode. high = service credentials.
+# low = local development, not worth rotating.
+# --------------------------------------------------------------------------
+
+SECRET_TYPES: list[tuple[str, str, "re.Pattern[str]"]] = [
+    ("critical", "Stripe key",       re.compile(r"\b(?:sk|rk)_live_([A-Za-z0-9]{16,})")),
+    ("critical", "AWS access key",   re.compile(r"\b(?:AKIA|ASIA)([A-Z0-9]{12,})")),
+    ("critical", "Anthropic key",    re.compile(r"\bsk-ant-[a-z0-9-]*([A-Za-z0-9_\-]{16,})")),
+    ("critical", "OpenAI key",       re.compile(r"\bsk-(?!ant)[A-Za-z0-9]{2,}-([A-Za-z0-9_\-]{16,})")),
+    ("critical", "JWT / service key", re.compile(r"\beyJ[A-Za-z0-9_\-]{6,}\.([A-Za-z0-9_\-]{20,})")),
+    ("high",     "GitHub PAT",       re.compile(r"\b(?:ghp_|gho_|ghu_|ghs_|ghr_|github_pat_)([A-Za-z0-9_]{16,})")),
+    ("high",     "Google API key",   re.compile(r"\bAIza([A-Za-z0-9_\-]{16,})")),
+    ("high",     "Slack token",      re.compile(r"\bxox[baprs]-([A-Za-z0-9\-]{16,})")),
+    ("high",     "Vercel token",     re.compile(r"\bvcp_([A-Za-z0-9]{16,})")),
+    ("high",     "GitLab PAT",       re.compile(r"\bglpat-([A-Za-z0-9_\-]{16,})")),
+    ("high",     "DigitalOcean",     re.compile(r"\bdop_v1_([a-f0-9]{32,})")),
+    ("high",     "HuggingFace",      re.compile(r"\bhf_([A-Za-z0-9]{16,})")),
+]
+
+# Connection strings. Loopback is dev credential churn, not an incident.
+_URL_CRED = re.compile(r"([a-z][a-z0-9+.\-]*)://([^\s:/@]+):([^\s@/]{6,})@([^\s/:\"']+)")
+_LOCAL_HOST = re.compile(r"^(127\.0\.0\.1|localhost|0\.0\.0\.0|\[?::1\]?|host\.docker\.internal)$", re.I)
+
+# Secret-shaped assignments, minus the field names that merely *sound* like one.
+_NAMED_SECRET = re.compile(
+    r"\b([A-Za-z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|APIKEY|API_KEY|ACCESS_KEY|PRIVATE_KEY)[A-Za-z0-9_]*)"
+    r"\s*[=:]\s*['\"]?([A-Za-z0-9_\-\.]{12,})", re.IGNORECASE)
+
+# These are column names, metric names, and already-encrypted columns. They
+# match the "sounds like a secret" pattern and are not secrets.
+_NOT_SECRET_NAMES = re.compile(
+    r"(?i)^(?:"
+    r"(?:input|output|total|cache[a-z_]*|reasoning[a-z_]*|max|min|num|n)_?tokens?"
+    r"|tokens?_?(?:count|used|remaining|limit|usage|per[a-z_]*)"
+    r"|[a-z_]*_(?:enc|encrypted|hash|hashed|digest|fingerprint)"
+    r"|(?:encrypted|hashed)_[a-z_]*"
+    r"|[a-z_]*token_(?:id|type|name|expiry|expires[a-z_]*)"
+    r")$")
+
+
+def _looks_like_placeholder(v: str) -> bool:
+    low = v.lower()
+    return (v.isdigit()
+            or _SHELL_REF.match(v) is not None
+            or _MASKED in v
+            or low in {"true", "false", "null", "none", "undefined", "changeme", "example"}
+            or low.startswith(("your_", "your-", "xxx", "<", "$(", "placeholder",
+                               "dummy", "test_", "fake", "changeme", "example",
+                               "insert_", "replace_", "todo")))
+
+
+# A variable named STRIPE_SECRET_KEY is critical whether or not its value
+# happens to carry a recognisable live-key prefix.
+_CRITICAL_NAMES = re.compile(
+    r"(?i)(stripe|aws|service_role|servicerole|private_key|master|root|prod|payment|billing)")
+
+
+def _priority_for_name(name: str) -> str:
+    return "critical" if _CRITICAL_NAMES.search(name) else "high"
+
+
+def classify_secrets(cmd: str) -> list[tuple[str, str, str]]:
+    """Return [(priority, type, sha256[:8])] for each distinct secret in a command.
+
+    The secret value is hashed immediately and never retained.
+    """
+    out: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+
+    def add(priority: str, kind: str, value: str) -> None:
+        if _looks_like_placeholder(value):
+            return
+        fp = hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:8]
+        if fp in seen:
+            return
+        seen.add(fp)
+        out.append((priority, kind, fp))
+
+    for priority, kind, rx in SECRET_TYPES:
+        for m in rx.finditer(cmd):
+            add(priority, kind, m.group(0))
+
+    for m in _URL_CRED.finditer(cmd):
+        scheme, _user, pw, host = m.groups()
+        local = _LOCAL_HOST.match(host) is not None
+        add("low" if local else "critical",
+            f"{scheme} password ({'local' if local else 'remote'})", pw)
+
+    for m in _NAMED_SECRET.finditer(cmd):
+        name, value = m.group(1), m.group(2)
+        if _NOT_SECRET_NAMES.match(name):
+            continue
+        add(_priority_for_name(name), name.upper(), value)
+
+    return out
+
+
 def command_head(cmd: str) -> str | None:
     """The program actually being run.
 
@@ -402,6 +508,8 @@ class Fleet:
         self.denials: Counter = Counter()
         self.secret_exposures = 0
         self.secret_projects: Counter = Counter()
+        # (priority, type, fingerprint) -> {uses, first, last, projects}
+        self.secrets: dict[str, dict] = {}   # sha256[:8] -> record
         self.unknown_models: Counter = Counter()
         self.first_ts: datetime | None = None
         self.last_ts: datetime | None = None
@@ -581,6 +689,22 @@ class Fleet:
         if contains_secret(cmd):
             self.secret_exposures += 1
             self.secret_projects[project] += 1
+
+        _rank = {"critical": 0, "high": 1, "low": 2}
+        for priority, kind, fp in classify_secrets(cmd):
+            e = self.secrets.setdefault(fp, {
+                "priority": priority, "kinds": set(), "uses": 0,
+                "first": None, "last": None, "projects": set()})
+            # the same value may appear under several names; keep the worst
+            if _rank[priority] < _rank[e["priority"]]:
+                e["priority"] = priority
+            e["kinds"].add(kind)
+            e["uses"] += 1
+            e["projects"].add(project)
+            if ts:
+                day = ts.date().isoformat()
+                e["first"] = min(e["first"] or day, day)
+                e["last"] = max(e["last"] or day, day)
 
         matches = audit_command(cmd)
         if not matches:
@@ -821,13 +945,29 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
     for cmd, n in fleet.bash_first_token.most_common(12):
         print(f"    {num(n):>7}  {cmd[:40]}")
 
-    if fleet.secret_exposures:
-        print(f"\n  {c.red}▲ {num(fleet.secret_exposures)} commands contained credential "
-              f"material{c.off}")
-        for p, n in fleet.secret_projects.most_common(5):
-            print(f"      {num(n):>7}  {p[:56]}")
-        print(f"    {c.dim}Those secrets are sitting in plaintext in your transcripts under")
-        print(f"    ~/.claude/projects. Rotate anything live. Output here is redacted.{c.off}")
+    if fleet.secrets:
+        order = {"critical": 0, "high": 1, "low": 2}
+        rows = sorted(fleet.secrets.items(),
+                      key=lambda kv: (order.get(kv[1]["priority"], 9), -kv[1]["uses"]))
+        distinct = len(rows)
+        actionable = sum(1 for _, e in rows if e["priority"] != "low")
+
+        print(f"\n  {c.red}▲ {num(distinct)} distinct secrets{c.off} exposed across "
+              f"{num(fleet.secret_exposures)} commands "
+              f"{c.dim}({num(actionable)} worth rotating){c.off}")
+        print(f"\n  {'':<9} {'type':<26} {'uses':>6}  {'first':<11} {'last':<11} id")
+        for fp, e in rows[:24]:
+            pri = e["priority"]
+            col = c.red if pri == "critical" else (c.yellow if pri == "high" else c.dim)
+            mark = "ROTATE" if pri == "critical" else ("rotate" if pri == "high" else "dev")
+            kind = ", ".join(sorted(e["kinds"]))
+            print(f"    {col}{mark:<7}{c.off} {kind[:26]:<26} {num(e['uses']):>6}  "
+                  f"{(e['first'] or '?'):<11} {(e['last'] or '?'):<11} {c.dim}{fp}{c.off}")
+        if len(rows) > 24:
+            print(f"    {c.dim}… {len(rows) - 24} more{c.off}")
+        print(f"\n    {c.dim}id is sha256[:8] of the secret; the value is never stored or")
+        print(f"    printed. Same secret reused 200 times counts once. Rotate in the order")
+        print(f"    shown, then purge the transcripts that carry them.{c.off}")
 
     highs = [f for f in fleet.flags if f["severity"] == "high"]
     meds = [f for f in fleet.flags if f["severity"] == "med"]
@@ -899,6 +1039,15 @@ def to_json(fleet: Fleet, raw: bool = False) -> dict:
             ],
         },
         "secret_exposures": fleet.secret_exposures,
+        "secrets": [
+            {"priority": e["priority"], "types": sorted(e["kinds"]), "id": fp,
+             "uses": e["uses"], "first_seen": e["first"], "last_seen": e["last"],
+             "projects": sorted(e["projects"])}
+            for fp, e in sorted(
+                fleet.secrets.items(),
+                key=lambda kv: ({"critical": 0, "high": 1, "low": 2}.get(kv[1]["priority"], 9),
+                                -kv[1]["uses"]))
+        ],
         "secret_projects": dict(fleet.secret_projects),
         "redacted": not raw,
         "permission_modes": dict(fleet.permission_modes),
