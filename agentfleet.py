@@ -49,32 +49,46 @@ CACHE_READ_MULT = 0.10
 CACHE_WRITE_5M_MULT = 1.25
 CACHE_WRITE_1H_MULT = 2.00
 
+# Two providers, two cache conventions. Getting this backwards overcharges:
+#
+#   anthropic  input_tokens EXCLUDES cached. cache_read is a separate bucket at
+#              0.10x, cache writes cost 1.25x (5m TTL) or 2.00x (1h TTL).
+#   openai     input_tokens INCLUDES cached_input_tokens. Cached portion bills at
+#              0.10x, the rest at full rate. There is no cache-write premium, and
+#              reasoning_output_tokens is a subset of output_tokens, not an addition.
 PRICING = {
-    # model id            (input $/Mtok, output $/Mtok)
-    "claude-fable-5":     (10.0, 50.0),
-    "claude-mythos-5":    (10.0, 50.0),
-    "claude-opus-5":      (5.0, 25.0),
-    "claude-opus-4-8":    (5.0, 25.0),
-    "claude-opus-4-7":    (5.0, 25.0),
-    "claude-opus-4-6":    (5.0, 25.0),
-    "claude-sonnet-5":    (3.0, 15.0),
-    "claude-sonnet-4-6":  (3.0, 15.0),
-    "claude-haiku-4-5":   (1.0, 5.0),
+    # model id            (input $/Mtok, output $/Mtok, provider)
+    "claude-fable-5":     (10.0, 50.0, "anthropic"),
+    "claude-mythos-5":    (10.0, 50.0, "anthropic"),
+    "claude-opus-5":      (5.0, 25.0, "anthropic"),
+    "claude-opus-4-8":    (5.0, 25.0, "anthropic"),
+    "claude-opus-4-7":    (5.0, 25.0, "anthropic"),
+    "claude-opus-4-6":    (5.0, 25.0, "anthropic"),
+    "claude-sonnet-5":    (3.0, 15.0, "anthropic"),
+    "claude-sonnet-4-6":  (3.0, 15.0, "anthropic"),
+    "claude-haiku-4-5":   (1.0, 5.0, "anthropic"),
+    # OpenAI rates via pricepertoken.com, 2026-08-22. Third-party aggregator,
+    # not OpenAI's own page: verify before trusting a number that matters.
+    "gpt-5.2-codex":      (1.75, 14.0, "openai"),
 }
+
+OPENAI_CACHED_MULT = 0.10
 
 # Claude Sonnet 5 introductory pricing, through 2026-08-31.
 SONNET5_INTRO_UNTIL = datetime(2026, 8, 31, 23, 59, 59, tzinfo=timezone.utc)
-SONNET5_INTRO = (2.0, 10.0)
+SONNET5_INTRO = (2.0, 10.0, "anthropic")
 
-DEFAULT_RATES = (5.0, 25.0)  # unknown model: assume Opus-tier, and say so
+DEFAULT_RATES = (5.0, 25.0, "anthropic")  # unknown model: assume Opus-tier, and say so
 
 
-def rates_for(model: str, when: datetime | None) -> tuple[float, float, bool]:
-    """Return (input_rate, output_rate, is_known) for a model at a point in time."""
+def rates_for(model: str, when: datetime | None) -> tuple[float, float, str, bool]:
+    """Return (input_rate, output_rate, provider, is_known) at a point in time."""
     if model == "claude-sonnet-5" and when is not None and when <= SONNET5_INTRO_UNTIL:
         return (*SONNET5_INTRO, True)
     if model in PRICING:
         return (*PRICING[model], True)
+    if model.startswith(("gpt-", "o1", "o3", "o4")):
+        return (1.75, 14.0, "openai", False)
     return (*DEFAULT_RATES, False)
 
 
@@ -338,9 +352,37 @@ def parse_ts(raw: str | None) -> datetime | None:
         return None
 
 
+def codex_roots() -> list[Path]:
+    """Codex writes append-only session rollouts under $CODEX_HOME/sessions."""
+    base = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    sess = base / "sessions"
+    return [sess] if sess.is_dir() else []
+
+
+def codex_session_cost(usage: dict, model: str) -> float:
+    """Cost of one Codex session from its final cumulative usage.
+
+    OpenAI reports cached_input_tokens as a SUBSET of input_tokens, and
+    reasoning_output_tokens as a subset of output_tokens. Adding either to its
+    parent double-counts.
+    """
+    in_rate, out_rate, provider, _known = rates_for(model, None)
+    total_in = usage.get("input_tokens", 0) or 0
+    cached = usage.get("cached_input_tokens", 0) or 0
+    out = usage.get("output_tokens", 0) or 0
+    if provider == "openai":
+        fresh = max(total_in - cached, 0)
+        return (fresh / 1e6 * in_rate
+                + cached / 1e6 * in_rate * OPENAI_CACHED_MULT
+                + out / 1e6 * out_rate)
+    return total_in / 1e6 * in_rate + out / 1e6 * out_rate
+
+
 class Fleet:
     def __init__(self) -> None:
         self.messages = 0
+        self.cost_by_agent: dict[str, float] = defaultdict(float)
+        self.units_by_agent: Counter = Counter()
         self.cost_by_model: dict[str, float] = defaultdict(float)
         self.msgs_by_model: Counter = Counter()
         self.cost_by_project: dict[str, float] = defaultdict(float)
@@ -376,7 +418,7 @@ class Fleet:
         out = usage.get("output_tokens", 0) or 0
         rd = usage.get("cache_read_input_tokens", 0) or 0
 
-        in_rate, out_rate, known = rates_for(model, ts)
+        in_rate, out_rate, _provider, known = rates_for(model, ts)
         if not known:
             self.unknown_models[model] += 1
 
@@ -389,6 +431,8 @@ class Fleet:
         )
 
         self.messages += 1
+        self.cost_by_agent["claude-code"] += cost
+        self.units_by_agent["claude-code"] += 1
         self.msgs_by_model[model] += 1
         self.cost_by_model[model] += cost
         self.cost_by_project[project] += cost
@@ -404,6 +448,118 @@ class Fleet:
                 self.first_ts = ts
             if self.last_ts is None or ts > self.last_ts:
                 self.last_ts = ts
+
+    def add_codex_session(self, project: str, model: str, usage: dict,
+                          ts: datetime | None) -> None:
+        """Record one Codex session from its FINAL cumulative usage.
+
+        `total_token_usage` is cumulative across the session and `token_count`
+        events repeat, so summing either over-counts badly. The last total is
+        the session total, exactly.
+        """
+        cost = codex_session_cost(usage, model)
+        _, _, _, known = rates_for(model, None)
+        if not known:
+            self.unknown_models[model] += 1
+
+        self.messages += 1
+        self.cost_by_agent["codex"] += cost
+        self.units_by_agent["codex"] += 1
+        self.msgs_by_model[model] += 1
+        self.cost_by_model[model] += cost
+        self.cost_by_project[project] += cost
+        cached = usage.get("cached_input_tokens", 0) or 0
+        self.tokens["input"] += max((usage.get("input_tokens", 0) or 0) - cached, 0)
+        self.tokens["cache_read"] += cached
+        self.tokens["output"] += usage.get("output_tokens", 0) or 0
+        if ts:
+            self.cost_by_day[ts.date().isoformat()] += cost
+            if self.first_ts is None or ts < self.first_ts:
+                self.first_ts = ts
+            if self.last_ts is None or ts > self.last_ts:
+                self.last_ts = ts
+
+    def scan_codex(self, roots: list[Path], since: datetime | None,
+                   project_filter: str | None) -> None:
+        for root in roots:
+            for f in sorted(root.rglob("rollout-*.jsonl")):
+                self._scan_codex_file(f, since, project_filter)
+
+    def _scan_codex_file(self, path: Path, since: datetime | None,
+                         project_filter: str | None) -> None:
+        try:
+            self.bytes_scanned += path.stat().st_size
+        except OSError:
+            return
+        self.files_scanned += 1
+
+        cwd = model = None
+        best: dict | None = None
+        best_total = -1
+        last_ts: datetime | None = None
+        pending: list[tuple[str, datetime | None]] = []
+
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    try:
+                        rec = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if not isinstance(rec, dict):
+                        continue
+                    ts = parse_ts(rec.get("timestamp"))
+                    payload = rec.get("payload")
+                    if not isinstance(payload, dict):
+                        continue
+                    kind = rec.get("type")
+
+                    if kind == "session_meta":
+                        cwd = payload.get("cwd") or cwd
+                    elif kind == "turn_context":
+                        cwd = payload.get("cwd") or cwd
+                        model = payload.get("model") or model
+                        pol = payload.get("approval_policy")
+                        if pol:
+                            self.permission_modes[f"codex:{pol}"] += 1
+                        sb = payload.get("sandbox_policy")
+                        if isinstance(sb, dict) and sb.get("type"):
+                            self.permission_modes[f"sandbox:{sb['type']}"] += 1
+                    elif kind == "event_msg" and payload.get("type") == "token_count":
+                        info = payload.get("info") or {}
+                        tot = info.get("total_token_usage")
+                        if isinstance(tot, dict):
+                            n = tot.get("total_tokens", 0) or 0
+                            if n > best_total:      # cumulative: keep the maximum
+                                best_total, best = n, tot
+                            if ts:
+                                last_ts = ts
+                    elif payload.get("type") == "function_call" and \
+                            payload.get("name") == "shell_command":
+                        try:
+                            args = json.loads(payload.get("arguments") or "{}")
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+                        cmd = args.get("command")
+                        if cmd:
+                            pending.append((cmd, ts))
+                            cwd = args.get("workdir") or cwd
+        except OSError:
+            return
+
+        if since and last_ts and last_ts < since:
+            return
+        project = pretty_project(cwd.lstrip("/").replace("/", "-")) if cwd else "unknown"
+        if project_filter and project_filter.lower() not in project.lower():
+            return
+
+        for cmd, ts in pending:
+            # Normalise Codex's shell_command onto the same "Bash" tool name the
+            # Claude Code path uses, so the audit is one cross-agent view.
+            self.add_tool(project, "Bash", {"command": cmd}, ts)
+
+        if best:
+            self.add_codex_session(project, model or "unknown", best, last_ts)
 
     def add_tool(self, project: str, name: str, tool_input: dict, ts: datetime | None) -> None:
         self.tools[name] += 1
@@ -443,10 +599,8 @@ class Fleet:
     def scan(self, roots: list[Path], since: datetime | None, project_filter: str | None,
              progress: bool) -> None:
         if not roots:
-            sys.exit("agentfleet: no Claude Code transcripts found.\n"
-                     "Looked in ~/.claude/projects and $CLAUDE_CONFIG_DIR/projects.\n"
-                     "Pass --root DIR if yours lives elsewhere.")
-        self.roots = roots
+            return
+        self.roots.extend(roots)
         dirs = sorted(d for r in roots for d in r.iterdir() if d.is_dir())
         for i, d in enumerate(dirs, 1):
             project = pretty_project(d.name)
@@ -524,6 +678,16 @@ class Fleet:
             return 0.0
         return max((self.last_ts - self.first_ts).total_seconds() / 86400.0, 1.0)
 
+    @property
+    def active_days(self) -> int:
+        """Days with any recorded spend.
+
+        Rates must be derived from this, not from the calendar span. One stale
+        session from six months ago stretches the span and silently divides the
+        weekly rate by five, understating a real burn rate.
+        """
+        return len([d for d, v in self.cost_by_day.items() if v > 0]) or 1
+
 
 # --------------------------------------------------------------------------
 # Rendering
@@ -562,7 +726,7 @@ def rule(c: C, title: str = "", width: int = 74) -> None:
 
 def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> None:
     span = fleet.span_days
-    weeks = span / 7.0 if span else 0
+    active = fleet.active_days
 
     if not bash_only:
         rule(c, "FLEET")
@@ -580,9 +744,11 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
         print(f"  tokens        {num(tok)}")
         print(f"  {c.bold}cost{c.off}          {c.bold}{money(fleet.total_cost)}{c.off} "
               f"{c.dim}notional, at API list price{c.off}")
-        if weeks >= 1:
-            print(f"  {c.dim}per week      {money(fleet.total_cost / weeks)}"
-                  f"   ·  annualized {money(fleet.total_cost / weeks * 52)}{c.off}")
+        if active >= 2:
+            per_day = fleet.total_cost / active
+            print(f"  {c.dim}per active day {money(per_day)}"
+                  f"   ·  per week {money(per_day * 7)}"
+                  f"   ·  {active} active days of {span:.0f}{c.off}")
 
         rule(c, "TOKENS")
         for k, label in (("input", "input"), ("output", "output"),
@@ -592,6 +758,15 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
             v = fleet.tokens.get(k, 0)
             pct = (v / tok * 100) if tok else 0
             print(f"  {label:<22} {num(v):>16}  {c.dim}{pct:5.1f}%{c.off}")
+
+        if len(fleet.cost_by_agent) > 1:
+            rule(c, "BY AGENT")
+            print(f"  {'agent':<22} {'units':>9} {'cost':>13}   share")
+            for a, cost in sorted(fleet.cost_by_agent.items(), key=lambda kv: -kv[1]):
+                share = (cost / fleet.total_cost * 100) if fleet.total_cost else 0
+                unit = "messages" if a == "claude-code" else "sessions"
+                print(f"  {a:<22} {num(fleet.units_by_agent[a]):>9} {money(cost):>13}   "
+                      f"{c.dim}{share:5.1f}%  {unit}{c.off}")
 
         rule(c, "BY MODEL")
         print(f"  {'model':<22} {'msgs':>9} {'cost':>13}   share")
@@ -696,12 +871,14 @@ def to_json(fleet: Fleet, raw: bool = False) -> dict:
             "from": fleet.first_ts.isoformat() if fleet.first_ts else None,
             "to": fleet.last_ts.isoformat() if fleet.last_ts else None,
             "days": round(fleet.span_days, 2),
+            "active_days": fleet.active_days,
         },
         "scanned": {"files": fleet.files_scanned, "bytes": fleet.bytes_scanned,
                     "roots": [str(r) for r in fleet.roots]},
         "messages": fleet.messages,
         "cost_usd": round(fleet.total_cost, 4),
         "tokens": dict(fleet.tokens),
+        "by_agent": {k: round(v, 4) for k, v in fleet.cost_by_agent.items()},
         "by_model": {k: round(v, 4) for k, v in
                      sorted(fleet.cost_by_model.items(), key=lambda kv: -kv[1])},
         "by_project": {k: round(v, 4) for k, v in
@@ -737,6 +914,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--top", type=int, default=12, metavar="N", help="projects to list (default 12)")
     ap.add_argument("--bash", action="store_true", help="shell audit only")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--agent", choices=["all", "claude", "codex"], default="all",
+                    help="which agents to include (default: all)")
     ap.add_argument("--no-redact", action="store_true",
                     help="do NOT redact credentials from output (unsafe to share)")
     ap.add_argument("--root", metavar="DIR", help="transcript directory")
@@ -747,10 +926,25 @@ def main(argv: list[str] | None = None) -> int:
     if args.days:
         since = datetime.now(timezone.utc) - timedelta(days=args.days)
 
-    roots = [Path(args.root).expanduser()] if args.root else transcript_roots()
-
     fleet = Fleet()
-    fleet.scan(roots, since, args.project, progress=not args.json and sys.stderr.isatty())
+    progress = not args.json and sys.stderr.isatty()
+
+    if args.root:
+        fleet.scan([Path(args.root).expanduser()], since, args.project, progress=progress)
+    else:
+        if args.agent in ("all", "claude"):
+            roots = transcript_roots()
+            if roots:
+                fleet.scan(roots, since, args.project, progress=progress)
+            elif args.agent == "claude":
+                sys.exit("agentfleet: no Claude Code transcripts found.")
+        if args.agent in ("all", "codex"):
+            croots = codex_roots()
+            if croots:
+                fleet.roots.extend(croots)
+                fleet.scan_codex(croots, since, args.project)
+            elif args.agent == "codex":
+                sys.exit("agentfleet: no Codex sessions found under $CODEX_HOME/sessions.")
 
     if fleet.messages == 0 and fleet.bash_total == 0:
         print("agentfleet: no matching activity found.", file=sys.stderr)

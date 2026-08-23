@@ -2,17 +2,18 @@
 
 **What your coding agents cost, and what they actually did.**
 
-Claude Code writes a complete record of every session to your disk: token usage per
-message, every tool call, every shell command. What it doesn't give you is a view
-across all of it. If you run agents in more than one project, you cannot currently
-answer:
+Terminal-native coding agents write a complete record of every session to your
+disk: token usage per turn, every tool call, every shell command. What they don't
+give you is a view across all of it. If you run agents in more than one project, or
+more than one agent, you cannot currently answer:
 
 - What did my agents cost last month?
 - Which project is burning the budget?
 - What shell commands have my agents actually been running?
 - Did a credential ever end up in a command?
 
-`agentfleet` answers those four questions from data already on your machine.
+`agentfleet` answers those four questions from data already on your machine,
+across **Claude Code** and **Codex**, in one report.
 
 ```
 $ agentfleet
@@ -58,6 +59,7 @@ python3 agentfleet.py --bash           # shell audit only
 python3 agentfleet.py --project svc    # filter to matching projects
 python3 agentfleet.py --json           # machine-readable
 python3 agentfleet.py --top 25         # show more projects
+python3 agentfleet.py --agent codex    # one agent only (claude | codex | all)
 ```
 
 ## Privacy
@@ -133,16 +135,43 @@ output harder to read. Redaction is idempotent.
 If the report tells you commands contained credential material, those secrets are
 sitting in plaintext in your transcripts. Rotate anything live.
 
-## Limitations
+## Which agents, and why not the others
 
-- **Claude Code only.** The 70% of engineers running 2–4 agents get a partial
-  picture. Cursor, Codex, Cline, and Aider are not read yet.
+| Agent | Supported | Why |
+|---|---|---|
+| **Claude Code** | yes | `~/.claude/projects/**/*.jsonl` |
+| **Codex** | yes | `$CODEX_HOME/sessions/**/rollout-*.jsonl` |
+| Cursor | **no** | Nothing to read. All `composerData` records are empty shells: `conversationMap {}`, `usageData {}`. The `ai_code_hashes` and `conversation_summaries` tables have zero rows. Content is server-side. |
+| Windsurf | **no** | `globalStorage` holds config and auth only. No conversation or usage store. Server-side. |
+| Cline, Aider | not yet | Both write local files. Untested, likely feasible. |
+
+The pattern is clean: **terminal-native agents write local rollouts, IDE forks are
+thin clients that keep everything server-side.** Supporting Cursor or Windsurf would
+mean network calls and OAuth against their APIs, which would cost this tool the three
+properties it's built on — no network, read-only, auditable in one sitting. That
+trade isn't worth making, so the scope is stated honestly instead: every agent with
+a shell on your machine.
+
+Two provider quirks the cost code has to get right, because both silently overcharge
+if handled like the other:
+
+- **Anthropic** reports `input_tokens` *excluding* cache, with cache reads and
+  writes as separate buckets.
+- **OpenAI** reports `input_tokens` *including* `cached_input_tokens`, and
+  `reasoning_output_tokens` as a subset of `output_tokens`. Neither is an addition.
+- Codex's `total_token_usage` is **cumulative** across a session and its
+  `token_count` events repeat, so the session total is the final value, never a sum.
+
+## Limitations
 - **Reporting only.** It observes; it does not enforce. Claude Code's own
   permission rules, sandboxing, and hooks are where enforcement belongs.
 - **Pattern matching has a ceiling.** A command that builds a string dynamically,
   or runs a script whose contents live in a file, will not be caught. This raises
   the floor on visibility; it is not a security boundary.
-- **Prices are hardcoded** and dated in the source. They will drift.
+- **Prices are hardcoded** and dated in the source. They will drift. OpenAI rates
+  come from a third-party aggregator rather than OpenAI's own page.
+- **Rates use active days**, not calendar span, so one stale session from months ago
+  doesn't silently divide your weekly burn rate by five.
 - **Cache TTL inference.** Older transcripts only record a flat cache-creation
   total, which is assumed to be 5-minute TTL and may under-price slightly.
 

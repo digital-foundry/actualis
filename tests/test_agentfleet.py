@@ -160,8 +160,12 @@ class TestPricing(unittest.TestCase):
         self.assertEqual(af.rates_for("claude-sonnet-5", after)[:2], (3.0, 15.0))
 
     def test_unknown_model_is_flagged_not_silently_guessed(self):
-        _, _, known = af.rates_for("claude-does-not-exist", None)
+        *_, known = af.rates_for("claude-does-not-exist", None)
         self.assertFalse(known)
+
+    def test_provider_is_reported(self):
+        self.assertEqual(af.rates_for("claude-opus-5", None)[2], "anthropic")
+        self.assertEqual(af.rates_for("gpt-5.2-codex", None)[2], "openai")
 
     def test_cost_math_end_to_end(self):
         """1M of each bucket on Opus ($5 in / $25 out) = 5 + 25 + 10 + 6.25 + 0.5."""
@@ -180,6 +184,54 @@ class TestPricing(unittest.TestCase):
         f = af.Fleet()
         f.add_usage("p", "claude-opus-5", {"cache_creation_input_tokens": 1_000_000}, None)
         self.assertAlmostEqual(f.total_cost, 6.25, places=6)
+
+
+class TestCodex(unittest.TestCase):
+    """Codex reports usage differently from Claude Code in two ways that will
+    silently corrupt totals if handled like Anthropic's."""
+
+    def test_cached_is_a_subset_of_input_not_an_addition(self):
+        """OpenAI: input_tokens INCLUDES cached. Billing all of it at full rate
+        overcharges; the cached portion bills at 0.10x."""
+        usage = {"input_tokens": 1_000_000, "cached_input_tokens": 900_000,
+                 "output_tokens": 100_000}
+        cost = af.codex_session_cost(usage, "gpt-5.2-codex")
+        expected = (0.1 * 1.75) + (0.9 * 1.75 * 0.10) + (0.1 * 14.0)
+        self.assertAlmostEqual(cost, expected, places=6)
+
+    def test_reasoning_tokens_are_not_added_to_output(self):
+        a = af.codex_session_cost(
+            {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 1_000_000}, "gpt-5.2-codex")
+        b = af.codex_session_cost(
+            {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 1_000_000,
+             "reasoning_output_tokens": 900_000}, "gpt-5.2-codex")
+        self.assertEqual(a, b)
+
+    def test_fully_cached_session_is_cheap(self):
+        usage = {"input_tokens": 1_000_000, "cached_input_tokens": 1_000_000, "output_tokens": 0}
+        self.assertAlmostEqual(af.codex_session_cost(usage, "gpt-5.2-codex"), 0.175, places=6)
+
+    def test_session_total_is_the_max_not_the_sum(self):
+        """total_token_usage is cumulative and token_count events repeat.
+        Summing them inflates a session's cost by orders of magnitude."""
+        f = af.Fleet()
+        final = {"input_tokens": 1_000_000, "cached_input_tokens": 0, "output_tokens": 0}
+        f.add_codex_session("proj", "gpt-5.2-codex", final, None)
+        self.assertAlmostEqual(f.total_cost, 1.75, places=6)
+        self.assertEqual(f.units_by_agent["codex"], 1)
+
+    def test_agents_are_tracked_separately(self):
+        f = af.Fleet()
+        f.add_usage("p", "claude-opus-5", {"output_tokens": 1_000_000}, None)
+        f.add_codex_session("p", "gpt-5.2-codex", {"output_tokens": 1_000_000}, None)
+        self.assertAlmostEqual(f.cost_by_agent["claude-code"], 25.0, places=6)
+        self.assertAlmostEqual(f.cost_by_agent["codex"], 14.0, places=6)
+
+    def test_codex_shell_commands_join_the_same_audit(self):
+        f = af.Fleet()
+        f.add_tool("proj", "Bash", {"command": "rm -rf /tmp/build"}, None)
+        self.assertEqual(f.tools["Bash"], 1)
+        self.assertTrue(any(x["severity"] == "high" for x in f.flags))
 
 
 class TestRoots(unittest.TestCase):
