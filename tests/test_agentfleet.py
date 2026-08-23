@@ -312,6 +312,45 @@ class TestCodex(unittest.TestCase):
         self.assertTrue(any(x["severity"] == "high" for x in f.flags))
 
 
+class TestCacheEfficiency(unittest.TestCase):
+
+    def test_output_tokens_are_excluded_from_the_denominator(self):
+        """Output is not cacheable. Counting it would make chatty projects look
+        broken when their caching is fine."""
+        from collections import Counter as C
+        chatty = C({"input": 10, "cache_w": 0, "cache_read": 90, "output": 10_000_000})
+        quiet = C({"input": 10, "cache_w": 0, "cache_read": 90, "output": 0})
+        self.assertAlmostEqual(af.cache_hit_rate(chatty), af.cache_hit_rate(quiet))
+        self.assertAlmostEqual(af.cache_hit_rate(quiet), 90.0)
+
+    def test_zero_context_does_not_divide_by_zero(self):
+        from collections import Counter as C
+        self.assertEqual(af.cache_hit_rate(C()), 0.0)
+
+    def test_savings_are_measured_against_sending_uncached(self):
+        """1M cache reads on Opus: $5.00 uncached versus $0.50 at the 0.10x
+        read rate, so $4.50 saved."""
+        f = af.Fleet()
+        f.add_usage("p", "claude-opus-5", {"cache_read_input_tokens": 1_000_000}, None)
+        saved = f.cache_uncached["p"] - f.cache_actual["p"]
+        self.assertAlmostEqual(saved, 4.50, places=6)
+
+    def test_cache_writes_cost_more_than_uncached(self):
+        """A 1h write is 2.00x, so a write-only project shows negative savings.
+        Reporting that honestly beats clamping it to zero."""
+        f = af.Fleet()
+        f.add_usage("p", "claude-opus-5",
+                    {"cache_creation": {"ephemeral_1h_input_tokens": 1_000_000,
+                                        "ephemeral_5m_input_tokens": 0}}, None)
+        self.assertLess(f.cache_uncached["p"] - f.cache_actual["p"], 0)
+
+    def test_rates_are_per_model(self):
+        f = af.Fleet()
+        f.add_usage("a", "claude-opus-5", {"cache_read_input_tokens": 1_000_000}, None)
+        f.add_usage("b", "claude-haiku-4-5", {"cache_read_input_tokens": 1_000_000}, None)
+        self.assertGreater(f.cache_uncached["a"], f.cache_uncached["b"])
+
+
 class TestTicketAttribution(unittest.TestCase):
 
     def test_extracts_numeric_tickets(self):

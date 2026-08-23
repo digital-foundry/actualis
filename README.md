@@ -103,6 +103,36 @@ it keeps the no-network promise intact.
 
 Findings are earned. On a fleet with nothing notable, the coach prints nothing.
 
+## Cache efficiency
+
+```
+CACHE EFFICIENCY
+  fleet hit rate  98.1% of input context served from cache
+  saved           $274,083.25 versus sending the same context uncached
+
+   hit rate         context        saved  project
+      98.3%  53,502,084,188  $229,183.43  digital-business-cards
+      97.5%   6,388,644,406   $27,240.68  systematic-venture-capital
+      96.8%     357,231,826    $1,497.92  huestonhomes
+
+  No project is more than 15 points below your median of 96.8%.
+```
+
+Hit rate is `cache_read / (input + cache_write + cache_read)` — the share of
+**input context** served from cache. Output tokens are excluded because they are
+not cacheable, and including them makes a chatty project look broken when its
+caching is fine.
+
+Savings are measured against the counterfactual of sending the same context
+uncached, priced per model at the message level. Note that a project doing mostly
+cache *writes* can show negative savings, since a 1-hour write costs 2.00x. That
+is reported rather than clamped to zero.
+
+A project more than 15 points below your own median is flagged (`AF002`) as
+likely having something unstable early in its prompt prefix. Projects below the
+reporting threshold are excluded from both the table and the coach, so the two
+never disagree.
+
 ## Subagents
 
 Subagent runs are reported separately: how many, which models, how much shell and

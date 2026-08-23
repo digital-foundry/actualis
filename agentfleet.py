@@ -556,6 +556,11 @@ class Fleet:
         self.cost_by_project: dict[str, float] = defaultdict(float)
         self.cost_by_day: dict[str, float] = defaultdict(float)
         self.tokens_by_project: dict[str, Counter] = defaultdict(Counter)
+        # Input-side cost as billed, and what the same context would have cost
+        # with no caching at all. Accumulated per message because the rate
+        # varies by model and cannot be recovered from totals afterwards.
+        self.cache_actual: dict[str, float] = defaultdict(float)
+        self.cache_uncached: dict[str, float] = defaultdict(float)
         self.msgs_by_project: Counter = Counter()
         self.cost_by_ticket: dict[str, float] = defaultdict(float)
         self.msgs_by_ticket: Counter = Counter()
@@ -637,6 +642,13 @@ class Fleet:
         pt["input"] += inp; pt["output"] += out
         pt["cache_w"] += w1h + w5m; pt["cache_read"] += rd
         self.msgs_by_project[project] += 1
+
+        self.cache_actual[project] += (
+            inp / 1e6 * in_rate
+            + w1h / 1e6 * in_rate * CACHE_WRITE_1H_MULT
+            + w5m / 1e6 * in_rate * CACHE_WRITE_5M_MULT
+            + rd / 1e6 * in_rate * CACHE_READ_MULT)
+        self.cache_uncached[project] += (inp + w1h + w5m + rd) / 1e6 * in_rate
 
         bucket = branch_bucket(branch)
         self.cost_by_branch[bucket] += cost
@@ -983,6 +995,16 @@ class Finding:
         self.evidence, self.action, self.impact = evidence, action, impact
 
 
+def cache_hit_rate(t: Counter) -> float:
+    """Share of INPUT context served from cache.
+
+    Output tokens are not cacheable, so including them in the denominator
+    understates the rate and makes projects with chatty output look broken.
+    """
+    denom = t["input"] + t["cache_w"] + t["cache_read"]
+    return (t["cache_read"] / denom * 100) if denom else 0.0
+
+
 def _median(xs: list[float]) -> float:
     if not xs:
         return 0.0
@@ -1012,14 +1034,15 @@ def coach(fleet: "Fleet") -> list[Finding]:
     # --- AF002 cache efficiency vs your own median -------------------------
     ratios: dict[str, float] = {}
     for proj, t in fleet.tokens_by_project.items():
-        tot = sum(t.values())
-        if tot > 1_000_000 and fleet.cost_by_project.get(proj, 0) >= MIN_PROJECT_COST:
-            ratios[proj] = t["cache_read"] / tot * 100
+        if (t["input"] + t["cache_w"] + t["cache_read"]) > 1_000_000 and \
+                fleet.cost_by_project.get(proj, 0) >= MIN_PROJECT_COST:
+            ratios[proj] = cache_hit_rate(t)
     if len(ratios) >= 3:
         med = _median(list(ratios.values()))
         for proj, r in sorted(ratios.items(), key=lambda kv: kv[1]):
             if r < med - 15 and r < 90:
-                waste = fleet.cost_by_project.get(proj, 0) * ((med - r) / 100) * 0.5
+                waste = max(fleet.cache_uncached.get(proj, 0) * (med - r) / 100
+                            * (1 - CACHE_READ_MULT), 0.0)
                 out.append(Finding(
                     "AF002", "high", "Cache efficiency below your own median",
                     f"{proj} reads {r:.0f}% of tokens from cache; your median project "
@@ -1463,6 +1486,49 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
                 print(f"\n  {c.yellow}▲{c.off} {top_share:.0f}% of all spend is one project: "
                       f"{c.bold}{projects[0][0]}{c.off}")
 
+        if fleet.tokens_by_project:
+            rows = []
+            for proj, t in fleet.tokens_by_project.items():
+                ctx = t["input"] + t["cache_w"] + t["cache_read"]
+                # Same eligibility as AF002, or the section flags projects the
+                # coach will never mention. A $4 worktree at 78% is noise.
+                if ctx < 1_000_000 or fleet.cost_by_project.get(proj, 0) < MIN_PROJECT_COST:
+                    continue
+                rows.append((proj, cache_hit_rate(t), ctx,
+                             fleet.cache_uncached[proj] - fleet.cache_actual[proj],
+                             fleet.cost_by_project.get(proj, 0.0)))
+            if rows:
+                rows.sort(key=lambda r: -r[2])
+                med_pre = _median([r[1] for r in rows])
+                shown = rows[:top]
+                # A project called out as an outlier must be visible, even when
+                # it is too small to make the top-N by context volume.
+                shown += [r for r in rows[top:] if r[1] < med_pre - 15]
+                saved = sum(fleet.cache_uncached.values()) - sum(fleet.cache_actual.values())
+                allctx = Counter()
+                for t in fleet.tokens_by_project.values():
+                    allctx.update(t)
+                fleet_rate = cache_hit_rate(allctx)
+                med = _median([r[1] for r in rows])
+
+                rule(c, "CACHE EFFICIENCY")
+                print(f"  fleet hit rate  {c.bold}{fleet_rate:.1f}%{c.off} of input context "
+                      f"served from cache")
+                print(f"  saved           {c.bold}{money(saved)}{c.off} {c.dim}versus sending "
+                      f"the same context uncached{c.off}")
+                print(f"\n  {'hit rate':>9}  {'context':>14}  {'saved':>11}  project")
+                for proj, rate, ctx, sv, _cost in shown:
+                    col = c.ok if rate >= med else (c.yellow if rate >= med - 15 else c.red)
+                    print(f"  {col}{rate:>8.1f}%{c.off}  {num(ctx):>14}  {money(sv):>11}  "
+                          f"{proj[:40]}")
+                low = [r for r in rows if r[1] < med - 15]
+                if low:
+                    print(f"\n  {c.yellow}▲{c.off} {len(low)} project(s) more than 15 points "
+                          f"below your median of {med:.1f}%. See AF002.")
+                else:
+                    print(f"\n  {c.dim}No project is more than 15 points below your median "
+                          f"of {med:.1f}%.{c.off}")
+
         if fleet.cost_by_ticket:
             tickets = sorted(fleet.cost_by_ticket.items(), key=lambda kv: -kv[1])
             ticketed = sum(fleet.cost_by_ticket.values())
@@ -1637,6 +1703,21 @@ def to_json(fleet: Fleet, raw: bool = False) -> dict:
         },
         "by_model": {k: round(v, 4) for k, v in
                      sorted(fleet.cost_by_model.items(), key=lambda kv: -kv[1])},
+        "cache": {
+            "fleet_hit_rate_pct": round(cache_hit_rate(
+                Counter({k: sum(t[k] for t in fleet.tokens_by_project.values())
+                         for k in ("input", "cache_w", "cache_read")})), 2),
+            "saved_usd": round(sum(fleet.cache_uncached.values())
+                               - sum(fleet.cache_actual.values()), 4),
+            "by_project": {
+                p: {"hit_rate_pct": round(cache_hit_rate(t), 2),
+                    "context_tokens": t["input"] + t["cache_w"] + t["cache_read"],
+                    "saved_usd": round(fleet.cache_uncached[p] - fleet.cache_actual[p], 4)}
+                for p, t in sorted(fleet.tokens_by_project.items(),
+                                   key=lambda kv: -(kv[1]["input"] + kv[1]["cache_w"]
+                                                    + kv[1]["cache_read"]))
+                if (t["input"] + t["cache_w"] + t["cache_read"]) >= 1_000_000},
+        },
         "by_ticket": [
             {"ticket": t, "cost_usd": round(cost, 4),
              "messages": fleet.msgs_by_ticket[t],
