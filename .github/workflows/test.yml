@@ -4,7 +4,7 @@ on:
   push: { branches: [main] }
   pull_request:
   schedule:
-    - cron: "0 6 * * 1"   # weekly: catches rot in a repo with no dependencies
+    - cron: "0 6 * * 1"   # weekly: a repo with no dependencies still rots
 
 permissions:
   contents: read
@@ -14,22 +14,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The README claims 3.9+ and cross-platform. Claims get tested.
+        # The README claims Python 3.9+ and cross-platform. Claims get tested.
+        # Python is installed with uv rather than actions/setup-python, which
+        # has no 3.9 build for current runners (macOS is arm64, ubuntu is 24.04).
         os: [ubuntu-latest, macos-latest, windows-latest]
         python: ["3.9", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "${{ matrix.python }}" }
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: version in use
+        run: uv run --python ${{ matrix.python }} python -c "import sys; print(sys.version)"
+
       - name: no third-party imports
-        shell: bash
         run: |
-          python -c "
+          uv run --python ${{ matrix.python }} python -c "
           import ast, sys
-          # An explicit allowlist rather than sys.stdlib_module_names, which
-          # does not exist before 3.10 and would skip this check on the oldest
-          # version it most needs to run on.
           allowed = {'__future__','argparse','collections','contextlib','datetime',
                      'hashlib','importlib','io','json','os','pathlib','re',
                      'subprocess','sys','time','unittest'}
@@ -44,9 +48,13 @@ jobs:
           print('imports:', sorted(found))
           print('outside allowlist:', extra or 'none')
           sys.exit(1 if extra else 0)"
-      - run: python -m unittest discover -s tests -v
-      - name: runs on an empty machine without crashing
+
+      - name: tests
+        run: uv run --python ${{ matrix.python }} python -m unittest discover -s tests -v
+
+      - name: exits cleanly with no transcripts
         shell: bash
         run: |
-          mkdir -p /tmp/empty
-          python agentfleet.py --root /tmp/empty || test $? -eq 1
+          mkdir -p empty-probe
+          uv run --python ${{ matrix.python }} python agentfleet.py --root empty-probe \
+            && echo "unexpected success" && exit 1 || test $? -eq 1
