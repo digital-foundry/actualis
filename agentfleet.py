@@ -8,6 +8,10 @@ shell command your agents ran.
 
 No network. No telemetry. No dependencies. Reads only files already on your disk.
 
+Copyright (C) 2026 Digital Foundry Solutions, LLC
+Licensed under the GNU General Public License v3 or later. See LICENSE.
+This program comes with ABSOLUTELY NO WARRANTY.
+
 Usage:
     python3 agentfleet.py                 # full report, all time
     python3 agentfleet.py --days 30       # last 30 days

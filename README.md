@@ -309,3 +309,15 @@ if handled like the other:
 The cost pipeline was cross-checked against an independent `jq` implementation over
 the same transcripts: 135,508 messages / $44,397.88 on the first root, matching to
 the cent. Do the same before trusting any number here that matters to you.
+
+## License
+
+GPL-3.0-or-later. Copyright (C) 2026 Digital Foundry Solutions, LLC.
+
+Running this tool places no obligation on you: use it internally, in a company,
+on client work, however you like. The copyleft only applies if you **distribute a
+modified version**, in which case that version has to carry the same freedoms.
+
+Note the deliberate gap: GPL-3.0 does not reach a hosted service. Someone can
+take this, modify it, and run it as a SaaS without publishing anything. AGPL-3.0
+is the variant that closes that.
