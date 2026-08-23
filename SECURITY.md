@@ -33,6 +33,21 @@ own real secrets from it.
 - **Secrets in your transcripts.** The tool reports that condition; it does not
   cause it.
 
+## Hardening
+
+Transcripts contain whatever an agent typed, fetched, or was fed, including text
+from web pages and files. All of it is treated as untrusted input.
+
+- **Terminal escape sequences are stripped** from every string derived from a
+  transcript, at the point it enters the data structure rather than at print
+  time. Escape codes can move the cursor and overwrite text, which would let a
+  crafted command hide its dangerous half from the audit that exists to reveal
+  it. Found by probing, not review.
+- **Regex quantifiers are bounded.** Wide character classes with unbounded `*`
+  backtrack quadratically. A 140,000-character command took **164 seconds**
+  before this was fixed; it now takes 80 ms, a 2,000x difference. Input is also
+  capped per line and in total as defence in depth.
+
 ## Design commitments
 
 These are properties, not aspirations, and each is covered by tests:

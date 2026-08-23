@@ -1,0 +1,46 @@
+name: test
+
+on:
+  push: { branches: [main] }
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"   # weekly: catches rot in a repo with no dependencies
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # The README claims 3.9+ and cross-platform. Claims get tested.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.9", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ matrix.python }}" }
+      - name: no third-party imports
+        shell: bash
+        run: |
+          python -c "
+          import ast,sys
+          std = set(sys.stdlib_module_names)
+          tree = ast.parse(open('agentfleet.py').read())
+          bad = []
+          for n in ast.walk(tree):
+              if isinstance(n, ast.Import):
+                  bad += [a.name.split('.')[0] for a in n.names]
+              elif isinstance(n, ast.ImportFrom) and n.level == 0 and n.module:
+                  bad.append(n.module.split('.')[0])
+          extra = sorted(set(bad) - std - {'__future__'})
+          print('third-party imports:', extra or 'none')
+          sys.exit(1 if extra else 0)"
+      - run: python -m unittest discover -s tests -v
+      - name: runs on an empty machine without crashing
+        shell: bash
+        run: |
+          mkdir -p /tmp/empty
+          python agentfleet.py --root /tmp/empty || test $? -eq 1

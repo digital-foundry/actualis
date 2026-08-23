@@ -125,17 +125,17 @@ BASH_RULES: list[Rule] = [
     ("med",  "privilege",        r"\bchown\s+-R\s+root\b"),
 
     # --- remote code execution ---
-    ("high", "remote-exec",      r"\b(curl|wget)\b[^|;\n]*\|\s*(sudo\s+)?(ba|z|k)?sh\b"),
+    ("high", "remote-exec",      r"\b(curl|wget)\b[^|;\n]{0,512}\|\s*(sudo\s+)?(ba|z|k)?sh\b"),
     # An interpreter with an inline-script flag (-c/-e/-m) treats stdin as DATA,
     # so `curl … | python3 -c '…'` is parsing a response, not running downloaded
     # code. Only the bare interpreter form executes what was fetched.
-    ("high", "remote-exec",      r"\b(curl|wget)\b[^|;\n]*\|\s*(sudo\s+)?(python3?|node|perl|ruby)\b"
+    ("high", "remote-exec",      r"\b(curl|wget)\b[^|;\n]{0,512}\|\s*(sudo\s+)?(python3?|node|perl|ruby)\b"
                                  r"(?!\s+-(?:c|e|m|p)\b)"),
     ("med",  "remote-exec",      r"\bnpx\s+(-y\s+)?https?://"),
-    ("med",  "remote-exec",      r"\bpip\s+install\b[^|;\n]*\bhttps?://"),
+    ("med",  "remote-exec",      r"\bpip\s+install\b[^|;\n]{0,512}\bhttps?://"),
 
     # --- credential and secret access ---
-    ("high", "credentials",      r"(cat|less|more|head|tail|strings|cp|scp|base64)\b[^|;\n]*"
+    ("high", "credentials",      r"(cat|less|more|head|tail|strings|cp|scp|base64)\b[^|;\n]{0,512}"
                                  r"(\.env(\.[a-z]+)?|id_[rd]sa|\.pem|\.p12|credentials|\.netrc|\.npmrc|\.pypirc)\b"),
     ("high", "credentials",      r"\bsecurity\s+find-(generic|internet)-password\b"),
     ("med",  "credentials",      r"\b(printenv|env)\b\s*(\||$)"),
@@ -146,11 +146,11 @@ BASH_RULES: list[Rule] = [
     # Case-sensitive on the flags: curl -D (dump headers) is not curl -d (send body).
     # Skipped entirely when the command only talks to loopback.
     ("high", "egress",           r"(?!.*(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\]))"
-                                 r"\bcurl\b[^|;\n]*\s(?-i:-d|--data|--data-raw|--data-binary|-F|--form|-T|--upload-file)\b"),
-    ("med",  "egress",           r"\b(scp|rsync)\b[^|;\n]*\s[^\s]+@[^\s]+:"),
+                                 r"\bcurl\b[^|;\n]{0,512}\s(?-i:-d|--data|--data-raw|--data-binary|-F|--form|-T|--upload-file)\b"),
+    ("med",  "egress",           r"\b(scp|rsync)\b[^|;\n]{0,512}\s[^\s]+@[^\s]+:"),
 
     # --- git danger ---
-    ("high", "git",              r"\bgit\s+push\b[^|;\n]*\s(--force|-f)\b"),
+    ("high", "git",              r"\bgit\s+push\b[^|;\n]{0,512}\s(--force|-f)\b"),
     ("high", "git",              r"\bgit\s+(filter-branch|filter-repo)\b"),
     ("med",  "git",              r"\bgit\s+reset\s+--hard\b"),
     ("med",  "git",              r"\bgit\s+clean\s+-[a-zA-Z]*f"),
@@ -162,12 +162,12 @@ BASH_RULES: list[Rule] = [
     ("high", "publish",          r"\b(kubectl|helm)\b.*\b(delete|destroy)\b"),
     ("high", "publish",          r"\bterraform\s+(apply|destroy)\b(?!.*-plan)"),
     ("med",  "publish",          r"\b(vercel|netlify|fly|wrangler)\s+deploy\b"),
-    ("high", "publish",          r"\baws\s+s3\s+(rm|sync)\b[^|;\n]*--delete\b"),
+    ("high", "publish",          r"\baws\s+s3\s+(rm|sync)\b[^|;\n]{0,512}--delete\b"),
 
     # --- database ---
     ("high", "database",         r"\b(DROP|TRUNCATE)\s+(TABLE|DATABASE|SCHEMA)\b"),
     ("high", "database",         r"\bDELETE\s+FROM\b(?![^;]*\bWHERE\b)"),
-    ("med",  "database",         r"\b(psql|mysql|mongosh)\b[^|;\n]*-c\b"),
+    ("med",  "database",         r"\b(psql|mysql|mongosh)\b[^|;\n]{0,512}-c\b"),
 
     # --- history and audit tampering ---
     ("high", "audit",            r"\bhistory\s+-c\b"),
@@ -190,17 +190,17 @@ def audit_command(cmd: str) -> list[tuple[str, str, str]]:
     of a 40-line heredoc tells you nothing, so each match carries the line that
     actually triggered it.
     """
-    lines = cmd.splitlines() or [cmd]
+    # Every rule's character classes exclude \n, so no rule can match across a
+    # line break. Scanning is therefore per line, and the whole-command retry
+    # this used to do was both redundant and the entire cost: it doubled the
+    # work on the slowest possible input.
+    lines = [ln[:MAX_SCAN_LINE] for ln in (cmd.splitlines() or [cmd])[:MAX_SCAN_LINES]]
     out: list[tuple[str, str, str]] = []
     for sev, cat, rx in COMPILED_RULES:
         for ln in lines:
             if rx.search(ln):
-                out.append((sev, cat, ln.strip()))
+                out.append((sev, cat, clean(ln.strip())))
                 break
-        else:
-            # Some rules span lines (e.g. a pipeline broken across newlines).
-            if rx.search(cmd):
-                out.append((sev, cat, cmd.strip().splitlines()[0]))
     return out
 
 
@@ -222,8 +222,8 @@ _TOKEN_PREFIXES = [
 _SECRET_PATTERNS = [
     # KEY=value / KEY: value for anything that smells like a secret
     re.compile(
-        r"(?i)\b([A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|APIKEY|API_KEY|ACCESS_KEY"
-        r"|PRIVATE_KEY|CREDENTIAL|AUTH|BEARER|SESSION|COOKIE)[A-Z0-9_]*)"
+        r"(?i)\b([A-Z0-9_]{0,40}(?:SECRET|TOKEN|PASSWORD|PASSWD|APIKEY|API_KEY|ACCESS_KEY"
+        r"|PRIVATE_KEY|CREDENTIAL|AUTH|BEARER|SESSION|COOKIE)[A-Z0-9_]{0,40})"
         r"(\s*[=:]\s*)(['\"]?)"
         r"(?!(?:Bearer|Basic|Digest|Token|None|null|true|false)\b)"
         r"([^\s'\";|&]{6,})"
@@ -233,7 +233,7 @@ _SECRET_PATTERNS = [
     # Authorization headers
     re.compile(r"(?i)(authorization:\s*(?:bearer|basic)\s+)([^\s'\"]{8,})"),
     # postgres://user:pass@host and friends
-    re.compile(r"([a-z][a-z0-9+.\-]*://[^\s:/@]+:)([^\s@/]{3,})(@)"),
+    re.compile(r"([a-z][a-z0-9+.\-]{0,20}://[^\s:/@]{1,128}:)([^\s@/]{3,256})(@)"),
 ]
 
 
@@ -257,7 +257,7 @@ def redact(text: str) -> str:
     """Remove credential material from a command string. Idempotent."""
     if not text:
         return text
-    out = text
+    out = text[:MAX_SCAN_TOTAL]
     # Order matters: the Authorization header rule must run before the generic
     # KEY=value rule, or "AUTH" in "Authorization:" makes it eat the scheme word.
     out = _SECRET_PATTERNS[2].sub(lambda m: f"{m.group(1)}{_mask(m.group(2))}", out)
@@ -277,6 +277,40 @@ _BODY_KEYWORDS = {"do", "then", "else", "fi", "done", "esac", "in", "{", "(", "!
 _PREFIX_WORDS = {"sudo", "env", "exec", "time", "nohup", "command", "builtin", "nice", "xargs"}
 _TAKES_PATH_ARG = {"cd", "pushd", "popd"}
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+
+
+# --------------------------------------------------------------------------
+# Untrusted text
+#
+# Transcripts contain whatever an agent typed, fetched, or was fed — including
+# content from web pages and files. Anything from a transcript is untrusted and
+# must be neutralised before it reaches a terminal, a log, or JSON.
+#
+# Terminal escapes are the live risk: a command carrying \x1b[2J clears the
+# reader's screen, and cursor-movement or overwrite sequences can HIDE the
+# dangerous part of a command from the audit that exists to show it. For a tool
+# whose threat model includes a prompt-injected agent, that is the attack.
+# --------------------------------------------------------------------------
+
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+# Bound the work any single command can cause. audit_command runs ~40 patterns
+# with wide character classes; a 140,000-character line took 164 seconds before
+# these caps, which is a denial of service reachable from transcript content.
+MAX_SCAN_LINE = 4096
+MAX_SCAN_LINES = 400
+# classify_secrets and redact must see the WHOLE command, since a credential can
+# sit anywhere in it, so they are bounded by total length rather than per line.
+# Real commands carrying secrets are small; a 40,000-character single line is
+# pathological and cost 4 seconds unbounded.
+MAX_SCAN_TOTAL = 32768
+
+
+def clean(text: str | None) -> str:
+    """Strip control characters from untrusted text. Tabs and newlines survive."""
+    if not text:
+        return ""
+    return _CONTROL.sub("", text.replace("\t", " "))
 
 
 # --------------------------------------------------------------------------
@@ -347,7 +381,7 @@ def branch_bucket(branch: str | None) -> str:
 SECRET_TYPES: list[tuple[str, str, "re.Pattern[str]"]] = [
     ("critical", "Stripe key",       re.compile(r"\b(?:sk|rk)_live_([A-Za-z0-9]{16,})")),
     ("critical", "AWS access key",   re.compile(r"\b(?:AKIA|ASIA)([A-Z0-9]{12,})")),
-    ("critical", "Anthropic key",    re.compile(r"\bsk-ant-[a-z0-9-]*([A-Za-z0-9_\-]{16,})")),
+    ("critical", "Anthropic key",    re.compile(r"\bsk-ant-[a-z0-9-]{0,20}([A-Za-z0-9_\-]{16,})")),
     ("critical", "OpenAI key",       re.compile(r"\bsk-(?!ant)[A-Za-z0-9]{2,}-([A-Za-z0-9_\-]{16,})")),
     ("critical", "JWT / service key", re.compile(r"\beyJ[A-Za-z0-9_\-]{6,}\.([A-Za-z0-9_\-]{20,})")),
     ("high",     "GitHub PAT",       re.compile(r"\b(?:ghp_|gho_|ghu_|ghs_|ghr_|github_pat_)([A-Za-z0-9_]{16,})")),
@@ -360,12 +394,12 @@ SECRET_TYPES: list[tuple[str, str, "re.Pattern[str]"]] = [
 ]
 
 # Connection strings. Loopback is dev credential churn, not an incident.
-_URL_CRED = re.compile(r"([a-z][a-z0-9+.\-]*)://([^\s:/@]+):([^\s@/]{6,})@([^\s/:\"']+)")
+_URL_CRED = re.compile(r"([a-z][a-z0-9+.\-]{0,20})://([^\s:/@]{1,128}):([^\s@/]{6,256})@([^\s/:\"']{1,255})")
 _LOCAL_HOST = re.compile(r"^(127\.0\.0\.1|localhost|0\.0\.0\.0|\[?::1\]?|host\.docker\.internal)$", re.I)
 
 # Secret-shaped assignments, minus the field names that merely *sound* like one.
 _NAMED_SECRET = re.compile(
-    r"\b([A-Za-z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|APIKEY|API_KEY|ACCESS_KEY|PRIVATE_KEY)[A-Za-z0-9_]*)"
+    r"\b([A-Za-z0-9_]{0,40}(?:SECRET|TOKEN|PASSWORD|PASSWD|APIKEY|API_KEY|ACCESS_KEY|PRIVATE_KEY)[A-Za-z0-9_]{0,40})"
     r"\s*[=:]\s*['\"]?([A-Za-z0-9_\-\.]{12,})", re.IGNORECASE)
 
 # These are column names, metric names, and already-encrypted columns. They
@@ -410,6 +444,7 @@ def classify_secrets(cmd: str) -> list[tuple[str, str, str]]:
 
     The secret value is hashed immediately and never retained.
     """
+    cmd = cmd[:MAX_SCAN_TOTAL]
     out: list[tuple[str, str, str]] = []
     seen: set[str] = set()
 
@@ -430,13 +465,13 @@ def classify_secrets(cmd: str) -> list[tuple[str, str, str]]:
         scheme, _user, pw, host = m.groups()
         local = _LOCAL_HOST.match(host) is not None
         add("low" if local else "critical",
-            f"{scheme} password ({'local' if local else 'remote'})", pw)
+            clean(f"{scheme} password ({'local' if local else 'remote'})")[:48], pw)
 
     for m in _NAMED_SECRET.finditer(cmd):
         name, value = m.group(1), m.group(2)
         if _NOT_SECRET_NAMES.match(name):
             continue
-        add(_priority_for_name(name), name.upper(), value)
+        add(_priority_for_name(name), clean(name.upper())[:48], value)
 
     return out
 
@@ -512,7 +547,7 @@ def pretty_project(slug: str) -> str:
     for prefix in ("Documents-", "Projects-", "code-", "src-", "github-", "dev-"):
         if s.startswith(prefix):
             s = s[len(prefix):]
-    return s or slug
+    return clean(s or slug)
 
 
 def parse_ts(raw: str | None) -> datetime | None:
@@ -608,6 +643,11 @@ class Fleet:
 
     def add_usage(self, project: str, model: str, usage: dict, ts: datetime | None,
                   branch: str | None = None) -> None:
+        # Sanitise at the boundary of the data structure rather than at one call
+        # site, so no future caller can bypass it.
+        project = clean(project)[:120] or "unknown"
+        model = clean(model)[:48] or "unknown"
+        branch = (clean(branch)[:120] or None) if branch else None
         cc = usage.get("cache_creation") or {}
         w1h = cc.get("ephemeral_1h_input_tokens", 0) or 0
         w5m = cc.get("ephemeral_5m_input_tokens", 0) or 0
@@ -794,7 +834,7 @@ class Fleet:
         transcript, so what is recorded here is an explicit FLOOR.
         """
         self.sub_calls += 1
-        model = result.get("resolvedModel") or "unknown"
+        model = clean(result.get("resolvedModel") or "unknown")[:48] or "unknown"
         self.sub_by_model[model] += 1
         self.sub_status[result.get("status") or "?"] += 1
         self.sub_ms += result.get("totalDurationMs") or 0
@@ -818,6 +858,8 @@ class Fleet:
                 + (u.get("cache_read_input_tokens", 0) or 0) / 1e6 * in_rate * CACHE_READ_MULT)
 
     def add_tool(self, project: str, name: str, tool_input: dict, ts: datetime | None) -> None:
+        project = clean(project)[:120] or "unknown"
+        name = clean(name)[:48] or "?"
         self.tools[name] += 1
         if name != "Bash":
             return
@@ -828,7 +870,7 @@ class Fleet:
         self.bash_by_project[project] += 1
         head = command_head(cmd)
         if head:
-            self.bash_first_token[head[:40]] += 1
+            self.bash_first_token[clean(head)[:40]] += 1
 
         if contains_secret(cmd):
             self.secret_exposures += 1
@@ -932,8 +974,8 @@ class Fleet:
 
                     usage = msg.get("usage")
                     if isinstance(usage, dict):
-                        self.add_usage(project, msg.get("model") or "unknown", usage, ts,
-                                       rec.get("gitBranch"))
+                        self.add_usage(project, msg.get("model") or "unknown",
+                                       usage, ts, rec.get("gitBranch"))
 
                     tur = rec.get("toolUseResult")
                     if isinstance(tur, dict) and tur.get("toolStats") is not None:

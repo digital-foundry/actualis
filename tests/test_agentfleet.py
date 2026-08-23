@@ -585,6 +585,61 @@ class TestWatch(unittest.TestCase):
         af.notify("t", 'msg with "quotes" and $vars')
 
 
+class TestHardening(unittest.TestCase):
+    """Transcript content is untrusted: it includes whatever an agent typed,
+    fetched, or was fed. Both defects below were found by probing, not review."""
+
+    def test_no_catastrophic_backtracking(self):
+        """A 140k-character command took 164 SECONDS before input bounds."""
+        import time
+        for probe in (";".join(["echo x"] * 20000),
+                      "eyJ" + "A" * 30000 + "." + "B" * 30000,
+                      "curl " + "a" * 40000 + " -d x",
+                      "rm " + "-r" * 8000 + "f /"):
+            with self.subTest(n=len(probe)):
+                t = time.perf_counter()
+                af.audit_command(probe)
+                af.classify_secrets(probe)
+                af.redact(probe)
+                self.assertLess(time.perf_counter() - t, 2.0)
+
+    def test_terminal_escapes_are_stripped_from_evidence(self):
+        """Escape sequences can HIDE the dangerous half of a command from the
+        audit that exists to reveal it."""
+        evil = "echo hi\x1b[2J\x1b[H\x1b]0;OWNED\x07 && rm -rf /tmp/x"
+        lines = [ln for _, _, ln in af.audit_command(evil)]
+        self.assertTrue(lines)
+        for ln in lines:
+            self.assertNotIn("\x1b", ln)
+            self.assertNotIn("\x07", ln)
+            self.assertIn("rm -rf", ln)   # the real content still shows
+
+    def test_clean_strips_control_chars_but_keeps_text(self):
+        self.assertEqual(af.clean("a\x00b\x1bc\x7fd"), "abcd")
+        self.assertEqual(af.clean("normal text"), "normal text")
+        self.assertEqual(af.clean(None), "")
+
+    def test_control_chars_cannot_reach_project_or_model_names(self):
+        f = af.Fleet()
+        f.add_usage("p", "claude\x1b[2J-opus-5", {"output_tokens": 10}, None,
+                    "feat/1-a\x1b]0;x\x07")
+        for name in list(f.msgs_by_model) + list(f.cost_by_branch):
+            with self.subTest(name=name):
+                self.assertNotIn("\x1b", name)
+
+    def test_control_chars_cannot_reach_secret_type_names(self):
+        f = af.Fleet()
+        f.add_tool("p", "Bash", {"command": "MY\x1b[2JTOKEN=abcdefghijklmnop"}, None)
+        for e in f.secrets.values():
+            for k in e["kinds"]:
+                self.assertNotIn("\x1b", k)
+
+    def test_oversized_input_is_bounded_not_dropped(self):
+        """Bounding must not silently stop detecting on the lines it does scan."""
+        cmd = "\n".join(["echo filler"] * 50 + ["rm -rf /tmp/x"])
+        self.assertIn("destructive", {c for _, c, _ in af.audit_command(cmd)})
+
+
 class TestDocumentation(unittest.TestCase):
     """Docs drift silently. These fail the build instead."""
 

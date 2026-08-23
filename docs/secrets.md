@@ -59,6 +59,13 @@ that one.
 `changeme`, `example`, `dummy`, `placeholder`, `test_`, `fake`, `todo`, bare
 numbers, and anything already redacted.
 
+## Untrusted input
+
+Command text is treated as hostile. Control characters are stripped before
+anything is printed or written to JSON, and every pattern uses bounded
+quantifiers so a pathological command cannot hang the scan. See
+[SECURITY.md](../SECURITY.md#hardening).
+
 ## What it cannot see
 
 Pattern matching has a ceiling, and it is stated here rather than discovered
