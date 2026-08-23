@@ -518,6 +518,8 @@ class TestShareLeakage(unittest.TestCase):
         f.add_subagent({"resolvedModel": "claude-sonnet-5", "status": "completed",
                         "totalDurationMs": 1000, "totalTokens": 10,
                         "toolStats": {"bashCount": 40}, "usage": {"output_tokens": 1}}, ts)
+        for i in range(4):
+            f.add_tool("ACME-CLASSIFIED-MERGER", "Bash", {"command": f"make build-{i}"}, ts)
         f.permission_modes.update({"auto": 900, "default": 100})
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -553,8 +555,8 @@ class TestShareLeakage(unittest.TestCase):
 
     def test_still_reports_the_useful_shape(self):
         out = self._share_output()
-        for want in ["agentfleet", "median cost per ticket", "shell commands",
-                     "unsupervised", "credentials"]:
+        for want in ["agentfleet", "median cost per ticket", "shell command",
+                     "unsupervised", "credentials", "list price"]:
             with self.subTest(want=want):
                 self.assertIn(want, out)
 
