@@ -941,11 +941,16 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
                                 notify(f"agentfleet: {cats}", line_txt[:120])
 
             mins = (datetime.now(timezone.utc) - started).total_seconds() / 60
-            print(f"\r{c.dim}  {mins:5.1f}m · {cmds} commands · "
-                  f"{flagged} flagged · {crit} secrets{c.off}", end="", flush=True)
+            # The heartbeat is a live status line for a terminal. Redirected to a
+            # log it would write ~1.3 MB a day of carriage returns, so it is
+            # suppressed and only real events get recorded.
+            if sys.stdout.isatty():
+                print(f"\r{c.dim}  {mins:5.1f}m · {cmds} commands · "
+                      f"{flagged} flagged · {crit} secrets{c.off}", end="", flush=True)
             time.sleep(interval)
     except KeyboardInterrupt:
-        print(f"\r{' ' * 72}\r", end="")
+        if sys.stdout.isatty():
+            print(f"\r{' ' * 72}\r", end="")
         print(f"{c.bold}stopped{c.off} after {mins:.1f}m · {cmds} commands · "
               f"{flagged} flagged · {crit} distinct secrets")
         return 0
