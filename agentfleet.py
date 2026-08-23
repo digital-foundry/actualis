@@ -868,6 +868,14 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
           quiet: bool, raw: bool) -> int:
     import time
 
+    # Python block-buffers stdout when it is not a terminal. For a watcher that
+    # means an alert can sit unwritten in a 4KB buffer for hours, which defeats
+    # the entire point of running it in the background.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
+
     offsets: dict[Path, int] = {}
     for f in _jsonl_files(roots, codex):
         try:
