@@ -26,17 +26,23 @@ jobs:
         shell: bash
         run: |
           python -c "
-          import ast,sys
-          std = set(sys.stdlib_module_names)
+          import ast, sys
+          # An explicit allowlist rather than sys.stdlib_module_names, which
+          # does not exist before 3.10 and would skip this check on the oldest
+          # version it most needs to run on.
+          allowed = {'__future__','argparse','collections','contextlib','datetime',
+                     'hashlib','importlib','io','json','os','pathlib','re',
+                     'subprocess','sys','time','unittest'}
           tree = ast.parse(open('agentfleet.py').read())
-          bad = []
+          found = set()
           for n in ast.walk(tree):
               if isinstance(n, ast.Import):
-                  bad += [a.name.split('.')[0] for a in n.names]
+                  found |= {a.name.split('.')[0] for a in n.names}
               elif isinstance(n, ast.ImportFrom) and n.level == 0 and n.module:
-                  bad.append(n.module.split('.')[0])
-          extra = sorted(set(bad) - std - {'__future__'})
-          print('third-party imports:', extra or 'none')
+                  found.add(n.module.split('.')[0])
+          extra = sorted(found - allowed)
+          print('imports:', sorted(found))
+          print('outside allowlist:', extra or 'none')
           sys.exit(1 if extra else 0)"
       - run: python -m unittest discover -s tests -v
       - name: runs on an empty machine without crashing
