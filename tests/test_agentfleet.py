@@ -397,6 +397,62 @@ class TestCoach(unittest.TestCase):
         self.assertEqual(sev, sorted(sev, key=lambda s: {"critical": 0, "high": 1, "info": 2}[s]))
 
 
+class TestSubagents(unittest.TestCase):
+
+    RESULT = {
+        "resolvedModel": "claude-sonnet-5", "status": "completed",
+        "totalDurationMs": 60_000, "totalTokens": 76248,
+        "toolStats": {"bashCount": 10, "readCount": 4, "editFileCount": 2,
+                      "searchCount": 0, "otherToolCount": 1,
+                      "linesAdded": 100, "linesRemoved": 20},
+        "usage": {"input_tokens": 0, "output_tokens": 1_000_000,
+                  "cache_read_input_tokens": 0,
+                  "cache_creation": {"ephemeral_1h_input_tokens": 0,
+                                     "ephemeral_5m_input_tokens": 0}},
+    }
+
+    def test_cost_floor_is_excluded_from_the_headline(self):
+        """A lower bound must never be folded into a validated total."""
+        f = af.Fleet()
+        f.add_subagent(self.RESULT, None)
+        self.assertEqual(f.total_cost, 0.0)
+        self.assertGreater(f.sub_cost_floor, 0.0)
+
+    def test_cost_floor_prices_by_resolved_model(self):
+        """With a timestamp inside the intro window Sonnet 5 is $10/Mtok out."""
+        f = af.Fleet()
+        f.add_subagent(self.RESULT, datetime(2026, 8, 1, tzinfo=timezone.utc))
+        self.assertAlmostEqual(f.sub_cost_floor, 10.0, places=6)
+
+    def test_undated_call_uses_the_conservative_rate(self):
+        """No timestamp means no intro discount: over-stating a floor is safer
+        than under-stating it."""
+        f = af.Fleet()
+        f.add_subagent(self.RESULT, None)
+        self.assertAlmostEqual(f.sub_cost_floor, 15.0, places=6)
+
+    def test_one_million_context_suffix_is_stripped_for_pricing(self):
+        f = af.Fleet()
+        f.add_subagent({**self.RESULT, "resolvedModel": "claude-opus-5[1m]"}, None)
+        self.assertAlmostEqual(f.sub_cost_floor, 25.0, places=6)
+        self.assertEqual(f.sub_by_model["claude-opus-5[1m]"], 1)
+
+    def test_tool_stats_accumulate(self):
+        f = af.Fleet()
+        f.add_subagent(self.RESULT, None); f.add_subagent(self.RESULT, None)
+        self.assertEqual(f.sub_tools["bashCount"], 20)
+        self.assertEqual(f.sub_lines["added"], 200)
+        self.assertEqual(f.sub_calls, 2)
+
+    def test_af011_fires_when_shell_activity_is_hidden(self):
+        f = af.Fleet()
+        for _ in range(20):
+            f.add_subagent(self.RESULT, None)          # 200 hidden bash calls
+        for i in range(100):
+            f.add_tool("p", "Bash", {"command": f"echo {i}"}, None)
+        self.assertIn("AF011", {x.id for x in af.coach(f)})
+
+
 class TestWatch(unittest.TestCase):
 
     def test_extracts_claude_code_commands(self):

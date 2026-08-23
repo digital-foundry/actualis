@@ -103,6 +103,35 @@ it keeps the no-network promise intact.
 
 Findings are earned. On a fleet with nothing notable, the coach prints nothing.
 
+## Subagents
+
+Subagent runs are reported separately: how many, which models, how much shell and
+edit activity, wall-clock, and lines changed.
+
+```
+SUBAGENTS
+  872 runs · 63.9 hours wall-clock · 146,282 lines added, 17,855 removed
+       628  claude-sonnet-5
+        90  claude-haiku-4-5-20251001
+        89  claude-opus-4-8[1m]
+
+  tool activity  bash 12,951 · read 4,469 · edit 3,051
+  cost floor     $58.03 — a LOWER BOUND, excluded from the headline figure
+```
+
+**Their cost is a floor, not a total, and it is kept out of the headline number.**
+The parent transcript records only each run's final message: `totalTokens` equals
+the sum of that single `usage` object in 873 of 873 observed cases, and scales
+about 2x from a 4-tool run to a 45-tool run, which is context growth rather than
+summation. The cumulative spend of a subagent's turns is not recoverable, so it is
+not estimated.
+
+**The bigger finding is what the audit cannot see.** 12,951 shell commands ran
+inside subagents — 21% of all shell activity — and their command text is never
+written to the parent transcript. Subagents inherit the parent's permissions but
+not its visibility. The shell audit says so explicitly rather than reporting a
+number that looks complete.
+
 ## Privacy
 
 Nothing leaves your machine. No network calls, no telemetry, no analytics, no

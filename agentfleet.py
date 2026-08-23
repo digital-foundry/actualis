@@ -563,6 +563,16 @@ class Fleet:
         self.dates_by_ticket: dict[str, list] = defaultdict(list)
         self.projects_by_ticket: dict[str, set] = defaultdict(set)
         self.cost_by_branch: dict[str, float] = defaultdict(float)
+        # Subagents. Kept OUT of total_cost on purpose: only a lower bound on
+        # their spend is recoverable, and folding an estimate into a validated
+        # number would quietly corrupt it.
+        self.sub_calls = 0
+        self.sub_by_model: Counter = Counter()
+        self.sub_cost_floor = 0.0
+        self.sub_tools: Counter = Counter()
+        self.sub_lines: Counter = Counter()
+        self.sub_ms = 0
+        self.sub_status: Counter = Counter()
         self.denials_by_project: Counter = Counter()
         self.bash_by_project: Counter = Counter()
         self.effort_mix: Counter = Counter()
@@ -758,6 +768,39 @@ class Fleet:
         if best:
             self.add_codex_session(project, model or "unknown", best, last_ts)
 
+    def add_subagent(self, result: dict, ts: datetime | None) -> None:
+        """One completed subagent run.
+
+        `totalTokens` is NOT the run total. It equals the sum of the final
+        message's usage in 873 of 873 observed cases and scales only ~2x from a
+        4-tool run to a 45-tool run, which is context growth, not summation. The
+        cumulative spend of a subagent's turns is not present in the parent
+        transcript, so what is recorded here is an explicit FLOOR.
+        """
+        self.sub_calls += 1
+        model = result.get("resolvedModel") or "unknown"
+        self.sub_by_model[model] += 1
+        self.sub_status[result.get("status") or "?"] += 1
+        self.sub_ms += result.get("totalDurationMs") or 0
+
+        stats = result.get("toolStats") or {}
+        for k in ("bashCount", "readCount", "editFileCount", "searchCount", "otherToolCount"):
+            self.sub_tools[k] += stats.get(k, 0) or 0
+        self.sub_lines["added"] += stats.get("linesAdded", 0) or 0
+        self.sub_lines["removed"] += stats.get("linesRemoved", 0) or 0
+
+        u = result.get("usage")
+        if isinstance(u, dict):
+            base = model.replace("[1m]", "")
+            in_rate, out_rate, _prov, _known = rates_for(base, ts)
+            cc = u.get("cache_creation") or {}
+            self.sub_cost_floor += (
+                (u.get("input_tokens", 0) or 0) / 1e6 * in_rate
+                + (u.get("output_tokens", 0) or 0) / 1e6 * out_rate
+                + (cc.get("ephemeral_1h_input_tokens", 0) or 0) / 1e6 * in_rate * CACHE_WRITE_1H_MULT
+                + (cc.get("ephemeral_5m_input_tokens", 0) or 0) / 1e6 * in_rate * CACHE_WRITE_5M_MULT
+                + (u.get("cache_read_input_tokens", 0) or 0) / 1e6 * in_rate * CACHE_READ_MULT)
+
     def add_tool(self, project: str, name: str, tool_input: dict, ts: datetime | None) -> None:
         self.tools[name] += 1
         if name != "Bash":
@@ -875,6 +918,10 @@ class Fleet:
                     if isinstance(usage, dict):
                         self.add_usage(project, msg.get("model") or "unknown", usage, ts,
                                        rec.get("gitBranch"))
+
+                    tur = rec.get("toolUseResult")
+                    if isinstance(tur, dict) and tur.get("toolStats") is not None:
+                        self.add_subagent(tur, ts)
 
                     content = msg.get("content")
                     if isinstance(content, list):
@@ -1094,6 +1141,20 @@ def coach(fleet: "Fleet") -> list[Finding]:
             f"detached HEAD, so it cannot be tied to an issue.",
             "Fine for exploration and ops work. If you ever want per-ticket chargeback "
             "to be credible, branch naming is the cheapest thing to fix."))
+
+    # --- AF011 shell activity the audit cannot see -------------------------
+    sub_bash = fleet.sub_tools.get("bashCount", 0)
+    if sub_bash and fleet.bash_total:
+        blind = sub_bash / (fleet.bash_total + sub_bash) * 100
+        if blind >= 10:
+            out.append(Finding(
+                "AF011", "high", "A fifth of shell activity is invisible to the audit",
+                f"{num(sub_bash)} shell commands ran inside {num(fleet.sub_calls)} "
+                f"subagent runs, {blind:.0f}% of all shell activity. Their command text "
+                f"is never written to the parent transcript.",
+                "Subagents inherit the parent's permissions but not its visibility. If "
+                "the audit matters to you, prefer doing shell work in the main loop, or "
+                "treat these runs as unreviewed."))
 
     order = {"critical": 0, "high": 1, "info": 2}
     out.sort(key=lambda f: order.get(f.severity, 9))
@@ -1430,6 +1491,25 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
                 print(f"  {c.dim}Detached HEAD is usually a git worktree; that spend "
                       f"cannot be attributed to a ticket.{c.off}")
 
+        if fleet.sub_calls:
+            rule(c, "SUBAGENTS")
+            hrs = fleet.sub_ms / 3_600_000
+            print(f"  {num(fleet.sub_calls)} runs  ·  {hrs:.1f} hours wall-clock  ·  "
+                  f"{num(fleet.sub_lines['added'])} lines added, "
+                  f"{num(fleet.sub_lines['removed'])} removed")
+            for m, n in fleet.sub_by_model.most_common():
+                print(f"    {num(n):>6}  {m}")
+            print(f"\n  {c.dim}tool activity{c.off}  "
+                  f"bash {num(fleet.sub_tools['bashCount'])}  ·  "
+                  f"read {num(fleet.sub_tools['readCount'])}  ·  "
+                  f"edit {num(fleet.sub_tools['editFileCount'])}")
+            print(f"  {c.dim}cost floor{c.off}     {money(fleet.sub_cost_floor)} "
+                  f"{c.dim}— a LOWER BOUND, not a total, and excluded from the "
+                  f"headline figure{c.off}")
+            print(f"  {c.dim}Only each run's final message is recorded in the parent")
+            print(f"  transcript, so the cumulative cost of a subagent's turns cannot")
+            print(f"  be recovered. It is not estimated here.{c.off}")
+
         rule(c, "TOOL CALLS")
         total_tools = sum(fleet.tools.values())
         for name, n in fleet.tools.most_common(10):
@@ -1443,6 +1523,13 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
     share = fleet.tools.get("Bash", 0) / total_tools * 100 if total_tools else 0
     print(f"  bash calls    {num(fleet.bash_total)}  "
           f"{c.dim}{share:.0f}% of all agent tool calls{c.off}")
+    sub_bash = fleet.sub_tools.get("bashCount", 0)
+    if sub_bash:
+        blind = sub_bash / (fleet.bash_total + sub_bash) * 100
+        print(f"  {c.yellow}unauditable{c.off}   {num(sub_bash)} more shell commands ran "
+              f"inside subagents {c.dim}({blind:.0f}% of all shell activity){c.off}")
+        print(f"  {c.dim}Their command text is not written to the parent transcript, so "
+              f"nothing below covers them.{c.off}")
 
     if fleet.permission_modes:
         modes = "  ".join(f"{k}={num(v)}" for k, v in fleet.permission_modes.most_common(5))
@@ -1537,6 +1624,17 @@ def to_json(fleet: Fleet, raw: bool = False) -> dict:
         "cost_usd": round(fleet.total_cost, 4),
         "tokens": dict(fleet.tokens),
         "by_agent": {k: round(v, 4) for k, v in fleet.cost_by_agent.items()},
+        "subagents": {
+            "runs": fleet.sub_calls,
+            "by_model": dict(fleet.sub_by_model.most_common()),
+            "status": dict(fleet.sub_status),
+            "cost_floor_usd": round(fleet.sub_cost_floor, 4),
+            "cost_floor_note": "lower bound only; cumulative subagent spend is not "
+                               "recoverable from the parent transcript",
+            "tools": dict(fleet.sub_tools),
+            "lines": dict(fleet.sub_lines),
+            "wall_clock_hours": round(fleet.sub_ms / 3_600_000, 2),
+        },
         "by_model": {k: round(v, 4) for k, v in
                      sorted(fleet.cost_by_model.items(), key=lambda kv: -kv[1])},
         "by_ticket": [
