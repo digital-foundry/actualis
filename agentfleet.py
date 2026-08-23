@@ -276,6 +276,59 @@ _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 
 
 # --------------------------------------------------------------------------
+# Ticket attribution
+#
+# Cost per project answers "where did the money go" at a granularity nobody
+# budgets in. Branch names almost always carry the issue number, so the same
+# data answers "what did issue #1283 cost", which is the unit engineering and
+# finance already think in.
+#
+# One ticket often spans several branches (feat/1283-p5-…, feat/1283-p6-…), so
+# grouping by ticket rather than branch is the point of the exercise.
+# --------------------------------------------------------------------------
+
+TRUNK_BRANCHES = {"main", "master", "develop", "dev", "trunk", "release"}
+
+# "issue-742" is issue 742, not project ISSUE ticket 742, so the generic
+# tracker prefixes must be matched before the Jira-style project-key rule.
+_TRACKER_WORDS = r"issue|issues|gh|pr|bug|ticket|task|story|card"
+
+_TICKET_PATTERNS = [
+    re.compile(rf"^(?:[a-z]+/)?(?:{_TRACKER_WORDS})[-_]?(\d{{1,6}})\b", re.I),
+    re.compile(rf"^[a-z]+/(?!(?:{_TRACKER_WORDS})\b)([A-Z][A-Z0-9]+-\d+)", re.I),
+    re.compile(rf"^(?!(?:{_TRACKER_WORDS})\b)([A-Z][A-Z0-9]+-\d+)", re.I),
+    re.compile(r"^[a-z]+/(\d{1,6})\b", re.I),            # feat/1283-slug
+    re.compile(r"^(\d{2,6})-"),                           # 1283-slug
+]
+
+
+def extract_ticket(branch: str | None) -> str | None:
+    """The issue id a branch refers to, or None for trunk and ad-hoc work."""
+    if not branch:
+        return None
+    b = branch.strip()
+    if b in TRUNK_BRANCHES or b == "HEAD":
+        return None
+    for rx in _TICKET_PATTERNS:
+        m = rx.match(b)
+        if m:
+            tok = m.group(1)
+            return f"#{tok}" if tok.isdigit() else tok.upper()
+    return None
+
+
+def branch_bucket(branch: str | None) -> str:
+    """Where unticketed work is reported."""
+    if not branch:
+        return "unknown"
+    if branch in TRUNK_BRANCHES:
+        return "trunk"
+    if branch == "HEAD":
+        return "detached HEAD"
+    return branch
+
+
+# --------------------------------------------------------------------------
 # Secret classification
 #
 # "792 commands contained credentials" is alarming and useless. What you need
@@ -500,6 +553,12 @@ class Fleet:
         self.cost_by_day: dict[str, float] = defaultdict(float)
         self.tokens_by_project: dict[str, Counter] = defaultdict(Counter)
         self.msgs_by_project: Counter = Counter()
+        self.cost_by_ticket: dict[str, float] = defaultdict(float)
+        self.msgs_by_ticket: Counter = Counter()
+        self.branches_by_ticket: dict[str, set] = defaultdict(set)
+        self.dates_by_ticket: dict[str, list] = defaultdict(list)
+        self.projects_by_ticket: dict[str, set] = defaultdict(set)
+        self.cost_by_branch: dict[str, float] = defaultdict(float)
         self.denials_by_project: Counter = Counter()
         self.bash_by_project: Counter = Counter()
         self.effort_mix: Counter = Counter()
@@ -524,7 +583,8 @@ class Fleet:
 
     # -- ingest ------------------------------------------------------------
 
-    def add_usage(self, project: str, model: str, usage: dict, ts: datetime | None) -> None:
+    def add_usage(self, project: str, model: str, usage: dict, ts: datetime | None,
+                  branch: str | None = None) -> None:
         cc = usage.get("cache_creation") or {}
         w1h = cc.get("ephemeral_1h_input_tokens", 0) or 0
         w5m = cc.get("ephemeral_5m_input_tokens", 0) or 0
@@ -563,6 +623,17 @@ class Fleet:
         pt["input"] += inp; pt["output"] += out
         pt["cache_w"] += w1h + w5m; pt["cache_read"] += rd
         self.msgs_by_project[project] += 1
+
+        bucket = branch_bucket(branch)
+        self.cost_by_branch[bucket] += cost
+        ticket = extract_ticket(branch)
+        if ticket:
+            self.cost_by_ticket[ticket] += cost
+            self.msgs_by_ticket[ticket] += 1
+            self.branches_by_ticket[ticket].add(branch)
+            self.projects_by_ticket[ticket].add(project)
+            if ts:
+                self.dates_by_ticket[ticket].append(ts.date().isoformat())
 
         if ts:
             self.cost_by_day[ts.date().isoformat()] += cost
@@ -798,7 +869,8 @@ class Fleet:
 
                     usage = msg.get("usage")
                     if isinstance(usage, dict):
-                        self.add_usage(project, msg.get("model") or "unknown", usage, ts)
+                        self.add_usage(project, msg.get("model") or "unknown", usage, ts,
+                                       rec.get("gitBranch"))
 
                     content = msg.get("content")
                     if isinstance(content, list):
@@ -991,6 +1063,33 @@ def coach(fleet: "Fleet") -> list[Finding]:
                 f"or above.",
                 "Correct for hard work and wasteful for mechanical edits. Dropping "
                 "routine turns to low or medium effort is the cheapest available saving."))
+
+    # --- AF009 ticket cost outliers, against your own median ---------------
+    if len(fleet.cost_by_ticket) >= 8:
+        costs = list(fleet.cost_by_ticket.values())
+        med = _median(costs)
+        top_t, top_c = max(fleet.cost_by_ticket.items(), key=lambda kv: kv[1])
+        if med > 0 and top_c > med * 8:
+            brs = len(fleet.branches_by_ticket[top_t])
+            out.append(Finding(
+                "AF009", "info", "One ticket cost far more than your typical ticket",
+                f"{top_t} cost {money(top_c)} across {brs} branch(es) and "
+                f"{num(fleet.msgs_by_ticket[top_t])} messages. Your median ticket is "
+                f"{money(med)} over {len(costs)} tickets.",
+                "Either it was genuinely large, or it was underscoped and got restarted. "
+                "The branch count usually tells you which."))
+
+    # --- AF010 work that cannot be attributed ------------------------------
+    trunk = fleet.cost_by_branch.get("trunk", 0.0)
+    detached = fleet.cost_by_branch.get("detached HEAD", 0.0)
+    if total > 100 and (trunk + detached) / total > 0.35:
+        pct = (trunk + detached) / total * 100
+        out.append(Finding(
+            "AF010", "info", "A large share of spend is not attributable to a ticket",
+            f"{pct:.0f}% of spend ({money(trunk + detached)}) happened on trunk or in a "
+            f"detached HEAD, so it cannot be tied to an issue.",
+            "Fine for exploration and ops work. If you ever want per-ticket chargeback "
+            "to be credible, branch naming is the cheapest thing to fix."))
 
     order = {"critical": 0, "high": 1, "info": 2}
     out.sort(key=lambda f: order.get(f.severity, 9))
@@ -1299,6 +1398,34 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
                 print(f"\n  {c.yellow}▲{c.off} {top_share:.0f}% of all spend is one project: "
                       f"{c.bold}{projects[0][0]}{c.off}")
 
+        if fleet.cost_by_ticket:
+            tickets = sorted(fleet.cost_by_ticket.items(), key=lambda kv: -kv[1])
+            ticketed = sum(fleet.cost_by_ticket.values())
+            trunk = fleet.cost_by_branch.get("trunk", 0.0)
+            detached = fleet.cost_by_branch.get("detached HEAD", 0.0)
+
+            rule(c, f"BY TICKET  (top {min(top, len(tickets))} of {len(tickets)})")
+            print(f"  {'cost':>11}  {'ticket':<10} {'msgs':>8}  {'days':>5}  where")
+            for t, cost in tickets[:top]:
+                days = fleet.dates_by_ticket.get(t, [])
+                span = f"{len(set(days))}" if days else "?"
+                brs = fleet.branches_by_ticket[t]
+                where = ", ".join(sorted(brs)[:2])
+                if len(brs) > 2:
+                    where += f" +{len(brs) - 2}"
+                print(f"  {money(cost):>11}  {c.bold}{t:<10}{c.off} "
+                      f"{num(fleet.msgs_by_ticket[t]):>8}  {span:>5}  {where[:44]}")
+
+            multi = [t for t, b in fleet.branches_by_ticket.items() if len(b) > 1]
+            print(f"\n  {c.dim}{money(ticketed)} attributed to {len(tickets)} tickets"
+                  + (f" ({len(multi)} spanning several branches)" if multi else "")
+                  + f"  ·  {money(trunk)} on trunk"
+                  + (f"  ·  {money(detached)} detached HEAD" if detached else "")
+                  + f"{c.off}")
+            if detached > 0:
+                print(f"  {c.dim}Detached HEAD is usually a git worktree; that spend "
+                      f"cannot be attributed to a ticket.{c.off}")
+
         rule(c, "TOOL CALLS")
         total_tools = sum(fleet.tools.values())
         for name, n in fleet.tools.most_common(10):
@@ -1408,6 +1535,18 @@ def to_json(fleet: Fleet, raw: bool = False) -> dict:
         "by_agent": {k: round(v, 4) for k, v in fleet.cost_by_agent.items()},
         "by_model": {k: round(v, 4) for k, v in
                      sorted(fleet.cost_by_model.items(), key=lambda kv: -kv[1])},
+        "by_ticket": [
+            {"ticket": t, "cost_usd": round(cost, 4),
+             "messages": fleet.msgs_by_ticket[t],
+             "branches": sorted(fleet.branches_by_ticket[t]),
+             "projects": sorted(fleet.projects_by_ticket[t]),
+             "active_days": len(set(fleet.dates_by_ticket.get(t, []))),
+             "first_seen": min(fleet.dates_by_ticket[t]) if fleet.dates_by_ticket.get(t) else None,
+             "last_seen": max(fleet.dates_by_ticket[t]) if fleet.dates_by_ticket.get(t) else None}
+            for t, cost in sorted(fleet.cost_by_ticket.items(), key=lambda kv: -kv[1])
+        ],
+        "by_branch": {k: round(v, 4) for k, v in
+                      sorted(fleet.cost_by_branch.items(), key=lambda kv: -kv[1])},
         "by_project": {k: round(v, 4) for k, v in
                        sorted(fleet.cost_by_project.items(), key=lambda kv: -kv[1])},
         "by_day": dict(sorted(fleet.cost_by_day.items())),

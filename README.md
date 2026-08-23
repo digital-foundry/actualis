@@ -9,6 +9,7 @@ more than one agent, you cannot currently answer:
 
 - What did my agents cost last month?
 - Which project is burning the budget?
+- What did issue #1283 cost?
 - What shell commands have my agents actually been running?
 - Did a credential ever end up in a command?
 
@@ -56,11 +57,51 @@ python3 agentfleet.py
 python3 agentfleet.py                  # full report
 python3 agentfleet.py --days 30        # last 30 days
 python3 agentfleet.py --bash           # shell audit only
+python3 agentfleet.py --coach          # findings and recommended actions only
+python3 agentfleet.py --watch          # live alerting on new secrets
 python3 agentfleet.py --project svc    # filter to matching projects
 python3 agentfleet.py --json           # machine-readable
 python3 agentfleet.py --top 25         # show more projects
 python3 agentfleet.py --agent codex    # one agent only (claude | codex | all)
 ```
+
+## Cost per ticket
+
+Branch names almost always carry the issue number, so the same data that answers
+"what did this project cost" also answers **"what did issue #1283 cost"** — the
+unit engineering and finance already budget in.
+
+```
+BY TICKET  (top 5 of 166)
+         cost  ticket         msgs   days  where
+    $3,337.23  #1283        10,788      5  feat/1283-p4-pdf-web, feat/1283-p5-pdf-visio +1
+    $1,689.12  #2500         4,551      2  fix/2500-no-credentials-in-argv
+    $1,619.75  #1408         4,552      2  feat/1408-promote-signup-public-write
+
+  $21,288.90 across 166 tickets (12 spanning several branches) · $13,088.85 on trunk
+```
+
+One ticket often spans several branches, so grouping by ticket rather than branch
+is the point. `feat/1283-p4-…`, `p5-…` and `p6-…` are one number. Work on trunk or
+in a detached HEAD is reported separately rather than guessed at.
+
+Recognised: `feat/1283-slug`, `fix/2500-slug`, `PROJ-456`, `feature/PROJ-456`,
+`issue-742`, `gh_91`, `1283-slug`. Anything else is left unattributed rather than
+invented.
+
+## The coach
+
+The report says what happened; `--coach` says what to do about it. Findings carry
+stable ids (`AF001`–`AF010`) so they can be quoted and documented, and each one
+carries evidence, an action, and an impact estimate where one can be computed
+honestly.
+
+**Benchmarks are computed against you, not against other users.** Project versus
+project, week versus week, ticket versus your median ticket. That needs no
+telemetry, no account, and no population — it works on day one with one user, and
+it keeps the no-network promise intact.
+
+Findings are earned. On a fleet with nothing notable, the coach prints nothing.
 
 ## Privacy
 

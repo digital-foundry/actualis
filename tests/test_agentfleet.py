@@ -300,6 +300,49 @@ class TestCodex(unittest.TestCase):
         self.assertTrue(any(x["severity"] == "high" for x in f.flags))
 
 
+class TestTicketAttribution(unittest.TestCase):
+
+    def test_extracts_numeric_tickets(self):
+        for br, want in [("feat/1283-p6-mobile-textlayer", "#1283"),
+                         ("fix/2500-no-credentials-in-argv", "#2500"),
+                         ("chore/1155-sca-burndown", "#1155"),
+                         ("1283-some-slug", "#1283"),
+                         ("issue-742", "#742"),
+                         ("gh_91", "#91")]:
+            with self.subTest(br=br):
+                self.assertEqual(af.extract_ticket(br), want)
+
+    def test_extracts_jira_style(self):
+        self.assertEqual(af.extract_ticket("feature/PROJ-456-thing"), "PROJ-456")
+        self.assertEqual(af.extract_ticket("ABC-12-slug"), "ABC-12")
+
+    def test_trunk_and_detached_are_not_tickets(self):
+        for br in ["main", "master", "develop", "trunk", "HEAD", "", None]:
+            with self.subTest(br=br):
+                self.assertIsNone(af.extract_ticket(br))
+
+    def test_unticketed_branches_are_not_invented(self):
+        self.assertIsNone(af.extract_ticket("worktree-lp-doc-cleanup"))
+        self.assertIsNone(af.extract_ticket("spike/try-something"))
+
+    def test_one_ticket_spanning_branches_is_one_row(self):
+        """The point of grouping by ticket rather than branch."""
+        f = af.Fleet()
+        for br in ("feat/1283-p5-pdf-vision", "feat/1283-p6-mobile-textlayer"):
+            f.add_usage("proj", "claude-opus-5", {"output_tokens": 1_000_000}, None, br)
+        self.assertEqual(list(f.cost_by_ticket), ["#1283"])
+        self.assertAlmostEqual(f.cost_by_ticket["#1283"], 50.0, places=6)
+        self.assertEqual(len(f.branches_by_ticket["#1283"]), 2)
+
+    def test_trunk_and_detached_are_bucketed_separately(self):
+        f = af.Fleet()
+        f.add_usage("p", "claude-opus-5", {"output_tokens": 1_000_000}, None, "main")
+        f.add_usage("p", "claude-opus-5", {"output_tokens": 1_000_000}, None, "HEAD")
+        self.assertEqual(f.cost_by_ticket, {})
+        self.assertIn("trunk", f.cost_by_branch)
+        self.assertIn("detached HEAD", f.cost_by_branch)
+
+
 class TestCoach(unittest.TestCase):
     """Findings must be earned. A coach that always says something says nothing."""
 
