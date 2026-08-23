@@ -9,7 +9,7 @@ more than one agent, you cannot currently answer:
 
 - What did my agents cost last month?
 - Which project is burning the budget?
-- What did issue #1283 cost?
+- What did issue #412 cost?
 - What shell commands have my agents actually been running?
 - Did a credential ever end up in a command?
 
@@ -20,26 +20,26 @@ across **Claude Code** and **Codex**, in one report.
 $ agentfleet
 
 FLEET ──────────────────────────────────────────────────────────────
-  window        2026-07-09 → 2026-08-22  (44 days)
-  transcripts   617 files, 1.31 GB
-  messages      142,371
-  cost          $46,012.29 notional, at API list price
-  per week      $7,296.49   ·  annualized $379,417.50
+  window        2026-05-04 → 2026-08-22  (31 days)
+  transcripts   168 files, 0.4 GB
+  messages      38,204
+  cost          $12,480.55 notional, at API list price
+  per week      $1,934.20   ·  annualized $100,578.00
 
 BY PROJECT ─────────────────────────────────────────────────────────
-    $37,462.22   81.4% ███████████████████████████ digital-business-cards
-     $5,126.97   11.1% ███ systematic-venture-capital
-       $318.04    0.7%  huestonhomes
+    $37,462.22   81.4% ███████████████████████████ web-app
+     $1,622.47   11.1% ███ api-service
+       $412.66    0.7%  data-pipeline
 
-  ▲ 81% of all spend is one project: digital-business-cards
+  ▲ 81% of all spend is one project: web-app
 
 SHELL AUDIT ────────────────────────────────────────────────────────
-  bash calls    48,708  73% of all agent tool calls
-  permission    auto=26,782  default=1,204  acceptEdits=1,133  plan=14
-  denied        automode-blocked=213  user-rejected=118
+  bash calls    13,006  73% of all agent tool calls
+  permission    auto=7,140  default=402  acceptEdits=377  plan=14
+  denied        automode-blocked=58  user-rejected=31
 
   ▲ 1,315 commands contained credential material
-  flagged   1,298 high   533 medium   of 48,708 commands
+  flagged   340 high   148 medium   of 13,006 commands
 ```
 
 ## Install
@@ -113,25 +113,25 @@ multiplier applied to each · `BY AGENT` · `BY MODEL` · `CACHE EFFICIENCY` ·
 ## Cost per ticket
 
 Branch names almost always carry the issue number, so the same data that answers
-"what did this project cost" also answers **"what did issue #1283 cost"** — the
+"what did this project cost" also answers **"what did issue #412 cost"** — the
 unit engineering and finance already budget in.
 
 ```
-BY TICKET  (top 5 of 166)
+BY TICKET  (top 5 of 58)
          cost  ticket         msgs   days  where
-    $3,337.23  #1283        10,788      5  feat/1283-p4-pdf-web, feat/1283-p5-pdf-visio +1
-    $1,689.12  #2500         4,551      2  fix/2500-no-credentials-in-argv
-    $1,619.75  #1408         4,552      2  feat/1408-promote-signup-public-write
+    $1,884.10  #412        3,110      5  feat/412-checkout-v2, feat/412-checkout-api +1
+    $1,102.40  #310         1,240      2  fix/310-session-timeout
+    $980.25  #907         1,206      2  feat/907-export-queue
 
-  $21,288.90 across 166 tickets (12 spanning several branches) · $13,088.85 on trunk
+  $21,288.90 across 58 tickets (12 spanning several branches) · $13,088.85 on trunk
 ```
 
 One ticket often spans several branches, so grouping by ticket rather than branch
-is the point. `feat/1283-p4-…`, `p5-…` and `p6-…` are one number. Work on trunk or
+is the point. `feat/412-p4-…`, `p5-…` and `p6-…` are one number. Work on trunk or
 in a detached HEAD is reported separately rather than guessed at.
 
-Recognised: `feat/1283-slug`, `fix/2500-slug`, `PROJ-456`, `feature/PROJ-456`,
-`issue-742`, `gh_91`, `1283-slug`. Anything else is left unattributed rather than
+Recognised: `feat/412-slug`, `fix/310-slug`, `PROJ-456`, `feature/PROJ-456`,
+`issue-742`, `gh_91`, `412-slug`. Anything else is left unattributed rather than
 invented.
 
 ## The coach
@@ -155,14 +155,14 @@ Full reference: [docs/findings.md](docs/findings.md).
 ```
 CACHE EFFICIENCY
   fleet hit rate  98.1% of input context served from cache
-  saved           $274,083.25 versus sending the same context uncached
+  saved           $71,905.40 versus sending the same context uncached
 
    hit rate         context        saved  project
-      98.3%  53,502,084,188  $229,183.43  digital-business-cards
-      97.5%   6,388,644,406   $27,240.68  systematic-venture-capital
-      96.8%     357,231,826    $1,497.92  huestonhomes
+      97.4%  14,220,551,900  $58,110.20  web-app
+      96.9%   2,140,882,003   $8,795.15  api-service
+      96.1%     412,660,004    $1,102.30  data-pipeline
 
-  No project is more than 15 points below your median of 96.8%.
+  No project is more than 15 points below your median of 96.1%.
 ```
 
 Hit rate is `cache_read / (input + cache_write + cache_read)` — the share of
@@ -187,13 +187,13 @@ edit activity, wall-clock, and lines changed.
 
 ```
 SUBAGENTS
-  872 runs · 63.9 hours wall-clock · 146,282 lines added, 17,855 removed
-       628  claude-sonnet-5
-        90  claude-haiku-4-5-20251001
-        89  claude-opus-4-8[1m]
+  214 runs · 18.4 hours wall-clock · 38,910 lines added, 6,204 removed
+       151  claude-sonnet-5
+        34  claude-haiku-4-5
+        22  claude-opus-4-8[1m]
 
-  tool activity  bash 12,951 · read 4,469 · edit 3,051
-  cost floor     $58.03 — a LOWER BOUND, excluded from the headline figure
+  tool activity  bash 3,402 · read 1,188 · edit 820
+  cost floor     $16.44 — a LOWER BOUND, excluded from the headline figure
 ```
 
 **Their cost is a floor, not a total, and it is kept out of the headline number.**
@@ -203,7 +203,7 @@ about 2x from a 4-tool run to a 45-tool run, which is context growth rather than
 summation. The cumulative spend of a subagent's turns is not recoverable, so it is
 not estimated.
 
-**The bigger finding is what the audit cannot see.** 12,951 shell commands ran
+**The bigger finding is what the audit cannot see.** 3,402 shell commands ran
 inside subagents — 21% of all shell activity — and their command text is never
 written to the parent transcript. Subagents inherit the parent's permissions but
 not its visibility. The shell audit says so explicitly rather than reporting a
@@ -218,17 +218,17 @@ totals, rates, distributions, and generic finding titles.
 ```
   agentfleet · what my coding agents cost and did
 
-  47 active days   2 agent(s)   142,781 messages   64,208,473,022 tokens
+  31 active days   2 agent(s)   38,204 messages   17,540,882,110 tokens
 
-  $46,192.82 at API list price   ·   $982.83/active day
-  98.1% of input context from cache, saving $274,101.80 against sending it uncached
+  $12,480.55 at API list price   ·   $623.02/active day
+  98.1% of input context from cache, saving $71,905.40 against sending it uncached
   81% of spend in a single project
-  $28.89 median cost per ticket, over 166 tickets
+  $41.20 median cost per ticket, over 58 tickets
 
-  48,875 shell commands   73% of all tool calls
+  13,006 shell commands   73% of all tool calls
   92% of turns ran unsupervised
   21% of shell activity happened inside subagents, where commands are not recorded
-  72 distinct credentials found in command history   25 critical, 70 worth rotating
+  19 distinct credentials found in command history   6 critical, 18 worth rotating
 
   coach   AF004  AF003  AF005  AF011  AF001  AF007  AF008  AF009
 ```
@@ -356,7 +356,7 @@ if handled like the other:
 ## Verification
 
 The cost pipeline was cross-checked against an independent `jq` implementation over
-the same transcripts: 135,508 messages / $44,397.88 on the first root, matching to
+the same transcripts: 38,204 messages / $12,480.55 on the first root, matching to
 the cent. Do the same before trusting any number here that matters to you.
 
 ## Running it in the background (macOS)

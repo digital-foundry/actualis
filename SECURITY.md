@@ -5,9 +5,12 @@ correctness is therefore a security property, not just a quality one.
 
 ## Reporting a vulnerability
 
-Email **aaron.wise@digitalfoundry.tech** with "agentfleet security" in the
-subject. Please do not open a public issue for anything in the classes below.
-Expect an acknowledgement within a few days.
+Use **GitHub private vulnerability reporting** — the *Report a vulnerability*
+button under this repository's Security tab. It is private, it threads, and it
+needs no email address from either of us.
+
+Please do not open a public issue for anything in the classes below. Expect an
+acknowledgement within a few days.
 
 ## What counts as a vulnerability here
 

@@ -24,8 +24,8 @@ First working version. Not yet published.
   model in the loop. Tuned to a 3.8% flag rate by deleting rules as much as
   adding them.
 - **Secret classification**: distinct credentials by type and priority,
-  deduplicated by `sha256[:8]`, ranked for rotation. Turns "792 flagged commands"
-  into "37 secrets, 36 worth rotating".
+  deduplicated by `sha256[:8]`, ranked for rotation. Turns "310 flagged commands"
+  into "37 secrets, 18 worth rotating".
 - Reports what it **cannot** see: subagent shell commands are absent from the
   parent transcript, ~21% of shell activity on the author's fleet.
 - **Redaction on by default** everywhere including `--json`.

@@ -36,8 +36,8 @@ that and prints a warning.
 ## `secrets[]`
 
 ```json
-{ "priority": "critical", "types": ["STRIPE_SECRET_KEY"], "id": "dbd90550",
-  "uses": 2, "first_seen": "2026-08-18", "last_seen": "2026-08-18",
+{ "priority": "critical", "types": ["STRIPE_SECRET_KEY"], "id": "a41f9c02",
+  "uses": 2, "first_seen": "2026-05-30", "last_seen": "2026-05-30",
   "projects": ["…"] }
 ```
 
@@ -46,10 +46,10 @@ that and prints a warning.
 ## `by_ticket[]`
 
 ```json
-{ "ticket": "#1283", "cost_usd": 3337.23, "messages": 10788,
-  "branches": ["feat/1283-p4-pdf-web", "feat/1283-p5-pdf-vision"],
+{ "ticket": "#412", "cost_usd": 3337.23, "messages": 10788,
+  "branches": ["feat/412-checkout-v2", "feat/412-checkout-api"],
   "projects": ["…"], "active_days": 5,
-  "first_seen": "2026-07-18", "last_seen": "2026-08-21" }
+  "first_seen": "2026-05-06", "last_seen": "2026-06-02" }
 ```
 
 ## `subagents`

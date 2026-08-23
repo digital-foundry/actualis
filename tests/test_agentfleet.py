@@ -354,10 +354,10 @@ class TestCacheEfficiency(unittest.TestCase):
 class TestTicketAttribution(unittest.TestCase):
 
     def test_extracts_numeric_tickets(self):
-        for br, want in [("feat/1283-p6-mobile-textlayer", "#1283"),
-                         ("fix/2500-no-credentials-in-argv", "#2500"),
-                         ("chore/1155-sca-burndown", "#1155"),
-                         ("1283-some-slug", "#1283"),
+        for br, want in [("feat/412-checkout-mobile", "#412"),
+                         ("fix/1180-session-timeout", "#1180"),
+                         ("chore/733-dep-bump", "#733"),
+                         ("412-some-slug", "#412"),
                          ("issue-742", "#742"),
                          ("gh_91", "#91")]:
             with self.subTest(br=br):
@@ -373,17 +373,17 @@ class TestTicketAttribution(unittest.TestCase):
                 self.assertIsNone(af.extract_ticket(br))
 
     def test_unticketed_branches_are_not_invented(self):
-        self.assertIsNone(af.extract_ticket("worktree-lp-doc-cleanup"))
+        self.assertIsNone(af.extract_ticket("worktree-scratch"))
         self.assertIsNone(af.extract_ticket("spike/try-something"))
 
     def test_one_ticket_spanning_branches_is_one_row(self):
         """The point of grouping by ticket rather than branch."""
         f = af.Fleet()
-        for br in ("feat/1283-p5-pdf-vision", "feat/1283-p6-mobile-textlayer"):
+        for br in ("feat/412-checkout-api", "feat/412-checkout-mobile"):
             f.add_usage("proj", "claude-opus-5", {"output_tokens": 1_000_000}, None, br)
-        self.assertEqual(list(f.cost_by_ticket), ["#1283"])
-        self.assertAlmostEqual(f.cost_by_ticket["#1283"], 50.0, places=6)
-        self.assertEqual(len(f.branches_by_ticket["#1283"]), 2)
+        self.assertEqual(list(f.cost_by_ticket), ["#412"])
+        self.assertAlmostEqual(f.cost_by_ticket["#412"], 50.0, places=6)
+        self.assertEqual(len(f.branches_by_ticket["#412"]), 2)
 
     def test_trunk_and_detached_are_bucketed_separately(self):
         f = af.Fleet()

@@ -318,10 +318,10 @@ def clean(text: str | None) -> str:
 #
 # Cost per project answers "where did the money go" at a granularity nobody
 # budgets in. Branch names almost always carry the issue number, so the same
-# data answers "what did issue #1283 cost", which is the unit engineering and
+# data answers "what did issue #412 cost", which is the unit engineering and
 # finance already think in.
 #
-# One ticket often spans several branches (feat/1283-p5-…, feat/1283-p6-…), so
+# One ticket often spans several branches (feat/412-p5-…, feat/412-p6-…), so
 # grouping by ticket rather than branch is the point of the exercise.
 # --------------------------------------------------------------------------
 
@@ -335,8 +335,8 @@ _TICKET_PATTERNS = [
     re.compile(rf"^(?:[a-z]+/)?(?:{_TRACKER_WORDS})[-_]?(\d{{1,6}})\b", re.I),
     re.compile(rf"^[a-z]+/(?!(?:{_TRACKER_WORDS})\b)([A-Z][A-Z0-9]+-\d+)", re.I),
     re.compile(rf"^(?!(?:{_TRACKER_WORDS})\b)([A-Z][A-Z0-9]+-\d+)", re.I),
-    re.compile(r"^[a-z]+/(\d{1,6})\b", re.I),            # feat/1283-slug
-    re.compile(r"^(\d{2,6})-"),                           # 1283-slug
+    re.compile(r"^[a-z]+/(\d{1,6})\b", re.I),            # feat/412-slug
+    re.compile(r"^(\d{2,6})-"),                           # 412-slug
 ]
 
 
