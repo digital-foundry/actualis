@@ -13,6 +13,7 @@ tested without them. See .gitleaksignore.
 
 import importlib.util
 import json
+import os
 import sys
 import unittest
 from datetime import datetime, timezone
@@ -775,7 +776,7 @@ class TestExplainability(unittest.TestCase):
                    "BY MODEL": "cost", "CACHE EFFICIENCY": "cache",
                    "BY TICKET": "tickets", "TOOL CALLS": "shell",
                    "SUBAGENTS": "subagents", "SHELL AUDIT": "shell",
-                   "REFUSALS": "refusals",
+                   "REFUSALS": "refusals", "SUPPRESSIONS": "suppressions",
                    "COACH": "coach", "AGENT PLATFORMS": "agents", "EXPLAIN": "sources"}
         for sec in sections:
             with self.subTest(section=sec):
@@ -1637,3 +1638,182 @@ class TestRateProvenance(unittest.TestCase):
         # The refresh path exists, and it lives outside the shipped package.
         self.assertTrue((ROOT / "tools" / "price-check.py").exists())
         self.assertIn("tools", str(ROOT / "tools"))
+
+
+class TestSuppressions(unittest.TestCase):
+    """A detector that cries wolf gets ignored, so there has to be a way to say
+    it is wrong. The design rule is one line: a suppression holds a finding back
+    from the actionable list, it never removes it from the count.
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = self._tmp.name
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = self._old
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _fleet_with_secret():
+        f = af.Fleet()
+        f.add_tool("proj", "Bash",
+                   {"command": "export API_TOKEN=notarealtokenjustafixture02"},
+                   datetime(2026, 8, 1, tzinfo=timezone.utc))
+        return f
+
+    def test_a_suppressed_finding_is_still_counted(self):
+        """The whole design. If suppressing deleted the finding, a heavily
+        suppressed scan would be indistinguishable from a clean one."""
+        before = self._fleet_with_secret()
+        fp = next(iter(before.secrets))
+        af.add_suppression(fp, "test fixture")
+        after = self._fleet_with_secret()
+        self.assertEqual(len(after.secrets), len(before.secrets))
+        self.assertEqual(after.suppressed_secrets, 1)
+        self.assertEqual(len(after.actionable_secrets), 0)
+        payload = af.to_json(after)
+        self.assertEqual(payload["suppressed_secrets"], 1)
+        self.assertTrue(payload["secrets"][0]["suppressed"])
+        self.assertEqual(payload["secrets"][0]["suppressed_reason"], "test fixture")
+
+    def test_an_unsuppressed_finding_is_actionable(self):
+        f = self._fleet_with_secret()
+        self.assertEqual(f.suppressed_secrets, 0)
+        self.assertEqual(len(f.actionable_secrets), len(f.secrets))
+
+    def test_removing_the_line_undoes_it(self):
+        f = self._fleet_with_secret()
+        fp = next(iter(f.secrets))
+        path = af.add_suppression(fp, "temporary")
+        self.assertIn(fp, af.load_suppressions())
+        kept = [ln for ln in path.read_text().splitlines() if not ln.startswith(fp)]
+        path.write_text("\n".join(kept) + "\n")
+        self.assertNotIn(fp, af.load_suppressions())
+
+    def test_a_suppression_records_why(self):
+        """A file of bare fingerprints is unreviewable six months later."""
+        path = af.add_suppression("a41f9c02", "vendor example key in our docs")
+        body = path.read_text()
+        self.assertIn("a41f9c02", body)
+        self.assertIn("vendor example key in our docs", body)
+        self.assertRegex(body, r"\(added \d{4}-\d{2}-\d{2}\)")
+
+    def test_a_missing_reason_is_recorded_not_rejected(self):
+        af.add_suppression("b00b1e55", "")
+        self.assertEqual(af.load_suppressions()["b00b1e55"], "(no reason given)")
+
+    def test_the_file_is_plain_text_and_survives_hand_editing(self):
+        path = af.add_suppression("a1b2c3d4", "one")
+        path.write_text(path.read_text()
+                        + "\n# a comment someone added by hand\n"
+                        + "  e5f6a7b8   spaced out reason  \n"
+                        + "\n")
+        loaded = af.load_suppressions()
+        self.assertIn("a1b2c3d4", loaded)
+        self.assertEqual(loaded["e5f6a7b8"], "spaced out reason")
+
+    def test_a_malformed_file_is_survivable(self):
+        path = af.suppression_paths()[0]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\x00\x01 garbage\n#\n\n   \n")
+        af.load_suppressions()   # must not raise
+
+    def test_an_empty_fingerprint_is_refused(self):
+        with self.assertRaises(ValueError):
+            af.add_suppression("   ", "reason")
+
+    def test_the_report_url_is_only_ever_printed(self):
+        """No network. The tool prints a URL and the user decides."""
+        url = af.report_url("API_TOKEN", "id a41f9c02")
+        self.assertTrue(url.startswith("https://github.com/digital-foundry/actualis/issues/new"))
+        self.assertIn("labels=false-positive", url)
+        import ast
+        tree = ast.parse(af.SRC_TEXT)
+        nets = set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Import):
+                nets |= {a.name.split(".")[0] for a in n.names}
+            elif isinstance(n, ast.ImportFrom) and n.module:
+                nets.add(n.module.split(".")[0])
+        self.assertEqual(nets & {"urllib", "http", "socket", "requests"}, set())
+
+    def test_the_url_encoder_matches_the_standard_library(self):
+        """Hand-rolled to keep the no-network guarantee absolute, so it has to
+        be right rather than approximately right."""
+        from urllib.parse import quote
+        for text in ["hello world", "a/b?c=d&e#f", "café 日本", "100%", "~-_.", ""]:
+            with self.subTest(text=text):
+                self.assertEqual(af._percent_encode(text), quote(text, safe=""))
+
+    def test_the_report_shows_how_to_suppress_where_the_finding_is(self):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            af.render(self._fleet_with_secret(), af.C(False), bash_only=False, top=5)
+        out = buf.getvalue()
+        self.assertIn("--suppress", out)
+        self.assertIn("still counted", out.lower().replace("stays counted", "still counted"))
+
+
+class TestRenderedReportLeaksNothing(unittest.TestCase):
+    """CodeQL flags the secrets section as clear-text logging of sensitive data.
+    It is a false positive -- taint tracking follows the `secrets` dict and
+    cannot see that only fingerprints and type names ever reach a print -- but
+    "it is a false positive" is worth nothing as an opinion. These assert it.
+    """
+
+    SECRET_VALUES = [
+        "notarealtokenjustafixture02",
+        "ghp_abcdefghijklmnopqrstuvwxyz012345",
+        "notarealpassphrasejustafixture03",
+    ]
+
+    def _fleet(self):
+        f = af.Fleet()
+        ts = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        for i, v in enumerate(self.SECRET_VALUES):
+            f.add_tool(f"proj{i}", "Bash", {"command": f"export API_TOKEN={v}"}, ts)
+        return f
+
+    def test_the_secret_value_is_never_retained_in_memory(self):
+        """The strongest form: it is not printed because it does not exist."""
+        f = self._fleet()
+        blob = repr(f.secrets)
+        for v in self.SECRET_VALUES:
+            with self.subTest(value=v[:12]):
+                self.assertNotIn(v, blob)
+
+    def test_the_rendered_report_contains_no_secret_value(self):
+        import io, contextlib
+        f = self._fleet()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            af.render(f, af.C(False), bash_only=False, top=10)
+        out = buf.getvalue()
+        for v in self.SECRET_VALUES:
+            with self.subTest(value=v[:12]):
+                self.assertNotIn(v, out)
+        # And it does print the fingerprint, which is the point of the section.
+        self.assertTrue(any(fp in out for fp in f.secrets))
+
+    def test_the_json_payload_contains_no_secret_value(self):
+        blob = json.dumps(af.to_json(self._fleet()))
+        for v in self.SECRET_VALUES:
+            with self.subTest(value=v[:12]):
+                self.assertNotIn(v, blob)
+
+    def test_a_fingerprint_is_not_reversible_to_the_value(self):
+        """sha256[:8] of the value. Truncated deliberately: enough to correlate
+        two sightings, not enough to be a credential."""
+        f = self._fleet()
+        for fp in f.secrets:
+            with self.subTest(fp=fp):
+                self.assertEqual(len(fp), 8)
+                self.assertRegex(fp, r"^[0-9a-f]{8}$")
+                self.assertNotIn(fp, self.SECRET_VALUES)

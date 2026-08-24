@@ -35,6 +35,8 @@ that and prints a warning.
 | `coach` | findings: `id`, `severity`, `title`, `evidence`, `action`, `impact` |
 | `secrets` | array; see below |
 | `secret_exposures` | commands containing credential material |
+| `suppressed_secrets` | findings marked as false positives on this machine |
+| `suppression_note` | why a suppressed finding is still counted here |
 | `secret_projects` | those commands per project |
 | `redacted` | whether values were masked (`true` unless `--no-redact`) |
 | `permission_modes` | turns per permission mode |
@@ -186,6 +188,12 @@ an empty collection.
 ```
 
 `id` is `sha256[:8]` of the value. The value itself is never emitted.
+
+Each entry also carries `suppressed` and `suppressed_reason`. **A suppressed
+finding is still listed here and still counted** — it is held back from the
+actionable list in the report, not hidden. A scan with many suppressions must
+not be indistinguishable from a clean one, and `suppressed_secrets` is the
+number that makes the difference visible.
 
 ## `by_ticket[]`
 

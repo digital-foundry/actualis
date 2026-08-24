@@ -108,6 +108,9 @@ python3 actualis.py --agent codex    # one agent only (claude | codex | all)
 | `--interval SEC` | `--watch` poll interval, default 4 |
 | `--quiet` | `--watch`: notify on secrets only, not every flagged command |
 | `--no-redact` | **do not** redact credentials from output; unsafe to share |
+| `--suppress ID` | mark a finding as a false positive on this machine (it stays counted) |
+| `--reason TEXT` | why that suppression is correct, recorded for review |
+| `--suppressions` | list current suppressions and where they are read from |
 | `--explain [TOPIC]` | how a number is computed, what it assumes, how to check it |
 | `--why AFxxx` | explain one finding against your actual numbers |
 | `--agents` | installed agent platforms and whether their binaries are validly signed |
@@ -405,6 +408,31 @@ The rules were tuned against 48,000 real agent commands, and tuning meant deleti
 rules as much as adding them. A rule matching `>/dev/null 2>&1` as "audit
 tampering" fired 1,206 times at essentially 100% false positive, so it's gone; a
 noisy rule destroys trust in the rules that matter. Current flag rate is about 3.8%.
+
+## When it is wrong
+
+A detector that cries wolf gets ignored, so there is a way to tell it it is
+wrong, at the point where you disagree with it rather than in documentation you
+would have to go looking for:
+
+```sh
+actualis --suppress a41f9c02 --reason "test fixture in our CI config"
+actualis --suppressions
+```
+
+Suppressions are a plain text file — greppable, diffable, reviewable in a pull
+request, and editable by hand six months later by someone who did not write it.
+Read from `$XDG_CONFIG_HOME/actualis/suppressions` and from
+`./.actualis-suppressions`, so a team can commit a shared list.
+
+**A suppression never removes a finding from the count.** It is held back from
+the actionable list, and it still appears in `--json` with `suppressed: true` and
+its reason. If suppressing something deleted it, the report would start lying by
+omission and you could not tell a clean scan from a heavily suppressed one.
+
+If a detection is wrong for everyone rather than just for you, the report prints
+a pre-filled issue URL. It prints it; it never opens it and never sends
+anything.
 
 ## Redaction
 
