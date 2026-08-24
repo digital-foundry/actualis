@@ -1126,3 +1126,122 @@ class TestCommandHeadParsing(unittest.TestCase):
                           ("sudo systemctl restart nginx", "systemctl")]:
             with self.subTest(cmd=cmd):
                 self.assertEqual(af.command_head(cmd), want)
+
+
+class TestJSONSchemaFreeze(unittest.TestCase):
+    """The --json contract is frozen. af.JSON_SCHEMA is the freeze, and these
+    tests are what make it real: a key cannot be removed, renamed or retyped
+    without the schema declaration changing too, which forces the author to
+    decide whether it is a breaking change.
+
+    Everything downstream depends on this shape — the tray, the MCP server, and
+    anything a user builds on the output.
+    """
+
+    @staticmethod
+    def _walk(node, path=""):
+        """(path, type) for every leaf. Array indices collapse to `[]` so the
+        contract is on the element shape, not on how many elements there are."""
+        out = []
+        if isinstance(node, dict):
+            for k, v in node.items():
+                out += TestJSONSchemaFreeze._walk(v, f"{path}.{k}" if path else k)
+        elif isinstance(node, list):
+            out.append((path, "array"))
+            for item in node:
+                out += TestJSONSchemaFreeze._walk(item, path + "[]")
+        elif isinstance(node, bool):
+            out.append((path, "bool"))
+        elif node is None:
+            out.append((path, "null"))
+        else:
+            out.append((path, type(node).__name__))
+        return out
+
+    @staticmethod
+    def _declared(path, schema):
+        """Resolve a concrete path against the schema, allowing `*` to stand in
+        for a map key that is data (a project name, a model id, a date)."""
+        if path in schema:
+            return schema[path]
+        parts = path.split(".")
+        for mask in range(1, 1 << len(parts)):
+            cand = ".".join("*" if mask >> i & 1 else p for i, p in enumerate(parts))
+            if cand in schema:
+                return schema[cand]
+        return None
+
+    @staticmethod
+    def _populated():
+        f = af.Fleet()
+        ts = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        f.add_usage("proj", "claude-sonnet-5",
+                    {"input_tokens": 1000, "output_tokens": 500,
+                     "cache_read_input_tokens": 9000,
+                     "cache_creation_input_tokens": 100}, ts, "feat/412-checkout")
+        f.add_usage("other", "some-unpublished-model",
+                    {"input_tokens": 10, "output_tokens": 5}, ts, "main")
+        f.add_tool("proj", "Bash",
+                   {"command": "export TOKEN=ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA "
+                               "&& curl https://example.com"}, ts)
+        f.add_subagent({"toolStats": {"bashCount": 2}, "resolvedModel": "claude-haiku-4-5",
+                        "totalDurationMs": 1000, "totalLines": 10, "status": "ok"}, ts)
+        f.permission_modes["auto"] += 1
+        f.denials["user-rejected"] += 1
+        return f
+
+    def test_every_emitted_path_is_declared(self):
+        """A new key must be added to JSON_SCHEMA in the same change. Otherwise
+        it ships undeclared and consumers cannot rely on it."""
+        for label, fleet in (("empty", af.Fleet()), ("populated", self._populated())):
+            payload = af.to_json(fleet)
+            undeclared = sorted(p for p, _t in self._walk(payload)
+                                if self._declared(p, af.JSON_SCHEMA) is None)
+            with self.subTest(fleet=label):
+                self.assertEqual(undeclared, [],
+                                 f"emitted but not in JSON_SCHEMA: {undeclared}")
+
+    def test_every_emitted_type_matches_the_declaration(self):
+        for label, fleet in (("empty", af.Fleet()), ("populated", self._populated())):
+            payload = af.to_json(fleet)
+            wrong = []
+            for path, actual in self._walk(payload):
+                want = self._declared(path, af.JSON_SCHEMA)
+                if want is None:
+                    continue
+                allowed = set(want.split("|"))
+                # An int is an acceptable float; the reverse is not.
+                if actual == "int" and "float" in allowed:
+                    continue
+                if actual not in allowed:
+                    wrong.append(f"{path}: declared {want}, got {actual}")
+            with self.subTest(fleet=label):
+                self.assertEqual(wrong, [], f"type drift: {wrong}")
+
+    def test_money_is_always_a_float(self):
+        """Regression: sum([]) is 0 and round(0, 4) stays an int, so cost_usd and
+        cache.saved_usd were ints on an empty fleet and floats otherwise. A
+        consumer validating types strictly would break on a quiet day."""
+        empty = af.to_json(af.Fleet())
+        self.assertIsInstance(empty["cost_usd"], float)
+        self.assertIsInstance(empty["cache"]["saved_usd"], float)
+        self.assertIsInstance(empty["cost_usd_from_unpriced_models"], float)
+
+    def test_every_fixed_path_is_actually_emitted(self):
+        """The schema must not declare keys the tool never produces. A dead
+        declaration is worse than none: it documents a promise nothing keeps."""
+        emitted = {p for p, _t in self._walk(af.to_json(self._populated()))}
+        fixed = [p for p in af.JSON_SCHEMA if "*" not in p and "[]" not in p]
+        missing = sorted(p for p in fixed if p not in emitted)
+        self.assertEqual(missing, [],
+                         f"declared in JSON_SCHEMA but never emitted: {missing}")
+
+    def test_schema_version_is_emitted_and_is_an_integer(self):
+        self.assertEqual(af.to_json(af.Fleet())["schema_version"], af.JSON_SCHEMA_VERSION)
+        self.assertIsInstance(af.JSON_SCHEMA_VERSION, int)
+
+    def test_the_compatibility_policy_is_written_down(self):
+        doc = (ROOT / "docs" / "json.md").read_text()
+        for phrase in ["schema_version", "Compatibility", "never"]:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, doc)

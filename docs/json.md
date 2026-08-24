@@ -8,7 +8,8 @@ that and prints a warning.
 
 | key | contents |
 |---|---|
-| `version` | tool version |
+| `schema_version` | integer. The contract version of this document. See [Compatibility](#compatibility) |
+| `version` | tool version. Changes far more often than `schema_version` and means something different |
 | `window` | `from`, `to`, `days`, `active_days` |
 | `scanned` | `files`, `bytes`, `roots[]` |
 | `messages` | count of assistant messages with usage |
@@ -38,6 +39,47 @@ that and prints a warning.
 | `denials` | rejections by kind |
 | `unknown_models` | models seen with no pricing entry, billed at Opus-tier rates |
 | `aggregator_priced_models` | models priced from a third party because the vendor publishes no rate for that id |
+
+## Compatibility
+
+`schema_version` is currently **1**. It describes the shape of this output and
+is deliberately separate from the tool version: `actualis --version` moves on
+every release, `schema_version` moves only when something breaks.
+
+Within a major schema version:
+
+| | |
+|---|---|
+| **May** | a new key appears |
+| **May** | a new value appears in an existing enum, such as a new denial kind |
+| **May** | a new field appears on an array element |
+| **May** | a description, note string, or key order changes |
+| **Never** | a key is removed or renamed |
+| **Never** | a key changes type |
+| **Never** | an existing key changes meaning |
+
+So parse defensively for keys you do not recognise, and rely on the ones you do.
+
+The freeze is machine-checked, not a promise in prose. `JSON_SCHEMA` in
+`actualis.py` is a flat map of dotted path to type, and the test suite validates
+real output against it on both an empty and a populated fleet. A key cannot be
+removed, renamed or retyped without that declaration changing in the same commit,
+which forces the author to decide whether they are breaking the contract.
+
+Path syntax in that declaration:
+
+| form | meaning |
+|---|---|
+| `a.b` | a fixed key |
+| `a.*` | a map whose **keys are data** — project names, model ids, dates |
+| `a[].b` | a field on each element of an array |
+| `str\|null` | legitimately absent sometimes |
+
+Two consequences worth knowing. Money fields are **always** floats, including
+when they are zero — an earlier version emitted `0` on an empty fleet and `0.0`
+otherwise, which broke strict type validation on a quiet day. And a `*` or `[]`
+path is absent when the map or array is empty; that is not a missing key, it is
+an empty collection.
 
 ## `secrets[]`
 

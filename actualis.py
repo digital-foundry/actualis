@@ -2666,8 +2666,118 @@ def render_share(fleet: "Fleet", c: C) -> None:
     print(f"  flat fee, so read this as consumption.{o}\n")
 
 
+# --------------------------------------------------------------------------
+# The --json contract
+#
+# Everything downstream agrees with this: the tray, the MCP server, and anything
+# a user builds on `actualis --json`. It is frozen, and JSON_SCHEMA below is the
+# freeze — a flat map of dotted path to type, checked against real output by the
+# test suite so a key cannot be removed or retyped by accident.
+#
+# Within a major schema version:
+#   MAY   add a new key, add a new enum value, add an array element field
+#   MAY   change a description, a note string, or the ORDER of keys
+#   NEVER remove a key, rename one, or change its type
+#   NEVER change the meaning of an existing key
+#
+# Path syntax:
+#   a.b    a fixed key
+#   a.*    a map whose KEYS are data (project names, model ids, dates)
+#   a[].b  a field on each element of an array
+#   "x|null" a value that is legitimately absent
+#
+# Bump JSON_SCHEMA_VERSION only for a breaking change, and say so in CHANGELOG.
+# --------------------------------------------------------------------------
+
+JSON_SCHEMA_VERSION = 1
+
+JSON_SCHEMA: dict[str, str] = {
+    "schema_version": "int",
+    "version": "str",
+    "window.from": "str|null",
+    "window.to": "str|null",
+    "window.days": "float",
+    "window.active_days": "int",
+    "scanned.files": "int",
+    "scanned.bytes": "int",
+    "scanned.roots": "array",
+    "scanned.roots[]": "str",
+    "messages": "int",
+    "cost_usd": "float",
+    "cost_usd_from_unpriced_models": "float",
+    "cost_note": "str",
+    "duplicate_usage_records_skipped": "int",
+    "duplicate_note": "str",
+    "tokens.*": "int",
+    "by_agent.*": "float",
+    "subagents.runs": "int",
+    "subagents.by_model.*": "int",
+    "subagents.status.*": "int",
+    "subagents.cost_floor_usd": "float",
+    "subagents.cost_floor_note": "str",
+    "subagents.tools.*": "int",
+    "subagents.lines.*": "int",
+    "subagents.wall_clock_hours": "float",
+    "by_model.*": "float",
+    "cache.fleet_hit_rate_pct": "float",
+    "cache.saved_usd": "float",
+    "cache.by_project.*.hit_rate_pct": "float",
+    "cache.by_project.*.context_tokens": "int",
+    "cache.by_project.*.saved_usd": "float",
+    "by_ticket": "array",
+    "by_ticket[].ticket": "str",
+    "by_ticket[].cost_usd": "float",
+    "by_ticket[].messages": "int",
+    "by_ticket[].branches": "array",
+    "by_ticket[].branches[]": "str",
+    "by_ticket[].projects": "array",
+    "by_ticket[].projects[]": "str",
+    "by_ticket[].active_days": "int",
+    "by_ticket[].first_seen": "str",
+    "by_ticket[].last_seen": "str",
+    "by_branch.*": "float",
+    "by_project.*": "float",
+    "by_day.*": "float",
+    "tools.*": "int",
+    "bash.total": "int",
+    "bash.commands.*": "int",
+    "bash.flag_counts.*": "int",
+    "bash.flags": "array",
+    "bash.flags[].severity": "str",
+    "bash.flags[].categories": "array",
+    "bash.flags[].categories[]": "str",
+    "bash.flags[].project": "str",
+    "bash.flags[].when": "str|null",
+    "bash.flags[].evidence": "str",
+    "coach": "array",
+    "coach[].id": "str",
+    "coach[].severity": "str",
+    "coach[].title": "str",
+    "coach[].evidence": "str",
+    "coach[].action": "str",
+    "coach[].impact": "str|null",
+    "secret_exposures": "int",
+    "secrets": "array",
+    "secrets[].id": "str",
+    "secrets[].priority": "str",
+    "secrets[].types": "array",
+    "secrets[].types[]": "str",
+    "secrets[].uses": "int",
+    "secrets[].projects": "array",
+    "secrets[].projects[]": "str",
+    "secrets[].first_seen": "str",
+    "secrets[].last_seen": "str",
+    "secret_projects.*": "int",
+    "redacted": "bool",
+    "permission_modes.*": "int",
+    "denials.*": "int",
+    "unknown_models.*": "int",
+    "aggregator_priced_models.*": "int",
+}
+
 def to_json(fleet: Fleet, raw: bool = False) -> dict:
     return {
+        "schema_version": JSON_SCHEMA_VERSION,
         "version": __version__,
         "window": {
             "from": fleet.first_ts.isoformat() if fleet.first_ts else None,
@@ -2678,7 +2788,7 @@ def to_json(fleet: Fleet, raw: bool = False) -> dict:
         "scanned": {"files": fleet.files_scanned, "bytes": fleet.bytes_scanned,
                     "roots": [str(r) for r in fleet.roots]},
         "messages": fleet.messages,
-        "cost_usd": round(fleet.total_cost, 4),
+        "cost_usd": float(round(fleet.total_cost, 4)),
         "cost_usd_from_unpriced_models": round(fleet.cost_unknown, 4),
         "cost_note": "models with no published rate are priced at the top of the "
                      "known range for their provider, so that share is an upper "
@@ -2706,8 +2816,8 @@ def to_json(fleet: Fleet, raw: bool = False) -> dict:
             "fleet_hit_rate_pct": round(cache_hit_rate(
                 Counter({k: sum(t[k] for t in fleet.tokens_by_project.values())
                          for k in ("input", "cache_w", "cache_read")})), 2),
-            "saved_usd": round(sum(fleet.cache_uncached.values())
-                               - sum(fleet.cache_actual.values()), 4),
+            "saved_usd": float(round(sum(fleet.cache_uncached.values())
+                                     - sum(fleet.cache_actual.values()), 4)),
             "by_project": {
                 p: {"hit_rate_pct": round(cache_hit_rate(t), 2),
                     "context_tokens": t["input"] + t["cache_w"] + t["cache_read"],
