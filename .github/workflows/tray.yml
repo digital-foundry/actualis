@@ -11,6 +11,14 @@ on:
 permissions:
   contents: read
 
+# Only on the PR path. release.yml calls the same reusable workflow and must
+# never have its build cancelled out from under a publish.
+concurrency:
+  group: tray-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  # timeout-minutes is not accepted on a job that calls a reusable workflow;
+  # the limit is set on the job inside tray-build.yml.
   build:
     uses: ./.github/workflows/tray-build.yml

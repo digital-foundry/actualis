@@ -9,8 +9,20 @@ on:
 permissions:
   contents: read
 
+# A second push to the same PR makes the first run pointless. Without this it
+# runs to completion anyway, on three operating systems, and macOS bills at 10x
+# the Linux rate. Pushes to main are never cancelled: main's history has to
+# stay checkable.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
+    # Real runs finish in about 30 seconds. The GitHub default is 360 minutes,
+    # so a wedged runner burns six hours per job before anything notices — and
+    # a stuck job does not fail, it just sits there holding up the release.
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:

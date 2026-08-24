@@ -13,6 +13,9 @@ permissions:
 
 jobs:
   build:
+    # cgo across three platforms, plus an apt install on Linux. Slowest real
+    # run is a couple of minutes; this is headroom, not a target.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
