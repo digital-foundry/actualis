@@ -47,11 +47,35 @@ Trunk-based. `main` is always releasable and is the only long-lived branch.
 There is no `develop`, no release branch and no long-lived integration branch.
 For a project this size they cost more in merge overhead than they return.
 
-**`main` is protected.** Force-pushes and deletion are blocked, and the Python
-test matrix must pass before a merge. That protection is not decoration: this
-repository's history was rewritten once, deliberately, to purge brand artwork
-and a stale binary — with the rules now in place, the same operation needs a
-conscious bypass rather than a stray `--force`.
+**`main` is protected, including from maintainers.** Force-pushes and deletion
+are blocked, every change goes through a pull request, and the Python test
+matrix must pass before a merge. There are **no bypass actors** — an admin gets
+the same refusal everyone else does:
+
+```
+! [remote rejected] main -> main (push declined due to repository rule violations)
+  - 4 of 4 required status checks are expected.
+  - Changes must be made through a pull request.
+```
+
+That last part was not true until 2026-08-24. The repository role held an
+`always` bypass, so every maintainer push went straight to `main` and skipped
+all four required checks. The rules read as protection and behaved as a
+suggestion, which is worse than having none: it is protection you stop
+checking.
+
+So the loop is: branch, push the branch, open a PR, let the matrix run, merge.
+Approvals are not required — a solo maintainer can merge their own PR — but the
+checks are.
+
+Tags are not covered by the ruleset, so `git push origin v1.2.3` still works
+directly and still triggers `release.yml`. That is deliberate: the tag is cut
+from a commit that already passed the matrix on `main`.
+
+This protection is not decoration. This repository's history was rewritten
+once, deliberately, to purge brand artwork and a stale binary — with the rules
+now in place, the same operation means editing the ruleset first, on purpose,
+rather than a stray `--force` succeeding quietly.
 
 Outside contributors work from a fork. Fork pull requests require maintainer
 approval before any workflow runs, so a first PR will sit until someone presses
