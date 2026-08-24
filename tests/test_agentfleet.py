@@ -20,6 +20,9 @@ sys.modules["agentfleet"] = af
 spec.loader.exec_module(af)
 
 
+af.SRC_TEXT = (ROOT / "agentfleet.py").read_text()
+
+
 def cats(cmd):
     return {c for _, c, _ in af.audit_command(cmd)}
 
@@ -705,6 +708,61 @@ class TestMCP(unittest.TestCase):
     def test_cost_is_labelled_as_list_price(self):
         """A model relaying this must not present it as a bill."""
         self.assertIn("cost_note", self._call("fleet_summary"))
+
+
+class TestExplainability(unittest.TestCase):
+    """A number that cannot be interrogated should not be acted on."""
+
+    def test_every_topic_has_all_four_parts(self):
+        for topic, e in af.EXPLAIN.items():
+            with self.subTest(topic=topic):
+                for key in ("measures", "formula", "assumes", "verify"):
+                    self.assertIn(key, e)
+                    self.assertTrue(e[key], f"{topic}.{key} is empty")
+
+    def test_every_report_section_has_an_explain_topic(self):
+        """A section with no explanation is a black box by definition."""
+        import re
+        sections = set(re.findall(r'rule\(c, "([A-Z][A-Z ]+)"', af.SRC_TEXT))
+        mapping = {"FLEET": "sources", "TOKENS": "cost", "BY AGENT": "cost",
+                   "BY MODEL": "cost", "CACHE EFFICIENCY": "cache",
+                   "BY TICKET": "tickets", "TOOL CALLS": "shell",
+                   "SUBAGENTS": "subagents", "SHELL AUDIT": "shell",
+                   "COACH": "coach", "AGENT PLATFORMS": "agents", "EXPLAIN": "sources"}
+        for sec in sections:
+            with self.subTest(section=sec):
+                self.assertIn(sec, mapping, f"{sec} has no explain topic")
+                self.assertIn(mapping[sec], af.EXPLAIN)
+
+    def test_verify_command_is_runnable_not_prose(self):
+        for topic, e in af.EXPLAIN.items():
+            with self.subTest(topic=topic):
+                v = str(e["verify"])
+                self.assertTrue(any(v.startswith(p) for p in
+                                    ("agentfleet", "codesign", "ls ", "grep ")),
+                                f"{topic} verify is not a command: {v}")
+
+
+class TestAgentVerification(unittest.TestCase):
+
+    def test_status_table_covers_every_status_used(self):
+        import re
+        used = set(re.findall(r'info\["status"\] = "([a-z-]+)"', af.SRC_TEXT))
+        used.add("verified")
+        for st in used:
+            with self.subTest(status=st):
+                self.assertIn(st, af.AGENT_STATUS)
+
+    def test_expected_signers_are_known_publishers(self):
+        for cmd, team in af.EXPECTED_SIGNER.items():
+            with self.subTest(cmd=cmd):
+                self.assertIn(team, af.KNOWN_PUBLISHERS)
+
+    def test_missing_binary_returns_none(self):
+        self.assertIsNone(af.verify_agent("Nope", "definitely-not-a-real-binary-xyz"))
+
+    def test_verify_agents_never_raises(self):
+        self.assertIsInstance(af.verify_agents(), list)
 
 
 class TestDocumentation(unittest.TestCase):

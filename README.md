@@ -91,6 +91,9 @@ python3 agentfleet.py --agent codex    # one agent only (claude | codex | all)
 | `--interval SEC` | `--watch` poll interval, default 4 |
 | `--quiet` | `--watch`: notify on secrets only, not every flagged command |
 | `--no-redact` | **do not** redact credentials from output; unsafe to share |
+| `--explain [TOPIC]` | how a number is computed, what it assumes, how to check it |
+| `--why AFxxx` | explain one finding against your actual numbers |
+| `--agents` | installed agent platforms and whether their binaries are validly signed |
 | `--mcp` | run as an MCP server over stdio ([below](#ask-the-agent-about-itself)) |
 | `--version` | print version |
 
@@ -238,6 +241,64 @@ The test suite plants identifying strings — a project name, a branch, a path, 
 live-shaped key, an internal hostname — and asserts that none of them can reach
 this output. Secret fingerprints are excluded too, since a hash is still an
 identifier that could be correlated.
+
+## Nothing is a black box
+
+Every figure is answerable: where it came from, how it was computed, what it
+assumes, and how to check it **without trusting this tool**.
+
+```sh
+agentfleet --explain            # list the topics
+agentfleet --explain cost       # the formula, the assumptions, an independent check
+agentfleet --why AF005          # why one finding fired, with your actual numbers
+```
+
+Topics: `sources`, `cost`, `cache`, `tickets`, `secrets`, `subagents`, `shell`,
+`coach`, `agents`.
+
+Each explanation carries the same four parts, deliberately: what it measures, the
+exact formula, what it assumes, and a command that checks the answer some other
+way. If a number cannot be interrogated, it should not be acted on.
+
+## Are your agents what they claim to be?
+
+This tool reads what agents did. The obvious next question is whether the agent
+itself is genuine — a modified `claude` binary could do anything and still write
+a plausible transcript.
+
+```
+$ agentfleet --agents
+
+  OK   Claude Code  claude
+       Developer ID Application: Anthropic PBC (Q6L2SF6YDW)
+       signature valid, team Q6L2SF6YDW as expected
+
+  OK   Codex  codex
+       Developer ID Application: OpenAI OpCo, LLC (2DC432GLL2)
+       signature valid, team 2DC432GLL2 as expected
+
+  -    GitHub Copilot CLI  copilot
+       no code signature (expected for npm and script installs)
+```
+
+| status | meaning |
+|---|---|
+| `OK` | validly signed by the publisher expected for that tool |
+| `WARN` | validly signed, but **not by the expected publisher** |
+| `FAIL` | signature present and **invalid — the binary was modified** |
+| `-` | unsigned; normal for npm and script installs |
+| `?` | signed by an unpinned publisher, or unassessable on this platform |
+
+Team IDs are pinned per tool, so a valid signature from the *wrong* publisher is
+visible rather than silently accepted.
+
+**What a valid signature proves:** the binary came from that publisher and has
+not been altered since signing. Tested by flipping one byte in a 325 MB signed
+binary; it reports `FAIL`. **What it does not prove:** that the software is safe,
+or that the publisher deserves trust. **Unsigned is not malicious** — script
+based tools are never code-signed.
+
+macOS only. Other platforms report *unassessed* rather than pretending.
 
 ## Ask the agent about itself
 

@@ -1439,6 +1439,378 @@ def _commands_in(rec: dict) -> list[str]:
 
 
 # --------------------------------------------------------------------------
+# Explanations
+#
+# Every figure this tool prints should be answerable: where it came from, how it
+# was computed, what it assumes, and how to check it without trusting this tool.
+# A number you cannot interrogate is a number you should not act on.
+#
+# Each entry carries the same four parts on purpose, so the shape is predictable:
+# what it measures, the formula, the assumptions, and an independent check.
+# --------------------------------------------------------------------------
+
+EXPLAIN: dict[str, dict[str, object]] = {
+    "sources": {
+        "measures": "Which files every number is derived from.",
+        "formula": [
+            "Claude Code  ~/.claude/projects/**/*.jsonl  (plus $CLAUDE_CONFIG_DIR)",
+            "Codex        $CODEX_HOME/sessions/**/rollout-*.jsonl",
+            "",
+            "Files are opened read-only. Nothing is written, cached, or sent.",
+            "Every directory actually scanned is printed in the report header.",
+        ],
+        "assumes": [
+            "The agents wrote an accurate record. This tool reads it; it does not",
+            "witness the work independently.",
+        ],
+        "verify": "ls ~/.claude/projects/*/ | head   # the raw data is yours to read",
+    },
+    "cost": {
+        "measures": "What the recorded token usage would cost at provider list prices.",
+        "formula": [
+            "per message, using that message's model:",
+            "  input        x rate",
+            "  output       x rate",
+            "  cache write  x rate x 2.00  (1h TTL)  or  x 1.25  (5m TTL)",
+            "  cache read   x rate x 0.10",
+            "",
+            "OpenAI differs: input_tokens INCLUDES cached, so the cached portion is",
+            "billed at 0.10x and only the remainder at full rate.",
+        ],
+        "assumes": [
+            "List prices, hardcoded and dated in the source. They drift.",
+            "On a Pro/Max subscription you pay a flat fee, so this is an",
+            "opportunity-cost figure and a consumption signal, NOT a bill.",
+            "OpenAI rates come from a third-party aggregator, not OpenAI's page.",
+        ],
+        "verify": "agentfleet --json | jq '.tokens, .cost_usd'   # then apply the rates yourself",
+    },
+    "cache": {
+        "measures": "Share of input context served from cache, and what that saved.",
+        "formula": [
+            "hit rate = cache_read / (input + cache_write + cache_read)",
+            "saved    = (cost of sending the same context uncached) - (cost actually billed)",
+            "",
+            "Output tokens are excluded from the denominator because they cannot be",
+            "cached; including them makes a chatty project look broken.",
+        ],
+        "assumes": [
+            "The counterfactual is that the same context would have been sent.",
+            "A write-heavy project can show NEGATIVE savings, since a 1h cache",
+            "write costs 2.00x. That is reported rather than clamped to zero.",
+        ],
+        "verify": "agentfleet --json | jq '.cache'",
+    },
+    "tickets": {
+        "measures": "Cost attributed to an issue, via the branch a message was written on.",
+        "formula": [
+            "gitBranch is recorded on every message. The issue id is extracted from it:",
+            "  feat/412-slug -> #412     PROJ-456-slug -> PROJ-456     issue-742 -> #742",
+            "",
+            "One ticket often spans several branches, so grouping is by ticket.",
+            "Trunk and detached HEAD get their own buckets and are NOT attributed.",
+        ],
+        "assumes": [
+            "Branch names carry the issue number. Where they do not, the work is",
+            "reported as unattributed rather than guessed at.",
+        ],
+        "verify": "agentfleet --json | jq '.by_ticket[0], .by_branch'",
+    },
+    "secrets": {
+        "measures": "Distinct credentials appearing in recorded shell commands.",
+        "formula": [
+            "Command text is matched against known token prefixes, connection-string",
+            "shapes, and secret-shaped assignments. Each hit is hashed immediately to",
+            "sha256[:8]; the value is never stored, printed, or written to JSON.",
+            "",
+            "A secret is a VALUE: the same one under two variable names is one row,",
+            "and the worst priority wins.",
+        ],
+        "assumes": [
+            "Pattern matching has a ceiling. Dynamically built values, secrets read",
+            "from files, and anything inside a subagent are NOT detectable.",
+            "This raises the floor on visibility. It is not a security boundary.",
+        ],
+        "verify": "grep -rl 'sk_live_' ~/.claude/projects/ | head   # find them yourself",
+    },
+    "subagents": {
+        "measures": "Work done by subagents, and the part of it that cannot be seen.",
+        "formula": [
+            "Each Agent tool result carries resolvedModel, toolStats and totalTokens.",
+            "",
+            "totalTokens is NOT the run total: it equals the sum of the run's FINAL",
+            "message usage in every observed case, and scales only ~2x from a 4-tool",
+            "run to a 45-tool run, which is context growth rather than summation.",
+            "So the cost shown is an explicit FLOOR and is excluded from the headline.",
+        ],
+        "assumes": [
+            "Subagent shell commands are counted but their text is never written to",
+            "the parent transcript, so none of them can be audited.",
+        ],
+        "verify": "agentfleet --json | jq '.subagents'",
+    },
+    "shell": {
+        "measures": "Commands the agents ran, and which are worth a look.",
+        "formula": [
+            "Every recorded Bash invocation is matched against ~40 deterministic",
+            "patterns in nine categories. No model is involved and no score drifts:",
+            "a command either matches a rule or it does not.",
+            "",
+            "Rules are line-scoped and quantifier-bounded, so a pathological command",
+            "cannot hang the scan.",
+        ],
+        "assumes": [
+            "A flag means 'worth looking at', not 'wrong'. Most rm -rf calls are a",
+            "build directory. Current flag rate is about 3.8%.",
+        ],
+        "verify": "agentfleet --json | jq '.bash.flag_counts'",
+    },
+    "coach": {
+        "measures": "Findings worth acting on, benchmarked against your own history.",
+        "formula": [
+            "Each finding AF001-AF011 has a documented threshold. Comparisons are",
+            "against YOUR OWN median: project vs project, week vs week, ticket vs",
+            "your median ticket.",
+            "",
+            "There is no telemetry and no population. Nothing is compared to other",
+            "users, because nothing about you leaves the machine.",
+        ],
+        "assumes": [
+            "A finding is earned. On an unremarkable fleet the coach says nothing.",
+        ],
+        "verify": "agentfleet --why AF002   # the threshold and your actual values",
+    },
+    "agents": {
+        "measures": "Whether installed agent binaries are what they claim to be.",
+        "formula": [
+            "macOS: codesign --verify --strict, then the Team ID is compared against",
+            "a pinned expectation per tool. A modified binary fails verification.",
+            "",
+            "Proves: it came from that publisher and has not been altered since.",
+            "Does NOT prove: that the software is safe.",
+        ],
+        "assumes": [
+            "Unsigned is not malicious. npm and script installs are never signed.",
+            "Implemented for macOS only; elsewhere it reports 'unassessed'.",
+        ],
+        "verify": "codesign --display --verbose=4 $(which claude)",
+    },
+}
+
+
+def render_explain(topic: str | None, c: C) -> int:
+    if not topic or topic not in EXPLAIN:
+        rule(c, "EXPLAIN")
+        print(f"  {c.dim}Every figure is answerable. Pick a topic:{c.off}\n")
+        for k, v in EXPLAIN.items():
+            print(f"    {c.bold}{k:<11}{c.off} {v['measures']}")
+        print(f"\n  {c.dim}agentfleet --explain cost{c.off}")
+        print(f"  {c.dim}agentfleet --why AF002      explain one finding, with your numbers{c.off}\n")
+        return 0 if not topic else 1
+
+    e = EXPLAIN[topic]
+    rule(c, f"EXPLAIN  {topic}")
+    print(f"  {e['measures']}\n")
+    print(f"  {c.bold}How it is computed{c.off}")
+    for line in e["formula"]:
+        print(f"    {c.dim}{line}{c.off}" if line else "")
+    print(f"\n  {c.bold}What it assumes{c.off}")
+    for line in e["assumes"]:
+        print(f"    {line}")
+    print(f"\n  {c.bold}Check it without trusting this tool{c.off}")
+    print(f"    {c.cyan}{e['verify']}{c.off}\n")
+    return 0
+
+
+def render_why(fid: str, fleet: Fleet, c: C) -> int:
+    """Explain one finding against the user's actual numbers."""
+    fid = fid.upper()
+    found = [f for f in coach(fleet) if f.id == fid]
+    rule(c, f"WHY  {fid}")
+    if not found:
+        known = sorted({x.id for x in coach(fleet)})
+        print(f"  {fid} is not firing on your data.")
+        if known:
+            print(f"  {c.dim}Currently firing: {', '.join(known)}{c.off}")
+        print(f"  {c.dim}All findings and their thresholds: docs/findings.md{c.off}\n")
+        return 1
+    f = found[0]
+    col = c.red if f.severity == "critical" else (c.yellow if f.severity == "high" else c.cyan)
+    print(f"  {col}{f.severity.upper()}{c.off}  {c.bold}{f.title}{c.off}\n")
+    print(f"  {c.bold}Why it fired, with your numbers{c.off}")
+    for line in _wrap(f.evidence, 84):
+        print(f"    {line}")
+    if f.impact:
+        print(f"\n  {c.bold}Estimated impact{c.off}\n    {c.yellow}{f.impact}{c.off}")
+    print(f"\n  {c.bold}What to do{c.off}")
+    for line in _wrap(f.action, 84):
+        print(f"    {line}")
+    print(f"\n  {c.dim}Threshold and method: docs/findings.md#{fid.lower()}{c.off}")
+    print(f"  {c.dim}Underlying data:      agentfleet --json{c.off}\n")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Agent platform verification
+#
+# This tool reads what agents did. A reasonable next question is whether the
+# agent itself is what it claims to be — a modified `claude` binary could do
+# anything and would still write a plausible-looking transcript.
+#
+# On macOS that is answerable: Developer ID signatures bind a binary to a
+# publisher and break on modification. Team IDs below were observed on real
+# installs and are pinned so an unexpected signer is visible.
+#
+# WHAT THIS PROVES: the binary came from that publisher and has not been altered
+# since signing. WHAT IT DOES NOT PROVE: that the software is safe, or that the
+# publisher is trustworthy. Unsigned is not the same as malicious — npm-installed
+# tools are scripts and are never code-signed.
+# --------------------------------------------------------------------------
+
+KNOWN_PUBLISHERS = {
+    "Q6L2SF6YDW": "Anthropic PBC",
+    "2DC432GLL2": "OpenAI OpCo, LLC",
+    "UBF8T346G9": "Microsoft Corporation",
+    "EQHXZ8M8AV": "Google LLC",
+}
+
+# Which team is expected to sign which tool. A valid signature from the WRONG
+# publisher is the interesting case, and it is invisible without this.
+EXPECTED_SIGNER = {
+    "claude": "Q6L2SF6YDW",
+    "codex": "2DC432GLL2",
+}
+
+AGENT_COMMANDS = [
+    ("Claude Code", "claude"),
+    ("Codex", "codex"),
+    ("GitHub Copilot CLI", "copilot"),
+    ("Gemini CLI", "gemini"),
+    ("Cursor Agent", "cursor-agent"),
+    ("Aider", "aider"),
+    ("Cline", "cline"),
+    ("OpenCode", "opencode"),
+]
+
+# status -> (glyph, meaning)
+AGENT_STATUS = {
+    "verified":       ("OK",   "signed by the expected publisher"),
+    "wrong-signer":   ("WARN", "validly signed, but not by the expected publisher"),
+    "signed-unknown": ("?",    "validly signed by a publisher not in the pin list"),
+    "unsigned":       ("-",    "no code signature; normal for script-based tools"),
+    "tampered":       ("FAIL", "signature present but INVALID: binary was modified"),
+    "unknown":        ("?",    "could not be assessed on this platform"),
+}
+
+
+def _run(cmd: list[str], timeout: float = 8.0) -> tuple[int, str]:
+    import subprocess
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except Exception:
+        return -1, ""
+
+
+def _which(cmd: str) -> str | None:
+    import shutil
+    p = shutil.which(cmd)
+    return os.path.realpath(p) if p else None
+
+
+def verify_agent(label: str, cmd: str) -> dict | None:
+    """Assess one agent binary. Returns None when it is not installed."""
+    path = _which(cmd)
+    if not path:
+        return None
+
+    info: dict = {"agent": label, "command": cmd, "path": path,
+                  "status": "unknown", "signer": None, "team_id": None,
+                  "identifier": None, "detail": ""}
+
+    try:
+        info["size_bytes"] = os.path.getsize(path)
+    except OSError:
+        pass
+
+    if sys.platform != "darwin":
+        info["detail"] = ("code-signature verification is implemented for macOS only; "
+                          "this platform is reported as unassessed rather than trusted")
+        return info
+
+    code, out = _run(["codesign", "--display", "--verbose=4", path])
+    if "not signed at all" in out or code != 0 and "Identifier=" not in out:
+        info["status"] = "unsigned"
+        info["detail"] = "no code signature (expected for npm and script installs)"
+        return info
+
+    for line in out.splitlines():
+        if line.startswith("TeamIdentifier="):
+            info["team_id"] = line.split("=", 1)[1].strip()
+        elif line.startswith("Identifier="):
+            info["identifier"] = line.split("=", 1)[1].strip()
+        elif line.startswith("Authority=") and info["signer"] is None:
+            info["signer"] = line.split("=", 1)[1].strip()
+
+    vcode, vout = _run(["codesign", "--verify", "--strict", path])
+    if vcode != 0:
+        info["status"] = "tampered"
+        info["detail"] = (vout.strip().splitlines() or ["signature verification failed"])[0]
+        return info
+
+    team = info["team_id"]
+    if team in (None, "not set"):
+        info["status"] = "signed-unknown"
+        info["detail"] = "signed but carries no team identifier"
+    elif cmd in EXPECTED_SIGNER:
+        if team == EXPECTED_SIGNER[cmd]:
+            info["status"] = "verified"
+            info["detail"] = f"signature valid, team {team} as expected"
+        else:
+            info["status"] = "wrong-signer"
+            info["detail"] = (f"signed by {team} but {EXPECTED_SIGNER[cmd]} was expected "
+                              f"for {cmd}")
+    elif team in KNOWN_PUBLISHERS:
+        info["status"] = "verified"
+        info["detail"] = f"signature valid, {KNOWN_PUBLISHERS[team]}"
+    else:
+        info["status"] = "signed-unknown"
+        info["detail"] = f"signature valid, publisher {team} is not pinned"
+    return info
+
+
+def verify_agents() -> list[dict]:
+    out = []
+    for label, cmd in AGENT_COMMANDS:
+        r = verify_agent(label, cmd)
+        if r:
+            out.append(r)
+    return out
+
+
+def render_agents(rows: list[dict], c: C) -> None:
+    rule(c, "AGENT PLATFORMS")
+    if not rows:
+        print(f"  {c.dim}No agent binaries found on PATH.{c.off}")
+        return
+    for r in rows:
+        glyph, _ = AGENT_STATUS.get(r["status"], ("?", ""))
+        col = {"verified": c.ok, "tampered": c.red, "wrong-signer": c.red,
+               "unsigned": c.dim, "signed-unknown": c.yellow}.get(r["status"], c.dim)
+        print(f"\n  {col}{glyph:<4}{c.off} {c.bold}{r['agent']}{c.off}"
+              f"  {c.dim}{r['command']}{c.off}")
+        if r.get("signer"):
+            print(f"       {r['signer']}")
+        print(f"       {c.dim}{r['detail']}{c.off}")
+        print(f"       {c.dim}{r['path'][:88]}{c.off}")
+    print(f"\n  {c.dim}A valid signature proves the binary came from that publisher and has")
+    print(f"  not been modified since. It does not prove the software is safe, and")
+    print(f"  unsigned does not mean malicious: script-based tools are never signed.")
+    print(f"  Verify independently: codesign --display --verbose=4 <path>{c.off}")
+    print()
+
+
+# --------------------------------------------------------------------------
 # MCP server
 #
 # Lets the agent query its own cost and exposure mid-session: "what did this
@@ -1493,6 +1865,21 @@ MCP_TOOLS = [
         "description": "Things worth acting on, benchmarked against this user's own "
                        "history: cache efficiency, unsupervised execution, stale "
                        "credentials, cost outliers.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "explain",
+        "description": "How a number is computed, what it assumes, and how to verify it "
+                       "independently. Topics: sources, cost, cache, tickets, secrets, "
+                       "subagents, shell, coach, agents.",
+        "inputSchema": {"type": "object", "properties": {
+            "topic": {"type": "string"}}, "required": ["topic"]},
+    },
+    {
+        "name": "verify_agents",
+        "description": "Which agent platforms are installed and whether their binaries "
+                       "are validly signed by the expected publisher. Detects a modified "
+                       "binary.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
@@ -1598,6 +1985,20 @@ def _mcp_call(name: str, args: dict, cache: _MCPCache) -> dict:
                          "first_seen": e["first"], "last_seen": e["last"],
                          "projects": sorted(e["projects"])} for fp, e in rows[:50]],
         }
+
+    if name == "explain":
+        topic = str(args.get("topic", "")).lower()
+        e = EXPLAIN.get(topic)
+        if not e:
+            return {"topics": sorted(EXPLAIN), "error": f"unknown topic: {topic}"}
+        return {"topic": topic, "measures": e["measures"], "formula": e["formula"],
+                "assumes": e["assumes"], "verify_independently": e["verify"]}
+
+    if name == "verify_agents":
+        rows = verify_agents()
+        return {"agents": rows,
+                "note": "a valid signature proves origin and integrity, not safety; "
+                        "unsigned is normal for npm and script installs"}
 
     if name == "coach_findings":
         return {"findings": [{"id": x.id, "severity": x.severity, "title": x.title,
@@ -1965,6 +2366,9 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
               f"{', '.join(fleet.unknown_models)}")
 
     print()
+    print(f"{c.dim}  Ask how any of this was computed:  agentfleet --explain")
+    print(f"  Ask why a finding fired:            agentfleet --why AF004{c.off}")
+    print()
     print(f"{c.dim}  Costs are Anthropic API list prices (verified 2026-08-22). On a Pro/Max")
     print(f"  subscription your actual outlay is the flat fee; read this as consumption.")
     print(f"  Flags mean 'worth looking at', not 'wrong'. Nothing left this machine.")
@@ -2160,6 +2564,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--top", type=int, default=12, metavar="N", help="projects to list (default 12)")
     ap.add_argument("--bash", action="store_true", help="shell audit only")
     ap.add_argument("--coach", action="store_true", help="coaching findings only")
+    ap.add_argument("--explain", nargs="?", const="", metavar="TOPIC",
+                    help="how a number is computed, what it assumes, how to check it")
+    ap.add_argument("--why", metavar="AFxxx",
+                    help="explain one coach finding against your actual numbers")
+    ap.add_argument("--agents", action="store_true",
+                    help="which agent platforms are installed, and whether their "
+                         "binaries are validly signed by the expected publisher")
     ap.add_argument("--mcp", action="store_true",
                     help="run as an MCP server over stdio so an agent can query itself")
     ap.add_argument("--share", action="store_true",
@@ -2185,6 +2596,18 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.mcp:
         return mcp_serve()
+
+    if args.explain is not None:
+        return render_explain(args.explain or None, C(use_color()))
+
+    if args.agents:
+        rows = verify_agents()
+        if args.json:
+            json.dump({"agents": rows}, sys.stdout, indent=2)
+            print()
+        else:
+            render_agents(rows, C(use_color()))
+        return 0
 
     if args.watch:
         if args.root:
@@ -2218,6 +2641,9 @@ def main(argv: list[str] | None = None) -> int:
     if fleet.messages == 0 and fleet.bash_total == 0:
         print("agentfleet: no matching activity found.", file=sys.stderr)
         return 1
+
+    if args.why:
+        return render_why(args.why, fleet, C(use_color()))
 
     if args.json:
         json.dump(to_json(fleet, raw=args.no_redact), sys.stdout, indent=2)

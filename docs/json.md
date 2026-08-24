@@ -81,6 +81,8 @@ claude mcp add agentfleet -- agentfleet --mcp
 | `exposed_secrets` | rotation list: priority, types, fingerprint, dates |
 | `coach_findings` | `AF001`–`AF011` with evidence and actions |
 | `shell_audit` | counts by category, permission modes, the subagent blind spot |
+| `explain` | how a figure is computed, what it assumes, how to verify it |
+| `verify_agents` | installed agent platforms and their signature status |
 
 **What it deliberately does not return.** Everything here is read by a model and
 written back into a transcript that this tool then scans, so the surface is

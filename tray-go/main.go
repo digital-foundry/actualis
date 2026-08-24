@@ -35,15 +35,64 @@ import (
 	"fyne.io/systray"
 )
 
+// Two variants per state. A single-colour glyph vanishes on a menu bar of the
+// opposite shade, so each icon also carries a contrasting halo, and on macOS the
+// system appearance picks the right pair. Elsewhere the halo alone keeps it
+// legible without needing to know the background.
+//
 //go:embed icons/clean.png
-var iconClean []byte
+var icCleanLight []byte
 
-//go:embed icons/alert.png
-var iconAlert []byte
+//go:embed icons/clean-dark.png
+var icCleanDark []byte
+
+//go:embed icons/warn.png
+var icWarnLight []byte
+
+//go:embed icons/warn-dark.png
+var icWarnDark []byte
+
+//go:embed icons/critical.png
+var icCritLight []byte
+
+//go:embed icons/critical-dark.png
+var icCritDark []byte
+
+// darkMenuBar reports whether the system is in dark appearance. Only macOS is
+// asked; elsewhere the halo carries legibility and the answer does not matter.
+func darkMenuBar() bool {
+	if runtime.GOOS != "darwin" {
+		return false
+	}
+	out, err := exec.Command("defaults", "read", "-g", "AppleInterfaceStyle").Output()
+	return err == nil && strings.Contains(strings.ToLower(string(out)), "dark")
+}
+
+func iconFor(state string) []byte {
+	dark := darkMenuBar()
+	switch state {
+	case "critical":
+		if dark {
+			return icCritDark
+		}
+		return icCritLight
+	case "warn":
+		if dark {
+			return icWarnDark
+		}
+		return icWarnLight
+	default:
+		if dark {
+			return icCleanDark
+		}
+		return icCleanLight
+	}
+}
 
 // ---------------------------------------------------------------- report
 
 type report struct {
+	fingerprints map[string]bool
 	critical    int
 	rotatable   int
 	cost        float64
@@ -104,6 +153,7 @@ func fetch(days int) report {
 	if v, ok := root["cost_usd"].(float64); ok {
 		r.cost = v
 	}
+	r.fingerprints = map[string]bool{}
 	if secrets, ok := root["secrets"].([]any); ok {
 		for _, s := range secrets {
 			m, _ := s.(map[string]any)
@@ -111,6 +161,9 @@ func fetch(days int) report {
 			case "critical":
 				r.critical++
 				r.rotatable++
+				if fp, ok := m["id"].(string); ok {
+					r.fingerprints[fp] = true
+				}
 			case "high":
 				r.rotatable++
 			}
@@ -187,6 +240,8 @@ type ui struct {
 	rep     report
 	days    int
 	loading bool
+	seen    map[string]bool // critical fingerprints already announced
+	primed  bool            // first scan must not fire a flood of alerts
 
 	mHeader, mSub, mCost, mShell, mUnsup, mInvis *systray.MenuItem
 	mFindings                                    []*systray.MenuItem
@@ -196,10 +251,43 @@ type ui struct {
 
 func main() { systray.Run(newUI().onReady, func() {}) }
 
-func newUI() *ui { return &ui{days: 7, mDays: map[int]*systray.MenuItem{}} }
+func newUI() *ui {
+	return &ui{days: 7, mDays: map[int]*systray.MenuItem{}, seen: map[string]bool{}}
+}
+
+// notify raises a native desktop notification. Best effort: a missing notifier
+// must never take the tray down.
+func notify(title, body string) {
+	switch runtime.GOOS {
+	case "darwin":
+		script := fmt.Sprintf("display notification %q with title %q sound name \"Ping\"",
+			body, title)
+		_ = exec.Command("osascript", "-e", script).Run()
+	case "linux":
+		_ = exec.Command("notify-send", "-u", "critical", title, body).Run()
+	case "windows":
+		_ = exec.Command("powershell", "-NoProfile", "-Command",
+			fmt.Sprintf("[void][Windows.UI.Notifications.ToastNotificationManager];"+
+				"Write-Output %q", title+": "+body)).Run()
+	}
+}
+
+// flash draws attention when something new appears. Three beats is noticeable
+// without becoming an animation nobody can turn off.
+func (u *ui) flash(state string) {
+	go func() {
+		for i := 0; i < 3; i++ {
+			systray.SetIcon(iconFor("critical"))
+			time.Sleep(320 * time.Millisecond)
+			systray.SetIcon(iconFor("clean"))
+			time.Sleep(220 * time.Millisecond)
+		}
+		systray.SetIcon(iconFor(state))
+	}()
+}
 
 func (u *ui) onReady() {
-	systray.SetIcon(iconClean)
+	systray.SetIcon(iconFor("clean"))
 	systray.SetTooltip("agentfleet")
 
 	u.mHeader = systray.AddMenuItem("Loading…", "")
@@ -299,8 +387,26 @@ func (u *ui) refresh() {
 
 	u.mu.Lock()
 	u.rep, u.loading = r, false
+	fresh := []string{}
+	for fp := range r.fingerprints {
+		if !u.seen[fp] {
+			u.seen[fp] = true
+			if u.primed {
+				fresh = append(fresh, fp)
+			}
+		}
+	}
+	// The first scan establishes a baseline. Announcing a month of history on
+	// launch would train the user to ignore the notification permanently.
+	u.primed = true
 	u.mu.Unlock()
+
 	u.render()
+	if len(fresh) > 0 {
+		notify("agentfleet: new credential exposed",
+			fmt.Sprintf("%d new critical credential(s) in your agent history", len(fresh)))
+		u.flash(u.state())
+	}
 }
 
 func (u *ui) render() {
@@ -309,21 +415,27 @@ func (u *ui) render() {
 	u.mu.Unlock()
 
 	if r.err != "" {
-		systray.SetIcon(iconAlert)
+		systray.SetIcon(iconFor("warn"))
 		systray.SetTooltip("agentfleet: " + r.err)
 		u.mHeader.SetTitle(r.err)
 		return
 	}
 
 	if r.critical > 0 {
-		systray.SetIcon(iconAlert)
+		systray.SetIcon(iconFor("critical"))
 		// Only macOS and some Linux desktops show this; Windows ignores it.
 		systray.SetTitle(strconv.Itoa(r.critical))
 		systray.SetTooltip(fmt.Sprintf("agentfleet — %d critical credential(s) exposed", r.critical))
 		u.mHeader.SetTitle(fmt.Sprintf("%d critical credential(s) exposed", r.critical))
 		show(u.mSub, fmt.Sprintf("%d worth rotating in total", r.rotatable))
+	} else if r.rotatable > 0 {
+		systray.SetIcon(iconFor("warn"))
+		systray.SetTitle("")
+		systray.SetTooltip(fmt.Sprintf("agentfleet — %d credential(s) worth rotating", r.rotatable))
+		u.mHeader.SetTitle(fmt.Sprintf("%d credential(s) worth rotating", r.rotatable))
+		u.mSub.Hide()
 	} else {
-		systray.SetIcon(iconClean)
+		systray.SetIcon(iconFor("clean"))
 		systray.SetTitle("")
 		systray.SetTooltip("agentfleet — no critical credentials exposed")
 		u.mHeader.SetTitle("No critical credentials exposed")
@@ -355,6 +467,18 @@ func (u *ui) render() {
 			m.Hide()
 		}
 	}
+}
+
+func (u *ui) state() string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.rep.critical > 0 {
+		return "critical"
+	}
+	if u.rep.rotatable > 0 {
+		return "warn"
+	}
+	return "clean"
 }
 
 func show(m *systray.MenuItem, s string) { m.SetTitle(s); m.Show() }
