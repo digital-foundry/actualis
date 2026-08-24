@@ -1,0 +1,81 @@
+# Publish to PyPI on a version tag, using Trusted Publishing.
+#
+# There is no API token here and none in the repository secrets. PyPI verifies
+# a short-lived OIDC identity minted by GitHub for this exact workflow, so
+# there is no long-lived credential to leak, rotate, or find in a transcript.
+# For a tool whose entire pitch is that it has no supply chain and no secrets,
+# a PYPI_API_TOKEN sitting in repo settings would be the wrong look and the
+# wrong risk.
+#
+# One-time setup on PyPI (Your projects -> Publishing -> Add a pending publisher):
+#   PyPI project name : actualis
+#   Owner             : digital-foundry
+#   Repository        : actualis
+#   Workflow          : release.yml
+#   Environment       : pypi
+# A "pending" publisher can be created before the project exists; the first
+# successful run claims the name.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:        # so the existing v0.1.0 tag can be published too
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.13"
+
+      # The tag and the packaged version must agree. They have drifted in every
+      # project that did not check, and a mismatched upload cannot be undone:
+      # PyPI does not allow re-uploading a filename.
+      - name: tag matches pyproject version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(uv run --no-project python -c \
+            "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "tag=$tag pyproject=$pkg"
+          [ "$tag" = "$pkg" ] || { echo "::error::tag $tag != pyproject $pkg"; exit 1; }
+
+      - name: tests must pass before anything is published
+        run: uv run --no-project python -m unittest discover -s tests -q
+
+      - name: build
+        run: uv build
+
+      # Catches malformed metadata before it reaches PyPI, where the filename
+      # is then burned forever.
+      - name: check metadata
+        run: uvx twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi          # must match the pending publisher config
+    permissions:
+      id-token: write          # OIDC: this is what replaces the API token
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          attestations: true   # PEP 740 provenance, verifiable against this repo
