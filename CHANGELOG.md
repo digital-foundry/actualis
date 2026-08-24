@@ -21,10 +21,10 @@
 
 - **`tools/denials.py`** — joins Claude Code's tool-refusal records to the exact
   commands they blocked, via `tool_use_id`. Read-only, no network, standard
-  library only, and it prints program names rather than command text. Written
-  for [an article](https://actualis.app/writing/what-your-agent-refuses/) and
-  kept because the join turns out to be useful: a refused command is never sent
-  to a provider, so this is a signal no API-layer tool can see.
+  library only, and it prints program names rather than command text. The join
+  is exact — 359 of 359 on the corpus it was written against — and a refused
+  command is never sent to a provider, so this is a signal that exists only in
+  the local transcript. It is also what turned up the `command_head` bug above.
 
 ## 0.1.1 — 2026-08-24
 

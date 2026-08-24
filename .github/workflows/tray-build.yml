@@ -1,0 +1,94 @@
+# The tray build, called by both tray.yml (on push and PR) and release.yml
+# (on a version tag). It lives here so the binaries attached to a release are
+# built by exactly the same steps CI runs, rather than by a second copy that
+# drifts.
+
+name: tray-build
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            goos: darwin
+            artifact: actualis-tray-macos-arm64
+          - os: ubuntu-latest
+            goos: linux
+            artifact: actualis-tray-linux-amd64
+          - os: windows-latest
+            goos: windows
+            artifact: actualis-tray-windows-amd64.exe
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run: { working-directory: tray-go }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: "1.23"
+          cache-dependency-path: tray-go/go.sum
+
+      # systray is cgo: Cocoa on macOS, Win32 on Windows, and GTK plus an
+      # AppIndicator on Linux. This is why the binaries are built natively on
+      # each runner rather than cross-compiled from one machine.
+      - name: linux tray dependencies
+        if: matrix.goos == 'linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libayatana-appindicator3-dev
+
+      - name: vet
+        run: go vet ./...
+
+      # Literal flags per platform. An earlier version assembled them in a
+      # shell variable and silently produced unstripped console binaries, so
+      # there is no interpolation here to get wrong.
+      # trayVersion is stamped so a bug report names an exact commit. The
+      # value is a GitHub expression, substituted into the YAML before the
+      # shell ever sees it, so the flags stay literal.
+      - name: build (unix)
+        if: matrix.goos != 'windows'
+        run: go build -trimpath -ldflags "-s -w -X main.trayVersion=${{ github.sha }}" -o "${{ matrix.artifact }}" .
+
+      # -H windowsgui suppresses the console window. Without it the tray works
+      # but a black cmd window sits behind it for the life of the process.
+      - name: build (windows)
+        if: matrix.goos == 'windows'
+        run: go build -trimpath -ldflags "-s -w -H windowsgui -X main.trayVersion=${{ github.sha }}" -o "${{ matrix.artifact }}" .
+
+      - name: verify the binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -lh "${{ matrix.artifact }}"
+          test -s "${{ matrix.artifact }}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            # Fail closed. An assertion that treats "cannot tell" as "confirmed"
+            # is worse than no assertion; an earlier version did exactly that and
+            # passed a console binary.
+            command -v file >/dev/null || { echo "::error::file(1) unavailable, cannot verify subsystem"; exit 1; }
+            DESC=$(file -b "${{ matrix.artifact }}")
+            echo "$DESC"
+            case "$DESC" in
+              *console*) echo "::error::console subsystem: -H windowsgui did not apply"; exit 1 ;;
+              *) echo "GUI subsystem confirmed" ;;
+            esac
+          else
+            file -b "${{ matrix.artifact }}"
+          fi
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: tray-go/${{ matrix.artifact }}
+          retention-days: 30
