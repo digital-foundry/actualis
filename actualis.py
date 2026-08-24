@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-agentfleet - what your coding agents cost, and what they actually did.
+Actualis — what actually ran.
+
+Local. Read-only. Honest about limits.
 
 Reads Claude Code's local session transcripts and produces a fleet-wide report:
 spend by model and project, tool activity, and a deterministic audit of every
@@ -13,11 +15,11 @@ Licensed under the GNU Affero General Public License v3 or later. See LICENSE.
 This program comes with ABSOLUTELY NO WARRANTY.
 
 Usage:
-    python3 agentfleet.py                 # full report, all time
-    python3 agentfleet.py --days 30       # last 30 days
-    python3 agentfleet.py --bash          # shell audit only
-    python3 agentfleet.py --json          # machine-readable
-    python3 agentfleet.py --project foo   # filter to matching projects
+    python3 actualis.py                 # full report, all time
+    python3 actualis.py --days 30       # last 30 days
+    python3 actualis.py --bash          # shell audit only
+    python3 actualis.py --json          # machine-readable
+    python3 actualis.py --project foo   # filter to matching projects
 """
 
 from __future__ import annotations
@@ -1341,7 +1343,7 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
     started = datetime.now(timezone.utc)
 
     srcs = ", ".join(str(r) for r in (roots + codex))
-    print(f"{c.bold}agentfleet watch{c.off} {c.dim}· {len(offsets)} files · every "
+    print(f"{c.bold}actualis watch{c.off} {c.dim}· {len(offsets)} files · every "
           f"{interval:g}s · ctrl-c to stop{c.off}")
     print(f"{c.dim}watching {srcs}{c.off}")
     print(f"{c.dim}Starting from now. Existing history is not replayed.{c.off}\n")
@@ -1389,7 +1391,7 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
                             msg = f"{kind} in {project}"
                             print(f"\r{c.red}▲ SECRET{c.off}  {msg}  {c.dim}{fp}{c.off}"
                                   + " " * 20)
-                            notify("agentfleet: credential exposed", msg)
+                            notify("actualis: credential exposed", msg)
                         hits = audit_command(command)
                         high = [h for h in hits if h[0] == "high"]
                         if high:
@@ -1399,7 +1401,7 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
                             print(f"\r{c.yellow}▲ {cats}{c.off}  {line_txt[:88]}"
                                   f"  {c.dim}{project[:28]}{c.off}" + " " * 10)
                             if not quiet:
-                                notify(f"agentfleet: {cats}", line_txt[:120])
+                                notify(f"actualis: {cats}", line_txt[:120])
 
             mins = (datetime.now(timezone.utc) - started).total_seconds() / 60
             # The heartbeat is a live status line for a terminal. Redirected to a
@@ -1483,7 +1485,7 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "opportunity-cost figure and a consumption signal, NOT a bill.",
             "OpenAI rates come from a third-party aggregator, not OpenAI's page.",
         ],
-        "verify": "agentfleet --json | jq '.tokens, .cost_usd'   # then apply the rates yourself",
+        "verify": "actualis --json | jq '.tokens, .cost_usd'   # then apply the rates yourself",
     },
     "cache": {
         "measures": "Share of input context served from cache, and what that saved.",
@@ -1499,7 +1501,7 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "A write-heavy project can show NEGATIVE savings, since a 1h cache",
             "write costs 2.00x. That is reported rather than clamped to zero.",
         ],
-        "verify": "agentfleet --json | jq '.cache'",
+        "verify": "actualis --json | jq '.cache'",
     },
     "tickets": {
         "measures": "Cost attributed to an issue, via the branch a message was written on.",
@@ -1514,7 +1516,7 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "Branch names carry the issue number. Where they do not, the work is",
             "reported as unattributed rather than guessed at.",
         ],
-        "verify": "agentfleet --json | jq '.by_ticket[0], .by_branch'",
+        "verify": "actualis --json | jq '.by_ticket[0], .by_branch'",
     },
     "secrets": {
         "measures": "Distinct credentials appearing in recorded shell commands.",
@@ -1547,7 +1549,7 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "Subagent shell commands are counted but their text is never written to",
             "the parent transcript, so none of them can be audited.",
         ],
-        "verify": "agentfleet --json | jq '.subagents'",
+        "verify": "actualis --json | jq '.subagents'",
     },
     "shell": {
         "measures": "Commands the agents ran, and which are worth a look.",
@@ -1563,7 +1565,7 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "A flag means 'worth looking at', not 'wrong'. Most rm -rf calls are a",
             "build directory. Current flag rate is about 3.8%.",
         ],
-        "verify": "agentfleet --json | jq '.bash.flag_counts'",
+        "verify": "actualis --json | jq '.bash.flag_counts'",
     },
     "coach": {
         "measures": "Findings worth acting on, benchmarked against your own history.",
@@ -1578,7 +1580,7 @@ EXPLAIN: dict[str, dict[str, object]] = {
         "assumes": [
             "A finding is earned. On an unremarkable fleet the coach says nothing.",
         ],
-        "verify": "agentfleet --why AF002   # the threshold and your actual values",
+        "verify": "actualis --why AF002   # the threshold and your actual values",
     },
     "agents": {
         "measures": "Whether installed agent binaries are what they claim to be.",
@@ -1604,8 +1606,8 @@ def render_explain(topic: str | None, c: C) -> int:
         print(f"  {c.dim}Every figure is answerable. Pick a topic:{c.off}\n")
         for k, v in EXPLAIN.items():
             print(f"    {c.bold}{k:<11}{c.off} {v['measures']}")
-        print(f"\n  {c.dim}agentfleet --explain cost{c.off}")
-        print(f"  {c.dim}agentfleet --why AF002      explain one finding, with your numbers{c.off}\n")
+        print(f"\n  {c.dim}actualis --explain cost{c.off}")
+        print(f"  {c.dim}actualis --why AF002      explain one finding, with your numbers{c.off}\n")
         return 0 if not topic else 1
 
     e = EXPLAIN[topic]
@@ -1646,7 +1648,7 @@ def render_why(fid: str, fleet: Fleet, c: C) -> int:
     for line in _wrap(f.action, 84):
         print(f"    {line}")
     print(f"\n  {c.dim}Threshold and method: docs/findings.md#{fid.lower()}{c.off}")
-    print(f"  {c.dim}Underlying data:      agentfleet --json{c.off}\n")
+    print(f"  {c.dim}Underlying data:      actualis --json{c.off}\n")
     return 0
 
 
@@ -2055,7 +2057,7 @@ def mcp_serve() -> int:
                     "protocolVersion": asked if asked in MCP_PROTOCOL_VERSIONS
                                        else MCP_PROTOCOL_VERSIONS[0],
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "agentfleet", "version": __version__},
+                    "serverInfo": {"name": "actualis", "version": __version__},
                 }
             elif method in ("tools/list", "server/discover"):
                 result = {"tools": MCP_TOOLS, "ttlMs": 3_600_000, "cacheScope": "session"}
@@ -2366,8 +2368,8 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
               f"{', '.join(fleet.unknown_models)}")
 
     print()
-    print(f"{c.dim}  Ask how any of this was computed:  agentfleet --explain")
-    print(f"  Ask why a finding fired:            agentfleet --why AF004{c.off}")
+    print(f"{c.dim}  Ask how any of this was computed:  actualis --explain")
+    print(f"  Ask why a finding fired:            actualis --why AF004{c.off}")
     print()
     print(f"{c.dim}  Costs are Anthropic API list prices (verified 2026-08-22). On a Pro/Max")
     print(f"  subscription your actual outlay is the flat fee; read this as consumption.")
@@ -2418,7 +2420,7 @@ def render_share(fleet: "Fleet", c: C) -> None:
     o = c.off
     d = c.dim
 
-    print(f"\n{b}  agentfleet{o} {d}· what my coding agents cost and did{o}\n")
+    print(f"\n{b}  ACTUALIS{o} {d}· what actually ran{o}\n")
     print(f"  {fleet.active_days} active days   "
           f"{len(fleet.cost_by_agent)} agent(s)   "
           f"{num(fleet.messages)} messages   {num(tok)} tokens")
@@ -2458,7 +2460,7 @@ def render_share(fleet: "Fleet", c: C) -> None:
         for f in findings[:4]:
             print(f"    {d}{f.id}  {f.title}{o}")
 
-    print(f"\n  {d}Generated locally by agentfleet. No project names, branches,")
+    print(f"\n  {d}Generated locally by actualis. No project names, branches,")
     print(f"  paths, commands or identifiers are included in this summary.")
     print(f"  Costs are Anthropic and OpenAI list prices; a subscription bills a")
     print(f"  flat fee, so read this as consumption.{o}\n")
@@ -2556,8 +2558,8 @@ def to_json(fleet: Fleet, raw: bool = False) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        prog="agentfleet",
-        description="What your coding agents cost, and what they actually did.",
+        prog="actualis",
+        description="What actually ran. Local, read-only, honest about limits.",
     )
     ap.add_argument("--days", type=int, metavar="N", help="only the last N days")
     ap.add_argument("--project", metavar="SUBSTR", help="only projects matching SUBSTR")
@@ -2587,7 +2589,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-redact", action="store_true",
                     help="do NOT redact credentials from output (unsafe to share)")
     ap.add_argument("--root", metavar="DIR", help="transcript directory")
-    ap.add_argument("--version", action="version", version=f"agentfleet {__version__}")
+    ap.add_argument("--version", action="version", version=f"actualis {__version__}")
     args = ap.parse_args(argv)
 
     since = None
@@ -2629,17 +2631,17 @@ def main(argv: list[str] | None = None) -> int:
             if roots:
                 fleet.scan(roots, since, args.project, progress=progress)
             elif args.agent == "claude":
-                sys.exit("agentfleet: no Claude Code transcripts found.")
+                sys.exit("actualis: no Claude Code transcripts found.")
         if args.agent in ("all", "codex"):
             croots = codex_roots()
             if croots:
                 fleet.roots.extend(croots)
                 fleet.scan_codex(croots, since, args.project)
             elif args.agent == "codex":
-                sys.exit("agentfleet: no Codex sessions found under $CODEX_HOME/sessions.")
+                sys.exit("actualis: no Codex sessions found under $CODEX_HOME/sessions.")
 
     if fleet.messages == 0 and fleet.bash_total == 0:
-        print("agentfleet: no matching activity found.", file=sys.stderr)
+        print("actualis: no matching activity found.", file=sys.stderr)
         return 1
 
     if args.why:

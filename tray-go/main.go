@@ -1,9 +1,9 @@
-// agentfleet tray — macOS, Linux and Windows.
+// actualis tray — macOS, Linux and Windows.
 //
 // Copyright (C) 2026 Digital Foundry Solutions, LLC
 // Licensed under the GNU Affero General Public License v3 or later.
 //
-// A thin shell over the CLI: it runs `agentfleet --json --days N` on a ticker
+// A thin shell over the CLI: it runs `actualis --json --days N` on a ticker
 // and renders the result. All measurement lives in the CLI, which stays the
 // single auditable artifact with no dependencies. This binary has one
 // dependency, for drawing a tray icon, and holds no logic worth auditing.
@@ -35,37 +35,48 @@ import (
 	"fyne.io/systray"
 )
 
-// Two variants per state. A single-colour glyph vanishes on a menu bar of the
-// opposite shade, so each icon also carries a contrasting halo, and on macOS the
-// system appearance picks the right pair. Elsewhere the halo alone keeps it
-// legible without needing to know the background.
+// ACTUALIS icon system 1.0.0.
 //
-//go:embed icons/clean.png
-var icCleanLight []byte
+// Monochrome by default so the mark reads as identity; amber indicates state
+// only, per the brand rule. Every state is also distinguished by FORM — a ring,
+// a badge, a spinner, a slash — because the accessibility rule is that colour
+// alone must never carry meaning.
+//
+// Two variants per state for light and dark, plus a contrasting outline so the
+// mark survives a menu bar whose appearance we guessed wrong.
+//
+//go:embed icons/idle.png
+var icIdleL []byte
 
-//go:embed icons/clean-dark.png
-var icCleanDark []byte
+//go:embed icons/idle-dark.png
+var icIdleD []byte
 
-//go:embed icons/warn.png
-var icWarnLight []byte
+//go:embed icons/monitoring.png
+var icMonL []byte
 
-//go:embed icons/warn-dark.png
-var icWarnDark []byte
+//go:embed icons/monitoring-dark.png
+var icMonD []byte
 
-//go:embed icons/critical.png
-var icCritLight []byte
+//go:embed icons/exposed.png
+var icExpL []byte
 
-//go:embed icons/critical-dark.png
-var icCritDark []byte
+//go:embed icons/exposed-dark.png
+var icExpD []byte
+
+//go:embed icons/syncing.png
+var icSyncL []byte
+
+//go:embed icons/syncing-dark.png
+var icSyncD []byte
 
 //go:embed icons/error.png
-var icErrLight []byte
+var icErrL []byte
 
 //go:embed icons/error-dark.png
-var icErrDark []byte
+var icErrD []byte
 
 // darkMenuBar reports whether the system is in dark appearance. Only macOS is
-// asked; elsewhere the halo carries legibility and the answer does not matter.
+// asked; elsewhere the outline carries legibility and the answer does not matter.
 func darkMenuBar() bool {
 	if runtime.GOOS != "darwin" {
 		return false
@@ -75,30 +86,27 @@ func darkMenuBar() bool {
 }
 
 func iconFor(state string) []byte {
-	dark := darkMenuBar()
+	d := darkMenuBar()
+	pick := func(light, dark []byte) []byte {
+		if d {
+			return dark
+		}
+		return light
+	}
 	switch state {
+	case "exposed":
+		return pick(icExpL, icExpD)
+	case "monitoring":
+		return pick(icMonL, icMonD)
+	case "syncing":
+		return pick(icSyncL, icSyncD)
 	case "error":
-		if dark {
-			return icErrDark
-		}
-		return icErrLight
-	case "critical":
-		if dark {
-			return icCritDark
-		}
-		return icCritLight
-	case "warn":
-		if dark {
-			return icWarnDark
-		}
-		return icWarnLight
+		return pick(icErrL, icErrD)
 	default:
-		if dark {
-			return icCleanDark
-		}
-		return icCleanLight
+		return pick(icIdleL, icIdleD)
 	}
 }
+
 
 // ---------------------------------------------------------------- report
 
@@ -122,18 +130,18 @@ type finding struct{ ID, Title, Severity string }
 // findBinary resolves the CLI without a login shell's PATH, which a
 // desktop-launched process does not inherit.
 func findBinary() string {
-	if p, err := exec.LookPath("agentfleet"); err == nil {
+	if p, err := exec.LookPath("actualis"); err == nil {
 		return p
 	}
 	home, _ := os.UserHomeDir()
 	candidates := []string{
-		filepath.Join(home, ".local", "bin", "agentfleet"),
-		"/opt/homebrew/bin/agentfleet",
-		"/usr/local/bin/agentfleet",
-		filepath.Join(home, "AppData", "Local", "Programs", "agentfleet", "agentfleet.exe"),
+		filepath.Join(home, ".local", "bin", "actualis"),
+		"/opt/homebrew/bin/actualis",
+		"/usr/local/bin/actualis",
+		filepath.Join(home, "AppData", "Local", "Programs", "actualis", "actualis.exe"),
 	}
 	if runtime.GOOS == "windows" {
-		candidates = append(candidates, "agentfleet.exe")
+		candidates = append(candidates, "actualis.exe")
 	}
 	for _, c := range candidates {
 		if fi, err := os.Stat(c); err == nil && !fi.IsDir() {
@@ -147,17 +155,17 @@ func fetch(days int) report {
 	r := report{at: time.Now()}
 	bin := findBinary()
 	if bin == "" {
-		r.err = "agentfleet not found on PATH"
+		r.err = "actualis not found on PATH"
 		return r
 	}
 	out, err := exec.Command(bin, "--json", "--days", strconv.Itoa(days)).Output()
 	if err != nil {
-		r.err = "could not run agentfleet: " + err.Error()
+		r.err = "could not run actualis: " + err.Error()
 		return r
 	}
 	var root map[string]any
 	if err := json.Unmarshal(out, &root); err != nil {
-		r.err = "agentfleet returned no usable JSON"
+		r.err = "actualis returned no usable JSON"
 		return r
 	}
 
@@ -233,13 +241,13 @@ func fetch(days int) report {
 func shareText() string {
 	bin := findBinary()
 	if bin == "" {
-		return "agentfleet not found"
+		return "actualis not found"
 	}
 	cmd := exec.Command(bin, "--share")
 	cmd.Env = append(os.Environ(), "NO_COLOR=1")
 	out, err := cmd.Output()
 	if err != nil {
-		return "could not run agentfleet"
+		return "could not run actualis"
 	}
 	return string(out)
 }
@@ -288,9 +296,9 @@ func notify(title, body string) {
 func (u *ui) flash(state string) {
 	go func() {
 		for i := 0; i < 3; i++ {
-			systray.SetIcon(iconFor("critical"))
+			systray.SetIcon(iconFor("exposed"))
 			time.Sleep(320 * time.Millisecond)
-			systray.SetIcon(iconFor("warn"))
+			systray.SetIcon(iconFor("syncing"))
 			time.Sleep(220 * time.Millisecond)
 		}
 		systray.SetIcon(iconFor(state))
@@ -298,8 +306,8 @@ func (u *ui) flash(state string) {
 }
 
 func (u *ui) onReady() {
-	systray.SetIcon(iconFor("clean"))
-	systray.SetTooltip("agentfleet")
+	systray.SetIcon(iconFor("idle"))
+	systray.SetTooltip("Actualis — what actually ran")
 
 	u.mHeader = systray.AddMenuItem("Loading…", "")
 	u.mHeader.Disable()
@@ -327,7 +335,7 @@ func (u *ui) onReady() {
 		u.mDays[d] = window.AddSubMenuItemCheckbox(fmt.Sprintf("Last %d days", d), "", d == u.days)
 	}
 	systray.AddSeparator()
-	u.mQuit = systray.AddMenuItem("Quit", "")
+	u.mQuit = systray.AddMenuItem("Quit Actualis", "")
 
 	go u.loop()
 	go u.refresh()
@@ -414,7 +422,7 @@ func (u *ui) refresh() {
 
 	u.render()
 	if len(fresh) > 0 {
-		notify("agentfleet: new credential exposed",
+		notify("actualis: new credential exposed",
 			fmt.Sprintf("%d new critical credential(s) in your agent history", len(fresh)))
 		u.flash(u.state())
 	}
@@ -427,28 +435,28 @@ func (u *ui) render() {
 
 	if r.err != "" {
 		systray.SetIcon(iconFor("error"))
-		systray.SetTooltip("agentfleet: " + r.err)
+		systray.SetTooltip("actualis: " + r.err)
 		u.mHeader.SetTitle(r.err)
 		return
 	}
 
 	if r.critical > 0 {
-		systray.SetIcon(iconFor("critical"))
+		systray.SetIcon(iconFor("exposed"))
 		// Only macOS and some Linux desktops show this; Windows ignores it.
 		systray.SetTitle(strconv.Itoa(r.critical))
-		systray.SetTooltip(fmt.Sprintf("agentfleet — %d critical credential(s) exposed", r.critical))
+		systray.SetTooltip(fmt.Sprintf("Actualis — %d critical credential(s) exposed", r.critical))
 		u.mHeader.SetTitle(fmt.Sprintf("%d critical credential(s) exposed", r.critical))
 		show(u.mSub, fmt.Sprintf("%d worth rotating in total", r.rotatable))
 	} else if r.rotatable > 0 {
-		systray.SetIcon(iconFor("warn"))
+		systray.SetIcon(iconFor("monitoring"))
 		systray.SetTitle("")
-		systray.SetTooltip(fmt.Sprintf("agentfleet — %d credential(s) worth rotating", r.rotatable))
+		systray.SetTooltip(fmt.Sprintf("Actualis — %d credential(s) worth rotating", r.rotatable))
 		u.mHeader.SetTitle(fmt.Sprintf("%d credential(s) worth rotating", r.rotatable))
 		u.mSub.Hide()
 	} else {
-		systray.SetIcon(iconFor("clean"))
+		systray.SetIcon(iconFor("idle"))
 		systray.SetTitle("")
-		systray.SetTooltip("agentfleet — no critical credentials exposed")
+		systray.SetTooltip("Actualis — no critical credentials exposed")
 		u.mHeader.SetTitle("No critical credentials exposed")
 		u.mSub.Hide()
 	}
@@ -484,12 +492,12 @@ func (u *ui) state() string {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	if u.rep.critical > 0 {
-		return "critical"
+		return "exposed"
 	}
 	if u.rep.rotatable > 0 {
-		return "warn"
+		return "monitoring"
 	}
-	return "clean"
+	return "idle"
 }
 
 func show(m *systray.MenuItem, s string) { m.SetTitle(s); m.Show() }

@@ -1,6 +1,6 @@
 # JSON output
 
-`agentfleet --json` emits the full report as machine-readable data.
+`actualis --json` emits the full report as machine-readable data.
 **Credentials are redacted by default**, including here; `--no-redact` disables
 that and prints a warning.
 
@@ -68,10 +68,10 @@ cumulative subagent spend cannot be recovered and is not estimated.
 
 # MCP tools
 
-`agentfleet --mcp` speaks JSON-RPC over stdio. Register it with:
+`actualis --mcp` speaks JSON-RPC over stdio. Register it with:
 
 ```sh
-claude mcp add agentfleet -- agentfleet --mcp
+claude mcp add actualis -- actualis --mcp
 ```
 
 | tool | returns |

@@ -14,7 +14,7 @@ reduce it to a synthetic string that reproduces the behaviour.
 **Reproduce** — the command you ran, and a synthetic input if relevant:
 
 ```
-agentfleet ...
+actualis ...
 ```
 
-**Environment** — `agentfleet --version`, OS, `python3 --version`
+**Environment** — `actualis --version`, OS, `python3 --version`

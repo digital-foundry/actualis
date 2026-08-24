@@ -1,4 +1,4 @@
-module github.com/digital-foundry/agentfleet/tray
+module github.com/digital-foundry/actualis/tray
 
 go 1.23
 

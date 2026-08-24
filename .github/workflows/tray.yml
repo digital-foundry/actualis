@@ -19,13 +19,13 @@ jobs:
         include:
           - os: macos-latest
             goos: darwin
-            artifact: agentfleet-tray-macos-arm64
+            artifact: actualis-tray-macos-arm64
           - os: ubuntu-latest
             goos: linux
-            artifact: agentfleet-tray-linux-amd64
+            artifact: actualis-tray-linux-amd64
           - os: windows-latest
             goos: windows
-            artifact: agentfleet-tray-windows-amd64.exe
+            artifact: actualis-tray-windows-amd64.exe
     runs-on: ${{ matrix.os }}
     defaults:
       run: { working-directory: tray-go }

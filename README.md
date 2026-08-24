@@ -1,6 +1,14 @@
-# agentfleet
+# ACTUALIS
 
-**What your coding agents cost, and what they actually did.**
+**What actually ran.**
+
+*Local. Read-only. Honest about limits.*
+
+Actualis reads existing coding-agent logs and turns them into clear answers about
+**exposure, activity, and cost**.
+
+> **Measure, don't interfere.** · **Read what's already there.**
+> **Tell the truth, including limits.** · **Evidence over opinion.**
 
 Terminal-native coding agents write a complete record of every session to your
 disk: token usage per turn, every tool call, every shell command. What they don't
@@ -13,11 +21,11 @@ more than one agent, you cannot currently answer:
 - What shell commands have my agents actually been running?
 - Did a credential ever end up in a command?
 
-`agentfleet` answers those four questions from data already on your machine,
+`actualis` answers those four questions from data already on your machine,
 across **Claude Code** and **Codex**, in one report.
 
 ```
-$ agentfleet
+$ actualis
 
 FLEET ──────────────────────────────────────────────────────────────
   window        2026-05-04 → 2026-06-04  (31 days)
@@ -47,14 +55,14 @@ SHELL AUDIT ──────────────────────�
 No dependencies beyond Python 3.9+. Either run the file directly:
 
 ```sh
-python3 agentfleet.py
+python3 actualis.py
 ```
 
 Or install it as a command:
 
 ```sh
 uv tool install .      # or: pipx install .
-agentfleet
+actualis
 ```
 
 `uv tool install` copies the code, so re-run it with `--force` after pulling to
@@ -63,15 +71,15 @@ pick up changes.
 ## Usage
 
 ```sh
-python3 agentfleet.py                  # full report
-python3 agentfleet.py --days 30        # last 30 days
-python3 agentfleet.py --bash           # shell audit only
-python3 agentfleet.py --coach          # findings and recommended actions only
-python3 agentfleet.py --watch          # live alerting on new secrets
-python3 agentfleet.py --project svc    # filter to matching projects
-python3 agentfleet.py --json           # machine-readable
-python3 agentfleet.py --top 25         # show more projects
-python3 agentfleet.py --agent codex    # one agent only (claude | codex | all)
+python3 actualis.py                  # full report
+python3 actualis.py --days 30        # last 30 days
+python3 actualis.py --bash           # shell audit only
+python3 actualis.py --coach          # findings and recommended actions only
+python3 actualis.py --watch          # live alerting on new secrets
+python3 actualis.py --project svc    # filter to matching projects
+python3 actualis.py --json           # machine-readable
+python3 actualis.py --top 25         # show more projects
+python3 actualis.py --agent codex    # one agent only (claude | codex | all)
 ```
 
 ### All options
@@ -220,7 +228,7 @@ project names, branches, ticket ids, paths, commands, or fingerprints. Only
 totals, rates, distributions, and generic finding titles.
 
 ```
-  agentfleet · what my coding agents cost and did
+  actualis · what my coding agents cost and did
 
   31 active days   2 agent(s)   38,204 messages   17,540,882,110 tokens
 
@@ -248,9 +256,9 @@ Every figure is answerable: where it came from, how it was computed, what it
 assumes, and how to check it **without trusting this tool**.
 
 ```sh
-agentfleet --explain            # list the topics
-agentfleet --explain cost       # the formula, the assumptions, an independent check
-agentfleet --why AF005          # why one finding fired, with your actual numbers
+actualis --explain            # list the topics
+actualis --explain cost       # the formula, the assumptions, an independent check
+actualis --why AF005          # why one finding fired, with your actual numbers
 ```
 
 Topics: `sources`, `cost`, `cache`, `tickets`, `secrets`, `subagents`, `shell`,
@@ -267,7 +275,7 @@ itself is genuine — a modified `claude` binary could do anything and still wri
 a plausible transcript.
 
 ```
-$ agentfleet --agents
+$ actualis --agents
 
   OK   Claude Code  claude
        Developer ID Application: Anthropic PBC (Q6L2SF6YDW)
@@ -307,7 +315,7 @@ it mid-session: *"what did this ticket cost?"*, *"do I have credentials
 exposed?"*
 
 ```sh
-claude mcp add agentfleet -- agentfleet --mcp
+claude mcp add actualis -- actualis --mcp
 ```
 
 Five tools: `fleet_summary`, `ticket_cost`, `exposed_secrets`, `coach_findings`,
@@ -449,7 +457,7 @@ the cent. Do the same before trusting any number here that matters to you.
 ## Tray app
 
 ```sh
-cd tray-go && go build -ldflags "-s -w" -o agentfleet-tray . && ./agentfleet-tray
+cd tray-go && go build -ldflags "-s -w" -o actualis-tray . && ./actualis-tray
 ```
 
 A **constant gauge mark with a status dot in the corner** — the pattern Docker,
@@ -470,19 +478,19 @@ install the LaunchAgent:
 
 ```sh
 mkdir -p ~/Library/LaunchAgents
-sed "s|__AGENTFLEET__|$(command -v agentfleet)|; s|__HOME__|$HOME|" \
-  packaging/com.digitalfoundry.agentfleet.watch.plist \
-  > ~/Library/LaunchAgents/com.digitalfoundry.agentfleet.watch.plist
+sed "s|__ACTUALIS__|$(command -v actualis)|; s|__HOME__|$HOME|" \
+  packaging/app.actualis.watch.plist \
+  > ~/Library/LaunchAgents/app.actualis.watch.plist
 launchctl bootstrap gui/$(id -u) \
-  ~/Library/LaunchAgents/com.digitalfoundry.agentfleet.watch.plist
+  ~/Library/LaunchAgents/app.actualis.watch.plist
 ```
 
 Check it, read it, stop it:
 
 ```sh
-launchctl print gui/$(id -u)/com.digitalfoundry.agentfleet.watch | head -20
-tail -f ~/Library/Logs/agentfleet-watch.log
-launchctl bootout gui/$(id -u)/com.digitalfoundry.agentfleet.watch
+launchctl print gui/$(id -u)/app.actualis.watch | head -20
+tail -f ~/Library/Logs/actualis-watch.log
+launchctl bootout gui/$(id -u)/app.actualis.watch
 ```
 
 It is a LaunchAgent rather than a LaunchDaemon on purpose: it must run inside

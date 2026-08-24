@@ -1,6 +1,6 @@
 # Security
 
-agentfleet reads session transcripts that contain credentials. Its own
+actualis reads session transcripts that contain credentials. Its own
 correctness is therefore a security property, not just a quality one.
 
 ## Reporting a vulnerability
@@ -15,7 +15,7 @@ acknowledgement within a few days.
 ## What counts as a vulnerability here
 
 - **A credential reaching output that should be redacted.** Any input where
-  `agentfleet` prints, logs, or emits a secret value without `--no-redact`.
+  `actualis` prints, logs, or emits a secret value without `--no-redact`.
 - **Anything identifying reaching `--share`.** A project name, branch, ticket,
   path, command, hostname, or fingerprint in the postable summary.
 - **A write or a network call.** The tool opens files read-only and makes no

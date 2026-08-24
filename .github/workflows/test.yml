@@ -37,7 +37,7 @@ jobs:
           allowed = {'__future__','argparse','collections','contextlib','datetime',
                      'hashlib','importlib','io','json','os','pathlib','re',
                      'subprocess','sys','time','unittest'}
-          tree = ast.parse(open('agentfleet.py').read())
+          tree = ast.parse(open('actualis.py').read())
           found = set()
           for n in ast.walk(tree):
               if isinstance(n, ast.Import):
@@ -56,5 +56,5 @@ jobs:
         shell: bash
         run: |
           mkdir -p empty-probe
-          uv run --python ${{ matrix.python }} python agentfleet.py --root empty-probe \
+          uv run --python ${{ matrix.python }} python actualis.py --root empty-probe \
             && echo "unexpected success" && exit 1 || test $? -eq 1

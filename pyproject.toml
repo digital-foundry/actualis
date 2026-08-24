@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agentfleet"
+name = "actualis"
 version = "0.1.0"
-description = "What your coding agents cost, and what they actually did."
+description = "What actually ran. Local, read-only, honest about limits."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "AGPL-3.0-or-later"
@@ -26,14 +26,14 @@ classifiers = [
 dependencies = []
 
 [project.scripts]
-agentfleet = "agentfleet:main"
+actualis = "actualis:main"
 
 [project.urls]
-Homepage = "https://github.com/digitalfoundry-aw/agentfleet"
-Issues = "https://github.com/digitalfoundry-aw/agentfleet/issues"
+Homepage = "https://github.com/digitalfoundry-aw/actualis"
+Issues = "https://github.com/digitalfoundry-aw/actualis/issues"
 
 [tool.hatch.build.targets.wheel]
-include = ["agentfleet.py"]
+include = ["actualis.py"]
 
 [tool.hatch.build.targets.sdist]
-include = ["agentfleet.py", "README.md", "LICENSE", "tests/"]
+include = ["actualis.py", "README.md", "LICENSE", "tests/"]

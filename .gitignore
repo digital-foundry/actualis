@@ -9,11 +9,11 @@ venv/
 
 # Never commit a report: they contain project names, commands, and paths.
 *.report.json
-agentfleet-*.json
+actualis-*.json
 
 # built tray bundle
 tray/*.app/
 
 # built tray binaries
-tray-go/agentfleet-tray
-tray-go/agentfleet-tray.exe
+tray-go/actualis-tray
+tray-go/actualis-tray.exe

@@ -3,18 +3,45 @@
 One Go binary per platform, about 2.6 MB, no runtime dependency.
 
 ```sh
-go build -ldflags "-s -w" -o agentfleet-tray .
-./agentfleet-tray
+go build -ldflags "-s -w" -o actualis-tray .
+./actualis-tray
 ```
 
 Prebuilt binaries for all three platforms are produced by the `tray` workflow on
 every push and attached as artifacts.
 
+## Brand
+
+Palette from the brand guide (master; the macOS icon sheet lists different
+values for slate, smoke and amber and is treated as the outlier):
+
+| | hex |
+|---|---|
+| CARBON | `#0B0C0E` |
+| SLATE | `#1F2430` |
+| SMOKE | `#3A414E` |
+| BONE | `#F2EFE9` |
+| AMBER | `#E08A24` |
+
+Type: **Inter** primary, **IBM Plex Mono** for data.
+
 ## The icon
 
-A **constant mark with a status dot in the corner** — the pattern Docker,
-1Password and Teams use. The identity never changes, so you can find it in a
-crowded menu bar; only the small badge moves.
+The **A-mark** from the Actualis icon system: two splayed legs with an amber
+baseline. Identity stays constant; state is carried by an added form.
+
+| state | form | when |
+|---|---|---|
+| idle | A-mark | nothing exposed |
+| monitoring | A-mark + dot | credentials worth rotating |
+| exposed | A-mark in an amber ring | critical credentials exposed |
+| syncing | segmented spinner | scanning |
+| error | crosshair | data could not be read |
+
+Two brand rules drive this. **Amber indicates state, never identity** — the mark
+still reads with amber stripped. And **colour alone never carries meaning**:
+every state is distinguished by a different *form*, so it survives a monochrome
+tray and colour-blind users alike.
 
 The mark is three descending bars: a measurement, and the shortest bar leaves
 the badge its corner. It was chosen by previewing candidates at **actual menu
@@ -84,7 +111,7 @@ next to your credentials.
 
 ## Relationship to the CLI
 
-This is a thin shell. It runs `agentfleet --json --days N` every ten minutes and
+This is a thin shell. It runs `actualis --json --days N` every ten minutes and
 renders the result. **All measurement lives in the CLI**, which stays
 dependency-free and auditable in one sitting. The tray has one dependency, for
 drawing a tray icon, and contains no logic worth reviewing.

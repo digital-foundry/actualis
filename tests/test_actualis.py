@@ -1,4 +1,4 @@
-"""Regression tests for agentfleet.
+"""Regression tests for actualis.
 
 Every test here corresponds to a defect found while validating the tool against
 ~48,000 real agent commands. They exist so those specific bugs cannot come back.
@@ -14,13 +14,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_file_location("agentfleet", ROOT / "agentfleet.py")
+spec = importlib.util.spec_from_file_location("actualis", ROOT / "actualis.py")
 af = importlib.util.module_from_spec(spec)
-sys.modules["agentfleet"] = af
+sys.modules["actualis"] = af
 spec.loader.exec_module(af)
 
 
-af.SRC_TEXT = (ROOT / "agentfleet.py").read_text()
+af.SRC_TEXT = (ROOT / "actualis.py").read_text()
 
 
 def cats(cmd):
@@ -552,14 +552,14 @@ class TestShareLeakage(unittest.TestCase):
     def test_no_paths_or_slashed_identifiers(self):
         out = self._share_output()
         for line in out.splitlines():
-            if "agentfleet" in line or "list price" in line:
+            if "actualis" in line or "list price" in line:
                 continue
             self.assertNotIn("/Users", line)
             self.assertNotIn("://", line)
 
     def test_still_reports_the_useful_shape(self):
         out = self._share_output()
-        for want in ["agentfleet", "median cost per ticket", "shell command",
+        for want in ["actualis", "median cost per ticket", "shell command",
                      "unsupervised", "credentials", "list price"]:
             with self.subTest(want=want):
                 self.assertIn(want, out)
@@ -739,7 +739,7 @@ class TestExplainability(unittest.TestCase):
             with self.subTest(topic=topic):
                 v = str(e["verify"])
                 self.assertTrue(any(v.startswith(p) for p in
-                                    ("agentfleet", "codesign", "ls ", "grep ")),
+                                    ("actualis", "codesign", "ls ", "grep ")),
                                 f"{topic} verify is not a command: {v}")
 
 
@@ -768,7 +768,7 @@ class TestAgentVerification(unittest.TestCase):
 class TestDocumentation(unittest.TestCase):
     """Docs drift silently. These fail the build instead."""
 
-    SRC = (ROOT / "agentfleet.py").read_text()
+    SRC = (ROOT / "actualis.py").read_text()
 
     def test_every_finding_id_is_documented(self):
         import re

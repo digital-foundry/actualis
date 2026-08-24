@@ -2,7 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  agentfleet watch, as a macOS LaunchAgent.
+  actualis watch, as a macOS LaunchAgent.
 
   Runs the live monitor in the background so new credential exposures raise a
   native notification without a terminal open.
@@ -13,25 +13,25 @@
 
   Install:
     mkdir -p ~/Library/LaunchAgents
-    sed "s|__AGENTFLEET__|$(command -v agentfleet)|; s|__HOME__|$HOME|" \
-      packaging/com.digitalfoundry.agentfleet.watch.plist \
-      > ~/Library/LaunchAgents/com.digitalfoundry.agentfleet.watch.plist
+    sed "s|__ACTUALIS__|$(command -v actualis)|; s|__HOME__|$HOME|" \
+      packaging/app.actualis.watch.plist \
+      > ~/Library/LaunchAgents/app.actualis.watch.plist
     launchctl bootstrap gui/$(id -u) \
-      ~/Library/LaunchAgents/com.digitalfoundry.agentfleet.watch.plist
+      ~/Library/LaunchAgents/app.actualis.watch.plist
 
   Status / logs / stop:
-    launchctl print gui/$(id -u)/com.digitalfoundry.agentfleet.watch | head -20
-    tail -f ~/Library/Logs/agentfleet-watch.log
-    launchctl bootout gui/$(id -u)/com.digitalfoundry.agentfleet.watch
+    launchctl print gui/$(id -u)/app.actualis.watch | head -20
+    tail -f ~/Library/Logs/actualis-watch.log
+    launchctl bootout gui/$(id -u)/app.actualis.watch
 -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.digitalfoundry.agentfleet.watch</string>
+    <string>app.actualis.watch</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>__AGENTFLEET__</string>
+        <string>__ACTUALIS__</string>
         <string>--watch</string>
         <!-- secrets only; drop --quiet to also be told about risky commands -->
         <string>--quiet</string>
@@ -56,9 +56,9 @@
     <!-- Only events are logged: the heartbeat is suppressed when stdout is not
          a terminal, so this file stays small. -->
     <key>StandardOutPath</key>
-    <string>__HOME__/Library/Logs/agentfleet-watch.log</string>
+    <string>__HOME__/Library/Logs/actualis-watch.log</string>
     <key>StandardErrorPath</key>
-    <string>__HOME__/Library/Logs/agentfleet-watch.log</string>
+    <string>__HOME__/Library/Logs/actualis-watch.log</string>
 
     <key>WorkingDirectory</key>
     <string>__HOME__</string>
