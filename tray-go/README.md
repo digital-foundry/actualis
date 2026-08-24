@@ -56,4 +56,6 @@ transcripts without reading the thing that draws a menu.
 
 - **macOS** — Xcode command line tools
 - **Linux** — `libgtk-3-dev libayatana-appindicator3-dev`
-- **Windows** — none beyond Go
+- **Windows** — none beyond Go. Build with
+  `-ldflags "-H windowsgui"` or a console window sits behind the tray icon for
+  the life of the process. CI asserts this rather than trusting it.

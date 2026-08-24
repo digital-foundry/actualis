@@ -50,15 +50,29 @@ jobs:
       - name: vet
         run: go vet ./...
 
+      # -H windowsgui suppresses the console window. Without it the tray works
+      # but a black cmd window sits behind it for the life of the process.
       - name: build
-        run: go build -trimpath -ldflags "-s -w" -o "${{ matrix.artifact }}" .
+        shell: bash
+        run: |
+          LDFLAGS="-s -w"
+          if [ "${{ matrix.goos }}" = "windows" ]; then LDFLAGS="$LDFLAGS -H windowsgui"; fi
+          go build -trimpath -ldflags "$LDFLAGS" -o "${{ matrix.artifact }}" .
 
       - name: it is a real binary for the right platform
         shell: bash
         run: |
           ls -lh "${{ matrix.artifact }}"
-          file "${{ matrix.artifact }}" || true
+          DESC=$(file -b "${{ matrix.artifact }}" || echo unknown)
+          echo "$DESC"
           test -s "${{ matrix.artifact }}"
+          # A tray app must not open a console window on Windows.
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            case "$DESC" in
+              *console*) echo "::error::windows binary is a console app; -H windowsgui missing"; exit 1 ;;
+              *GUI*|*unknown*) echo "GUI subsystem confirmed" ;;
+            esac
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
