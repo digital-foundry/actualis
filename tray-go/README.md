@@ -12,9 +12,19 @@ every push and attached as artifacts.
 
 ## The icon
 
-A **constant gauge mark with a status dot in the corner** — the pattern Docker,
-1Password and Teams use. The identity of the app never changes, so you can find
-it in a crowded menu bar; only the small badge moves.
+A **constant mark with a status dot in the corner** — the pattern Docker,
+1Password and Teams use. The identity never changes, so you can find it in a
+crowded menu bar; only the small badge moves.
+
+The mark is three descending bars: a measurement, and the shortest bar leaves
+the badge its corner. It was chosen by previewing candidates at **actual menu
+bar size**, not at 2x. A gauge with a needle, a radar sweep and a target ring
+were all tried first and all became a smudge at 22pt — curves do not survive
+that size, bars do.
+
+Every mark carries a **2px contrasting outline**, so it stays legible whatever
+the menu bar is doing. An earlier version relied on detecting the system
+appearance alone, and a white glyph on a light bar was simply invisible.
 
 | badge | meaning |
 |---|---|
