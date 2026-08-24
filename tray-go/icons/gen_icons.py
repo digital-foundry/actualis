@@ -60,21 +60,39 @@ UPD_X      = 0.50          #                            11.5/23
 UPD_Y      = -0.478        #                             -11/23
 
 # SYNCING: 8-segment spinner, no A-mark.
-SYNC_R     = 0.34          # segment ring radius / canvas
 SYNC_SEGS  = 8
 
-S  = 44                    # canvas, 22pt @2x
+# --- PRESENCE DEVIATION from the sheet ----------------------------------
+# The sheet's proportions, rendered faithfully, sit visibly lighter than the
+# rest of the menu bar. Measured against 12 neighbouring tray icons in a real
+# capture (see docs/decisions/0001-tray-icon-presence.md):
+#
+#     footprint height   ACTUALIS 30px   neighbours 30px (median)   ok
+#     ink coverage       ACTUALIS 0.31   neighbours 0.53 / 0.44*    light
+#     mean run length    ACTUALIS 3.18   neighbours 6.69 / 5.29*    light
+#                                        (* excluding solid-filled marks)
+#
+# Height already matched, so only weight and scale are adjusted. Everything
+# else -- crossbar position and length, dot sizes and offsets, ring stroke
+# ratio, the square A bbox -- stays exactly as measured off the sheet.
+CAP_BOOST    = 1.30        # 0.72 -> 0.94 of canvas height
+STROKE_BOOST = 1.70        # 0.12 -> 0.204 of cap; also applied
+                           # to the exposed ring, so it does not
+                           # stay hairline beside a bolder A
+
+S  = 44                    # canvas HEIGHT, 22pt @2x; macOS scales to this
+SW = 50                    # canvas WIDTH: the monitoring dots need the room,
+                           # and a status image may be wider than it is tall
 SS = 4                     # supersampling
 
 
 # ------------------------------------------------------------------ raster
 def render(shapes):
     """shapes: list of (hit_fn, rgb, alpha), painted back to front."""
-    buf = [[(0.0, 0.0, 0.0, 0.0)] * S for _ in range(S)]
-    buf = [[(0.0, 0.0, 0.0, 0.0) for _ in range(S)] for _ in range(S)]
+    buf = [[(0.0, 0.0, 0.0, 0.0) for _ in range(SW)] for _ in range(S)]
     for fn, rgb, alpha in shapes:
         for py in range(S):
-            for px in range(S):
+            for px in range(SW):
                 hits = sum(1 for sy in range(SS) for sx in range(SS)
                            if fn(px + (sx + .5) / SS, py + (sy + .5) / SS))
                 if not hits:
@@ -88,7 +106,7 @@ def render(shapes):
     raw = bytearray()
     for y in range(S):
         raw += b"\x00"
-        for x in range(S):
+        for x in range(SW):
             r, g, b, a = buf[y][x]
             raw += bytes((int(r + .5), int(g + .5), int(b + .5), int(a * 255 + .5)))
 
@@ -97,7 +115,7 @@ def render(shapes):
         return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c) & 0xffffffff)
 
     return (b"\x89PNG\r\n\x1a\n"
-            + chunk(b"IHDR", struct.pack(">IIBBBBB", S, S, 8, 6, 0, 0, 0))
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", SW, S, 8, 6, 0, 0, 0))
             + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
             + chunk(b"IEND", b""))
 
@@ -141,7 +159,7 @@ def arc(cx, cy, r, a0, a1, w):
 # ------------------------------------------------------------------ glyphs
 def a_mark(cap, cx, cy, ink, alpha=1.0):
     """The A: square bbox, apex a clean join, short centred amber dash."""
-    stroke = STROKE * cap
+    stroke = STROKE * STROKE_BOOST * cap
     top, bot = cy - cap / 2, cy + cap / 2
     # Inset the endpoints by half a stroke so the painted bbox is cap x cap.
     h = stroke / 2
@@ -157,12 +175,18 @@ def a_mark(cap, cx, cy, ink, alpha=1.0):
 
 
 def shapes_for(state, ink):
-    c = S / 2.0
-    cap = CAP * S
+    # Composition centre. Held left of the canvas centre so the monitoring
+    # dots and the update badge have room on the right without the A moving
+    # between states.
+    cap_px = CAP * CAP_BOOST * S
+    cx = 1.0 + cap_px / 2.0    # 1px left margin; the A's foot was clipped at 0
+    cy = S / 2.0
+    c = cx
+    cap = cap_px
 
     if state == "syncing":
-        r = SYNC_R * S
-        w = STROKE * cap
+        w = STROKE * STROKE_BOOST * cap
+        r = (cap - w) / 2.0   # same outer footprint as the A-mark
         out = []
         for i in range(SYNC_SEGS):
             a0 = i * (360 / SYNC_SEGS) + 6
@@ -172,29 +196,35 @@ def shapes_for(state, ink):
                 col, alpha = AMBER, 1.0 - i * 0.22
             else:
                 col, alpha = ink, 0.55 - (i - 3) * 0.07
-            out.append((arc(c, c, r, a0, a1, w), col, max(alpha, 0.18)))
+            out.append((arc(cx, cy, r, a0, a1, w), col, max(alpha, 0.18)))
         return out
 
     if state == "exposed":
         outer = RING_OUTER * S
-        rw = RING_W * outer
+        rw = RING_W * STROKE_BOOST * outer
         rcap = RING_CAP * outer
-        return (a_mark(rcap, c, c, ink)
-                + [(ring(c, c, (outer - rw) / 2.0, rw), AMBER, 1.0)])
+        return (a_mark(rcap, cx, cy, ink)
+                + [(ring(cx, cy, (outer - rw) / 2.0, rw), AMBER, 1.0)])
 
-    out = a_mark(cap, c, c, ink)
+    out = a_mark(cap, cx, cy, ink)
 
     if state == "monitoring":
-        out += [(disc(c + MON_SML_X * cap, c + MON_SML_Y * cap, MON_SML_R * cap), AMBER, 1.0),
-                (disc(c + MON_BIG_X * cap, c + MON_BIG_Y * cap, MON_BIG_R * cap), AMBER, 1.0)]
+        big_r, sml_r = MON_BIG_R * cap, MON_SML_R * cap
+        apex = cy - cap / 2.0
+        dot_y = apex + big_r          # tops flush with the apex
+        out += [(disc(cx + MON_SML_X * cap, dot_y, sml_r), AMBER, 1.0),
+                (disc(cx + MON_BIG_X * cap, dot_y, big_r), AMBER, 1.0)]
     elif state == "update":
         r = UPD_R * cap
         # Clamp into the canvas; at 44px the sheet's offset would overflow.
-        bx = min(c + UPD_X * cap, S - r - 0.5)
-        by = max(c + UPD_Y * cap, r + 0.5)
+        bx = min(cx + UPD_X * cap, SW - r - 1.0)
+        by = max(cy + UPD_Y * cap, r + 1.0)
         out += [(disc(bx, by, r), AMBER, 1.0)]
     elif state == "muted":
-        out += [(seg(6.5, S - 6.5, S - 6.5, 6.5, STROKE * cap), ink, 1.0)]
+        w = STROKE * STROKE_BOOST * cap
+        h = w / 2.0
+        out += [(seg(cx - cap / 2 + h, cy + cap / 2 - h,
+                     cx + cap / 2 - h, cy - cap / 2 + h, w), ink, 1.0)]
     return out
 
 
