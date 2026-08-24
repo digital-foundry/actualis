@@ -34,6 +34,46 @@ costs more trust than ten correct ones earn.
 by removing checks, not adding them. A rule that fires constantly destroys trust
 in the rules that matter.
 
+## Branching
+
+Trunk-based. `main` is always releasable and is the only long-lived branch.
+
+| branch | purpose | lifetime |
+|---|---|---|
+| `main` | releasable at every commit | permanent |
+| `fix/…`, `feat/…`, `docs/…` | one change, one branch | until merged |
+| `v*` tags | releases; `release.yml` publishes to PyPI on push | permanent |
+
+There is no `develop`, no release branch and no long-lived integration branch.
+For a project this size they cost more in merge overhead than they return.
+
+**`main` is protected.** Force-pushes and deletion are blocked, and the Python
+test matrix must pass before a merge. That protection is not decoration: this
+repository's history was rewritten once, deliberately, to purge brand artwork
+and a stale binary — with the rules now in place, the same operation needs a
+conscious bypass rather than a stray `--force`.
+
+Outside contributors work from a fork. Fork pull requests require maintainer
+approval before any workflow runs, so a first PR will sit until someone presses
+the button — that is the abuse control, not a comment on the change.
+
+Keep branches short-lived and rebase rather than merge, so history stays linear
+and `git log` reads as a sequence of changes rather than a merge diagram.
+
+## Supply chain
+
+Every GitHub Action is pinned to a full 40-character commit SHA, and the
+repository rejects workflows that reference a mutable tag. A tag can be moved;
+a SHA cannot. Dependabot proposes updates weekly and CI must pass before one
+lands.
+
+The version comment after each SHA is a human convenience only — the SHA is
+what runs. When updating, change both.
+
+This matters more here than in most repositories. Actualis exists to tell you
+what your agents actually did; a compromised action in its own release pipeline
+would undermine the claim at its root.
+
 ## Adding a coach finding
 
 1. Give it the next free `AFxxx` id. Never reuse a retired one.
