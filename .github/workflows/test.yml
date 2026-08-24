@@ -46,9 +46,11 @@ jobs:
         run: |
           uv run --python ${{ matrix.python }} python -c "
           import ast, sys
+          # Standard library only. 'typing' is stdlib and carries no runtime
+          # cost worth avoiding; it is here because Rate is a NamedTuple.
           allowed = {'__future__','argparse','collections','contextlib','datetime',
                      'hashlib','importlib','io','json','os','pathlib','re',
-                     'shutil','subprocess','sys','time','unittest'}
+                     'shutil','subprocess','sys','time','typing','unittest'}
           tree = ast.parse(open('actualis.py').read())
           found = set()
           for n in ast.walk(tree):

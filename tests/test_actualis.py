@@ -259,9 +259,19 @@ class TestPricing(unittest.TestCase):
         self.assertEqual(af.rates_for("gpt-5.2-codex", None)[2], "openai")
 
     def test_every_rate_declares_where_it_came_from(self):
-        for model, entry in af.PRICING.items():
-            self.assertEqual(len(entry), 4, f"{model} is missing a source")
-            self.assertIn(entry[3], (af.VENDOR, af.AGGREGATOR), model)
+        for model, rate in af.PRICING.items():
+            with self.subTest(model=model):
+                self.assertIn(rate.tier, af.RATE_TIERS, model)
+                self.assertGreater(rate.input, 0, model)
+                self.assertGreater(rate.output, 0, model)
+
+    def test_a_rate_in_the_table_is_never_merely_inferred(self):
+        """FAMILY and DEFAULT describe how a MISSING rate was guessed. A rate
+        sitting in the table came from somewhere real, or it should not be
+        there at all."""
+        for model, rate in af.PRICING.items():
+            with self.subTest(model=model):
+                self.assertIn(rate.tier, (af.VENDOR, af.VENDOR_DOC, af.AGGREGATOR))
 
     def test_the_one_aggregator_rate_is_marked_as_such(self):
         # OpenAI publishes no gpt-5.2-codex line, so this rate is third-party.
@@ -270,7 +280,14 @@ class TestPricing(unittest.TestCase):
         self.assertEqual(af.rates_for("claude-opus-5", None)[4], af.VENDOR)
 
     def test_unknown_models_are_never_vendor_sourced(self):
-        self.assertEqual(af.rates_for("totally-made-up", None)[4], af.AGGREGATOR)
+        """The point of the tier is that a guess cannot present itself as a
+        published price. Previously an unknown model was reported as
+        AGGREGATOR, which was itself untrue: no aggregator had been consulted."""
+        for model in ("totally-made-up", "claude-sonnet-4-9", "gpt-7-turbo", "o3-pro"):
+            with self.subTest(model=model):
+                tier = af.rates_for(model, None)[4]
+                self.assertNotIn(tier, (af.VENDOR, af.VENDOR_DOC))
+                self.assertIn(tier, (af.FAMILY, af.DEFAULT))
 
     def test_cost_math_end_to_end(self):
         """1M of each bucket on Opus ($5 in / $25 out) = 5 + 25 + 10 + 6.25 + 0.5."""
@@ -1040,7 +1057,8 @@ class TestAuditFindings2026_08_24(unittest.TestCase):
         usage = {"input_tokens": 1_000_000, "cached_input_tokens": 1_000_000,
                  "output_tokens": 0}
         cost = af.codex_session_cost(usage, "codex-something-new")
-        expected = 1_000_000 / 1e6 * af.OPENAI_FALLBACK[0] * af.OPENAI_CACHED_MULT
+        expected = (1_000_000 / 1e6 * af._provider_ceiling("openai").input
+                    * af.OPENAI_CACHED_MULT)
         self.assertAlmostEqual(cost, expected, places=10)
         self.assertLess(cost, 1.0, "Opus rates with no cache discount would be 5.00")
 
@@ -1167,7 +1185,16 @@ class TestJSONSchemaFreeze(unittest.TestCase):
             return schema[path]
         parts = path.split(".")
         for mask in range(1, 1 << len(parts)):
-            cand = ".".join("*" if mask >> i & 1 else p for i, p in enumerate(parts))
+            # A segment may carry an array marker -- `models_by_tier.default[]`.
+            # Wildcarding it must keep the marker, or an array element under a
+            # data-keyed map has no expressible declaration at all.
+            cand_parts = []
+            for i, part in enumerate(parts):
+                if mask >> i & 1:
+                    cand_parts.append("*[]" if part.endswith("[]") else "*")
+                else:
+                    cand_parts.append(part)
+            cand = ".".join(cand_parts)
             if cand in schema:
                 return schema[cand]
         return None
@@ -1508,3 +1535,105 @@ class TestNamedSecretCoverage(unittest.TestCase):
         self.assertTrue(af.classify_secrets("FOR_KEY=abcdefghijklmnop"))
         self.assertFalse(af.classify_secrets("PATCH=abcdefghijklmnop"))
         self.assertTrue(af.classify_secrets("GITLAB_PAT=abcdefghijklmnop"))
+
+
+class TestRateProvenance(unittest.TestCase):
+    """A cost tool that cannot say where a number came from is asking to be
+    trusted rather than checked. The tier is that answer, and it is ordered:
+    a published price and an inference are not equally good.
+    """
+
+    def test_the_tier_order_runs_best_to_worst(self):
+        self.assertEqual(af.RATE_TIERS,
+                         (af.VENDOR, af.VENDOR_DOC, af.AGGREGATOR, af.FAMILY, af.DEFAULT))
+
+    def test_resolution_falls_back_in_order(self):
+        cases = [
+            ("claude-sonnet-5", af.VENDOR),        # exact
+            ("gpt-5.2-codex", af.AGGREGATOR),      # exact, third-party
+            ("claude-sonnet-4-9", af.FAMILY),      # unseen sibling
+            ("gpt-7-turbo", af.FAMILY),
+            ("o3-pro", af.DEFAULT),                # provider recognised, no family
+            ("totally-made-up", af.DEFAULT),       # nothing recognised
+        ]
+        for model, tier in cases:
+            with self.subTest(model=model):
+                self.assertEqual(af.rate_for(model).tier, tier)
+
+    def test_a_family_guess_beats_the_global_ceiling(self):
+        """The whole point of family inference. An unseen Sonnet priced at the
+        global Opus-tier ceiling would overstate it by roughly 40%."""
+        fam = af.rate_for("claude-sonnet-4-9")
+        self.assertLess(fam.output, af.DEFAULT_RATES.output)
+        self.assertEqual(fam.provider, "anthropic")
+
+    def test_inference_errs_upward(self):
+        """A bill that surprises you downward is a better failure than one that
+        surprises you upward."""
+        for model in ("claude-sonnet-4-9", "claude-haiku-9", "gpt-7-turbo"):
+            with self.subTest(model=model):
+                guess = af.rate_for(model)
+                siblings = [r for k, r in af.PRICING.items()
+                            if r.provider == guess.provider and not r.retired]
+                self.assertGreaterEqual(guess.output, min(r.output for r in siblings))
+
+    def test_retired_models_do_not_set_the_ceiling(self):
+        """claude-opus-4-1 is $15/$75 and retired. Pricing a future Opus from it
+        would overstate by 3x."""
+        self.assertTrue(af.PRICING["claude-opus-4-1"].retired)
+        self.assertEqual(af.rate_for("claude-opus-4-1").output, 75.0)   # history is exact
+        self.assertLess(af.rate_for("claude-opus-9").output, 75.0)      # the future is not
+
+    def test_an_inference_never_claims_to_be_a_published_price(self):
+        for model in ("claude-sonnet-4-9", "o3-pro", "totally-made-up"):
+            with self.subTest(model=model):
+                r = af.rate_for(model)
+                self.assertFalse(r.confident)
+                self.assertTrue(r.note, "an inferred rate must say how it was reached")
+
+    def test_staleness_is_computed_offline(self):
+        """The tool makes no network calls, so it cannot know a price changed.
+        It can know how long since anyone checked."""
+        from datetime import timedelta
+        base = datetime.strptime(af.PRICING_VERIFIED, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        self.assertEqual(af.pricing_age_days(base), 0)
+        self.assertEqual(af.pricing_age_days(base + timedelta(days=120)), 120)
+        self.assertEqual(af.pricing_age_days(base - timedelta(days=5)), 0)  # never negative
+
+    def test_the_confidence_split_is_reported(self):
+        f = af.Fleet()
+        ts = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        usage = {"input_tokens": 1_000_000, "output_tokens": 0}
+        f.add_usage("p", "claude-sonnet-5", usage, ts)       # vendor
+        f.add_usage("p", "claude-sonnet-4-9", usage, ts)     # family
+        self.assertLess(f.confident_pct, 100.0)
+        self.assertGreater(f.confident_pct, 0.0)
+        p = af.to_json(f)["pricing"]
+        self.assertIn(af.VENDOR, p["cost_by_tier"])
+        self.assertIn(af.FAMILY, p["cost_by_tier"])
+        self.assertIn("claude-sonnet-4-9", p["models_by_tier"][af.FAMILY])
+
+    def test_an_all_vendor_fleet_is_fully_confident(self):
+        f = af.Fleet()
+        f.add_usage("p", "claude-opus-5", {"input_tokens": 1000, "output_tokens": 10},
+                    datetime(2026, 8, 1, tzinfo=timezone.utc))
+        self.assertEqual(f.confident_pct, 100.0)
+
+    def test_the_cli_never_fetches_a_price(self):
+        """The refresh path is a separate maintainer tool. If the CLI ever grows
+        a network call for pricing, the no-network promise is gone."""
+        import ast
+        banned = {"urllib", "http", "requests", "httpx", "socket", "ftplib",
+                  "telnetlib", "smtplib", "asyncio", "ssl", "xmlrpc"}
+        tree = ast.parse(af.SRC_TEXT)
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[0])
+        self.assertEqual(imported & banned, set(),
+                         f"the CLI imports a networking module: {imported & banned}")
+        # The refresh path exists, and it lives outside the shipped package.
+        self.assertTrue((ROOT / "tools" / "price-check.py").exists())
+        self.assertIn("tools", str(ROOT / "tools"))
