@@ -764,6 +764,127 @@ def command_head(cmd: str) -> str | None:
 
 
 # --------------------------------------------------------------------------
+# Suppressions
+#
+# A detector that cries wolf gets ignored, so there has to be a way to tell it
+# it is wrong. Two rules shape this:
+#
+# A suppression NEVER removes a finding from the count. If suppressing something
+# deleted it, the report would start lying by omission and a reader could not
+# tell a clean scan from a heavily suppressed one. Suppressed findings stay
+# counted, stay in --json, and the total is stated.
+#
+# The format is a plain text file rather than JSON or TOML: it has to be
+# greppable, diffable, reviewable in a pull request, and editable by hand six
+# months later by someone who did not write it. Every entry carries a reason
+# for the same reason.
+# --------------------------------------------------------------------------
+
+_ADDED_MARKER = re.compile(r"\s*\(added \d{4}-\d{2}-\d{2}\)\s*$")
+
+SUPPRESSION_FILENAME = "suppressions"
+PROJECT_SUPPRESSIONS = ".actualis-suppressions"
+
+
+def suppression_paths() -> list[Path]:
+    """Where suppressions are read from, least specific first.
+
+    A project-local file can be committed so a team shares one list; the user
+    file covers everything on this machine. Both are read; neither is required.
+    """
+    out = []
+    base = os.environ.get("XDG_CONFIG_HOME") or "~/.config"
+    out.append(Path(base).expanduser() / "actualis" / SUPPRESSION_FILENAME)
+    out.append(Path.cwd() / PROJECT_SUPPRESSIONS)
+    return out
+
+
+def load_suppressions() -> dict[str, str]:
+    """fingerprint -> reason. Malformed lines are skipped, never fatal."""
+    out: dict[str, str] = {}
+    for path in suppression_paths():
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            fp, _, reason = line.partition(" ")
+            fp = clean(fp)[:64]
+            if not fp:
+                continue
+            # `(added YYYY-MM-DD)` is written by --suppress, not typed by a
+            # person. Strip it so the reason a caller sees is only the reason.
+            reason = _ADDED_MARKER.sub("", clean(reason)).strip()
+            out[fp] = reason or "(no reason given)"
+    return out
+
+
+def add_suppression(fingerprint: str, reason: str) -> Path:
+    """Append one entry to the user's suppression file, creating it if needed."""
+    fingerprint = clean(fingerprint).strip()[:64]
+    if not fingerprint:
+        raise ValueError("a fingerprint is required")
+    reason = clean(reason).strip()[:200] or "(no reason given)"
+    path = suppression_paths()[0]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text(
+            "# actualis suppressions\n"
+            "#\n"
+            "# One finding per line: <fingerprint> <why it is not a real finding>\n"
+            "# Suppressed findings are still counted and still appear in --json.\n"
+            "# They are held back from the actionable list, not hidden.\n"
+            "#\n"
+            "# Remove a line to un-suppress. Committing a copy as "
+            f"{PROJECT_SUPPRESSIONS} shares it with a team.\n\n",
+            encoding="utf-8")
+    today = datetime.now(timezone.utc).date().isoformat()
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(f"{fingerprint}  {reason}  (added {today})\n")
+    return path
+
+
+_URL_SAFE = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~")
+
+
+def _percent_encode(text: str) -> str:
+    """Percent-encode for a query string.
+
+    Hand-rolled rather than urllib.parse.quote on purpose. urllib is the
+    networking package, and the no-network guarantee is worth more as an
+    absolute -- "this file imports nothing that can open a socket" -- than as a
+    rule with an exception for the one function that happens to be pure string
+    handling. Both the CI import allowlist and a test enforce that absolute.
+    """
+    out = []
+    for byte in text.encode("utf-8"):
+        ch = chr(byte)
+        out.append(ch if ch in _URL_SAFE else f"%{byte:02X}")
+    return "".join(out)
+
+
+def report_url(kind: str, detail: str) -> str:
+    """A pre-filled issue URL. Printed, never opened, never requested.
+
+    The tool makes no network calls, and that includes not quietly phoning home
+    with a report. The user decides whether to open it.
+    """
+    title = _percent_encode(f"False positive: {kind}")
+    body = _percent_encode(
+        f"**What was flagged:** {kind}\n\n"
+        f"**Why it is not a credential:**\n\n_(please describe)_\n\n"
+        f"**Detail actualis reported:**\n\n```\n{detail}\n```\n\n"
+        f"_No command text or secret value is included above; fill in only what "
+        f"you are comfortable sharing._\n")
+    return (f"https://github.com/digital-foundry/actualis/issues/new"
+            f"?labels=false-positive&title={title}&body={body}")
+
+
+# --------------------------------------------------------------------------
 # Transcript scanning
 # --------------------------------------------------------------------------
 
@@ -900,6 +1021,10 @@ class Fleet:
         self.secret_projects: Counter = Counter()
         # (priority, type, fingerprint) -> {uses, first, last, projects}
         self.secrets: dict[str, dict] = {}   # sha256[:8] -> record
+        # Loaded once per scan. A suppressed finding is held back from the
+        # actionable list, never removed from the count -- see the Suppressions
+        # section for why that distinction is the whole design.
+        self.suppressions: dict[str, str] = load_suppressions()
         self.unknown_models: Counter = Counter()
         # Models priced from a third party because the vendor publishes no rate
         # for that id. Counted separately from unknown models: the number is
@@ -1212,7 +1337,9 @@ class Fleet:
         for priority, kind, fp in classify_secrets(cmd):
             e = self.secrets.setdefault(fp, {
                 "priority": priority, "kinds": set(), "uses": 0,
-                "first": None, "last": None, "projects": set()})
+                "first": None, "last": None, "projects": set(),
+                "suppressed": fp in self.suppressions,
+                "suppressed_reason": self.suppressions.get(fp, "")})
             # the same value may appear under several names; keep the worst
             if _rank[priority] < _rank[e["priority"]]:
                 e["priority"] = priority
@@ -1357,6 +1484,15 @@ class Fleet:
     @property
     def total_cost(self) -> float:
         return sum(self.cost_by_model.values())
+
+    @property
+    def suppressed_secrets(self) -> int:
+        return sum(1 for e in self.secrets.values() if e.get("suppressed"))
+
+    @property
+    def actionable_secrets(self) -> dict[str, dict]:
+        """Findings not marked as false positives on this machine."""
+        return {k: v for k, v in self.secrets.items() if not v.get("suppressed")}
 
     @property
     def confident_cost(self) -> float:
@@ -1868,6 +2004,27 @@ EXPLAIN: dict[str, dict[str, object]] = {
         ],
         "verify": ("actualis --json | jq '.cost_usd, .duplicate_usage_records_skipped, "
                    ".cost_usd_from_unpriced_models'"),
+    },
+    "suppressions": {
+        "measures": "Findings you have marked as false positives on this machine.",
+        "formula": [
+            "Read, least specific first, from:",
+            "  $XDG_CONFIG_HOME/actualis/suppressions  (or ~/.config/...)",
+            "  ./.actualis-suppressions                (commit to share with a team)",
+            "",
+            "One finding per line: <id> <why it is not a real finding>",
+            "",
+            "  actualis --suppress <id> --reason \"test fixture in CI config\"",
+            "  actualis --suppressions",
+        ],
+        "assumes": [
+            "Nothing. A suppression is your judgement, recorded, not a claim by",
+            "this tool that the finding was wrong.",
+            "A suppressed finding is STILL COUNTED and still appears in --json.",
+            "It is held back from the actionable list, never hidden -- a scan",
+            "with many suppressions must not look like a clean one.",
+        ],
+        "verify": "actualis --json | jq '.suppressed_secrets, [.secrets[]|select(.suppressed)]'",
     },
     "refusals": {
         "measures": "What was stopped before it ran, and which gate stopped it.",
@@ -2828,16 +2985,22 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
         rows = sorted(fleet.secrets.items(),
                       key=lambda kv: (order.get(kv[1]["priority"], 9), -kv[1]["uses"]))
         distinct = len(rows)
-        actionable = sum(1 for _, e in rows if e["priority"] != "low")
+        actionable = sum(1 for _, e in rows
+                         if e["priority"] != "low" and not e.get("suppressed"))
+        suppressed = fleet.suppressed_secrets
 
         print(f"\n  {c.red}▲ {num(distinct)} distinct secrets{c.off} exposed across "
               f"{num(fleet.secret_exposures)} commands "
-              f"{c.dim}({num(actionable)} worth rotating){c.off}")
+              f"{c.dim}({num(actionable)} worth rotating"
+              + (f", {num(suppressed)} suppressed" if suppressed else "")
+              + f"){c.off}")
         print(f"\n  {'':<9} {'type':<26} {'uses':>6}  {'first':<11} {'last':<11} id")
         for fp, e in rows[:24]:
             pri = e["priority"]
             col = c.red if pri == "critical" else (c.yellow if pri == "high" else c.dim)
             mark = "ROTATE" if pri == "critical" else ("rotate" if pri == "high" else "dev")
+            if e.get("suppressed"):
+                col, mark = c.dim, "muted"
             kind = ", ".join(sorted(e["kinds"]))
             print(f"    {col}{mark:<7}{c.off} {kind[:26]:<26} {num(e['uses']):>6}  "
                   f"{(e['first'] or '?'):<11} {(e['last'] or '?'):<11} {c.dim}{fp}{c.off}")
@@ -2846,6 +3009,16 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
         print(f"\n    {c.dim}id is sha256[:8] of the secret; the value is never stored or")
         print(f"    printed. Same secret reused 200 times counts once. Rotate in the order")
         print(f"    shown, then purge the transcripts that carry them.{c.off}")
+        # In place, where the finding is, rather than in documentation nobody
+        # reads at the moment they disagree with it.
+        print(f"\n    {c.dim}Not a credential? Say so:{c.off}")
+        print(f"      actualis --suppress <id> --reason \"why it is not\"")
+        print(f"    {c.dim}It stays counted and stays in --json; it leaves this list.{c.off}")
+        first_wrong = next((fp for fp, e in rows if not e.get("suppressed")), None)
+        if first_wrong:
+            kinds = ", ".join(sorted(fleet.secrets[first_wrong]["kinds"]))[:40]
+            print(f"    {c.dim}Wrong for everyone, not just you? Report it:{c.off}")
+            print(f"      {c.dim}{report_url(kinds, 'id ' + first_wrong)[:96]}…{c.off}")
 
     highs = [f for f in fleet.flags if f["severity"] == "high"]
     meds = [f for f in fleet.flags if f["severity"] == "med"]
@@ -3088,6 +3261,10 @@ JSON_SCHEMA: dict[str, str] = {
     "coach[].action": "str",
     "coach[].impact": "str|null",
     "secret_exposures": "int",
+    "suppressed_secrets": "int",
+    "suppression_note": "str",
+    "secrets[].suppressed": "bool",
+    "secrets[].suppressed_reason": "str",
     "secrets": "array",
     "secrets[].id": "str",
     "secrets[].priority": "str",
@@ -3242,10 +3419,17 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
                    "evidence": f.evidence, "action": f.action, "impact": f.impact}
                   for f in coach(fleet)],
         "secret_exposures": fleet.secret_exposures,
+        "suppressed_secrets": fleet.suppressed_secrets,
+        "suppression_note": "suppressed findings are still counted and still "
+                            "listed here; they are held back from the actionable "
+                            "list, not hidden. A scan with many suppressions "
+                            "should look different from a clean one.",
         "secrets": [
             {"priority": e["priority"], "types": sorted(e["kinds"]), "id": fp,
              "uses": e["uses"], "first_seen": e["first"], "last_seen": e["last"],
-             "projects": sorted(e["projects"])}
+             "projects": sorted(e["projects"]),
+             "suppressed": bool(e.get("suppressed")),
+             "suppressed_reason": e.get("suppressed_reason", "")}
             for fp, e in sorted(
                 fleet.secrets.items(),
                 key=lambda kv: ({"critical": 0, "high": 1, "low": 2}.get(kv[1]["priority"], 9),
@@ -3311,6 +3495,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="which agents to include (default: all)")
     ap.add_argument("--no-redact", action="store_true",
                     help="do NOT redact credentials from output (unsafe to share)")
+    ap.add_argument("--suppress", metavar="ID",
+                    help="mark a finding as a false positive on this machine. "
+                         "It stays counted; it leaves the actionable list.")
+    ap.add_argument("--reason", metavar="TEXT",
+                    help="why --suppress is correct. Recorded so the file is "
+                         "reviewable later.")
+    ap.add_argument("--suppressions", action="store_true",
+                    help="list current suppressions and where they come from")
     ap.add_argument("--root", metavar="DIR", help="transcript directory")
     ap.add_argument("--version", action="version", version=f"actualis {__version__}")
     args = ap.parse_args(argv)
@@ -3318,6 +3510,37 @@ def main(argv: list[str] | None = None) -> int:
     since = None
     if args.days:
         since = datetime.now(timezone.utc) - timedelta(days=args.days)
+
+    if args.suppressions:
+        c = C(use_color())
+        rule(c, "SUPPRESSIONS")
+        for path in suppression_paths():
+            mark = "" if path.exists() else f"  {c.dim}(none){c.off}"
+            print(f"  {c.dim}{path}{c.off}{mark}")
+        current = load_suppressions()
+        print()
+        if not current:
+            print(f"  {c.dim}Nothing suppressed. Add one with:{c.off}")
+            print(f"    actualis --suppress <id> --reason \"why\"")
+        for fp, why in sorted(current.items()):
+            print(f"  {fp}  {c.dim}{why}{c.off}")
+        print(f"\n  {c.dim}Suppressed findings are still counted and still appear "
+              f"in --json.{c.off}")
+        return 0
+
+    if args.suppress:
+        c = C(use_color())
+        try:
+            path = add_suppression(args.suppress, args.reason or "")
+        except ValueError as exc:
+            sys.exit(f"actualis: {exc}")
+        print(f"  suppressed {args.suppress} in {path}")
+        if not args.reason:
+            print(f"  {c.yellow}▲{c.off} no --reason given. In six months nobody "
+                  f"will know why this is here.")
+        print(f"  {c.dim}It stays counted; it leaves the actionable list. "
+              f"Remove the line to undo.{c.off}")
+        return 0
 
     if args.mcp:
         return mcp_serve()

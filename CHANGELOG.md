@@ -4,6 +4,33 @@
 
 ### Added
 
+- **You can tell it when it is wrong, where you see it.** A detector that cries
+  wolf gets ignored, and widening detection made that urgent rather than nice.
+
+  ```sh
+  actualis --suppress a41f9c02 --reason "test fixture in our CI config"
+  actualis --suppressions
+  ```
+
+  **A suppression never removes a finding from the count.** It is held back from
+  the actionable list and still appears in `--json` with `suppressed: true` and
+  its reason, and `suppressed_secrets` reports the total. If suppressing deleted
+  the finding, a heavily suppressed scan would be indistinguishable from a clean
+  one, and the report would be lying by omission.
+
+  The store is plain text — greppable, diffable, reviewable in a pull request,
+  editable by hand six months later. Read from
+  `$XDG_CONFIG_HOME/actualis/suppressions` and `./.actualis-suppressions`, so a
+  team can commit a shared list. Every entry carries a reason, and `--suppress`
+  without `--reason` says so rather than accepting a bare fingerprint quietly.
+
+  The report shows how to suppress **next to the findings themselves**, plus a
+  pre-filled issue URL for a detection that is wrong for everyone. The URL is
+  printed. It is never opened and nothing is ever sent — the percent-encoder is
+  hand-written rather than importing `urllib`, so "this file imports nothing
+  that can open a socket" stays an absolute rather than a rule with an
+  exception. A test asserts it matches `urllib.parse.quote` exactly.
+
 - **Rate provenance is now an ordered pecking order, not a boolean.** A rate was
   either `VENDOR` or `AGGREGATOR`, which lumped a reputable third party together
   with an outright guess. There are now five tiers, best to worst: `vendor`,
