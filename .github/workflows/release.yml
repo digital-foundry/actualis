@@ -79,3 +79,69 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           attestations: true   # PEP 740 provenance, verifiable against this repo
+
+  # The tray binaries are built by the same reusable workflow CI uses, so what
+  # is attached to a release cannot drift from what was tested.
+  tray:
+    uses: ./.github/workflows/tray-build.yml
+
+  # Without this, a tag published to PyPI and left the GitHub release pointing
+  # at the previous version's binaries. That happened twice on 2026-08-24 and
+  # was only caught by looking; nothing failed, the release simply never
+  # appeared. Automating it is the only way that stays fixed.
+  github-release:
+    needs: [build, pypi, tray]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # create the release and upload its assets
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # No `name:` downloads every artifact, each into its own directory.
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          path: artifacts/
+
+      - name: assemble assets
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find artifacts -type f \( -name 'actualis-tray-*' -o -name '*.whl' \
+            -o -name '*.tar.gz' \) -exec cp {} release/ \;
+          cd release
+          # Explicit prefix rather than `*`, so the checksum file cannot list
+          # itself depending on when the shell creates it.
+          shasum -a 256 actualis-* > SHA256SUMS
+          ls -l
+
+      # The notes are the changelog section for this exact version. If the
+      # section is missing the release fails rather than shipping an empty one.
+      - name: release notes from the changelog
+        run: |
+          set -euo pipefail
+          python3 - "${GITHUB_REF_NAME#v}" > notes.md <<'EOF'
+          import re, sys
+          ver = sys.argv[1]
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          m = re.search(rf"^## {re.escape(ver)}\b.*?$(.*?)(?=^## |\Z)", text, re.M | re.S)
+          if not m:
+              sys.exit(f"::error::CHANGELOG.md has no section for {ver}")
+          body = m.group(1).strip()
+          if len(body) < 40:
+              sys.exit(f"::error::CHANGELOG section for {ver} is empty or a stub")
+          print(body)
+          EOF
+          echo "--- notes preview ---"; head -12 notes.md
+
+      - name: create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Actualis ${GITHUB_REF_NAME#v}" \
+            --notes-file notes.md \
+            --latest \
+            release/*
