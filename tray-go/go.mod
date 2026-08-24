@@ -2,7 +2,7 @@ module github.com/digital-foundry/actualis/tray
 
 go 1.23
 
-require fyne.io/systray v1.11.0
+require fyne.io/systray v1.12.2
 
 require (
 	github.com/godbus/dbus/v5 v5.1.0 // indirect
