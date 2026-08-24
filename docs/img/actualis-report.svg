@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="687" height="884" viewBox="0 0 687 884" font-family="ui-monospace,SFMono-Regular,Menlo,'IBM Plex Mono',monospace" font-size="13">
+<title>actualis report — illustrative output from a synthetic fleet</title>
+<rect width="687" height="884" rx="8" fill="#0B0C0E"/>
+<circle cx="24" cy="22" r="5.5" fill="#3A414E"/><circle cx="42" cy="22" r="5.5" fill="#3A414E"/><circle cx="60" cy="22" r="5.5" fill="#3A414E"/>
+<text x="80" y="26" fill="#6C7480" font-size="11" xml:space="preserve">actualis — illustrative output, synthetic data</text>
+<text x="26.0" y="60.0" fill="#FFFFFF" xml:space="preserve" font-weight="600">FLEET</text>
+<text x="74.3" y="60.0" fill="#6C7480" xml:space="preserve">──────────────────────────────────────────────────────────────────</text>
+<text x="26.0" y="79.0" fill="#F2EFE9" xml:space="preserve">  window        2026-07-20 → 2026-08-19  (30 days)</text>
+<text x="26.0" y="98.0" fill="#F2EFE9" xml:space="preserve">  transcripts   5 files, 0.00 GB</text>
+<text x="26.0" y="117.0" fill="#F2EFE9" xml:space="preserve">  messages      300</text>
+<text x="26.0" y="136.0" fill="#F2EFE9" xml:space="preserve">  tokens        164,491,707</text>
+<text x="42.1" y="155.0" fill="#FFFFFF" xml:space="preserve" font-weight="600">cost</text>
+<text x="154.8" y="155.0" fill="#FFFFFF" xml:space="preserve" font-weight="600">$102.82</text>
+<text x="219.2" y="155.0" fill="#6C7480" xml:space="preserve">notional, at API list price</text>
+<text x="42.1" y="174.0" fill="#6C7480" xml:space="preserve">per active day $3.32   ·  per week $23.22   ·  31 active days of 30</text>
+<text x="26.0" y="212.0" fill="#FFFFFF" xml:space="preserve" font-weight="600">BY MODEL</text>
+<text x="98.5" y="212.0" fill="#6C7480" xml:space="preserve">───────────────────────────────────────────────────────────────</text>
+<text x="26.0" y="231.0" fill="#F2EFE9" xml:space="preserve">  model                       msgs          cost   share</text>
+<text x="26.0" y="250.0" fill="#F2EFE9" xml:space="preserve">  claude-opus-5                220        $91.82   </text>
+<text x="436.6" y="250.0" fill="#6C7480" xml:space="preserve"> 89.3%</text>
+<text x="26.0" y="269.0" fill="#F2EFE9" xml:space="preserve">  claude-sonnet-5               54         $9.08   </text>
+<text x="436.6" y="269.0" fill="#6C7480" xml:space="preserve">  8.8%</text>
+<text x="26.0" y="288.0" fill="#F2EFE9" xml:space="preserve">  claude-haiku-4-5              26         $1.93   </text>
+<text x="436.6" y="288.0" fill="#6C7480" xml:space="preserve">  1.9%</text>
+<text x="26.0" y="326.0" fill="#FFFFFF" xml:space="preserve" font-weight="600">BY PROJECT  (top 12)</text>
+<text x="195.1" y="326.0" fill="#6C7480" xml:space="preserve">───────────────────────────────────────────────────</text>
+<text x="26.0" y="345.0" fill="#F2EFE9" xml:space="preserve">        $48.20   46.9%</text>
+<text x="211.2" y="345.0" fill="#7FA8BF" xml:space="preserve">███████████████</text>
+<text x="331.9" y="345.0" fill="#F2EFE9" xml:space="preserve"> home-dev-orbital-ledger</text>
+<text x="26.0" y="364.0" fill="#F2EFE9" xml:space="preserve">        $22.95   22.3%</text>
+<text x="211.2" y="364.0" fill="#7FA8BF" xml:space="preserve">███████</text>
+<text x="267.5" y="364.0" fill="#F2EFE9" xml:space="preserve"> home-dev-atlas-gateway</text>
+<text x="26.0" y="383.0" fill="#F2EFE9" xml:space="preserve">        $18.38   17.9%</text>
+<text x="211.2" y="383.0" fill="#7FA8BF" xml:space="preserve">█████</text>
+<text x="251.4" y="383.0" fill="#F2EFE9" xml:space="preserve"> home-dev-mesa-scheduler</text>
+<text x="26.0" y="402.0" fill="#F2EFE9" xml:space="preserve">         $8.36    8.1%</text>
+<text x="211.2" y="402.0" fill="#7FA8BF" xml:space="preserve">██</text>
+<text x="227.3" y="402.0" fill="#F2EFE9" xml:space="preserve"> home-dev-pinnacle-docs</text>
+<text x="26.0" y="421.0" fill="#F2EFE9" xml:space="preserve">         $4.93    4.8%</text>
+<text x="211.2" y="421.0" fill="#7FA8BF" xml:space="preserve">█</text>
+<text x="219.2" y="421.0" fill="#F2EFE9" xml:space="preserve"> home-dev-quarry-cli</text>
+<text x="26.0" y="459.0" fill="#FFFFFF" xml:space="preserve" font-weight="600">CACHE EFFICIENCY</text>
+<text x="162.9" y="459.0" fill="#6C7480" xml:space="preserve">───────────────────────────────────────────────────────</text>
+<text x="26.0" y="478.0" fill="#F2EFE9" xml:space="preserve">  fleet hit rate  </text>
+<text x="170.9" y="478.0" fill="#FFFFFF" xml:space="preserve" font-weight="600">97.3%</text>
+<text x="211.2" y="478.0" fill="#F2EFE9" xml:space="preserve"> of input context served from cache</text>
+<text x="26.0" y="497.0" fill="#F2EFE9" xml:space="preserve">  saved           </text>
+<text x="170.9" y="497.0" fill="#FFFFFF" xml:space="preserve" font-weight="600">$593.37</text>
+<text x="235.3" y="497.0" fill="#6C7480" xml:space="preserve">versus sending the same context uncached</text>
+<text x="26.0" y="535.0" fill="#F2EFE9" xml:space="preserve">   hit rate         context        saved  project</text>
+<text x="42.1" y="554.0" fill="#6FBF9A" xml:space="preserve">    97.2%</text>
+<text x="114.6" y="554.0" fill="#F2EFE9" xml:space="preserve">      73,674,272      $275.73  home-dev-orbital-ledger</text>
+<text x="42.1" y="592.0" fill="#6C7480" xml:space="preserve">No project is more than 15 points below your median of 97.2%.</text>
+<text x="26.0" y="630.0" fill="#FFFFFF" xml:space="preserve" font-weight="600">SHELL AUDIT</text>
+<text x="122.6" y="630.0" fill="#6C7480" xml:space="preserve">────────────────────────────────────────────────────────────</text>
+<text x="26.0" y="649.0" fill="#F2EFE9" xml:space="preserve">  bash calls    187  </text>
+<text x="195.1" y="649.0" fill="#6C7480" xml:space="preserve">100% of all agent tool calls</text>
+<text x="26.0" y="668.0" fill="#F2EFE9" xml:space="preserve">  permission    auto=226  default=74</text>
+<text x="42.1" y="725.0" fill="#E86A5A" xml:space="preserve">▲ 4 distinct secrets</text>
+<text x="203.1" y="725.0" fill="#F2EFE9" xml:space="preserve"> exposed across 12 commands </text>
+<text x="428.5" y="725.0" fill="#6C7480" xml:space="preserve">(4 worth rotating)</text>
+<text x="26.0" y="763.0" fill="#F2EFE9" xml:space="preserve">            type                         uses  first       last        id</text>
+<text x="58.2" y="782.0" fill="#E86A5A" xml:space="preserve">ROTATE </text>
+<text x="114.6" y="782.0" fill="#F2EFE9" xml:space="preserve"> Stripe key                      6  2026-07-23  2026-08-19  </text>
+<text x="597.6" y="782.0" fill="#6C7480" xml:space="preserve">6942a7f5</text>
+<text x="58.2" y="801.0" fill="#E86A5A" xml:space="preserve">ROTATE </text>
+<text x="114.6" y="801.0" fill="#F2EFE9" xml:space="preserve"> AWS access key                  2  2026-08-15  2026-08-15  </text>
+<text x="597.6" y="801.0" fill="#6C7480" xml:space="preserve">1a5d44a2</text>
+<text x="58.2" y="820.0" fill="#E86A5A" xml:space="preserve">ROTATE </text>
+<text x="114.6" y="820.0" fill="#F2EFE9" xml:space="preserve"> Anthropic key                   1  2026-07-30  2026-07-30  </text>
+<text x="597.6" y="820.0" fill="#6C7480" xml:space="preserve">7a01c70c</text>
+<text x="58.2" y="839.0" fill="#E08A24" xml:space="preserve">rotate </text>
+<text x="114.6" y="839.0" fill="#F2EFE9" xml:space="preserve"> GitHub PAT                      3  2026-07-27  2026-08-19  </text>
+<text x="597.6" y="839.0" fill="#6C7480" xml:space="preserve">ba86ffed</text>
+</svg>

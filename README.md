@@ -26,6 +26,13 @@ more than one agent, you cannot currently answer:
 `actualis` answers all five from data already on your machine,
 across **Claude Code** and **Codex**, in one report.
 
+<p align="center">
+  <img src="docs/img/actualis-report.svg" alt="An actualis report: fleet cost, spend by model and project, cache efficiency, and a table of exposed credentials ranked for rotation." width="700">
+</p>
+
+<p align="center"><sub>Illustrative output from a synthetic fleet — every project, branch and
+credential above is invented. Regenerate with <code>tools/make-demo-fleet.py</code>.</sub></p>
+
 ```
 $ actualis
 
