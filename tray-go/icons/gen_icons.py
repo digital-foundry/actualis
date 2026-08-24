@@ -76,9 +76,13 @@ SYNC_SEGS  = 8
 # else -- crossbar position and length, dot sizes and offsets, ring stroke
 # ratio, the square A bbox -- stays exactly as measured off the sheet.
 CAP_BOOST    = 1.30        # 0.72 -> 0.94 of canvas height
-STROKE_BOOST = 1.70        # 0.12 -> 0.204 of cap; also applied
-                           # to the exposed ring, so it does not
-                           # stay hairline beside a bolder A
+STROKE_BOOST = 1.35        # 0.12 -> 0.162 of cap; also applied to the
+                           # exposed ring so it does not stay hairline
+                           # beside a bolder A. Capped here by LEGIBILITY,
+                           # not by the coverage target: the exposed state
+                           # shrinks the A to 0.571 of the ring, and past
+                           # ~1.5 the crossbar fills the counter and the
+                           # mark reads as a filled triangle with a dot.
 
 S  = 44                    # canvas HEIGHT, 22pt @2x; macOS scales to this
 SW = 50                    # canvas WIDTH: the monitoring dots need the room,
@@ -168,7 +172,11 @@ def a_mark(cap, cx, cy, ink, alpha=1.0):
     right = (cx + cap / 2 - h, bot - h)
     legs = [(seg(*apex, *left, stroke), ink, alpha),
             (seg(*apex, *right, stroke), ink, alpha)]
-    dw = DASH_W * cap
+    # The boost scales the crossbar in BOTH dimensions. Thickening it alone
+    # takes the sheet's 2.6:1 dash to 1.9:1, and inside the exposed ring --
+    # where the A is only 0.571 of the ring -- it stops reading as a dash and
+    # becomes a dot.
+    dw = DASH_W * STROKE_BOOST * cap
     dy = top + DASH_Y * cap
     dash = [(seg(cx - dw / 2 + h, dy, cx + dw / 2 - h, dy, stroke), AMBER, alpha)]
     return legs + dash

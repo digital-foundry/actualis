@@ -38,11 +38,25 @@ nothing else.
 
 ```
 CAP_BOOST    = 1.30    #  0.72 -> 0.936 of canvas height
-STROKE_BOOST = 1.70    #  0.12 -> 0.204 of cap
+STROKE_BOOST = 1.35    #  0.12 -> 0.162 of cap
 ```
 
-`STROKE_BOOST` is applied to the exposed ring as well, so it does not stay
-hairline beside a bolder A.
+`STROKE_BOOST` applies to three things, and it has to apply to all three or the
+mark comes apart:
+
+- the A's legs;
+- the **exposed ring**, otherwise it stays hairline beside a bolder A;
+- the **crossbar's length as well as its thickness**. The sheet's dash is
+  2.6:1. Boosting only the thickness takes it to 1.9:1, and inside the exposed
+  ring -- where the A is reduced to 0.571 of the ring -- it stops reading as a
+  dash and becomes a dot.
+
+`STROKE_BOOST` is capped at 1.35 by **legibility, not by the coverage target**.
+1.70 hits the neighbour coverage band exactly and is wrong: at that weight the
+exposed A's counter closes and the mark reads as a filled triangle. Candidates
+were rendered at true menu bar scale and compared before choosing. The final
+figure sits a little under the neighbour band -- coverage 0.38-0.39 against
+0.44-0.53 -- and that gap is the price of keeping the counter open.
 
 Everything else stays exactly as measured off the sheet: the square A bbox, the
 crossbar's length and its position 0.81 down the cap, the two unequal amber
@@ -57,8 +71,9 @@ choices of their own:
 - The monitoring dots are clamped so their tops align with the A's apex. The
   sheet places them slightly above it, which at the boosted cap is off-canvas.
 
-Result, measured the same way as the table above: every state renders at 30px
-with coverage 0.42–0.46, against a neighbour band of 0.44–0.53.
+Result: every state renders at 30px, matching the neighbour median exactly,
+with the four states that carry the A-mark at coverage 0.38–0.39 against a
+neighbour band of 0.44–0.53. Up from 0.31.
 
 ## Consequences
 
@@ -79,6 +94,10 @@ with coverage 0.42–0.46, against a neighbour band of 0.44–0.53.
   this repo's call. Recorded here so it can be raised.
 - **Boost weight without scale.** Rejected: a heavier stroke on a small mark
   reads as a blob rather than as presence.
+- **Boost weight until coverage matches the neighbour band** (STROKE_BOOST
+  1.70). Rejected on inspection at true menu bar scale: it hits the number and
+  destroys the glyph. Coverage is a useful proxy for "does this hold its own",
+  not a target to optimise into.
 
 ## Open item
 
