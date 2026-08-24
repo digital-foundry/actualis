@@ -34,7 +34,7 @@ from collections import Counter, OrderedDict, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 # --------------------------------------------------------------------------
 # Pricing
