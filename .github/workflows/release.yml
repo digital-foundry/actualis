@@ -134,14 +134,24 @@ jobs:
           EOF
           echo "--- notes preview ---"; head -12 notes.md
 
+      # A release candidate must not be marked latest: anyone landing on the
+      # repository would be shown a pre-release as the current version, and
+      # `gh release download` with no tag would hand them one.
       - name: create the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          case "$ver" in
+            *a[0-9]*|*b[0-9]*|*rc[0-9]*|*.dev[0-9]*)
+              echo "$ver is a pre-release"; flags="--prerelease" ;;
+            *)
+              flags="--latest" ;;
+          esac
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "Actualis ${GITHUB_REF_NAME#v}" \
+            --title "Actualis $ver" \
             --notes-file notes.md \
-            --latest \
+            $flags \
             release/*
