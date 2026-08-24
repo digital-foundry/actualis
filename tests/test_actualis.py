@@ -4,6 +4,11 @@ Every test here corresponds to a defect found while validating the tool against
 ~48,000 real agent commands. They exist so those specific bugs cannot come back.
 
     python3 -m unittest discover -s tests -v
+
+Every credential-shaped string below is SYNTHETIC and has never been valid:
+obvious filler, a vendor's own published example (AKIAIOSFODNN7EXAMPLE is AWS's
+documentation key), or self-describing. A tool that detects secrets cannot be
+tested without them. See .gitleaksignore.
 """
 
 import importlib.util
@@ -51,12 +56,12 @@ class TestRedaction(unittest.TestCase):
         self.assertIn("db:5432", out)
 
     def test_redacts_authorization_header(self):
-        out = af.redact("curl -H 'Authorization: Bearer sk-ant-realvalue123456' https://x")
-        self.assertNotIn("sk-ant-realvalue123456", out)
+        out = af.redact("curl -H 'Authorization: Bearer sk-ant-fixtureonlyvalue1' https://x")
+        self.assertNotIn("sk-ant-fixtureonlyvalue1", out)
 
     def test_keeps_auth_scheme_word(self):
         """Regression: 'AUTH' in 'Authorization:' used to eat the scheme word."""
-        out = af.redact("curl -H 'Authorization: Bearer sk-ant-realvalue123456' https://x")
+        out = af.redact("curl -H 'Authorization: Bearer sk-ant-fixtureonlyvalue1' https://x")
         self.assertIn("Bearer", out)
 
     def test_shell_variable_reference_is_not_a_secret(self):

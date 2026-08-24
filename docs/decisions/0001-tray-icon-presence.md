@@ -5,7 +5,7 @@
 
 ## Context
 
-`branding/trayiconMac.png` specifies the tray icon geometry and its usage
+The ACTUALIS macOS icon sheet specifies the tray icon geometry and its usage
 notes say **"Do not alter proportions or stroke weights."** The icon set was
 rebuilt to follow it exactly — every ratio measured off the sheet rather than
 eyeballed, with the source measurement recorded beside each constant.

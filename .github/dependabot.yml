@@ -1,0 +1,17 @@
+# The Python CLI has no runtime dependencies by design, so there is no pip
+# ecosystem to watch here. What can rot is the tray's Go modules and the
+# actions pinned in CI, and a stale action is a supply-chain surface on a
+# repository whose whole pitch is that it does not have one.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "gomod"
+    directory: "/tray-go"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5

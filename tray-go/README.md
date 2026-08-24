@@ -39,7 +39,7 @@ baseline. Identity stays constant; state is carried by an added *form*.
 | error | A-mark with a slash (the sheet's MUTED glyph) | data could not be read |
 
 **The geometry is measured, not eyeballed.** Every ratio in
-`icons/gen_icons.py` was taken off `branding/trayiconMac.png` — the 32px cells
+`icons/gen_icons.py` was taken off the ACTUALIS macOS icon sheet — the 32px cells
 of the SIZES table for layout, the 98px overview tiles for stroke weight, with
 the source measurement recorded beside each constant. The sheet says *"do not
 alter proportions or stroke weights"*, so the generator is the spec and the

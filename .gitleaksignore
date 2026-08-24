@@ -1,0 +1,10 @@
+# Actualis detects credentials in agent logs, so its test suite necessarily
+# contains credential-shaped strings. Every one is synthetic: they are either
+# obvious filler (abcdefghijklmnop), vendors' own published examples
+# (AKIAIOSFODNN7EXAMPLE is AWS's documentation key), or self-describing
+# (vcp_notarealtokenjustafixture01).
+#
+# None has ever been valid. This file exists so a fork or a downstream scan
+# does not drown in findings that the project deliberately created.
+tests/test_actualis.py
+docs/secrets.md

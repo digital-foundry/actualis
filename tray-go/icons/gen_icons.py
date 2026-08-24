@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate the tray icon set from the ACTUALIS macOS icon sheet.
 
-Every constant below is measured off branding/trayiconMac.png rather than
+Every constant below is measured off the ACTUALIS macOS icon sheet rather than
 chosen by eye. The 32px cells of the SIZES table are the authoritative
 templates; the 98px STATE ICONS OVERVIEW tiles are used where the 32px
 cells are too coarse to measure (stroke weight, mainly). Measurements are
@@ -9,6 +9,11 @@ recorded next to each constant so they can be re-derived.
 
 The sheet's usage notes say "do not alter proportions or stroke weights",
 so these ratios are the spec. Change them only by re-measuring the sheet.
+
+The sheet itself is not in this repository. The AGPL licenses the code, not the
+marks, and shipping the brand artwork would invite forks to ship the identity
+too. The measurements below are therefore the authoritative public record of
+the geometry; the sheet is held privately by Digital Foundry Solutions, LLC.
 
 Two colourways are emitted per state because macOS template images are
 alpha-only -- they cannot carry the amber, and the sheet requires amber in

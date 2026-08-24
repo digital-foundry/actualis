@@ -38,7 +38,7 @@ import (
 
 // ACTUALIS icon system 1.0.0.
 //
-// Geometry comes from branding/trayiconMac.png, measured rather than eyeballed;
+// Geometry comes from the ACTUALIS macOS icon sheet, measured rather than eyeballed;
 // icons/gen_icons.py records every ratio and where on the sheet it was taken
 // from. The sheet says "do not alter proportions or stroke weights", so the
 // generator is the spec and the PNGs are build output.

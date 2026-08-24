@@ -29,8 +29,9 @@ dependencies = []
 actualis = "actualis:main"
 
 [project.urls]
-Homepage = "https://github.com/digitalfoundry-aw/actualis"
-Issues = "https://github.com/digitalfoundry-aw/actualis/issues"
+Homepage = "https://actualis.app"
+Source = "https://github.com/digital-foundry/actualis"
+Issues = "https://github.com/digital-foundry/actualis/issues"
 
 [tool.hatch.build.targets.wheel]
 include = ["actualis.py"]
