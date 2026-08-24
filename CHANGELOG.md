@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.1.3 — 2026-08-24
+
+Detection got wider and better sourced, and there is now a way to tell it when
+it is wrong. **If you are on 0.1.0, upgrade: it overstated cost by 2.13×.**
 
 ### Added
 
