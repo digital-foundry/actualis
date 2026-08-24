@@ -2323,6 +2323,10 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
         for r in fleet.roots:
             print(f"  {c.dim}source        {r}{c.off}")
         print(f"  messages      {num(fleet.messages)}")
+        # Printed so a screenshot of this report can be checked against the
+        # --json payload it came from. Same fleet, same digest.
+        print(f"  {c.dim}digest        {report_digest(_to_json_body(fleet)):.16}"
+              f"  (sha256, first 16){c.off}")
         if fleet.duplicate_usage_records:
             # Shown rather than hidden: this number is the difference between
             # the old headline and the real one, and a reader who saw the old
@@ -2694,6 +2698,7 @@ JSON_SCHEMA_VERSION = 1
 JSON_SCHEMA: dict[str, str] = {
     "schema_version": "int",
     "version": "str",
+    "report_sha256": "str",
     "window.from": "str|null",
     "window.to": "str|null",
     "window.days": "float",
@@ -2775,7 +2780,39 @@ JSON_SCHEMA: dict[str, str] = {
     "aggregator_priced_models.*": "int",
 }
 
+def canonical_json(payload: dict) -> str:
+    """The exact bytes the report hash is taken over.
+
+    Sorted keys and no incidental whitespace, so two runs over the same data
+    produce the same string regardless of dict ordering. ensure_ascii=False
+    keeps the bytes identical to what a UTF-8 reader sees rather than escaping
+    non-ASCII into a second representation.
+    """
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False)
+
+
+def report_digest(payload: dict) -> str:
+    """sha256 of the report, excluding the digest field itself.
+
+    Self-referential by construction otherwise: the hash cannot cover a field
+    whose value is the hash. Removing exactly that one key is what makes the
+    figure independently recomputable, and REPORT_DIGEST_EXCLUDES names it in
+    one place so the emitter and any verifier cannot disagree.
+    """
+    body = {k: v for k, v in payload.items() if k not in REPORT_DIGEST_EXCLUDES}
+    return hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
+
+
+REPORT_DIGEST_EXCLUDES = frozenset({"report_sha256"})
+
 def to_json(fleet: Fleet, raw: bool = False) -> dict:
+    payload = _to_json_body(fleet, raw)
+    payload["report_sha256"] = report_digest(payload)
+    return payload
+
+
+def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
     return {
         "schema_version": JSON_SCHEMA_VERSION,
         "version": __version__,

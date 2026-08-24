@@ -1245,3 +1245,80 @@ class TestJSONSchemaFreeze(unittest.TestCase):
         for phrase in ["schema_version", "Compatibility", "never"]:
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, doc)
+
+
+class TestReportDigest(unittest.TestCase):
+    """The report is content-addressed. This is the first link in the evidence
+    chain: hash-chaining and Merkle roots both build on a digest that means
+    something, so it has to be reproducible and independently recomputable by
+    someone who does not trust this tool.
+    """
+
+    @staticmethod
+    def _fleet(cost=1):
+        f = af.Fleet()
+        f.add_usage("proj", "claude-sonnet-5",
+                    {"input_tokens": cost, "output_tokens": cost},
+                    datetime(2026, 8, 1, tzinfo=timezone.utc), "main")
+        return f
+
+    def test_same_data_gives_the_same_digest(self):
+        self.assertEqual(af.to_json(self._fleet())["report_sha256"],
+                         af.to_json(self._fleet())["report_sha256"])
+
+    def test_different_data_gives_a_different_digest(self):
+        self.assertNotEqual(af.to_json(self._fleet(1))["report_sha256"],
+                            af.to_json(self._fleet(2))["report_sha256"])
+
+    def test_a_reader_can_recompute_it_without_this_tool(self):
+        """The point of a digest nobody can reproduce is nothing. This is the
+        exact procedure documented in docs/json.md."""
+        payload = af.to_json(self._fleet())
+        body = {k: v for k, v in payload.items() if k != "report_sha256"}
+        canonical = json.dumps(body, sort_keys=True, separators=(",", ":"),
+                               ensure_ascii=False)
+        import hashlib
+        self.assertEqual(hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+                         payload["report_sha256"])
+
+    def test_the_digest_does_not_cover_itself(self):
+        """Self-reference would make it uncomputable. Tampering with the digest
+        field must not change what the digest recomputes to -- otherwise there
+        is no fixed point and no way for a reader to check the figure."""
+        self.assertEqual(af.REPORT_DIGEST_EXCLUDES, frozenset({"report_sha256"}))
+        payload = af.to_json(self._fleet())
+        original = payload["report_sha256"]
+        payload["report_sha256"] = "0" * 64
+        self.assertEqual(af.report_digest(payload), original)
+
+    def test_key_order_does_not_change_the_digest(self):
+        """Canonicalisation is the whole reason this is stable. A digest that
+        moved when a dict happened to iterate differently would be worthless."""
+        payload = af.to_json(self._fleet())
+        body = {k: v for k, v in payload.items() if k != "report_sha256"}
+        shuffled = dict(reversed(list(body.items())))
+        self.assertEqual(af.canonical_json(body), af.canonical_json(shuffled))
+
+    def test_non_ascii_content_does_not_break_reproducibility(self):
+        f = af.Fleet()
+        f.add_usage("проект-café-日本", "claude-sonnet-5",
+                    {"input_tokens": 1, "output_tokens": 1},
+                    datetime(2026, 8, 1, tzinfo=timezone.utc))
+        a, b = af.to_json(f)["report_sha256"], af.to_json(f)["report_sha256"]
+        self.assertEqual(a, b)
+        self.assertEqual(len(a), 64)
+
+    def test_the_human_report_prints_the_same_digest(self):
+        """So a screenshot can be checked against the payload it came from."""
+        import io, contextlib
+        fleet = self._fleet()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            af.render(fleet, af.C(False), bash_only=False, top=5)
+        self.assertIn(af.to_json(fleet)["report_sha256"][:16], buf.getvalue())
+
+    def test_the_verification_procedure_is_documented(self):
+        doc = (ROOT / "docs" / "json.md").read_text()
+        for phrase in ["report_sha256", "sort_keys", "sha256"]:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, doc)
