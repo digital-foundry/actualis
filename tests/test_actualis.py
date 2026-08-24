@@ -241,18 +241,36 @@ class TestPricing(unittest.TestCase):
         self.assertEqual(af.CACHE_WRITE_1H_MULT, 2.00)
 
     def test_sonnet5_intro_pricing_expires(self):
+        # Sonnet 5 launched at $2/$10 "introductory through 2026-08-31"; that
+        # became the standard price and the rise to $3/$15 was cancelled. The
+        # rate must therefore NOT change across that boundary — the old date
+        # gate would have overstated every September session by 50%.
         before = datetime(2026, 8, 1, tzinfo=timezone.utc)
         after = datetime(2026, 9, 1, tzinfo=timezone.utc)
         self.assertEqual(af.rates_for("claude-sonnet-5", before)[:2], (2.0, 10.0))
-        self.assertEqual(af.rates_for("claude-sonnet-5", after)[:2], (3.0, 15.0))
+        self.assertEqual(af.rates_for("claude-sonnet-5", after)[:2], (2.0, 10.0))
 
     def test_unknown_model_is_flagged_not_silently_guessed(self):
-        *_, known = af.rates_for("claude-does-not-exist", None)
+        known = af.rates_for("claude-does-not-exist", None)[3]
         self.assertFalse(known)
 
     def test_provider_is_reported(self):
         self.assertEqual(af.rates_for("claude-opus-5", None)[2], "anthropic")
         self.assertEqual(af.rates_for("gpt-5.2-codex", None)[2], "openai")
+
+    def test_every_rate_declares_where_it_came_from(self):
+        for model, entry in af.PRICING.items():
+            self.assertEqual(len(entry), 4, f"{model} is missing a source")
+            self.assertIn(entry[3], (af.VENDOR, af.AGGREGATOR), model)
+
+    def test_the_one_aggregator_rate_is_marked_as_such(self):
+        # OpenAI publishes no gpt-5.2-codex line, so this rate is third-party.
+        # If that ever changes, promote it to VENDOR rather than deleting this.
+        self.assertEqual(af.rates_for("gpt-5.2-codex", None)[4], af.AGGREGATOR)
+        self.assertEqual(af.rates_for("claude-opus-5", None)[4], af.VENDOR)
+
+    def test_unknown_models_are_never_vendor_sourced(self):
+        self.assertEqual(af.rates_for("totally-made-up", None)[4], af.AGGREGATOR)
 
     def test_cost_math_end_to_end(self):
         """1M of each bucket on Opus ($5 in / $25 out) = 5 + 25 + 10 + 6.25 + 0.5."""
@@ -472,12 +490,19 @@ class TestSubagents(unittest.TestCase):
         f.add_subagent(self.RESULT, datetime(2026, 8, 1, tzinfo=timezone.utc))
         self.assertAlmostEqual(f.sub_cost_floor, 10.0, places=6)
 
-    def test_undated_call_uses_the_conservative_rate(self):
-        """No timestamp means no intro discount: over-stating a floor is safer
-        than under-stating it."""
+    def test_undated_call_prices_the_same_as_a_dated_one(self):
+        """This used to assert a higher floor for undated calls, because Sonnet 5
+        had a dated introductory rate and skipping it over-stated rather than
+        under-stated. That rate is now permanent, so no rate is date-dependent
+        and an undated call must agree with a dated one. If a future model gets
+        scheduled pricing, this is the test that should start failing."""
         f = af.Fleet()
         f.add_subagent(self.RESULT, None)
-        self.assertAlmostEqual(f.sub_cost_floor, 15.0, places=6)
+        self.assertAlmostEqual(f.sub_cost_floor, 10.0, places=6)
+
+        dated = af.Fleet()
+        dated.add_subagent(self.RESULT, datetime(2026, 12, 1, tzinfo=timezone.utc))
+        self.assertAlmostEqual(f.sub_cost_floor, dated.sub_cost_floor, places=6)
 
     def test_one_million_context_suffix_is_stripped_for_pricing(self):
         f = af.Fleet()
@@ -802,6 +827,17 @@ class TestDocumentation(unittest.TestCase):
         for k in kinds:
             with self.subTest(kind=k):
                 self.assertIn(k, doc)
+
+    def test_every_json_key_is_documented(self):
+        """docs/json.md was only checked for existence, so three keys had gone
+        undocumented — two of them for some time. A field nobody wrote down is a
+        field consumers cannot rely on."""
+        f = af.Fleet()
+        payload = af.to_json(f)
+        doc = (ROOT / "docs" / "json.md").read_text()
+        undocumented = [k for k in payload if f"`{k}`" not in doc]
+        self.assertEqual(undocumented, [],
+                         f"undocumented --json keys: {undocumented}")
 
     def test_expected_docs_exist_and_are_not_stubs(self):
         for rel in ["README.md", "LICENSE", "CHANGELOG.md", "CONTRIBUTING.md",

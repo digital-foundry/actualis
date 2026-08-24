@@ -18,6 +18,7 @@ that and prints a warning.
 | `subagents` | see below |
 | `cache` | `fleet_hit_rate_pct`, `saved_usd`, `by_project{}` |
 | `by_ticket[]` | see below |
+| `by_ticket` | cost and message counts per ticket, parsed from branch names |
 | `by_branch` | cost per branch bucket, including `trunk` and `detached HEAD` |
 | `by_model` | cost per model |
 | `by_project` | cost per project |
@@ -25,13 +26,14 @@ that and prints a warning.
 | `tools` | tool-call counts, descending |
 | `bash` | `total`, `commands{}`, `flag_counts{}`, `flags[]` |
 | `coach` | findings: `id`, `severity`, `title`, `evidence`, `action`, `impact` |
-| `secrets[]` | see below |
+| `secrets` | array; see below |
 | `secret_exposures` | commands containing credential material |
 | `secret_projects` | those commands per project |
 | `redacted` | whether values were masked (`true` unless `--no-redact`) |
 | `permission_modes` | turns per permission mode |
 | `denials` | rejections by kind |
-| `unknown_models` | models seen with no pricing entry |
+| `unknown_models` | models seen with no pricing entry, billed at Opus-tier rates |
+| `aggregator_priced_models` | models priced from a third party because the vendor publishes no rate for that id |
 
 ## `secrets[]`
 

@@ -63,40 +63,64 @@ CACHE_WRITE_1H_MULT = 2.00
 #   openai     input_tokens INCLUDES cached_input_tokens. Cached portion bills at
 #              0.10x, the rest at full rate. There is no cache-write premium, and
 #              reasoning_output_tokens is a subset of output_tokens, not an addition.
+# Rate provenance. A cost tool that cannot say where a number came from is
+# asking to be trusted rather than checked, so every rate carries its source.
+# VENDOR means the provider's own published price list; AGGREGATOR means a
+# third party, used only where the vendor does not publish that model id.
+VENDOR = "vendor"
+AGGREGATOR = "aggregator"
+
+# Verified against the vendors' own pages on 2026-08-24:
+#   platform.claude.com/docs/en/about-claude/pricing
+#   developers.openai.com/api/docs/pricing
 PRICING = {
-    # model id            (input $/Mtok, output $/Mtok, provider)
-    "claude-fable-5":     (10.0, 50.0, "anthropic"),
-    "claude-mythos-5":    (10.0, 50.0, "anthropic"),
-    "claude-opus-5":      (5.0, 25.0, "anthropic"),
-    "claude-opus-4-8":    (5.0, 25.0, "anthropic"),
-    "claude-opus-4-7":    (5.0, 25.0, "anthropic"),
-    "claude-opus-4-6":    (5.0, 25.0, "anthropic"),
-    "claude-sonnet-5":    (3.0, 15.0, "anthropic"),
-    "claude-sonnet-4-6":  (3.0, 15.0, "anthropic"),
-    "claude-haiku-4-5":   (1.0, 5.0, "anthropic"),
-    # OpenAI rates via pricepertoken.com, 2026-08-22. Third-party aggregator,
-    # not OpenAI's own page: verify before trusting a number that matters.
-    "gpt-5.2-codex":      (1.75, 14.0, "openai"),
+    # model id            (input $/Mtok, output $/Mtok, provider,   source)
+    "claude-fable-5":     (10.0, 50.0, "anthropic", VENDOR),
+    "claude-mythos-5":    (10.0, 50.0, "anthropic", VENDOR),
+    "claude-opus-5":      (5.0, 25.0, "anthropic", VENDOR),
+    "claude-opus-4-8":    (5.0, 25.0, "anthropic", VENDOR),
+    "claude-opus-4-7":    (5.0, 25.0, "anthropic", VENDOR),
+    "claude-opus-4-6":    (5.0, 25.0, "anthropic", VENDOR),
+    "claude-opus-4-5":    (5.0, 25.0, "anthropic", VENDOR),
+    "claude-opus-4-1":    (15.0, 75.0, "anthropic", VENDOR),   # retired, still billable on Bedrock/GCP
+    "claude-sonnet-5":    (2.0, 10.0, "anthropic", VENDOR),
+    "claude-sonnet-4-6":  (3.0, 15.0, "anthropic", VENDOR),
+    "claude-sonnet-4-5":  (3.0, 15.0, "anthropic", VENDOR),
+    "claude-haiku-4-5":   (1.0, 5.0, "anthropic", VENDOR),
+    "claude-haiku-3-5":   (0.80, 4.0, "anthropic", VENDOR),
+
+    "gpt-5.2":            (1.75, 14.0, "openai", VENDOR),
+    "gpt-5.3-codex":      (1.75, 14.0, "openai", VENDOR),
+    # OpenAI does not publish a `gpt-5.2-codex` line. The rate below is the
+    # aggregator's (pricepertoken.com, 2026-08-22) and happens to match what
+    # OpenAI charges for gpt-5.2 and gpt-5.3-codex, which is corroboration but
+    # not confirmation. Reported as aggregator-sourced wherever it is used.
+    "gpt-5.2-codex":      (1.75, 14.0, "openai", AGGREGATOR),
 }
 
 OPENAI_CACHED_MULT = 0.10
 
-# Claude Sonnet 5 introductory pricing, through 2026-08-31.
-SONNET5_INTRO_UNTIL = datetime(2026, 8, 31, 23, 59, 59, tzinfo=timezone.utc)
-SONNET5_INTRO = (2.0, 10.0, "anthropic")
-
+# Claude Sonnet 5 launched at $2/$10 as introductory pricing "through
+# 2026-08-31", and this file used to switch to $3/$15 after that date. Anthropic
+# has since made $2/$10 the standard price and cancelled the increase, so the
+# date gate is gone: it would have silently overstated every Sonnet 5 session
+# from September onward by 50%.
 DEFAULT_RATES = (5.0, 25.0, "anthropic")  # unknown model: assume Opus-tier, and say so
 
 
-def rates_for(model: str, when: datetime | None) -> tuple[float, float, str, bool]:
-    """Return (input_rate, output_rate, provider, is_known) at a point in time."""
-    if model == "claude-sonnet-5" and when is not None and when <= SONNET5_INTRO_UNTIL:
-        return (*SONNET5_INTRO, True)
+def rates_for(model: str, when: datetime | None) -> tuple[float, float, str, bool, str]:
+    """Return (input_rate, output_rate, provider, is_known, source) for a model.
+
+    `when` is retained for rates that vary by date. None are date-dependent
+    today; the parameter stays so a future scheduled change does not require
+    every caller to be touched again.
+    """
     if model in PRICING:
-        return (*PRICING[model], True)
+        in_rate, out_rate, provider, source = PRICING[model]
+        return (in_rate, out_rate, provider, True, source)
     if model.startswith(("gpt-", "o1", "o3", "o4")):
-        return (1.75, 14.0, "openai", False)
-    return (*DEFAULT_RATES, False)
+        return (1.75, 14.0, "openai", False, AGGREGATOR)
+    return (*DEFAULT_RATES, False, AGGREGATOR)
 
 
 # --------------------------------------------------------------------------
@@ -575,7 +599,7 @@ def codex_session_cost(usage: dict, model: str) -> float:
     reasoning_output_tokens as a subset of output_tokens. Adding either to its
     parent double-counts.
     """
-    in_rate, out_rate, provider, _known = rates_for(model, None)
+    in_rate, out_rate, provider, _known, _src = rates_for(model, None)
     total_in = usage.get("input_tokens", 0) or 0
     cached = usage.get("cached_input_tokens", 0) or 0
     out = usage.get("output_tokens", 0) or 0
@@ -635,6 +659,10 @@ class Fleet:
         # (priority, type, fingerprint) -> {uses, first, last, projects}
         self.secrets: dict[str, dict] = {}   # sha256[:8] -> record
         self.unknown_models: Counter = Counter()
+        # Models priced from a third party because the vendor publishes no rate
+        # for that id. Counted separately from unknown models: the number is
+        # probably right, but nobody authoritative has said so.
+        self.aggregator_models: Counter = Counter()
         self.first_ts: datetime | None = None
         self.last_ts: datetime | None = None
         self.roots: list[Path] = []
@@ -661,9 +689,11 @@ class Fleet:
         out = usage.get("output_tokens", 0) or 0
         rd = usage.get("cache_read_input_tokens", 0) or 0
 
-        in_rate, out_rate, _provider, known = rates_for(model, ts)
+        in_rate, out_rate, _provider, known, src = rates_for(model, ts)
         if not known:
             self.unknown_models[model] += 1
+        elif src == AGGREGATOR:
+            self.aggregator_models[model] += 1
 
         cost = (
             inp / 1e6 * in_rate
@@ -723,7 +753,7 @@ class Fleet:
         the session total, exactly.
         """
         cost = codex_session_cost(usage, model)
-        _, _, _, known = rates_for(model, None)
+        _, _, _, known, _ = rates_for(model, None)
         if not known:
             self.unknown_models[model] += 1
 
@@ -853,7 +883,7 @@ class Fleet:
         u = result.get("usage")
         if isinstance(u, dict):
             base = model.replace("[1m]", "")
-            in_rate, out_rate, _prov, _known = rates_for(base, ts)
+            in_rate, out_rate, _prov, _known, _src = rates_for(base, ts)
             cc = u.get("cache_creation") or {}
             self.sub_cost_floor += (
                 (u.get("input_tokens", 0) or 0) / 1e6 * in_rate
@@ -2367,6 +2397,12 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
         print(f"\n  {c.yellow}▲{c.off} unpriced models seen, billed at Opus-tier rates: "
               f"{', '.join(fleet.unknown_models)}")
 
+    if fleet.aggregator_models:
+        print(f"\n  {c.yellow}▲{c.off} priced from a third party, not the vendor's own "
+              f"list: {', '.join(fleet.aggregator_models)}")
+        print(f"    {c.dim}The rate is probably right; nobody authoritative has "
+              f"published it.{c.off}")
+
     print()
     print(f"{c.dim}  Ask how any of this was computed:  actualis --explain")
     print(f"  Ask why a finding fired:            actualis --why AF004{c.off}")
@@ -2551,6 +2587,7 @@ def to_json(fleet: Fleet, raw: bool = False) -> dict:
         "permission_modes": dict(fleet.permission_modes),
         "denials": dict(fleet.denials),
         "unknown_models": dict(fleet.unknown_models),
+        "aggregator_priced_models": dict(fleet.aggregator_models),
     }
 
 
