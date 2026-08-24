@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Added
+
+- **The `--json` output is now a frozen, versioned contract.** It carries
+  `schema_version` (currently `1`), separate from the tool version, and
+  `JSON_SCHEMA` in `actualis.py` declares every path and its type. The test
+  suite validates real output against that declaration on both an empty and a
+  populated fleet, so a key cannot be removed, renamed or retyped without the
+  declaration changing in the same commit. docs/json.md states what may and may
+  not change within a major version.
+
+### Fixed
+
+- **Money fields are always floats.** `sum([])` is `0` and `round(0, 4)` stays
+  an `int`, so `cost_usd` and `cache.saved_usd` were integers on an empty fleet
+  and floats otherwise. Anything validating types strictly would have broken on
+  a day with no activity.
+
 ### Changed
 
 - The release job no longer marks every release as `--latest`. A version
