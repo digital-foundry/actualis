@@ -23,7 +23,7 @@ more than one agent, you cannot currently answer:
 - What shell commands have my agents actually been running?
 - Did a credential ever end up in a command?
 
-`actualis` answers those four questions from data already on your machine,
+`actualis` answers all five from data already on your machine,
 across **Claude Code** and **Codex**, in one report.
 
 ```
