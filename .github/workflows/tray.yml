@@ -50,28 +50,38 @@ jobs:
       - name: vet
         run: go vet ./...
 
+      # Literal flags per platform. An earlier version assembled them in a
+      # shell variable and silently produced unstripped console binaries, so
+      # there is no interpolation here to get wrong.
+      - name: build (unix)
+        if: matrix.goos != 'windows'
+        run: go build -trimpath -ldflags "-s -w" -o "${{ matrix.artifact }}" .
+
       # -H windowsgui suppresses the console window. Without it the tray works
       # but a black cmd window sits behind it for the life of the process.
-      - name: build
-        shell: bash
-        run: |
-          LDFLAGS="-s -w"
-          if [ "${{ matrix.goos }}" = "windows" ]; then LDFLAGS="$LDFLAGS -H windowsgui"; fi
-          go build -trimpath -ldflags "$LDFLAGS" -o "${{ matrix.artifact }}" .
+      - name: build (windows)
+        if: matrix.goos == 'windows'
+        run: go build -trimpath -ldflags "-s -w -H windowsgui" -o "${{ matrix.artifact }}" .
 
-      - name: it is a real binary for the right platform
+      - name: verify the binary
         shell: bash
         run: |
+          set -euo pipefail
           ls -lh "${{ matrix.artifact }}"
-          DESC=$(file -b "${{ matrix.artifact }}" || echo unknown)
-          echo "$DESC"
           test -s "${{ matrix.artifact }}"
-          # A tray app must not open a console window on Windows.
           if [ "${{ matrix.goos }}" = "windows" ]; then
+            # Fail closed. An assertion that treats "cannot tell" as "confirmed"
+            # is worse than no assertion; an earlier version did exactly that and
+            # passed a console binary.
+            command -v file >/dev/null || { echo "::error::file(1) unavailable, cannot verify subsystem"; exit 1; }
+            DESC=$(file -b "${{ matrix.artifact }}")
+            echo "$DESC"
             case "$DESC" in
-              *console*) echo "::error::windows binary is a console app; -H windowsgui missing"; exit 1 ;;
-              *GUI*|*unknown*) echo "GUI subsystem confirmed" ;;
+              *console*) echo "::error::console subsystem: -H windowsgui did not apply"; exit 1 ;;
+              *) echo "GUI subsystem confirmed" ;;
             esac
+          else
+            file -b "${{ matrix.artifact }}"
           fi
 
       - uses: actions/upload-artifact@v4
