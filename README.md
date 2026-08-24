@@ -2,6 +2,8 @@
 
 **What actually ran.**
 
+[actualis.app](https://actualis.app) · [Latest release](https://github.com/digital-foundry/actualis/releases/latest) · [Changelog](CHANGELOG.md) · [Security policy](SECURITY.md) · [Trade marks](TRADEMARKS.md)
+
 *Local. Read-only. Honest about limits.*
 
 Actualis reads existing coding-agent logs and turns them into clear answers about
