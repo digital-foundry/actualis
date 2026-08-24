@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Named-secret detection missed 19 of 21 credential-shaped names.**
+  `export STRIPE_KEY=...` was not flagged: the name list carried `SECRET`,
+  `TOKEN` and `API_KEY` but no bare `KEY`. Also missed: `SIGNING_KEY`,
+  `ENCRYPTION_KEY`, `MASTER_KEY`, `DEPLOY_KEY`, `OPENAI_KEY`, `SUPABASE_PAT`,
+  `SENTRY_DSN`, `DB_CREDENTIAL`, `AUTH_HEADER`, `SESSION_COOKIE` and more.
+
+  Underneath it was two lists that had drifted apart: redaction and
+  classification each had their own idea of what a credential is called. So
+  `AUTH_HEADER` was masked in output but never reached the rotation list —
+  `secrets` undercounted, and nothing said so. There is now one list, used by
+  both, and a test asserting anything counted is also masked.
+
+  On a real 145k-command corpus this took distinct secrets from 83 to 126.
+
+  Widening detection without measuring the noise is how a security tool becomes
+  ignorable, so the false-positive battery ships as a test too. `PRIMARY_KEY`,
+  `CACHE_KEY`, `IDEMPOTENCY_KEY`, `KEY_NAME`, `KEYBOARD_LAYOUT`, `MONKEY_PATCH`,
+  `PATH` and `PATTERN` all stay quiet. So do **publishable** keys —
+  `SUPABASE_ANON_KEY` and anything prefixed `NEXT_PUBLIC_` or `EXPO_PUBLIC_` is
+  meant to ship to a browser, and telling someone to rotate one teaches them to
+  ignore the tool.
+
 ### Added
 
 - **Refusals are now joined to the commands they blocked.** A refusal is its own
