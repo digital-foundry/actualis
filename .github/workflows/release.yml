@@ -26,9 +26,17 @@ on:
 permissions:
   contents: read
 
+# Serialise releases without ever cancelling one. cancel-in-progress would let
+# a second tag kill a publish that is mid-upload to PyPI, and a half-uploaded
+# version cannot be re-uploaded: PyPI burns the filename permanently.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -68,6 +76,7 @@ jobs:
   pypi:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment: pypi          # must match the pending publisher config
     permissions:
       id-token: write          # OIDC: this is what replaces the API token
@@ -82,6 +91,8 @@ jobs:
 
   # The tray binaries are built by the same reusable workflow CI uses, so what
   # is attached to a release cannot drift from what was tested.
+  # No timeout-minutes here on purpose: GitHub rejects it on a job that calls a
+  # reusable workflow. The limit lives on the job inside tray-build.yml.
   tray:
     uses: ./.github/workflows/tray-build.yml
 
@@ -93,6 +104,7 @@ jobs:
     needs: [build, pypi, tray]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write        # create the release and upload its assets
     steps:
