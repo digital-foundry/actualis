@@ -37,92 +37,85 @@ import (
 
 // ACTUALIS icon system 1.0.0.
 //
-// Monochrome by default so the mark reads as identity; amber indicates state
-// only, per the brand rule. Every state is also distinguished by FORM — a ring,
-// a badge, a spinner, a slash — because the accessibility rule is that colour
-// alone must never carry meaning.
+// macOS gets TEMPLATE icons: alpha only, inked by the OS for whatever the menu
+// bar is actually doing. This replaced an AppleInterfaceStyle probe that was
+// simply wrong — it reported Dark on a machine whose menu bar was visibly
+// light, which is exactly how you ship an invisible icon. The OS knows; asking
+// it a proxy question does not work.
 //
-// Two variants per state for light and dark, plus a contrasting outline so the
-// mark survives a menu bar whose appearance we guessed wrong.
+// Everywhere else there is no template concept, so the fallback is drawn in
+// amber throughout: a mid-tone that reads on a light taskbar and a dark one
+// alike, so no appearance guess is needed there either.
 //
-//go:embed icons/idle.png
-var icIdleL []byte
+// State is carried by FORM — a ring, a dot, a spinner, a crosshair — never by
+// colour alone, per the brand accessibility rule. That is also what lets the
+// monochrome template convey every state.
 
-//go:embed icons/idle-dark.png
-var icIdleD []byte
+//go:embed icons/idle-template.png
+var tplIdle []byte
+
+//go:embed icons/idle.png
+var regIdle []byte
+
+//go:embed icons/monitoring-template.png
+var tplMon []byte
 
 //go:embed icons/monitoring.png
-var icMonL []byte
+var regMon []byte
 
-//go:embed icons/monitoring-dark.png
-var icMonD []byte
+//go:embed icons/exposed-template.png
+var tplExp []byte
 
 //go:embed icons/exposed.png
-var icExpL []byte
+var regExp []byte
 
-//go:embed icons/exposed-dark.png
-var icExpD []byte
+//go:embed icons/syncing-template.png
+var tplSync []byte
 
 //go:embed icons/syncing.png
-var icSyncL []byte
+var regSync []byte
 
-//go:embed icons/syncing-dark.png
-var icSyncD []byte
+//go:embed icons/error-template.png
+var tplErr []byte
 
 //go:embed icons/error.png
-var icErrL []byte
+var regErr []byte
 
-//go:embed icons/error-dark.png
-var icErrD []byte
-
-// darkMenuBar reports whether the system is in dark appearance. Only macOS is
-// asked; elsewhere the outline carries legibility and the answer does not matter.
-func darkMenuBar() bool {
-	if runtime.GOOS != "darwin" {
-		return false
-	}
-	out, err := exec.Command("defaults", "read", "-g", "AppleInterfaceStyle").Output()
-	return err == nil && strings.Contains(strings.ToLower(string(out)), "dark")
-}
-
-func iconFor(state string) []byte {
-	d := darkMenuBar()
-	pick := func(light, dark []byte) []byte {
-		if d {
-			return dark
-		}
-		return light
-	}
+// setIcon installs the state's mark. SetTemplateIcon uses the template on
+// macOS and falls back to the regular icon elsewhere, which is precisely the
+// behaviour wanted on all three platforms.
+func setIcon(state string) {
+	var tpl, reg []byte
 	switch state {
 	case "exposed":
-		return pick(icExpL, icExpD)
+		tpl, reg = tplExp, regExp
 	case "monitoring":
-		return pick(icMonL, icMonD)
+		tpl, reg = tplMon, regMon
 	case "syncing":
-		return pick(icSyncL, icSyncD)
+		tpl, reg = tplSync, regSync
 	case "error":
-		return pick(icErrL, icErrD)
+		tpl, reg = tplErr, regErr
 	default:
-		return pick(icIdleL, icIdleD)
+		tpl, reg = tplIdle, regIdle
 	}
+	systray.SetTemplateIcon(tpl, reg)
 }
-
 
 // ---------------------------------------------------------------- report
 
 type report struct {
 	fingerprints map[string]bool
-	critical    int
-	rotatable   int
-	cost        float64
-	shell       int
-	flaggedHigh int
-	unsupPct    float64
-	hasUnsup    bool
-	invisPct    float64
-	findings    []finding
-	err         string
-	at          time.Time
+	critical     int
+	rotatable    int
+	cost         float64
+	shell        int
+	flaggedHigh  int
+	unsupPct     float64
+	hasUnsup     bool
+	invisPct     float64
+	findings     []finding
+	err          string
+	at           time.Time
 }
 
 type finding struct{ ID, Title, Severity string }
@@ -296,17 +289,17 @@ func notify(title, body string) {
 func (u *ui) flash(state string) {
 	go func() {
 		for i := 0; i < 3; i++ {
-			systray.SetIcon(iconFor("exposed"))
+			setIcon("exposed")
 			time.Sleep(320 * time.Millisecond)
-			systray.SetIcon(iconFor("syncing"))
+			setIcon("syncing")
 			time.Sleep(220 * time.Millisecond)
 		}
-		systray.SetIcon(iconFor(state))
+		setIcon(state)
 	}()
 }
 
 func (u *ui) onReady() {
-	systray.SetIcon(iconFor("idle"))
+	setIcon("idle")
 	systray.SetTooltip("Actualis — what actually ran")
 
 	u.mHeader = systray.AddMenuItem("Loading…", "")
@@ -434,27 +427,27 @@ func (u *ui) render() {
 	u.mu.Unlock()
 
 	if r.err != "" {
-		systray.SetIcon(iconFor("error"))
+		setIcon("error")
 		systray.SetTooltip("actualis: " + r.err)
 		u.mHeader.SetTitle(r.err)
 		return
 	}
 
 	if r.critical > 0 {
-		systray.SetIcon(iconFor("exposed"))
+		setIcon("exposed")
 		// Only macOS and some Linux desktops show this; Windows ignores it.
 		systray.SetTitle(strconv.Itoa(r.critical))
 		systray.SetTooltip(fmt.Sprintf("Actualis — %d critical credential(s) exposed", r.critical))
 		u.mHeader.SetTitle(fmt.Sprintf("%d critical credential(s) exposed", r.critical))
 		show(u.mSub, fmt.Sprintf("%d worth rotating in total", r.rotatable))
 	} else if r.rotatable > 0 {
-		systray.SetIcon(iconFor("monitoring"))
+		setIcon("monitoring")
 		systray.SetTitle("")
 		systray.SetTooltip(fmt.Sprintf("Actualis — %d credential(s) worth rotating", r.rotatable))
 		u.mHeader.SetTitle(fmt.Sprintf("%d credential(s) worth rotating", r.rotatable))
 		u.mSub.Hide()
 	} else {
-		systray.SetIcon(iconFor("idle"))
+		setIcon("idle")
 		systray.SetTitle("")
 		systray.SetTooltip("Actualis — no critical credentials exposed")
 		u.mHeader.SetTitle("No critical credentials exposed")
