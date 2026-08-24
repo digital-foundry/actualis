@@ -200,9 +200,6 @@ func findBinary() string {
 		"/usr/local/bin/actualis",
 		filepath.Join(home, "AppData", "Local", "Programs", "actualis", "actualis.exe"),
 	}
-	if runtime.GOOS == "windows" {
-		candidates = append(candidates, "actualis.exe")
-	}
 	for _, c := range candidates {
 		if fi, err := os.Stat(c); err == nil && !fi.IsDir() {
 			return c
@@ -335,6 +332,21 @@ func newUI() *ui {
 	return &ui{days: 7, mDays: map[int]*systray.MenuItem{}, seen: map[string]bool{}}
 }
 
+// shellQuote wraps a path for POSIX sh. Single quotes suppress every
+// expansion; an embedded quote is closed, escaped and reopened.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// appleScriptString renders a Go string as an AppleScript literal. AppleScript
+// performs no substitution inside a literal, so escaping the quote and the
+// backslash is sufficient.
+func appleScriptString(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return `"` + s + `"`
+}
+
 // notify raises a native desktop notification. Best effort: a missing notifier
 // must never take the tray down.
 func notify(title, body string) {
@@ -346,9 +358,15 @@ func notify(title, body string) {
 	case "linux":
 		_ = exec.Command("notify-send", "-u", "critical", title, body).Run()
 	case "windows":
-		_ = exec.Command("powershell", "-NoProfile", "-Command",
-			fmt.Sprintf("[void][Windows.UI.Notifications.ToastNotificationManager];"+
-				"Write-Output %q", title+": "+body)).Run()
+		// The text goes through the environment and is referenced by name. Go's
+		// %q escapes quotes and backslashes but not $ or backtick, and
+		// PowerShell evaluates $(...) inside a double-quoted string, so
+		// formatting the text into the command would hand it execution. Not
+		// reachable from transcript content today; one call site away from it.
+		cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive",
+			"-Command", "Write-Output $Env:ACTUALIS_TRAY_NOTIFY")
+		cmd.Env = append(os.Environ(), "ACTUALIS_TRAY_NOTIFY="+title+": "+body)
+		_ = cmd.Run()
 	}
 }
 
@@ -672,19 +690,24 @@ func openReport() {
 	}
 	switch runtime.GOOS {
 	case "darwin":
+		// `do script` hands its argument to a shell, so the path must be
+		// single-quoted there: an unquoted /Users/first last/.local/bin/actualis
+		// simply breaks. The AppleScript literal then needs its own escaping.
+		sh := shellQuote(bin)
 		script := fmt.Sprintf(`tell application "Terminal"
 activate
-do script "%s --coach; echo; %s | less -R"
-end tell`, bin, bin)
+do script %s
+end tell`, appleScriptString(sh+" --coach; echo; "+sh+" | less -R"))
 		_ = exec.Command("osascript", "-e", script).Run()
 	case "windows":
 		_ = exec.Command("cmd", "/c", "start", "cmd", "/k",
-			bin+" --coach && "+bin).Start()
+			`"`+bin+`" --coach && "`+bin+`"`).Start()
 	default:
 		for _, term := range []string{"x-terminal-emulator", "gnome-terminal", "konsole", "xterm"} {
 			if _, err := exec.LookPath(term); err == nil {
+				sh := shellQuote(bin)
 				_ = exec.Command(term, "-e", "sh", "-c",
-					bin+" --coach; echo; "+bin+" | less -R; exec sh").Start()
+					sh+" --coach; echo; "+sh+" | less -R; exec sh").Start()
 				return
 			}
 		}

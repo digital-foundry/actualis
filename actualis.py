@@ -30,11 +30,11 @@ import json
 import os
 import re
 import sys
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # --------------------------------------------------------------------------
 # Pricing
@@ -105,7 +105,14 @@ OPENAI_CACHED_MULT = 0.10
 # has since made $2/$10 the standard price and cancelled the increase, so the
 # date gate is gone: it would have silently overstated every Sonnet 5 session
 # from September onward by 50%.
-DEFAULT_RATES = (5.0, 25.0, "anthropic")  # unknown model: assume Opus-tier, and say so
+# Unknown models are priced at the top of what we actually know for that
+# provider, so the fallback is an UPPER bound among current models — never a
+# silent guess in the cheap direction. It is still only a bound: a premium model
+# priced above everything in the table (o1-pro, say) would be understated, which
+# is why cost from unknown models is accumulated separately and reported as a
+# share of the headline rather than quietly folded into it.
+DEFAULT_RATES = (5.0, 25.0, "anthropic")   # Opus-tier
+OPENAI_FALLBACK = (1.75, 14.0, "openai")   # the only rate OpenAI publishes here
 
 
 def rates_for(model: str, when: datetime | None) -> tuple[float, float, str, bool, str]:
@@ -119,7 +126,7 @@ def rates_for(model: str, when: datetime | None) -> tuple[float, float, str, boo
         in_rate, out_rate, provider, source = PRICING[model]
         return (in_rate, out_rate, provider, True, source)
     if model.startswith(("gpt-", "o1", "o3", "o4")):
-        return (1.75, 14.0, "openai", False, AGGREGATOR)
+        return (*OPENAI_FALLBACK, False, AGGREGATOR)
     return (*DEFAULT_RATES, False, AGGREGATOR)
 
 
@@ -269,14 +276,29 @@ _MASKED = "<redacted"
 _SHELL_REF = re.compile(r"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$")
 
 
+# A four-character prefix is a useful hint on a 40-character token and a
+# meaningful fraction of a 10-character password, so the prefix is only shown
+# once the secret is long enough for four characters to be negligible. The exact
+# length is a fingerprint that confirms a guess, so it is bucketed instead.
+_MASK_PREFIX_MIN = 24
+_LENGTH_BUCKETS = ((32, "24-32"), (48, "33-48"), (64, "49-64"), (128, "65-128"))
+
+
+def _length_bucket(n: int) -> str:
+    for hi, label in _LENGTH_BUCKETS:
+        if n <= hi:
+            return label
+    return "128+"
+
+
 def _mask(s: str) -> str:
-    if _MASKED in s:          # already redacted; re-masking would corrupt the length
+    if _MASKED in s:          # already redacted; re-masking would corrupt the marker
         return s
     if _SHELL_REF.match(s):   # "$VERCEL_TOKEN" is a reference; the secret is elsewhere
         return s
-    if len(s) <= 8:
+    if len(s) < _MASK_PREFIX_MIN:
         return "<redacted>"
-    return f"{s[:4]}…<redacted:{len(s)}>"
+    return f"{s[:4]}…<redacted:{_length_bucket(len(s))}>"
 
 
 def redact(text: str) -> str:
@@ -294,7 +316,16 @@ def redact(text: str) -> str:
 
 
 def contains_secret(text: str) -> bool:
-    return redact(text) != text
+    """True when redaction would change the text.
+
+    Compared against the SAME truncated input redact() works on. Comparing
+    against the full text made every command longer than MAX_SCAN_TOTAL report
+    as containing a secret, because truncation alone made the strings differ.
+    """
+    if not text:
+        return False
+    head = text[:MAX_SCAN_TOTAL]
+    return redact(head) != head
 
 
 # Words that are never the command being run.
@@ -318,7 +349,20 @@ _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 # whose threat model includes a prompt-injected agent, that is the attack.
 # --------------------------------------------------------------------------
 
-_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+# C0/C1 controls defeat ANSI escapes. The Unicode ranges defeat the same attack
+# carried out without any escape: a right-to-left override visually reverses the
+# tail of a command in most terminals, and zero-width characters split a token so
+# it reads as something it is not. Both hide the dangerous part of a command from
+# the audit that exists to show it, which is the threat this module names.
+#   200b-200f  zero-width space/joiners, LRM/RLM
+#   2028-202e  line/paragraph separators, the bidi embedding and override set
+#   2060-2064  word joiner and invisible operators
+#   2066-2069  bidi isolates
+#   feff       zero-width no-break space (BOM)
+_CONTROL = re.compile(
+    "[\x00-\x08\x0b-\x1f\x7f-\x9f"
+    "\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u2069\ufeff]"
+)
 
 # Bound the work any single command can cause. audit_command runs ~40 patterns
 # with wide character classes; a 140,000-character line took 164 seconds before
@@ -599,7 +643,12 @@ def codex_session_cost(usage: dict, model: str) -> float:
     reasoning_output_tokens as a subset of output_tokens. Adding either to its
     parent double-counts.
     """
-    in_rate, out_rate, provider, _known, _src = rates_for(model, None)
+    in_rate, out_rate, provider, known, _src = rates_for(model, None)
+    if not known:
+        # This came out of a Codex rollout, so it is OpenAI regardless of what the
+        # rate-table fallback inferred from the model string. Without this an
+        # unrecognised Codex model was billed at Opus rates with no cache discount.
+        in_rate, out_rate, provider = OPENAI_FALLBACK
     total_in = usage.get("input_tokens", 0) or 0
     cached = usage.get("cached_input_tokens", 0) or 0
     out = usage.get("output_tokens", 0) or 0
@@ -663,6 +712,16 @@ class Fleet:
         # for that id. Counted separately from unknown models: the number is
         # probably right, but nobody authoritative has said so.
         self.aggregator_models: Counter = Counter()
+        # Cost attributable to models with no published rate. Reported as a
+        # share of the headline so a reader can bound how wrong it might be.
+        self.cost_unknown = 0.0
+        # Claude Code re-emits the same assistant record while a response
+        # streams: identical message id, identical usage, a fresh record uuid.
+        # Billing each occurrence overstated real spend by 2.13x on a live
+        # corpus, where 50.9% of usage records were repeats. The Codex path has
+        # always guarded its own version of this; this is the Claude equivalent.
+        self.seen_message_ids: set[str] = set()
+        self.duplicate_usage_records = 0
         self.first_ts: datetime | None = None
         self.last_ts: datetime | None = None
         self.roots: list[Path] = []
@@ -702,6 +761,9 @@ class Fleet:
             + w5m / 1e6 * in_rate * CACHE_WRITE_5M_MULT
             + rd / 1e6 * in_rate * CACHE_READ_MULT
         )
+
+        if not known:
+            self.cost_unknown += cost
 
         self.messages += 1
         self.cost_by_agent["claude-code"] += cost
@@ -756,6 +818,7 @@ class Fleet:
         _, _, _, known, _ = rates_for(model, None)
         if not known:
             self.unknown_models[model] += 1
+            self.cost_unknown += cost
 
         self.messages += 1
         self.cost_by_agent["codex"] += cost
@@ -951,7 +1014,14 @@ class Fleet:
         if not roots:
             return
         self.roots.extend(roots)
-        dirs = sorted(d for r in roots for d in r.iterdir() if d.is_dir())
+        dirs: list[Path] = []
+        for r in roots:
+            try:
+                dirs.extend(d for d in r.iterdir() if d.is_dir())
+            except OSError as exc:
+                print(f"actualis: cannot read {r}: {exc.strerror or exc}",
+                      file=sys.stderr)
+        dirs.sort()
         for i, d in enumerate(dirs, 1):
             project = pretty_project(d.name)
             if project_filter and project_filter.lower() not in project.lower():
@@ -1015,8 +1085,15 @@ class Fleet:
 
                     usage = msg.get("usage")
                     if isinstance(usage, dict):
-                        self.add_usage(project, msg.get("model") or "unknown",
-                                       usage, ts, rec.get("gitBranch"))
+                        # One billable message, however many records carry it.
+                        mid = msg.get("id")
+                        if mid and mid in self.seen_message_ids:
+                            self.duplicate_usage_records += 1
+                        else:
+                            if mid:
+                                self.seen_message_ids.add(mid)
+                            self.add_usage(project, msg.get("model") or "unknown",
+                                           usage, ts, rec.get("gitBranch"))
 
                     tur = rec.get("toolUseResult")
                     if isinstance(tur, dict) and tur.get("toolStats") is not None:
@@ -1317,19 +1394,27 @@ def notify(title: str, message: str) -> None:
     import subprocess
     try:
         if sys.platform == "darwin":
-            script = (f"display notification {json.dumps(message)} "
-                      f"with title {json.dumps(title)}")
+            # AppleScript string literals use the same \" and \\ escapes JSON does,
+            # and AppleScript performs no substitution inside a literal, so there is
+            # nothing for transcript content to break out into. ensure_ascii=False
+            # keeps non-ASCII readable rather than printing \uXXXX.
+            script = (f"display notification {json.dumps(message, ensure_ascii=False)} "
+                      f"with title {json.dumps(title, ensure_ascii=False)}")
             subprocess.run(["osascript", "-e", script], timeout=5,
                            capture_output=True, check=False)
         elif sys.platform.startswith("linux"):
-            subprocess.run(["notify-send", title, message], timeout=5,
+            subprocess.run(["notify-send", "--", title, message], timeout=5,
                            capture_output=True, check=False)
         elif sys.platform == "win32":
-            ps = (f"[Windows.UI.Notifications.ToastNotificationManager, "
-                  f"Windows.UI.Notifications, ContentType=WindowsRuntime] > $null; "
-                  f"Write-Output {json.dumps(title + ': ' + message)}")
-            subprocess.run(["powershell", "-NoProfile", "-Command", ps], timeout=5,
-                           capture_output=True, check=False)
+            # The text is passed through the environment and referenced by name.
+            # It MUST NOT be interpolated into the command: PowerShell evaluates
+            # $(...) and backtick escapes inside a double-quoted string, and this
+            # text comes from a transcript, so building the command by string
+            # formatting hands command execution to whatever an agent typed.
+            env = dict(os.environ, ACTUALIS_NOTIFY_TEXT=f"{title}: {message}")
+            subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                            "-Command", "Write-Output $Env:ACTUALIS_NOTIFY_TEXT"],
+                           timeout=5, capture_output=True, check=False, env=env)
     except Exception:
         pass  # a missing notifier must never take the watcher down
 
@@ -1731,17 +1816,20 @@ AGENT_STATUS = {
     "signed-unknown": ("?",    "validly signed by a publisher not in the pin list"),
     "unsigned":       ("-",    "no code signature; normal for script-based tools"),
     "tampered":       ("FAIL", "signature present but INVALID: binary was modified"),
-    "unknown":        ("?",    "could not be assessed on this platform"),
+    "unknown":        ("?",    "could not be assessed"),
 }
 
 
-def _run(cmd: list[str], timeout: float = 8.0) -> tuple[int, str]:
+def _run(cmd: list[str], timeout: float = 8.0) -> tuple[int | None, str]:
+    """(exit code, combined output). The code is None when the command could not
+    be run at all — missing binary, timeout, permission. That is a different fact
+    from a non-zero exit and callers must not conflate the two."""
     import subprocess
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return r.returncode, (r.stdout or "") + (r.stderr or "")
     except Exception:
-        return -1, ""
+        return None, ""
 
 
 def _which(cmd: str) -> str | None:
@@ -1771,7 +1859,11 @@ def verify_agent(label: str, cmd: str) -> dict | None:
         return info
 
     code, out = _run(["codesign", "--display", "--verbose=4", path])
-    if "not signed at all" in out or code != 0 and "Identifier=" not in out:
+    if code is None:
+        info["detail"] = ("codesign could not be run, so this binary was not "
+                          "assessed; it is not a claim that it is unsigned")
+        return info
+    if "not signed at all" in out or (code != 0 and "Identifier=" not in out):
         info["status"] = "unsigned"
         info["detail"] = "no code signature (expected for npm and script installs)"
         return info
@@ -1785,6 +1877,10 @@ def verify_agent(label: str, cmd: str) -> dict | None:
             info["signer"] = line.split("=", 1)[1].strip()
 
     vcode, vout = _run(["codesign", "--verify", "--strict", path])
+    if vcode is None:
+        info["status"] = "unknown"
+        info["detail"] = "signature present but verification could not be run"
+        return info
     if vcode != 0:
         info["status"] = "tampered"
         info["detail"] = (vout.strip().splitlines() or ["signature verification failed"])[0]
@@ -1926,15 +2022,32 @@ MCP_TOOLS = [
 ]
 
 
+# A scan is expensive, so results are cached — but the key comes from the
+# caller, so the cache must be bounded or a client choosing keys freely retains
+# an unbounded number of Fleets and triggers an unbounded number of scans.
+MCP_CACHE_MAX = 8
+MCP_MAX_DAYS = 3650
+MCP_MAX_PROJECT = 200
+
+
+def clamp_days(v: object) -> int | None:
+    """Client-supplied window, bounded. bool is an int in Python and must not pass."""
+    if isinstance(v, bool) or not isinstance(v, int):
+        return None
+    return min(max(v, 1), MCP_MAX_DAYS)
+
+
 class _MCPCache:
-    """A scan takes ~80s over a large fleet, so hold it for the process lifetime."""
+    """A scan takes ~80s over a large fleet, so hold it — but only a few, LRU."""
 
     def __init__(self) -> None:
-        self._store: dict[tuple, Fleet] = {}
+        self._store: OrderedDict[tuple, Fleet] = OrderedDict()
 
     def fleet(self, days: int | None = None, project: str | None = None) -> Fleet:
         key = (days, project)
-        if key not in self._store:
+        if key in self._store:
+            self._store.move_to_end(key)
+        else:
             f = Fleet()
             since = (datetime.now(timezone.utc) - timedelta(days=days)) if days else None
             roots = transcript_roots()
@@ -1945,14 +2058,15 @@ class _MCPCache:
                 f.roots.extend(croots)
                 f.scan_codex(croots, since, project)
             self._store[key] = f
+            while len(self._store) > MCP_CACHE_MAX:
+                self._store.popitem(last=False)
         return self._store[key]
 
 
 def _mcp_call(name: str, args: dict, cache: _MCPCache) -> dict:
-    days = args.get("days")
     project = args.get("project")
-    f = cache.fleet(days if isinstance(days, int) else None,
-                    project if isinstance(project, str) else None)
+    f = cache.fleet(clamp_days(args.get("days")),
+                    project[:MCP_MAX_PROJECT] if isinstance(project, str) else None)
 
     if name == "fleet_summary":
         ctx = Counter()
@@ -1968,6 +2082,8 @@ def _mcp_call(name: str, args: dict, cache: _MCPCache) -> dict:
                        "active_days": f.active_days},
             "messages": f.messages,
             "cost_usd_list_price": round(f.total_cost, 2),
+            "cost_usd_from_unpriced_models": round(f.cost_unknown, 2),
+            "duplicate_usage_records_skipped": f.duplicate_usage_records,
             "cost_note": "provider list prices; a subscription bills a flat fee, so read "
                          "this as consumption rather than a bill",
             "cache_hit_rate_pct": round(cache_hit_rate(ctx), 1),
@@ -2105,10 +2221,22 @@ def mcp_serve() -> int:
                     send({"jsonrpc": "2.0", "id": rid,
                           "error": {"code": -32601, "message": f"method not found: {method}"}})
                 continue
-        except Exception as exc:                      # never take the server down
+        except ValueError as exc:
+            # Deliberate, client-facing: the message is the caller's own tool name.
             if rid is not None:
                 send({"jsonrpc": "2.0", "id": rid,
-                      "error": {"code": -32603, "message": f"{type(exc).__name__}: {exc}"}})
+                      "error": {"code": -32602, "message": str(exc)[:200]}})
+            continue
+        except Exception as exc:                      # never take the server down
+            # Exception text routinely carries absolute filesystem paths, and this
+            # reply is written straight into the agent's transcript — the artefact
+            # this tool exists to keep clean. The detail goes to stderr instead,
+            # which is the same reasoning shell_audit already applies to command text.
+            print(f"actualis mcp: {type(exc).__name__}: {exc}", file=sys.stderr)
+            if rid is not None:
+                send({"jsonrpc": "2.0", "id": rid,
+                      "error": {"code": -32603,
+                                "message": f"internal error ({type(exc).__name__})"}})
             continue
 
         if rid is not None:
@@ -2168,6 +2296,15 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
         for r in fleet.roots:
             print(f"  {c.dim}source        {r}{c.off}")
         print(f"  messages      {num(fleet.messages)}")
+        if fleet.duplicate_usage_records:
+            # Shown rather than hidden: this number is the difference between
+            # the old headline and the real one, and a reader who saw the old
+            # figure deserves to see why it moved.
+            print(f"  {c.dim}repeats       {num(fleet.duplicate_usage_records)} "
+                  f"records collapsed (one message, many transcript rows){c.off}")
+        if fleet.cost_unknown > 0:
+            print(f"  {c.dim}unpriced      {money(fleet.cost_unknown)} of the total "
+                  f"is from models with no published rate{c.off}")
         tok = sum(fleet.tokens.values())
         print(f"  tokens        {num(tok)}")
         print(f"  {c.bold}cost{c.off}          {c.bold}{money(fleet.total_cost)}{c.off} "
@@ -2515,6 +2652,14 @@ def to_json(fleet: Fleet, raw: bool = False) -> dict:
                     "roots": [str(r) for r in fleet.roots]},
         "messages": fleet.messages,
         "cost_usd": round(fleet.total_cost, 4),
+        "cost_usd_from_unpriced_models": round(fleet.cost_unknown, 4),
+        "cost_note": "models with no published rate are priced at the top of the "
+                     "known range for their provider, so that share is an upper "
+                     "bound among current models rather than a measurement",
+        "duplicate_usage_records_skipped": fleet.duplicate_usage_records,
+        "duplicate_note": "one billable message can appear many times in a "
+                          "transcript while a response streams; repeats are "
+                          "counted once, by message id",
         "tokens": dict(fleet.tokens),
         "by_agent": {k: round(v, 4) for k, v in fleet.cost_by_agent.items()},
         "subagents": {
@@ -2650,7 +2795,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.watch:
         if args.root:
-            w_roots, w_codex = [Path(args.root).expanduser()], []
+            root = Path(args.root).expanduser()
+            w_roots, w_codex = ([], [root]) if args.agent == "codex" else ([root], [])
         else:
             w_roots = transcript_roots() if args.agent in ("all", "claude") else []
             w_codex = codex_roots() if args.agent in ("all", "codex") else []
@@ -2661,7 +2807,15 @@ def main(argv: list[str] | None = None) -> int:
     progress = not args.json and sys.stderr.isatty()
 
     if args.root:
-        fleet.scan([Path(args.root).expanduser()], since, args.project, progress=progress)
+        # --root names a directory; --agent says how to read it. Routing every
+        # --root to the Claude parser meant `--root X --agent codex` silently
+        # parsed Codex rollouts as Claude transcripts and reported nothing.
+        root = Path(args.root).expanduser()
+        if args.agent == "codex":
+            fleet.roots.append(root)
+            fleet.scan_codex([root], since, args.project)
+        else:
+            fleet.scan([root], since, args.project, progress=progress)
     else:
         if args.agent in ("all", "claude"):
             roots = transcript_roots()

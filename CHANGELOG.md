@@ -1,5 +1,87 @@
 # Changelog
 
+## 0.1.1 — 2026-08-24
+
+A three-pass audit — security, business logic, robustness — found eleven
+defects in 0.1.0. All are fixed here, each with a regression test that fails
+against 0.1.0.
+
+### Fixed — cost was more than double
+
+- **One message is now billed once, however many transcript records carry it.**
+  Claude Code re-emits an assistant record while a response streams: same
+  `message.id`, same usage block, a fresh record uuid each time. 0.1.0 billed
+  every occurrence. On a live corpus of 145,116 usage records, **50.9% were
+  repeats** and the reported total was **2.13× the real figure** — $46,997
+  against $22,064. Deduplication is by message id, keeps the first occurrence,
+  and also collapses messages replayed across resumed sessions. Across 71,311
+  ids in that corpus, no id ever carried a differing usage payload, so which
+  copy is kept does not matter.
+
+  This affected every derived number: cost by project, day, ticket, model and
+  branch, all token counters, cache hit rate, message counts, every coach
+  finding, `--json`, `--share` and the MCP `fleet_summary` tool. **If you acted
+  on a figure from 0.1.0, re-run it.** The report now prints how many repeats
+  were collapsed, so the change is visible rather than silent.
+
+  The Codex path already guarded its own version of this and had a test named
+  `session_total_is_the_max_not_the_sum`. The Claude path had neither, which is
+  why 107 passing tests missed it.
+
+### Fixed — security
+
+- **Notification text is no longer interpolated into a PowerShell command.**
+  The Windows path built `Write-Output "…"` with an f-string. JSON escaping
+  covers quotes and backslashes but not `$` or backtick, and PowerShell
+  evaluates `$(…)` inside double quotes — while `--watch` fed transcript-derived
+  command text straight in. That is code execution from content an agent wrote
+  into its own transcript, which is the threat model this tool is built around.
+  The text now travels through the environment and is referenced by name. The
+  Go tray carried the same latent pattern, one call site away from being
+  reachable, and is fixed the same way.
+- **`clean()` now strips Unicode characters that reorder or hide text**, not
+  only ASCII control characters. A right-to-left override visually reverses the
+  tail of a command in most terminals and needs no escape sequence at all, so
+  the previous defence stopped ANSI escapes while leaving the same attack
+  available through U+202E, zero-width characters and bidi isolates.
+- **Redaction no longer publishes a usable slice of a short secret.** A
+  four-character prefix is a hint on a 40-character token and 40% of a
+  10-character password. The prefix now appears only above 24 characters, and
+  the exact length — a fingerprint that confirms a guess — is bucketed.
+- **The MCP result cache is bounded** (LRU, 8 entries) and the client-supplied
+  window is clamped. The key came from the caller, so an unbounded cache let a
+  client retain unbounded memory and force unbounded rescans. `days` now
+  rejects booleans and clamps negatives, which previously put the cutoff in the
+  future and returned nothing.
+- **MCP internal errors no longer echo exception text to the client.** That
+  text routinely carries absolute filesystem paths, and an MCP reply is written
+  into the agent's transcript — the artefact this tool exists to keep clean.
+  Detail goes to stderr; the client gets the error class.
+
+### Fixed — correctness
+
+- **Unpriced models are reported as their own number.** Cost from models with
+  no published rate is accumulated separately and shown in the report, `--json`
+  and MCP, so the share that is an upper bound rather than a measurement can be
+  subtracted. Previously the two fallbacks erred in opposite directions with no
+  way to tell which applied.
+- **An unrecognised Codex model is priced as OpenAI.** The cached-token
+  discount was gated on the provider from the rate table, so an unknown model
+  fell back to the Anthropic default and a Codex session was billed at
+  Opus-tier rates with no cache discount.
+- **`contains_secret()` no longer fires on length alone.** It was
+  `redact(text) != text`, and `redact()` truncates, so every command longer
+  than 32,768 characters reported as holding a secret.
+- **A failure to run `codesign` is no longer reported as "unsigned".** A
+  timeout or missing binary returned the same value as a genuine negative
+  result, turning a transient failure into a positive claim about a signature.
+- **An unreadable `--root` prints an error instead of a traceback.**
+- **`--root` honours `--agent`**, so `--root X --agent codex` uses the Codex
+  parser rather than silently parsing rollouts as Claude transcripts.
+- **The tray no longer breaks on a path containing a space**, and no longer
+  considers a bare relative `actualis.exe` — which resolved against the working
+  directory, and is how a planted binary gets run.
+
 ## 0.1.0 — 2026-08-23
 
 First public release.

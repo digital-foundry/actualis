@@ -13,6 +13,10 @@ that and prints a warning.
 | `scanned` | `files`, `bytes`, `roots[]` |
 | `messages` | count of assistant messages with usage |
 | `cost_usd` | total, at provider list prices |
+| `cost_usd_from_unpriced_models` | how much of `cost_usd` came from models with no published rate |
+| `cost_note` | how unpriced models are rated, and in which direction that errs |
+| `duplicate_usage_records_skipped` | repeated records for the same message, counted once |
+| `duplicate_note` | why repeats occur and how they are collapsed |
 | `tokens` | `input`, `output`, `cache_w_1h`, `cache_w_5m`, `cache_read` |
 | `by_agent` | cost per agent (`claude-code`, `codex`) |
 | `subagents` | see below |
@@ -94,3 +98,26 @@ a secret value, never raw command text. Tests assert both.
 Both the retired `initialize` handshake and the stateless 2026-07-28 style are
 answered, since clients in the wild vary. The scan is cached for the life of the
 process.
+
+
+## Repeated records and unpriced models
+
+Two keys exist because two numbers used to be silently wrong.
+
+`duplicate_usage_records_skipped` counts records that were skipped because
+another record already reported the same `message.id`. Claude Code re-emits an
+assistant record while a response streams — same message id, same usage block,
+a fresh record uuid each time — so one billable message can appear many times.
+Billing each occurrence overstated real spend by **2.13x** on a live corpus, in
+which 50.9% of usage records were repeats. Deduplication is by message id and
+keeps the first occurrence; across 71,311 ids on that corpus no id ever carried
+a differing usage payload, so the choice of which copy to keep does not matter.
+A non-zero value here is normal and healthy. Zero on a large scan is suspicious.
+
+`cost_usd_from_unpriced_models` is the share of `cost_usd` attributable to
+models absent from the rate table. Those are priced at the top of the known
+range for their provider, so that share is an upper bound among current models,
+not a measurement. It is reported separately rather than folded in so you can
+subtract it and see the floor. A model priced above everything in the table
+would still be understated — which is exactly why the number is exposed instead
+of being described as merely "unknown".
