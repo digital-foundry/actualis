@@ -373,8 +373,18 @@ your spend by roughly an order of magnitude.
 **If you're on a Pro or Max subscription, this is not a bill.** Your actual outlay
 is the flat subscription fee. Read the total as *what this would have cost at API
 list price*: an opportunity-cost figure, a consumption signal, and a way to see
-which project is eating your quota. Unknown models are priced at Opus-tier rates
-and called out explicitly rather than silently guessed.
+which project is eating your quota. Models with no published rate are priced at
+the top of the known range for their provider, and that share is reported as its
+own number so you can subtract it rather than having to trust it.
+
+**One message is counted once.** A transcript repeats the same assistant record
+while a response streams — identical message id, identical usage block, a fresh
+record uuid each time — so the number of records is not the number of messages.
+Versions before 0.1.1 billed every record. On a real corpus of 145,116 usage
+records, 50.9% were repeats and the total came out **2.13× too high**: $46,997
+reported against $22,064 actual. The report prints how many repeats it collapsed,
+so you can see the deduplication working rather than take it on faith. **If you
+have a figure from 0.1.0, re-run it.**
 
 ## The shell audit
 
@@ -452,6 +462,10 @@ if handled like the other:
   the floor on visibility; it is not a security boundary.
 - **Prices are hardcoded** and dated in the source. They will drift. OpenAI rates
   come from a third-party aggregator rather than OpenAI's own page.
+- **Deduplication is by message id.** A record with no id cannot be keyed and is
+  always counted, so a transcript format that stops emitting ids would silently
+  return to over-counting. A repeat count of zero on a large scan is the signal
+  that this has happened.
 - **Rates use active days**, not calendar span, so one stale session from months ago
   doesn't silently divide your weekly burn rate by five.
 - **Cache TTL inference.** Older transcripts only record a flat cache-creation
@@ -459,9 +473,25 @@ if handled like the other:
 
 ## Verification
 
-The cost pipeline was cross-checked against an independent `jq` implementation over
-the same transcripts: 38,204 messages / $12,480.55 on the first root, matching to
-the cent. Do the same before trusting any number here that matters to you.
+The cost pipeline is cross-checked against an independent `jq` implementation over
+the same transcripts. Do the same before trusting any number here that matters to
+you.
+
+**That cross-check once agreed with a number that was twice too high**, and the
+reason is worth stating plainly: the `jq` implementation summed usage across every
+record, which is exactly the mistake the Python was making. Two implementations
+sharing an assumption agree with each other and are both wrong. An independent
+check is only independent where the assumptions differ, so a useful one here has
+to deduplicate on `message.id` — which the tool now does, and reports:
+
+```sh
+# what the tool says
+actualis --json | jq '.cost_usd, .duplicate_usage_records_skipped'
+
+# count distinct messages yourself, independently of this tool
+cat ~/.claude/projects/*/*.jsonl \
+  | jq -r 'select(.message.usage) | .message.id' | sort -u | wc -l
+```
 
 ## Tray app
 

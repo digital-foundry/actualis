@@ -1585,6 +1585,10 @@ EXPLAIN: dict[str, dict[str, object]] = {
     "cost": {
         "measures": "What the recorded token usage would cost at provider list prices.",
         "formula": [
+            "one billable message is counted ONCE, keyed on its message id. A",
+            "transcript repeats the same assistant record while a response streams,",
+            "so the record count is not the message count.",
+            "",
             "per message, using that message's model:",
             "  input        x rate",
             "  output       x rate",
@@ -1599,8 +1603,16 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "On a Pro/Max subscription you pay a flat fee, so this is an",
             "opportunity-cost figure and a consumption signal, NOT a bill.",
             "OpenAI rates come from a third-party aggregator, not OpenAI's page.",
+            "That a repeated message id means a repeated record, not repeated work.",
+            "Versions before 0.1.1 did not assume this and billed every record,",
+            "which overstated a real corpus by 2.13x. If you have a figure from",
+            "0.1.0, re-run it.",
+            "Models with no published rate are priced at the top of the known range",
+            "for their provider; that share is reported separately so you can",
+            "subtract it.",
         ],
-        "verify": "actualis --json | jq '.tokens, .cost_usd'   # then apply the rates yourself",
+        "verify": ("actualis --json | jq '.cost_usd, .duplicate_usage_records_skipped, "
+                   ".cost_usd_from_unpriced_models'"),
     },
     "cache": {
         "measures": "Share of input context served from cache, and what that saved.",
