@@ -1,0 +1,67 @@
+name: tray
+
+on:
+  push:
+    branches: [main]
+    paths: ["tray-go/**", ".github/workflows/tray.yml"]
+  pull_request:
+    paths: ["tray-go/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            goos: darwin
+            artifact: agentfleet-tray-macos-arm64
+          - os: ubuntu-latest
+            goos: linux
+            artifact: agentfleet-tray-linux-amd64
+          - os: windows-latest
+            goos: windows
+            artifact: agentfleet-tray-windows-amd64.exe
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run: { working-directory: tray-go }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: tray-go/go.sum
+
+      # systray is cgo: Cocoa on macOS, Win32 on Windows, and GTK plus an
+      # AppIndicator on Linux. This is why the binaries are built natively on
+      # each runner rather than cross-compiled from one machine.
+      - name: linux tray dependencies
+        if: matrix.goos == 'linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libayatana-appindicator3-dev
+
+      - name: vet
+        run: go vet ./...
+
+      - name: build
+        run: go build -trimpath -ldflags "-s -w" -o "${{ matrix.artifact }}" .
+
+      - name: it is a real binary for the right platform
+        shell: bash
+        run: |
+          ls -lh "${{ matrix.artifact }}"
+          file "${{ matrix.artifact }}" || true
+          test -s "${{ matrix.artifact }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: tray-go/${{ matrix.artifact }}
+          retention-days: 30

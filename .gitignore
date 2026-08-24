@@ -13,3 +13,7 @@ agentfleet-*.json
 
 # built tray bundle
 tray/*.app/
+
+# built tray binaries
+tray-go/agentfleet-tray
+tray-go/agentfleet-tray.exe
