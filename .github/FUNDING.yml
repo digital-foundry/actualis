@@ -1,5 +1,9 @@
 # Actualis is free and AGPL-3.0. Support is voluntary, buys nothing, and is
 # not a tax-deductible donation — Digital Foundry Solutions, LLC is a
 # for-profit company, not a registered charity.
-github: [digital-foundry]
+#
+# The `github:` entry is deliberately absent. The org is not enrolled in GitHub
+# Sponsors yet, and pointing the Sponsor button at an unenrolled org renders a
+# link that quietly redirects to the org profile — worse than no button. Add
+# `github: [digital-foundry]` back the day enrolment completes.
 custom: ["https://actualis.app/support/"]
