@@ -31,6 +31,7 @@ import os
 import re
 import sys
 from collections import Counter, OrderedDict, defaultdict
+from typing import NamedTuple
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -67,36 +68,85 @@ CACHE_WRITE_1H_MULT = 2.00
 # asking to be trusted rather than checked, so every rate carries its source.
 # VENDOR means the provider's own published price list; AGGREGATOR means a
 # third party, used only where the vendor does not publish that model id.
-VENDOR = "vendor"
-AGGREGATOR = "aggregator"
+# Rate provenance, as an ordered pecking order rather than a boolean.
+#
+# A cost tool that cannot say where a number came from is asking to be trusted
+# rather than checked. "Aggregator" alone was too coarse: it lumped a reputable
+# third party together with an outright guess, and said nothing about how stale
+# either was. Each tier below is strictly weaker than the one above it, and
+# RATE_TIERS fixes that order in one place so the report, the JSON and the tests
+# cannot disagree about which of two numbers is better founded.
+VENDOR = "vendor"            # the provider's own published price list
+VENDOR_DOC = "vendor-doc"    # provider docs, changelog or blog, not the price list
+AGGREGATOR = "aggregator"    # a third party that tracks prices
+FAMILY = "family"            # inferred from a sibling model in the same family
+DEFAULT = "default"          # the catch-all ceiling, used when nothing else fits
 
-# Verified against the vendors' own pages on 2026-08-24:
-#   platform.claude.com/docs/en/about-claude/pricing
-#   developers.openai.com/api/docs/pricing
-PRICING = {
-    # model id            (input $/Mtok, output $/Mtok, provider,   source)
-    "claude-fable-5":     (10.0, 50.0, "anthropic", VENDOR),
-    "claude-mythos-5":    (10.0, 50.0, "anthropic", VENDOR),
-    "claude-opus-5":      (5.0, 25.0, "anthropic", VENDOR),
-    "claude-opus-4-8":    (5.0, 25.0, "anthropic", VENDOR),
-    "claude-opus-4-7":    (5.0, 25.0, "anthropic", VENDOR),
-    "claude-opus-4-6":    (5.0, 25.0, "anthropic", VENDOR),
-    "claude-opus-4-5":    (5.0, 25.0, "anthropic", VENDOR),
-    "claude-opus-4-1":    (15.0, 75.0, "anthropic", VENDOR),   # retired, still billable on Bedrock/GCP
-    "claude-sonnet-5":    (2.0, 10.0, "anthropic", VENDOR),
-    "claude-sonnet-4-6":  (3.0, 15.0, "anthropic", VENDOR),
-    "claude-sonnet-4-5":  (3.0, 15.0, "anthropic", VENDOR),
-    "claude-haiku-4-5":   (1.0, 5.0, "anthropic", VENDOR),
-    "claude-haiku-3-5":   (0.80, 4.0, "anthropic", VENDOR),
+RATE_TIERS = (VENDOR, VENDOR_DOC, AGGREGATOR, FAMILY, DEFAULT)
 
-    "gpt-5.2":            (1.75, 14.0, "openai", VENDOR),
-    "gpt-5.3-codex":      (1.75, 14.0, "openai", VENDOR),
-    # OpenAI does not publish a `gpt-5.2-codex` line. The rate below is the
-    # aggregator's (pricepertoken.com, 2026-08-22) and happens to match what
-    # OpenAI charges for gpt-5.2 and gpt-5.3-codex, which is corroboration but
-    # not confirmation. Reported as aggregator-sourced wherever it is used.
-    "gpt-5.2-codex":      (1.75, 14.0, "openai", AGGREGATOR),
+# How far a rate can drift out of date before the report stops presenting it
+# without comment. Model prices move on the order of months, so a table older
+# than a quarter is a number worth doubting rather than quoting.
+PRICING_VERIFIED = "2026-08-24"
+PRICING_STALE_DAYS = 90
+
+RATE_SOURCES = {
+    "anthropic": "https://platform.claude.com/docs/en/about-claude/pricing",
+    "openai": "https://developers.openai.com/api/docs/pricing",
+    AGGREGATOR: "https://pricepertoken.com",
 }
+
+
+class Rate(NamedTuple):
+    """One model's price, and the provenance of that price."""
+    input: float          # $ per million input tokens
+    output: float         # $ per million output tokens
+    provider: str
+    tier: str             # one of RATE_TIERS
+    note: str = ""
+    # A retired model is still priced correctly for historical transcripts, but
+    # must not set the ceiling for a model that does not exist yet: opus-4-1 at
+    # $15/$75 would price a future Opus at three times the current rate.
+    retired: bool = False
+
+    @property
+    def confident(self) -> bool:
+        """Sourced from the provider itself, rather than inferred or guessed."""
+        return self.tier in (VENDOR, VENDOR_DOC)
+
+
+PRICING: dict[str, Rate] = {
+    "claude-fable-5":     Rate(10.0, 50.0, "anthropic", VENDOR),
+    "claude-mythos-5":    Rate(10.0, 50.0, "anthropic", VENDOR),
+    "claude-opus-5":      Rate(5.0, 25.0, "anthropic", VENDOR),
+    "claude-opus-4-8":    Rate(5.0, 25.0, "anthropic", VENDOR),
+    "claude-opus-4-7":    Rate(5.0, 25.0, "anthropic", VENDOR),
+    "claude-opus-4-6":    Rate(5.0, 25.0, "anthropic", VENDOR),
+    "claude-opus-4-5":    Rate(5.0, 25.0, "anthropic", VENDOR),
+    "claude-opus-4-1":    Rate(15.0, 75.0, "anthropic", VENDOR,
+                               "retired, still billable on Bedrock and GCP",
+                               retired=True),
+    "claude-sonnet-5":    Rate(2.0, 10.0, "anthropic", VENDOR),
+    "claude-sonnet-4-6":  Rate(3.0, 15.0, "anthropic", VENDOR),
+    "claude-sonnet-4-5":  Rate(3.0, 15.0, "anthropic", VENDOR),
+    "claude-haiku-4-5":   Rate(1.0, 5.0, "anthropic", VENDOR),
+    "claude-haiku-3-5":   Rate(0.80, 4.0, "anthropic", VENDOR),
+
+    "gpt-5.2":            Rate(1.75, 14.0, "openai", VENDOR),
+    "gpt-5.3-codex":      Rate(1.75, 14.0, "openai", VENDOR),
+    # OpenAI publishes no `gpt-5.2-codex` line. This matches what they charge
+    # for gpt-5.2 and gpt-5.3-codex, which is corroboration and not confirmation.
+    "gpt-5.2-codex":      Rate(1.75, 14.0, "openai", AGGREGATOR,
+                               "pricepertoken.com, 2026-08-22; no vendor line exists"),
+}
+
+# Model ids are versioned, so a new release lands in a family whose prices are
+# already known. Matching the family is a far better guess than the global
+# ceiling, and it is reported as an inference rather than as a fact.
+_FAMILY_PATTERNS = (
+    (re.compile(r"^claude-(opus|sonnet|haiku|fable|mythos)\b"), "anthropic"),
+    (re.compile(r"^(gpt|o[1-9])\b"), "openai"),
+)
 
 OPENAI_CACHED_MULT = 0.10
 
@@ -111,23 +161,97 @@ OPENAI_CACHED_MULT = 0.10
 # priced above everything in the table (o1-pro, say) would be understated, which
 # is why cost from unknown models is accumulated separately and reported as a
 # share of the headline rather than quietly folded into it.
-DEFAULT_RATES = (5.0, 25.0, "anthropic")   # Opus-tier
-OPENAI_FALLBACK = (1.75, 14.0, "openai")   # the only rate OpenAI publishes here
+# When nothing better is available. Opus-tier, so an unknown Anthropic model is
+# over-stated rather than under-stated: a bill that surprises you downward is a
+# far better failure than one that surprises you upward.
+DEFAULT_RATES = Rate(5.0, 25.0, "anthropic", DEFAULT,
+                     "no rate known for this model; priced at the ceiling")
+
+
+def _provider_ceiling(provider: str) -> Rate | None:
+    """The most expensive rate we actually know for a provider.
+
+    Used when a model is recognisably from a provider but is not in the table.
+    Deliberately the ceiling and not the median: this is a bound, and it is
+    reported as one.
+    """
+    known = [r for r in PRICING.values()
+             if r.provider == provider and not r.retired]
+    if not known:
+        return None
+    worst = max(known, key=lambda r: (r.output, r.input))
+    return Rate(worst.input, worst.output, provider, DEFAULT,
+                f"unknown {provider} model; priced at the most expensive "
+                f"{provider} rate on file")
+
+
+def _family_rate(model: str) -> Rate | None:
+    """The nearest known sibling in the same model family.
+
+    `claude-sonnet-4-9` ships and is not in the table. Every Sonnet we know is
+    within a factor of 1.5, so the family is a far better estimate than the
+    global ceiling -- but it is still an inference and says so.
+    """
+    for pattern, provider in _FAMILY_PATTERNS:
+        m = pattern.match(model)
+        if not m:
+            continue
+        family = m.group(0)
+        siblings = {k: r for k, r in PRICING.items()
+                    if k.startswith(family) and not r.retired}
+        if not siblings:
+            continue
+        # Highest-priced sibling, for the same reason the ceiling is used above.
+        name, best = max(siblings.items(), key=lambda kv: (kv[1].output, kv[1].input))
+        return Rate(best.input, best.output, provider, FAMILY,
+                    f"not in the table; priced as {name}, the most expensive "
+                    f"known {family} model")
+    return None
+
+
+def rate_for(model: str) -> Rate:
+    """Resolve a model to a rate, best source first.
+
+    exact table entry -> nearest sibling in the same family -> the most
+    expensive rate known for that provider -> the global ceiling. Every step
+    returns a Rate carrying the tier that answered, so the report can say how
+    the number was reached instead of presenting all four as equally solid.
+    """
+    hit = PRICING.get(model)
+    if hit:
+        return hit
+    fam = _family_rate(model)
+    if fam:
+        return fam
+    for _pattern, provider in _FAMILY_PATTERNS:
+        if _pattern.match(model):
+            ceiling = _provider_ceiling(provider)
+            if ceiling:
+                return ceiling
+    return DEFAULT_RATES
 
 
 def rates_for(model: str, when: datetime | None) -> tuple[float, float, str, bool, str]:
-    """Return (input_rate, output_rate, provider, is_known, source) for a model.
+    """Back-compatible shape: (input, output, provider, is_known, tier).
 
     `when` is retained for rates that vary by date. None are date-dependent
     today; the parameter stays so a future scheduled change does not require
     every caller to be touched again.
     """
-    if model in PRICING:
-        in_rate, out_rate, provider, source = PRICING[model]
-        return (in_rate, out_rate, provider, True, source)
-    if model.startswith(("gpt-", "o1", "o3", "o4")):
-        return (*OPENAI_FALLBACK, False, AGGREGATOR)
-    return (*DEFAULT_RATES, False, AGGREGATOR)
+    r = rate_for(model)
+    return (r.input, r.output, r.provider, r.tier == VENDOR, r.tier)
+
+
+def pricing_age_days(today: datetime | None = None) -> int:
+    """How stale the table is, computed offline from a date in the source.
+
+    The tool makes no network calls, so it cannot know whether a price changed.
+    It can know how long it has been since anyone checked, which is the honest
+    thing to report.
+    """
+    verified = datetime.strptime(PRICING_VERIFIED, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    now = today or datetime.now(timezone.utc)
+    return max((now - verified).days, 0)
 
 
 # --------------------------------------------------------------------------
@@ -701,12 +825,14 @@ def codex_session_cost(usage: dict, model: str) -> float:
     reasoning_output_tokens as a subset of output_tokens. Adding either to its
     parent double-counts.
     """
-    in_rate, out_rate, provider, known, _src = rates_for(model, None)
-    if not known:
-        # This came out of a Codex rollout, so it is OpenAI regardless of what the
-        # rate-table fallback inferred from the model string. Without this an
-        # unrecognised Codex model was billed at Opus rates with no cache discount.
-        in_rate, out_rate, provider = OPENAI_FALLBACK
+    r = rate_for(model)
+    in_rate, out_rate, provider = r.input, r.output, r.provider
+    if provider != "openai":
+        # This came out of a Codex rollout, so it is OpenAI whatever the model
+        # string looked like. Without this an unrecognised Codex model was
+        # billed at Anthropic rates with no cache discount at all.
+        ceiling = _provider_ceiling("openai") or DEFAULT_RATES
+        in_rate, out_rate, provider = ceiling.input, ceiling.output, "openai"
     total_in = usage.get("input_tokens", 0) or 0
     cached = usage.get("cached_input_tokens", 0) or 0
     out = usage.get("output_tokens", 0) or 0
@@ -779,6 +905,11 @@ class Fleet:
         # for that id. Counted separately from unknown models: the number is
         # probably right, but nobody authoritative has said so.
         self.aggregator_models: Counter = Counter()
+        # Spend split by how the rate was arrived at. A total that mixes
+        # published prices with inferences is only as trustworthy as its worst
+        # component, and the reader cannot know that unless it is shown.
+        self.cost_by_tier: dict[str, float] = defaultdict(float)
+        self.models_by_tier: dict[str, set] = defaultdict(set)
         # Cost attributable to models with no published rate. Reported as a
         # share of the headline so a reader can bound how wrong it might be.
         self.cost_unknown = 0.0
@@ -831,6 +962,8 @@ class Fleet:
 
         if not known:
             self.cost_unknown += cost
+        self.cost_by_tier[src] += cost
+        self.models_by_tier[src].add(model)
 
         self.messages += 1
         self.cost_by_agent["claude-code"] += cost
@@ -882,7 +1015,9 @@ class Fleet:
         the session total, exactly.
         """
         cost = codex_session_cost(usage, model)
-        _, _, _, known, _ = rates_for(model, None)
+        _, _, _, known, tier = rates_for(model, None)
+        self.cost_by_tier[tier] += cost
+        self.models_by_tier[tier].add(model)
         if not known:
             self.unknown_models[model] += 1
             self.cost_unknown += cost
@@ -1222,6 +1357,17 @@ class Fleet:
     @property
     def total_cost(self) -> float:
         return sum(self.cost_by_model.values())
+
+    @property
+    def confident_cost(self) -> float:
+        """Spend priced from a provider's own published rates."""
+        return sum(v for k, v in self.cost_by_tier.items()
+                   if k in (VENDOR, VENDOR_DOC))
+
+    @property
+    def confident_pct(self) -> float:
+        total = self.total_cost
+        return (self.confident_cost / total * 100) if total else 100.0
 
     @property
     def span_days(self) -> float:
@@ -2463,6 +2609,19 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
             # figure deserves to see why it moved.
             print(f"  {c.dim}repeats       {num(fleet.duplicate_usage_records)} "
                   f"records collapsed (one message, many transcript rows){c.off}")
+        # A total mixing published prices with inferences is only as sound as
+        # its weakest component. Saying so costs one line; not saying it lets an
+        # estimate read as a measurement.
+        if fleet.total_cost > 0 and fleet.confident_pct < 99.5:
+            tiers = ", ".join(f"{k} {money(v)}" for k, v in
+                              sorted(fleet.cost_by_tier.items(),
+                                     key=lambda kv: RATE_TIERS.index(kv[0])))
+            print(f"  {c.dim}priced from   {fleet.confident_pct:.0f}% published rates "
+                  f"· {tiers}{c.off}")
+        age = pricing_age_days()
+        if age > PRICING_STALE_DAYS:
+            print(f"  {c.yellow}▲ rates       last verified {PRICING_VERIFIED}, "
+                  f"{age} days ago. Prices move; treat this as dated.{c.off}")
         if fleet.cost_unknown > 0:
             print(f"  {c.dim}unpriced      {money(fleet.cost_unknown)} of the total "
                   f"is from models with no published rate{c.off}")
@@ -2865,6 +3024,18 @@ JSON_SCHEMA: dict[str, str] = {
     "messages": "int",
     "cost_usd": "float",
     "cost_usd_from_unpriced_models": "float",
+    "pricing.verified": "str",
+    "pricing.age_days": "int",
+    "pricing.stale": "bool",
+    "pricing.stale_after_days": "int",
+    "pricing.tier_order": "array",
+    "pricing.tier_order[]": "str",
+    "pricing.confident_pct": "float",
+    "pricing.cost_by_tier.*": "float",
+    "pricing.models_by_tier.*": "array",
+    "pricing.models_by_tier.*[]": "str",
+    "pricing.sources.*": "str",
+    "pricing.note": "str",
     "cost_note": "str",
     "duplicate_usage_records_skipped": "int",
     "duplicate_note": "str",
@@ -2989,7 +3160,23 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
                     "roots": [str(r) for r in fleet.roots]},
         "messages": fleet.messages,
         "cost_usd": float(round(fleet.total_cost, 4)),
-        "cost_usd_from_unpriced_models": round(fleet.cost_unknown, 4),
+        "cost_usd_from_unpriced_models": float(round(fleet.cost_unknown, 4)),
+        "pricing": {
+            "verified": PRICING_VERIFIED,
+            "age_days": pricing_age_days(),
+            "stale": pricing_age_days() > PRICING_STALE_DAYS,
+            "stale_after_days": PRICING_STALE_DAYS,
+            "tier_order": list(RATE_TIERS),
+            "confident_pct": float(round(fleet.confident_pct, 2)),
+            "cost_by_tier": {k: float(round(v, 4))
+                             for k, v in sorted(fleet.cost_by_tier.items())},
+            "models_by_tier": {k: sorted(v)
+                               for k, v in sorted(fleet.models_by_tier.items())},
+            "sources": dict(RATE_SOURCES),
+            "note": "tier_order runs best to worst. vendor is a published price; "
+                    "family and default are inferences, and a total is only as "
+                    "sound as its weakest component.",
+        },
         "cost_note": "models with no published rate are priced at the top of the "
                      "known range for their provider, so that share is an upper "
                      "bound among current models rather than a measurement",

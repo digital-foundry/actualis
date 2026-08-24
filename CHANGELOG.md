@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+### Added
+
+- **Rate provenance is now an ordered pecking order, not a boolean.** A rate was
+  either `VENDOR` or `AGGREGATOR`, which lumped a reputable third party together
+  with an outright guess. There are now five tiers, best to worst: `vendor`,
+  `vendor-doc`, `aggregator`, `family`, `default`.
+
+  Resolution falls back through them: exact entry, then the nearest current
+  sibling in the same model family, then the most expensive rate known for that
+  provider, then the global ceiling. Each step reports the tier that answered,
+  so a guess cannot present itself as a published price. An unseen
+  `claude-sonnet-4-9` is now priced from the Sonnet family instead of the
+  Opus-tier ceiling, which is roughly 40% closer.
+
+  Inference errs **upward** on purpose — a bill that surprises you downward is a
+  better failure than one that surprises you upward. Retired models are excluded
+  from inference: `claude-opus-4-1` at $15/$75 is still priced exactly for
+  historical transcripts, but must not set the ceiling for a model that does not
+  exist yet.
+
+- **The report says how much of a total rests on a published price.**
+  `confident_pct` plus a per-tier breakdown, in the report and in `--json`. A
+  total mixing published prices with inferences is only as sound as its weakest
+  component, and without this a reader cannot tell an estimate from a
+  measurement.
+
+- **Staleness is reported, computed offline.** The tool makes no network calls,
+  so it cannot know whether a price changed — but it can know how long since
+  anyone checked. Past 90 days the report says so rather than quoting a dated
+  number with a straight face.
+
+- **`tools/price-check.py`** — the refresh path, deliberately outside the CLI.
+  It reports table age and coverage offline, and with `--fetch` checks whether
+  each priced model id still appears on its provider's page. It does **not**
+  parse prices and never writes one: a silently mis-parsed rate would carry the
+  authority of a checked one. A test asserts the CLI imports no networking
+  module at all.
+
 ### Fixed
 
 - **Named-secret detection missed 19 of 21 credential-shaped names.**

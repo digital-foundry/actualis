@@ -17,6 +17,7 @@ that and prints a warning.
 | `cost_usd` | total, at provider list prices |
 | `cost_usd_from_unpriced_models` | how much of `cost_usd` came from models with no published rate |
 | `cost_note` | how unpriced models are rated, and in which direction that errs |
+| `pricing` | where each rate came from, how old the table is, and how much of the total rests on a published price. See [Rate provenance](#rate-provenance) |
 | `duplicate_usage_records_skipped` | repeated records for the same message, counted once |
 | `duplicate_note` | why repeats occur and how they are collapsed |
 | `tokens` | `input`, `output`, `cache_w_1h`, `cache_w_5m`, `cache_read` |
@@ -41,6 +42,52 @@ that and prints a warning.
 | `refusals` | what was stopped and by which gate, joined to the blocked command. See below |
 | `unknown_models` | models seen with no pricing entry, billed at Opus-tier rates |
 | `aggregator_priced_models` | models priced from a third party because the vendor publishes no rate for that id |
+
+## Rate provenance
+
+A cost tool that cannot say where a number came from is asking to be trusted
+rather than checked. `pricing` says.
+
+```json
+{ "verified": "2026-08-24", "age_days": 0, "stale": false, "stale_after_days": 90,
+  "tier_order": ["vendor","vendor-doc","aggregator","family","default"],
+  "confident_pct": 28.17,
+  "cost_by_tier":   { "vendor": 3.0, "aggregator": 3.15, "family": 4.5 },
+  "models_by_tier": { "vendor": ["claude-sonnet-5"], "family": ["claude-sonnet-4-9"] } }
+```
+
+`tier_order` runs **best to worst**, and the order is the point:
+
+| tier | means |
+|---|---|
+| `vendor` | the provider's own published price list |
+| `vendor-doc` | provider docs, changelog or blog — not the price list |
+| `aggregator` | a third party that tracks prices |
+| `family` | **inferred** from the most expensive current sibling in the same model family |
+| `default` | **inferred** from the most expensive rate known for that provider, or the global ceiling |
+
+A model is resolved in that order: exact entry, then nearest family sibling,
+then the provider ceiling, then the global ceiling. Each step reports the tier
+that answered, so a guess cannot present itself as a published price.
+
+Inference is deliberately biased **upward**. A bill that surprises you downward
+is a far better failure than one that surprises you upward. Retired models are
+excluded from inference: `claude-opus-4-1` is priced correctly for historical
+transcripts, but must not set the ceiling for a model that does not exist yet.
+
+`confident_pct` is the share of `cost_usd` priced from a provider's own rates.
+**A total is only as sound as its weakest component**, and without this number
+a reader cannot tell a measured figure from a mostly-inferred one.
+
+### Staleness
+
+The tool makes no network calls, so it cannot know whether a price changed. It
+can know how long it has been since anyone checked, and `age_days` reports
+exactly that, computed offline from `verified`. Past `stale_after_days` the
+report says so rather than quoting an old number with a straight face.
+
+Refreshing the table is a deliberate, human-run step — see `tools/price-check.py`
+in the repository. The CLI will never fetch a price on your behalf.
 
 ## Verifying a report
 
