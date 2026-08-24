@@ -1759,3 +1759,61 @@ class TestSuppressions(unittest.TestCase):
         out = buf.getvalue()
         self.assertIn("--suppress", out)
         self.assertIn("still counted", out.lower().replace("stays counted", "still counted"))
+
+
+class TestRenderedReportLeaksNothing(unittest.TestCase):
+    """CodeQL flags the secrets section as clear-text logging of sensitive data.
+    It is a false positive -- taint tracking follows the `secrets` dict and
+    cannot see that only fingerprints and type names ever reach a print -- but
+    "it is a false positive" is worth nothing as an opinion. These assert it.
+    """
+
+    SECRET_VALUES = [
+        "notarealtokenjustafixture02",
+        "ghp_abcdefghijklmnopqrstuvwxyz012345",
+        "notarealpassphrasejustafixture03",
+    ]
+
+    def _fleet(self):
+        f = af.Fleet()
+        ts = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        for i, v in enumerate(self.SECRET_VALUES):
+            f.add_tool(f"proj{i}", "Bash", {"command": f"export API_TOKEN={v}"}, ts)
+        return f
+
+    def test_the_secret_value_is_never_retained_in_memory(self):
+        """The strongest form: it is not printed because it does not exist."""
+        f = self._fleet()
+        blob = repr(f.secrets)
+        for v in self.SECRET_VALUES:
+            with self.subTest(value=v[:12]):
+                self.assertNotIn(v, blob)
+
+    def test_the_rendered_report_contains_no_secret_value(self):
+        import io, contextlib
+        f = self._fleet()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            af.render(f, af.C(False), bash_only=False, top=10)
+        out = buf.getvalue()
+        for v in self.SECRET_VALUES:
+            with self.subTest(value=v[:12]):
+                self.assertNotIn(v, out)
+        # And it does print the fingerprint, which is the point of the section.
+        self.assertTrue(any(fp in out for fp in f.secrets))
+
+    def test_the_json_payload_contains_no_secret_value(self):
+        blob = json.dumps(af.to_json(self._fleet()))
+        for v in self.SECRET_VALUES:
+            with self.subTest(value=v[:12]):
+                self.assertNotIn(v, blob)
+
+    def test_a_fingerprint_is_not_reversible_to_the_value(self):
+        """sha256[:8] of the value. Truncated deliberately: enough to correlate
+        two sightings, not enough to be a credential."""
+        f = self._fleet()
+        for fp in f.secrets:
+            with self.subTest(fp=fp):
+                self.assertEqual(len(fp), 8)
+                self.assertRegex(fp, r"^[0-9a-f]{8}$")
+                self.assertNotIn(fp, self.SECRET_VALUES)
