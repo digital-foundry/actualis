@@ -33,30 +33,42 @@ baseline. Identity stays constant; state is carried by an added *form*.
 | state | form | when |
 |---|---|---|
 | idle | A-mark | nothing exposed |
-| monitoring | A-mark + dot | credentials worth rotating |
-| exposed | A-mark in a ring | critical credentials exposed |
-| syncing | segmented spinner | scanning |
-| error | crosshair | data could not be read |
+| monitoring | A-mark + two amber dots | credentials worth rotating |
+| exposed | A-mark inside a thin amber ring | critical credentials exposed |
+| syncing | segmented spinner, no A-mark | scanning |
+| error | A-mark with a slash (the sheet's MUTED glyph) | data could not be read |
 
-**macOS gets template icons.** Alpha only, inked by the OS for whatever the menu
-bar is actually doing. This replaced an `AppleInterfaceStyle` probe that was
-measurably wrong: it reported *Dark* on a machine whose menu bar was visibly
-light, which is exactly how you ship an invisible icon. The OS already knows;
-asking it a proxy question does not work.
+**The geometry is measured, not eyeballed.** Every ratio in
+`icons/gen_icons.py` was taken off `branding/trayiconMac.png` — the 32px cells
+of the SIZES table for layout, the 98px overview tiles for stroke weight, with
+the source measurement recorded beside each constant. The sheet says *"do not
+alter proportions or stroke weights"*, so the generator is the spec and the
+PNGs are build output. Regenerate with `python3 icons/gen_icons.py`.
 
-Elsewhere there is no template concept, so the fallback is drawn in amber
-throughout — a mid-tone that reads on a light taskbar and a dark one alike, so
-no appearance guess is needed there either.
+**These are not template icons.** A macOS template image is alpha-only — the OS
+inks it as a flat monochrome mask — so it cannot carry the amber that the sheet
+puts on every state, in both its light-mode and dark-mode context examples.
+Amber is load-bearing: it is what makes an exposure read as a warning rather
+than as a letter A. So the icons ship in full colour, in two colourways, and
+the app installs the one matching the menu bar.
 
-Icons are rendered with 4x4 supersampling. An earlier set wrote hard pixels with
-a 2px outline and, sat beside real menu bar icons, read as a chunky sticker:
-everything else up there is a thin, antialiased, outline-free glyph. Stroke
-weight is 3.2px at 2x — about 1.6px on screen — to match that optical weight.
+Choosing a colourway means asking the OS what appearance it is drawing.
+`defaults read -g AppleInterfaceStyle` answers a proxy question and gets it
+wrong — it reported *Dark* on a machine whose menu bar was visibly light, which
+is exactly how you ship an invisible icon. `appearance_darwin.go` asks AppKit
+directly through `NSApp.effectiveAppearance`, and a 2-second watcher reinstalls
+the icon when the appearance flips, since for a healthy fleet the next state
+change may never come.
+
+Linux and Windows have no single reliable cross-desktop appearance signal, so
+they get the dark-menu-bar colourway by default. `ACTUALIS_TRAY_THEME=light`
+overrides it.
+
+Icons render at 44px (22pt @2x) with 4x4 supersampling.
 
 Two brand rules shape the rest. **Amber indicates state, never identity**, so
 the mark still reads with amber stripped. And **colour alone never carries
-meaning** — every state changes form, which is what lets a monochrome template
-convey all five.
+meaning** — every state also changes form.
 
 ## Alerting
 

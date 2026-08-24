@@ -37,68 +37,134 @@ import (
 
 // ACTUALIS icon system 1.0.0.
 //
-// macOS gets TEMPLATE icons: alpha only, inked by the OS for whatever the menu
-// bar is actually doing. This replaced an AppleInterfaceStyle probe that was
-// simply wrong — it reported Dark on a machine whose menu bar was visibly
-// light, which is exactly how you ship an invisible icon. The OS knows; asking
-// it a proxy question does not work.
+// Geometry comes from branding/trayiconMac.png, measured rather than eyeballed;
+// icons/gen_icons.py records every ratio and where on the sheet it was taken
+// from. The sheet says "do not alter proportions or stroke weights", so the
+// generator is the spec and the PNGs are build output.
 //
-// Everywhere else there is no template concept, so the fallback is drawn in
-// amber throughout: a mid-tone that reads on a light taskbar and a dark one
-// alike, so no appearance guess is needed there either.
+// These are NOT template icons. A macOS template image is alpha-only — the OS
+// inks it as a flat monochrome mask — which strips the amber the sheet puts on
+// every state, in both its light-mode and dark-mode context examples. Amber is
+// load-bearing here: it is what makes an exposure read as a warning. So the
+// icons ship in full colour, in two colourways, and the app picks the one that
+// matches the menu bar.
 //
-// State is carried by FORM — a ring, a dot, a spinner, a crosshair — never by
-// colour alone, per the brand accessibility rule. That is also what lets the
-// monochrome template convey every state.
+// Picking a colourway means asking the OS what appearance it is drawing. The
+// earlier `defaults read -g AppleInterfaceStyle` probe answered a proxy
+// question and got it wrong — Dark on a visibly light menu bar, hence an
+// invisible icon. menuBarIsDark asks AppKit directly via
+// NSApp.effectiveAppearance. Where the answer is unknown (Linux, Windows) the
+// dark colourway is used, overridable with ACTUALIS_TRAY_THEME.
+//
+// State is carried by FORM as well as colour — a ring, dots, a spinner, a
+// slash — so the icon still reads if the colour does not.
 
-//go:embed icons/idle-template.png
-var tplIdle []byte
+//go:embed icons/idle-dark.png
+var iconIdleDark []byte
 
-//go:embed icons/idle.png
-var regIdle []byte
+//go:embed icons/idle-light.png
+var iconIdleLight []byte
 
-//go:embed icons/monitoring-template.png
-var tplMon []byte
+//go:embed icons/monitoring-dark.png
+var iconMonDark []byte
 
-//go:embed icons/monitoring.png
-var regMon []byte
+//go:embed icons/monitoring-light.png
+var iconMonLight []byte
 
-//go:embed icons/exposed-template.png
-var tplExp []byte
+//go:embed icons/exposed-dark.png
+var iconExpDark []byte
 
-//go:embed icons/exposed.png
-var regExp []byte
+//go:embed icons/exposed-light.png
+var iconExpLight []byte
 
-//go:embed icons/syncing-template.png
-var tplSync []byte
+//go:embed icons/syncing-dark.png
+var iconSyncDark []byte
 
-//go:embed icons/syncing.png
-var regSync []byte
+//go:embed icons/syncing-light.png
+var iconSyncLight []byte
 
-//go:embed icons/error-template.png
-var tplErr []byte
+//go:embed icons/error-dark.png
+var iconErrDark []byte
 
-//go:embed icons/error.png
-var regErr []byte
+//go:embed icons/error-light.png
+var iconErrLight []byte
 
-// setIcon installs the state's mark. SetTemplateIcon uses the template on
-// macOS and falls back to the regular icon elsewhere, which is precisely the
-// behaviour wanted on all three platforms.
+// iconState remembers what is currently installed so the appearance watcher
+// can reinstall the same state in the other colourway.
+var iconState struct {
+	sync.Mutex
+	name string
+	dark bool
+	set  bool
+}
+
+// barIsDark reports whether the tray sits on a dark bar, which selects the
+// bone-ink colourway. ACTUALIS_TRAY_THEME names the BAR, not the ink, and
+// exists for Linux and Windows where there is no appearance signal to read.
+func barIsDark() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ACTUALIS_TRAY_THEME"))) {
+	case "light":
+		return false
+	case "dark":
+		return true
+	}
+	dark, known := menuBarIsDark()
+	if !known {
+		return true // a dark taskbar is the safer default
+	}
+	return dark
+}
+
+// setIcon installs the state's mark in the colourway matching the menu bar.
+// dark reports whether the menu bar is dark, i.e. whether the light-ink
+// artwork is wanted.
 func setIcon(state string) {
-	var tpl, reg []byte
+	dark := barIsDark()
+	iconState.Lock()
+	iconState.name, iconState.dark, iconState.set = state, dark, true
+	iconState.Unlock()
+	systray.SetIcon(iconFor(state, dark))
+}
+
+func iconFor(state string, dark bool) []byte {
+	var onDark, onLight []byte
 	switch state {
 	case "exposed":
-		tpl, reg = tplExp, regExp
+		onDark, onLight = iconExpDark, iconExpLight
 	case "monitoring":
-		tpl, reg = tplMon, regMon
+		onDark, onLight = iconMonDark, iconMonLight
 	case "syncing":
-		tpl, reg = tplSync, regSync
+		onDark, onLight = iconSyncDark, iconSyncLight
 	case "error":
-		tpl, reg = tplErr, regErr
+		onDark, onLight = iconErrDark, iconErrLight
 	default:
-		tpl, reg = tplIdle, regIdle
+		onDark, onLight = iconIdleDark, iconIdleLight
 	}
-	systray.SetTemplateIcon(tpl, reg)
+	if dark {
+		return onDark
+	}
+	return onLight
+}
+
+// watchAppearance reinstalls the current icon when the menu bar flips between
+// light and dark. Without this the ink stays inverted until the next state
+// change, which for a healthy fleet may be never.
+func watchAppearance() {
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	for range t.C {
+		dark := barIsDark()
+		iconState.Lock()
+		stale := iconState.set && iconState.dark != dark
+		name := iconState.name
+		if stale {
+			iconState.dark = dark
+		}
+		iconState.Unlock()
+		if stale {
+			systray.SetIcon(iconFor(name, dark))
+		}
+	}
 }
 
 // ---------------------------------------------------------------- report
@@ -300,6 +366,7 @@ func (u *ui) flash(state string) {
 
 func (u *ui) onReady() {
 	setIcon("idle")
+	go watchAppearance()
 	systray.SetTooltip("Actualis — what actually ran")
 
 	u.mHeader = systray.AddMenuItem("Loading…", "")
