@@ -58,6 +58,12 @@ var icCritLight []byte
 //go:embed icons/critical-dark.png
 var icCritDark []byte
 
+//go:embed icons/error.png
+var icErrLight []byte
+
+//go:embed icons/error-dark.png
+var icErrDark []byte
+
 // darkMenuBar reports whether the system is in dark appearance. Only macOS is
 // asked; elsewhere the halo carries legibility and the answer does not matter.
 func darkMenuBar() bool {
@@ -71,6 +77,11 @@ func darkMenuBar() bool {
 func iconFor(state string) []byte {
 	dark := darkMenuBar()
 	switch state {
+	case "error":
+		if dark {
+			return icErrDark
+		}
+		return icErrLight
 	case "critical":
 		if dark {
 			return icCritDark
@@ -279,7 +290,7 @@ func (u *ui) flash(state string) {
 		for i := 0; i < 3; i++ {
 			systray.SetIcon(iconFor("critical"))
 			time.Sleep(320 * time.Millisecond)
-			systray.SetIcon(iconFor("clean"))
+			systray.SetIcon(iconFor("warn"))
 			time.Sleep(220 * time.Millisecond)
 		}
 		systray.SetIcon(iconFor(state))
@@ -415,7 +426,7 @@ func (u *ui) render() {
 	u.mu.Unlock()
 
 	if r.err != "" {
-		systray.SetIcon(iconFor("warn"))
+		systray.SetIcon(iconFor("error"))
 		systray.SetTooltip("agentfleet: " + r.err)
 		u.mHeader.SetTitle(r.err)
 		return

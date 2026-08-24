@@ -446,17 +446,21 @@ The cost pipeline was cross-checked against an independent `jq` implementation o
 the same transcripts: 38,204 messages / $12,480.55 on the first root, matching to
 the cent. Do the same before trusting any number here that matters to you.
 
-## Menu bar app (macOS)
+## Tray app
 
 ```sh
-cd tray && ./build.sh && open agentfleet.app
+cd tray-go && go build -ldflags "-s -w" -o agentfleet-tray . && ./agentfleet-tray
 ```
 
-The badge counts **unrotated critical credentials**, not spend — a menu bar
-number earns its place by being actionable at a glance, and spend is not. One
-Swift file, ~150 KB, native AppKit, no Electron and no webview. It is a thin
-shell over `--json`; all measurement stays in the CLI. See
-[tray/README.md](tray/README.md).
+A **constant gauge mark with a status dot in the corner** — the pattern Docker,
+1Password and Teams use, so the app stays recognisable and only the badge
+changes. Green check when clean, amber when there is something to rotate, red
+when it is critical. A newly exposed credential also raises a native
+notification and flashes the badge.
+
+macOS, Linux and Windows from one Go codebase, ~2 MB, no Electron and no
+webview. It is a thin shell over `--json`; all measurement stays in the CLI.
+See [tray-go/README.md](tray-go/README.md).
 
 ## Running it in the background (macOS)
 
