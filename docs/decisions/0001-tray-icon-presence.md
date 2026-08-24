@@ -99,10 +99,24 @@ neighbour band of 0.44–0.53. Up from 0.31.
   destroys the glyph. Coverage is a useful proxy for "does this hold its own",
   not a target to optimise into.
 
-## Open item
+## Resolved: the palette contradiction
 
-The palettes disagree between sheets. `trayiconMac.png` gives slate `#2A3138`,
-smoke `#6B7278`, amber `#C47A3A`; the brand guide and `trayiconWindows.png`
-give `#1F2430`, `#3A414E`, `#E08A24`. The amber differs visibly. The macOS tray
-follows the macOS sheet (`#C47A3A`). Whoever owns the sheets should reconcile
-them.
+The sheets disagreed on three of five swatches. The macOS icon sheet printed
+slate `#2A3138`, smoke `#6B7278` and amber `#C47A3A`; the brand guide and the
+Windows sheet print `#1F2430`, `#3A414E` and `#E08A24`. Carbon and bone matched
+in both.
+
+Amber is the one that mattered: it is the brand's only accent, and `#C47A3A` is
+visibly browner and duller than `#E08A24`. The macOS tray shipped one and the
+website the other, so the two were the same brand in different colours.
+
+Settled on the **brand guide**. It is the primary source that the platform
+sheets derive from, the Windows sheet already agrees with it, and the website
+uses it. The pattern of the disagreement supports that reading rather than
+contradicting it: all three divergent swatches are browner and lighter on the
+macOS sheet while carbon and bone are identical, which is what a colour-profile
+mismatch in rendering looks like, not what three deliberate design changes look
+like.
+
+The tray icons are regenerated at `#E08A24`. If the sheet's amber turns out to
+be intentional after all, this is one constant in `gen_icons.py`.

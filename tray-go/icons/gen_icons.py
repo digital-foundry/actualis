@@ -27,10 +27,21 @@ import pathlib
 import struct
 import zlib
 
-# --- palette, from PALETTE (APPROVED) on the sheet -----------------------
+# --- palette --------------------------------------------------------------
+# From the ACTUALIS brand guide, which is the primary source. The macOS icon
+# sheet printed a different amber (#C47A3A), slate (#2A3138) and smoke
+# (#6B7278) -- browner and lighter than the guide on exactly those three
+# swatches, which is the signature of a colour-profile mismatch in rendering
+# rather than three separate design decisions. Carbon and bone matched, and a
+# genuine repalette would not have left those alone.
+#
+# Resolved in favour of the brand guide: the Windows sheet agrees with it, the
+# website uses it, and it is the source the platform sheets derive from. Amber
+# is the brand's only accent, so a mac tray that did not match the site was the
+# one place the drift was visible.
 CARBON = (0x0B, 0x0C, 0x0E)
 BONE   = (0xF2, 0xEF, 0xE9)
-AMBER  = (0xC4, 0x7A, 0x3A)
+AMBER  = (0xE0, 0x8A, 0x24)
 
 # --- geometry, as ratios ------------------------------------------------
 # A-mark, from the 32px IDLE cell: bbox 22w x 23h in a 32px canvas.
