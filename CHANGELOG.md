@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.1.0 — unreleased
+## 0.1.0 — 2026-08-23
 
-First working version. Not yet published.
+First public release.
 
 ### Reporting
 - Cost, tokens and message counts across **Claude Code** and **Codex**, priced
@@ -34,6 +34,35 @@ First working version. Not yet published.
 - Eleven findings (`AF001`–`AF011`) with evidence, an action, and an impact
   estimate where one is computable. Benchmarked against your own history, so no
   telemetry is needed and it works with one user.
+
+### Trust and explainability
+- **Agent binary verification.** Before trusting a transcript, the code
+  signature of the agent that produced it is checked against the expected
+  publisher — Anthropic for Claude Code, OpenAI for Codex. A tampered or
+  unsigned binary is reported as such rather than quietly accepted. Verified
+  empirically by flipping one byte of a 325MB signed binary and confirming the
+  check fails.
+- **`--why`** expands any finding to the records behind it; **`--explain`**
+  shows a metric's arithmetic, the rate applied, and what was excluded. No
+  figure is presented that cannot be traced to its evidence.
+- Unknown model rates are reported as unknown and excluded from totals rather
+  than guessed, and the total says so when it is short.
+
+### Tray
+- Native menu bar app for **macOS, Linux and Windows**, reading the same local
+  data as the CLI with no separate service.
+- State is carried by form as well as colour, so the mark still reads without
+  it. A newly-appearing critical credential raises one notification, once, per
+  credential — the first scan establishes a baseline rather than dumping a
+  month of history at launch.
+- Report a bug, request a feature, or support development from the menu. A
+  prefilled bug report carries the version and platform and nothing else: this
+  tool reads credential exposures, and a convenient diagnostics attachment
+  would be the worst bug it could ship.
+
+### Interfaces
+- **MCP server** over the 2026-07-28 stateless spec, exposing the same
+  read-only data to an agent that the CLI shows a human.
 
 ### Modes
 - `--watch` live alerting with native notifications, plus a macOS LaunchAgent.
