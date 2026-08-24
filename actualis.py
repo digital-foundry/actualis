@@ -718,6 +718,15 @@ class Fleet:
         self.flag_counts: Counter = Counter()
         self.permission_modes: Counter = Counter()
         self.denials: Counter = Counter()
+        # Refusals joined to the command they actually blocked. A refused
+        # command is never sent to a provider, so this exists only here: no
+        # API-layer view of the same session has any record of it.
+        self.refusals = 0
+        self.refusals_joined = 0
+        self.refusal_tool: dict[str, Counter] = defaultdict(Counter)
+        self.refusal_program: dict[str, Counter] = defaultdict(Counter)
+        self.refusal_project: dict[str, Counter] = defaultdict(Counter)
+        self.refusal_week: dict[str, Counter] = defaultdict(Counter)
         self.secret_exposures = 0
         self.secret_projects: Counter = Counter()
         # (priority, type, fingerprint) -> {uses, first, last, projects}
@@ -937,6 +946,38 @@ class Fleet:
         if best:
             self.add_codex_session(project, model or "unknown", best, last_ts)
 
+    def add_refusal(self, kind: str, rec: dict, project: str,
+                    ts: datetime | None, calls: dict[str, tuple[str, str]]) -> None:
+        """Attribute one refusal to the tool call it blocked.
+
+        The refusal record carries no tool_use block of its own; it points back
+        through `tool_use_id` on its tool_result. Reading only the refusal
+        record tells you a refusal happened and nothing about what was refused.
+        """
+        self.refusals += 1
+        self.refusal_project[project][kind] += 1
+        if ts:
+            self.refusal_week[ts.strftime("%Y-W%V")][kind] += 1
+
+        msg = rec.get("message")
+        blocks = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(blocks, list):
+            return
+        for b in blocks:
+            if not isinstance(b, dict) or b.get("type") != "tool_result":
+                continue
+            hit = calls.get(b.get("tool_use_id") or "")
+            if not hit:
+                continue
+            name, cmd = hit
+            self.refusals_joined += 1
+            self.refusal_tool[kind][clean(name)[:48] or "?"] += 1
+            if name == "Bash" and cmd:
+                head = command_head(cmd)
+                if head:
+                    self.refusal_program[kind][clean(head)[:40]] += 1
+            return
+
     def add_subagent(self, result: dict, ts: datetime | None) -> None:
         """One completed subagent run.
 
@@ -1062,6 +1103,10 @@ class Fleet:
             return
         self.files_scanned += 1
         self.bytes_scanned += size
+        # tool_use_id -> (tool name, command). Scoped to this file: a refusal
+        # always answers a tool call in the same session, so nothing needs to
+        # survive across files and memory stays bounded on a large fleet.
+        calls: dict[str, tuple[str, str]] = {}
         try:
             with path.open("r", encoding="utf-8", errors="replace") as fh:
                 for line in fh:
@@ -1090,6 +1135,7 @@ class Fleet:
                     if denial:
                         self.denials[denial] += 1
                         self.denials_by_project[project] += 1
+                        self.add_refusal(str(denial), rec, project, ts, calls)
                     eff = rec.get("effort")
                     if eff:
                         self.effort_mix[str(eff)] += 1
@@ -1120,6 +1166,11 @@ class Fleet:
                             if isinstance(block, dict) and block.get("type") == "tool_use":
                                 self.add_tool(project, block.get("name") or "?",
                                               block.get("input") or {}, ts)
+                                if block.get("id"):
+                                    calls[block["id"]] = (
+                                        block.get("name") or "?",
+                                        ((block.get("input") or {}).get("command") or "")
+                                        [:MAX_SCAN_LINE])
         except OSError:
             return
 
@@ -1628,6 +1679,31 @@ EXPLAIN: dict[str, dict[str, object]] = {
         ],
         "verify": ("actualis --json | jq '.cost_usd, .duplicate_usage_records_skipped, "
                    ".cost_usd_from_unpriced_models'"),
+    },
+    "refusals": {
+        "measures": "What was stopped before it ran, and which gate stopped it.",
+        "formula": [
+            "A refusal is its own transcript record carrying toolDenialKind. It",
+            "holds no tool_use block: it points back at the call it blocked",
+            "through tool_use_id on its tool_result.",
+            "",
+            "  index every tool_use id -> (tool name, command)",
+            "  for each refusal: look up its tool_use_id",
+            "  program = the head of that command, not its first token",
+            "",
+            "user-rejected     a human declined",
+            "automode-blocked  the auto-mode policy declined",
+            "automode-unavailable  the deciding model was unreachable",
+        ],
+        "assumes": [
+            "That a refusal answers a call in the same session file. Anything",
+            "unjoined is reported separately rather than dropped.",
+            "This machine only. Refusals are NOT deduplicated across developers,",
+            "and they are bounded by how long transcripts are kept.",
+            "A refusal is not a verdict. It says a gate fired, not that firing",
+            "was correct.",
+        ],
+        "verify": "actualis --json | jq '.refusals.total, .refusals.by_program'",
     },
     "cache": {
         "measures": "Share of input context served from cache, and what that saved.",
@@ -2193,6 +2269,17 @@ def _mcp_call(name: str, args: dict, cache: _MCPCache) -> dict:
             "permission_modes": dict(f.permission_modes),
             "denials": dict(f.denials),
             "most_run": dict(f.bash_first_token.most_common(15)),
+            "refusals": {
+                "total": f.refusals,
+                "joined_to_a_command": f.refusals_joined,
+                "by_gate": {k: dict(v.most_common(8))
+                            for k, v in sorted(f.refusal_tool.items())},
+                "by_program": {k: dict(v.most_common(12))
+                               for k, v in sorted(f.refusal_program.items())},
+                "note": "a refused command is never sent to a provider, so these "
+                        "exist only in the local transcript. Program names only, "
+                        "never the command text.",
+            },
             "note": "counts only; command text is deliberately not returned, because "
                     "anything returned here is written back into a transcript",
         }
@@ -2485,6 +2572,31 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
 
     # ---- shell audit -----------------------------------------------------
 
+    if fleet.refusals:
+        rule(c, "REFUSALS")
+        print(f"  {c.dim}What was stopped, and by whom. A refused command is never "
+              f"sent,{c.off}")
+        print(f"  {c.dim}so this exists only in your local transcripts.{c.off}\n")
+        gates = sorted(fleet.refusal_tool,
+                       key=lambda k: -sum(fleet.refusal_tool[k].values()))
+        for kind in gates:
+            who = "a human" if kind == "user-rejected" else "the policy"
+            n = sum(fleet.refusal_tool[kind].values())
+            print(f"  {c.bold}{kind}{c.off}  {c.dim}{n} · {who}{c.off}")
+            tools = ", ".join(f"{t} {v}" for t, v in fleet.refusal_tool[kind].most_common(4))
+            print(f"    tools     {tools}")
+            progs = fleet.refusal_program.get(kind)
+            if progs:
+                print(f"    programs  "
+                      + "  ".join(f"{p}:{v}" for p, v in progs.most_common(8)))
+        if len(fleet.refusal_week) > 1:
+            wk = sorted(fleet.refusal_week.items())
+            spark = "  ".join(f"{w.split('-W')[1]}:{sum(v.values())}" for w, v in wk[-8:])
+            print(f"\n  {c.dim}by week   {spark}{c.off}")
+        print(f"  {c.dim}This machine only. Refusals are not deduplicated across "
+              f"developers.{c.off}")
+        print()
+
     rule(c, "SHELL AUDIT")
     total_tools = sum(fleet.tools.values())
     share = fleet.tools.get("Bash", 0) / total_tools * 100 if total_tools else 0
@@ -2776,6 +2888,14 @@ JSON_SCHEMA: dict[str, str] = {
     "redacted": "bool",
     "permission_modes.*": "int",
     "denials.*": "int",
+    "refusals.total": "int",
+    "refusals.joined_to_a_command": "int",
+    "refusals.join_note": "str",
+    "refusals.scope_note": "str",
+    "refusals.by_gate.*.*": "int",
+    "refusals.by_program.*.*": "int",
+    "refusals.by_project.*.*": "int",
+    "refusals.by_week.*.*": "int",
     "unknown_models.*": "int",
     "aggregator_priced_models.*": "int",
 }
@@ -2905,6 +3025,23 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
         "redacted": not raw,
         "permission_modes": dict(fleet.permission_modes),
         "denials": dict(fleet.denials),
+        "refusals": {
+            "total": fleet.refusals,
+            "joined_to_a_command": fleet.refusals_joined,
+            "join_note": "a refusal points at the tool call it blocked through "
+                         "tool_use_id; anything unjoined means the call was not "
+                         "in the same session file",
+            "by_gate": {k: dict(v.most_common())
+                        for k, v in sorted(fleet.refusal_tool.items())},
+            "by_program": {k: dict(v.most_common(25))
+                           for k, v in sorted(fleet.refusal_program.items())},
+            "by_project": {k: dict(v.most_common())
+                           for k, v in sorted(fleet.refusal_project.items())},
+            "by_week": {k: dict(v.most_common())
+                        for k, v in sorted(fleet.refusal_week.items())},
+            "scope_note": "this machine only; refusals are not deduplicated "
+                          "across developers and are bounded by transcript retention",
+        },
         "unknown_models": dict(fleet.unknown_models),
         "aggregator_priced_models": dict(fleet.aggregator_models),
     }

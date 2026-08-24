@@ -4,6 +4,26 @@
 
 ### Added
 
+- **Refusals are now joined to the commands they blocked.** A refusal is its own
+  transcript record carrying `toolDenialKind`, with no `tool_use` block of its
+  own — it points back at the call it stopped through `tool_use_id`. Reading the
+  refusal alone tells you that something was refused and nothing about what.
+  Joined, it tells you a great deal.
+
+  New `REFUSALS` report section, a `refusals` block in `--json`, the same detail
+  on the MCP `shell_audit` tool, and `--explain refusals`. Program names only,
+  never command text: the commands people refuse are the ones least suited to
+  being pasted into an issue.
+
+  On a real corpus the join is exact — 359 of 359 — and the two gates turn out
+  to guard different doors. Humans most often stop `git`; the auto-mode policy
+  most often stops `export`, `source` and `op`, which read secrets rather than
+  destroy things.
+
+  This is one machine. Refusals are not deduplicated across developers and are
+  bounded by transcript retention, and the output says so rather than letting a
+  per-machine count read as an organisation-wide one.
+
 - **Reports are content-addressed.** Every `--json` payload carries
   `report_sha256`, the SHA-256 of itself with that one key removed, serialised
   canonically (sorted keys, no incidental whitespace, UTF-8 rather than escaped
