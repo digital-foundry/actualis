@@ -70,6 +70,26 @@ Two brand rules shape the rest. **Amber indicates state, never identity**, so
 the mark still reads with amber stripped. And **colour alone never carries
 meaning** — every state also changes form.
 
+## Menu
+
+Beyond the read-outs, the menu carries three outward links:
+
+| item | goes to |
+|---|---|
+| Help → Report a Bug… | a prefilled GitHub issue |
+| Help → Request a Feature… | a prefilled GitHub issue |
+| Support Development… | `actualis.app/support` |
+
+A prefilled bug report carries the tray version, the OS and the architecture,
+and **nothing else**. There is deliberately no "attach diagnostics" button:
+this tool reads credential exposures, and a convenience that posted them to a
+public issue tracker would be the worst bug it could have. The issue body says
+so, so a helpful reporter does not paste them by hand either.
+
+`trayVersion` is stamped at build time (`-X main.trayVersion=...`) and CI sets
+it to the commit SHA, so a report names an exact build. A hand-built binary
+reports `dev` rather than claiming a version it does not have.
+
 ## Alerting
 
 A **newly** appearing critical credential raises a native notification and

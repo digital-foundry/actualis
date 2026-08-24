@@ -53,15 +53,18 @@ jobs:
       # Literal flags per platform. An earlier version assembled them in a
       # shell variable and silently produced unstripped console binaries, so
       # there is no interpolation here to get wrong.
+      # trayVersion is stamped so a bug report names an exact commit. The
+      # value is a GitHub expression, substituted into the YAML before the
+      # shell ever sees it, so the flags stay literal.
       - name: build (unix)
         if: matrix.goos != 'windows'
-        run: go build -trimpath -ldflags "-s -w" -o "${{ matrix.artifact }}" .
+        run: go build -trimpath -ldflags "-s -w -X main.trayVersion=${{ github.sha }}" -o "${{ matrix.artifact }}" .
 
       # -H windowsgui suppresses the console window. Without it the tray works
       # but a black cmd window sits behind it for the life of the process.
       - name: build (windows)
         if: matrix.goos == 'windows'
-        run: go build -trimpath -ldflags "-s -w -H windowsgui" -o "${{ matrix.artifact }}" .
+        run: go build -trimpath -ldflags "-s -w -H windowsgui -X main.trayVersion=${{ github.sha }}" -o "${{ matrix.artifact }}" .
 
       - name: verify the binary
         shell: bash

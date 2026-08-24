@@ -17,3 +17,8 @@ tray/*.app/
 # built tray binaries
 tray-go/actualis-tray
 tray-go/actualis-tray.exe
+
+# Built tray binaries. Never commit these: a stale agentfleet-tray from
+# the old name sat in the tree for weeks.
+tray-go/actualis-tray
+tray-go/actualis-tray.exe

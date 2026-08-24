@@ -22,6 +22,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -324,6 +325,7 @@ type ui struct {
 	mHeader, mSub, mCost, mShell, mUnsup, mInvis *systray.MenuItem
 	mFindings                                    []*systray.MenuItem
 	mReport, mCopy, mRefresh, mQuit              *systray.MenuItem
+	mBug, mFeat, mSupport                        *systray.MenuItem
 	mDays                                        map[int]*systray.MenuItem
 }
 
@@ -364,6 +366,50 @@ func (u *ui) flash(state string) {
 	}()
 }
 
+// trayVersion is stamped at build time with -X main.trayVersion=... ; the
+// fallback keeps a hand-built binary honest rather than claiming a version it
+// does not have.
+var trayVersion = "dev"
+
+const (
+	repoURL    = "https://github.com/digital-foundry/actualis"
+	supportURL = "https://actualis.app/support/"
+)
+
+// issueURL builds a prefilled GitHub issue.
+//
+// It carries the tray version, OS and architecture and NOTHING ELSE. That is a
+// deliberate limit, not an oversight: this tool reads credential exposures, and
+// a convenient "attach diagnostics" button would post them to a public issue
+// tracker. Anything from a scan is for the user to paste knowingly.
+func issueURL(kind, label string) string {
+	body := fmt.Sprintf(
+		"\n\n---\nActualis tray %s · %s/%s\n\n"+
+			"Please do not paste scan output, transcripts or credentials into this issue.\n",
+		trayVersion, runtime.GOOS, runtime.GOARCH)
+	return fmt.Sprintf("%s/issues/new?labels=%s&title=%s&body=%s",
+		repoURL, url.QueryEscape(label),
+		url.QueryEscape(kind+": "), url.QueryEscape(body))
+}
+
+// openBrowser hands a URL to the desktop's default handler.
+func openBrowser(target string) {
+	// Only ever called with the constants above, but parse anyway so a future
+	// caller cannot hand the shell something unexpected.
+	u, err := url.Parse(target)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
+		return
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		_ = exec.Command("open", u.String()).Run()
+	case "windows":
+		_ = exec.Command("rundll32", "url.dll,FileProtocolHandler", u.String()).Run()
+	default:
+		_ = exec.Command("xdg-open", u.String()).Run()
+	}
+}
+
 func (u *ui) onReady() {
 	setIcon("idle")
 	go watchAppearance()
@@ -395,6 +441,13 @@ func (u *ui) onReady() {
 		u.mDays[d] = window.AddSubMenuItemCheckbox(fmt.Sprintf("Last %d days", d), "", d == u.days)
 	}
 	systray.AddSeparator()
+
+	help := systray.AddMenuItem("Help", "")
+	u.mBug = help.AddSubMenuItem("Report a Bug…", "Opens GitHub. Sends version and platform only")
+	u.mFeat = help.AddSubMenuItem("Request a Feature…", "Opens GitHub")
+	u.mSupport = systray.AddMenuItem("Support Development…", "Actualis is free. Opens actualis.app")
+
+	systray.AddSeparator()
 	u.mQuit = systray.AddMenuItem("Quit Actualis", "")
 
 	go u.loop()
@@ -423,6 +476,12 @@ func (u *ui) loop() {
 			go copyToClipboard(shareText())
 		case <-u.mReport.ClickedCh:
 			go openReport()
+		case <-u.mBug.ClickedCh:
+			go openBrowser(issueURL("Bug", "bug"))
+		case <-u.mFeat.ClickedCh:
+			go openBrowser(issueURL("Feature", "enhancement"))
+		case <-u.mSupport.ClickedCh:
+			go openBrowser(supportURL)
 		case <-u.mQuit.ClickedCh:
 			systray.Quit()
 			return
