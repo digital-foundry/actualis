@@ -252,11 +252,31 @@ _TOKEN_PREFIXES = [
     "AKIA", "ASIA", "AIza", "ya29.", "hf_", "lin_api_", "rk_live_", "sk_live_",
 ]
 
+# ONE list of what a credential is called, used by both redaction and
+# classification. They used to be separate and had drifted: AUTH_HEADER was
+# masked in output but never reached the rotation list, so `secrets` undercounted
+# and nothing said so. Two lists that must agree will not stay agreeing.
+#
+# `KEY` on its own is deliberately included despite the false-positive risk --
+# STRIPE_KEY, SIGNING_KEY and OPENAI_KEY are all real and were all missed. The
+# risk is handled by _NOT_SECRET_NAMES below rather than by refusing to look.
+# PAT is word-bounded on purpose: unbounded it matches PATH, PATTERN and PATCH.
+_SECRET_NAME_WORDS = (
+    r"SECRET|TOKEN|PASSWORD|PASSWD|APIKEY|API_KEY|ACCESS_KEY|PRIVATE_KEY"
+    r"|CREDENTIALS?|AUTH|BEARER|SESSION|COOKIE|DSN|PASSPHRASE"
+)
+
+# KEY and PAT are short and appear inside ordinary words -- FORKEY, KEYBOARD,
+# PATH, PATTERN, PATCH. Both are matched only on a word boundary.
+_SHORT_SECRET_WORDS = r"(?<![A-Za-z])(?:KEYS?|PAT)(?![A-Za-z])"
+
 _SECRET_PATTERNS = [
     # KEY=value / KEY: value for anything that smells like a secret
+    # Same name list as classification, by construction. A value masked here
+    # must also be counted there, or the rotation list silently undercounts.
     re.compile(
-        r"(?i)\b([A-Z0-9_]{0,40}(?:SECRET|TOKEN|PASSWORD|PASSWD|APIKEY|API_KEY|ACCESS_KEY"
-        r"|PRIVATE_KEY|CREDENTIAL|AUTH|BEARER|SESSION|COOKIE)[A-Z0-9_]{0,40})"
+        r"(?i)\b([A-Z0-9_]{0,40}(?:" + _SECRET_NAME_WORDS +
+        r"|" + _SHORT_SECRET_WORDS + r")[A-Z0-9_]{0,40})"
         r"(\s*[=:]\s*)(['\"]?)"
         r"(?!(?:Bearer|Basic|Digest|Token|None|null|true|false)\b)"
         r"([^\s'\";|&]{6,})"
@@ -477,7 +497,8 @@ _LOCAL_HOST = re.compile(r"^(127\.0\.0\.1|localhost|0\.0\.0\.0|\[?::1\]?|host\.d
 
 # Secret-shaped assignments, minus the field names that merely *sound* like one.
 _NAMED_SECRET = re.compile(
-    r"\b([A-Za-z0-9_]{0,40}(?:SECRET|TOKEN|PASSWORD|PASSWD|APIKEY|API_KEY|ACCESS_KEY|PRIVATE_KEY)[A-Za-z0-9_]{0,40})"
+    r"\b([A-Za-z0-9_]{0,40}(?:" + _SECRET_NAME_WORDS + r"|" + _SHORT_SECRET_WORDS + r")"
+    r"[A-Za-z0-9_]{0,40})"
     r"\s*[=:]\s*['\"]?([A-Za-z0-9_\-\.]{12,})", re.IGNORECASE)
 
 # These are column names, metric names, and already-encrypted columns. They
@@ -489,6 +510,28 @@ _NOT_SECRET_NAMES = re.compile(
     r"|[a-z_]*_(?:enc|encrypted|hash|hashed|digest|fingerprint)"
     r"|(?:encrypted|hashed)_[a-z_]*"
     r"|[a-z_]*token_(?:id|type|name|expiry|expires[a-z_]*)"
+    # `KEY` earns its place in the name list by catching STRIPE_KEY and
+    # SIGNING_KEY, but most things called *_KEY are not credentials: they are
+    # database keys, cache keys, filenames, or the NAME of a key rather than a
+    # key. Each of these was checked against a real false-positive battery.
+    # Database keys, cache keys, and keys that are public by definition. NOT
+    # api/ssh/gpg: API_KEY is the canonical credential name, and an env var
+    # holding an SSH or GPG key holds the private half.
+    r"|(?:primary|foreign|sort|partition|cache|composite|shard|idempotency"
+    r"|license|licence|public|row|range|hash)_keys?"
+    r"|keys?_(?:id|name|file|path|dir|prefix|pattern|type|size|format|algorithm)"
+    r"|[a-z_]*_keys?_(?:id|name|file|path|type)"
+    # Published on purpose. A Supabase anon key and anything a framework
+    # prefixes NEXT_PUBLIC_ or EXPO_PUBLIC_ is meant to ship to the browser.
+    # Telling someone to rotate one teaches them to ignore the tool.
+    r"|[a-z_]*(?:anon|publishable)_keys?"
+    r"|(?:next|expo|vite|react_app|public)_public[a-z_]*"
+    r"|[a-z_]*public_[a-z_]*keys?"
+    # Idempotency and deduplication keys are identifiers, not credentials.
+    r"|[a-z_]*(?:dedupe?|dedup|idempotenc[a-z]*|correlation|trace|request)_keys?"
+    r"|key(?:board|word|stone|note|frame|space)[a-z_]*"
+    r"|[a-z_]*monkey[a-z_]*"
+    r"|[a-z_]*(?:secret|token|password|key|credential)s?_(?:name|id|label|ref|alias|arn|uri|url|var)"
     # A bare plural names a COLLECTION (a list of prefixes, a count), not one
     # credential. Caught in the wild: this file's own regex literal listing
     # secret-ish words tripped the scanner while it was being edited.

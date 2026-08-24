@@ -1431,3 +1431,80 @@ class TestRefusalJoin(unittest.TestCase):
         payload = af.to_json(af.Fleet())
         self.assertIn("scope_note", payload["refusals"])
         self.assertIn("machine", payload["refusals"]["scope_note"])
+
+
+class TestNamedSecretCoverage(unittest.TestCase):
+    """Detecting credentials is the headline claim, so a name-shaped miss is
+    worse here than most bugs. `export STRIPE_KEY=...` went unflagged: the name
+    list had SECRET, TOKEN and API_KEY but not a bare KEY.
+
+    Both batteries are kept as tests because widening detection and keeping it
+    quiet are the same change, and only measuring one of them is how a security
+    tool becomes noise.
+    """
+
+    MUST_FIRE = [
+        "API_KEY", "APIKEY", "ACCESS_KEY", "PRIVATE_KEY", "AWS_SECRET", "API_TOKEN",
+        "STRIPE_KEY", "SIGNING_KEY", "ENCRYPTION_KEY", "MASTER_KEY", "DEPLOY_KEY",
+        "HMAC_KEY", "VERCEL_KEY", "OPENAI_KEY", "ANTHROPIC_KEY", "SSH_KEY",
+        "SSH_PRIVATE_KEY", "SUPABASE_PAT", "GITHUB_PAT", "AUTH_HEADER",
+        "BEARER_VALUE", "SESSION_COOKIE", "DB_CREDENTIAL", "SERVICE_CREDENTIALS",
+        "SENTRY_DSN", "DATABASE_DSN",
+    ]
+    MUST_BE_QUIET = [
+        # database and cache identifiers
+        "PRIMARY_KEY", "FOREIGN_KEY", "SORT_KEY", "PARTITION_KEY", "CACHE_KEY", "ROW_KEY",
+        # published on purpose
+        "PUBLIC_KEY", "SUPABASE_ANON_KEY", "EXPO_PUBLIC_SUPABASE_ANON_KEY",
+        "NEXT_PUBLIC_ANON_KEY",
+        # identifiers, not credentials
+        "IDEMPOTENCY_KEY", "DEDUPE_KEY", "TRACE_KEY", "CORRELATION_KEY",
+        # the NAME of a secret is not the secret
+        "KEY_NAME", "API_KEY_NAME", "SECRET_NAME",
+        # KEY and PAT are short and hide inside ordinary words
+        "FORKEY", "LOOKUP_FORKEY", "KEYBOARD_LAYOUT", "KEYWORD_LIST", "MONKEY_PATCH",
+        "PATH", "PATTERN", "PATCH_LEVEL",
+        # metrics and already-hashed columns
+        "INPUT_TOKENS", "TOTAL_TOKENS", "TOKEN_COUNT", "PASSWORD_HASH",
+    ]
+
+    @staticmethod
+    def _cmd(name):
+        return f"export {name}=notarealvaluejustafixture01"
+
+    def test_credential_shaped_names_are_flagged(self):
+        for name in self.MUST_FIRE:
+            with self.subTest(name=name):
+                self.assertTrue(af.classify_secrets(self._cmd(name)),
+                                f"{name} should be flagged and is not")
+
+    def test_innocent_names_stay_quiet(self):
+        for name in self.MUST_BE_QUIET:
+            with self.subTest(name=name):
+                self.assertFalse(af.classify_secrets(self._cmd(name)),
+                                 f"{name} is not a credential and was flagged")
+
+    def test_redaction_and_classification_share_one_name_list(self):
+        """They were separate and had drifted. AUTH_HEADER was masked in output
+        but never reached the rotation list, so `secrets` undercounted and
+        nothing said so."""
+        self.assertIn("_SECRET_NAME_WORDS", af.SRC_TEXT)
+        # Used by both the redaction pattern and the classifier.
+        self.assertGreaterEqual(af.SRC_TEXT.count("_SECRET_NAME_WORDS"), 3)
+
+    def test_anything_classified_is_also_redacted(self):
+        """The one-directional invariant. Over-redacting is free; counting
+        something that is never masked would print a secret it told you about."""
+        for name in self.MUST_FIRE + self.MUST_BE_QUIET:
+            cmd = self._cmd(name)
+            if af.classify_secrets(cmd):
+                with self.subTest(name=name):
+                    self.assertNotEqual(af.redact(cmd), cmd,
+                                        f"{name} is counted but never masked")
+
+    def test_short_words_only_match_on_a_boundary(self):
+        """KEY and PAT are three letters and live inside ordinary words."""
+        self.assertFalse(af.classify_secrets("FORKEY=abcdefghijklmnop"))
+        self.assertTrue(af.classify_secrets("FOR_KEY=abcdefghijklmnop"))
+        self.assertFalse(af.classify_secrets("PATCH=abcdefghijklmnop"))
+        self.assertTrue(af.classify_secrets("GITLAB_PAT=abcdefghijklmnop"))
