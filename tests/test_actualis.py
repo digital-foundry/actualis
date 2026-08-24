@@ -758,6 +758,7 @@ class TestExplainability(unittest.TestCase):
                    "BY MODEL": "cost", "CACHE EFFICIENCY": "cache",
                    "BY TICKET": "tickets", "TOOL CALLS": "shell",
                    "SUBAGENTS": "subagents", "SHELL AUDIT": "shell",
+                   "REFUSALS": "refusals",
                    "COACH": "coach", "AGENT PLATFORMS": "agents", "EXPLAIN": "sources"}
         for sec in sections:
             with self.subTest(section=sec):
@@ -1322,3 +1323,111 @@ class TestReportDigest(unittest.TestCase):
         for phrase in ["report_sha256", "sort_keys", "sha256"]:
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, doc)
+
+
+class TestRefusalJoin(unittest.TestCase):
+    """A refusal record carries no tool_use block of its own. It points back at
+    the call it blocked through tool_use_id, and reading the refusal alone tells
+    you a refusal happened and nothing about what was refused.
+
+    This is the one signal in the product that cannot exist upstream: a refused
+    command is never sent, so no API-layer view of the same session has it.
+    """
+
+    @staticmethod
+    def _session(tmp, records):
+        d = Path(tmp) / "-Users-x-proj"
+        d.mkdir(exist_ok=True)
+        (d / "s.jsonl").write_text("\n".join(json.dumps(r) for r in records) + "\n")
+        f = af.Fleet()
+        f.scan([Path(tmp)], None, None, progress=False)
+        return f
+
+    @staticmethod
+    def _call(tid, name="Bash", command="git push --force"):
+        return {"timestamp": "2026-08-01T10:00:00Z", "type": "assistant",
+                "uuid": "a", "message": {"id": "m" + tid, "role": "assistant",
+                "content": [{"type": "tool_use", "id": tid, "name": name,
+                             "input": {"command": command} if name == "Bash" else {}}]}}
+
+    @staticmethod
+    def _refusal(tid, kind="user-rejected"):
+        return {"timestamp": "2026-08-01T10:00:01Z", "type": "user", "uuid": "b",
+                "toolDenialKind": kind,
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": tid, "is_error": True,
+                     "content": "This command requires approval"}]}}
+
+    def test_a_refusal_resolves_to_the_command_it_blocked(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as t:
+            f = self._session(t, [self._call("t1"), self._refusal("t1")])
+        self.assertEqual(f.refusals, 1)
+        self.assertEqual(f.refusals_joined, 1)
+        self.assertEqual(f.refusal_tool["user-rejected"]["Bash"], 1)
+        self.assertEqual(f.refusal_program["user-rejected"]["git"], 1)
+
+    def test_the_program_is_the_head_not_the_first_token(self):
+        """`cd x && git push` is a refusal of git, not of cd."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as t:
+            f = self._session(t, [self._call("t1", command="cd /tmp && git push"),
+                                  self._refusal("t1")])
+        self.assertEqual(f.refusal_program["user-rejected"]["git"], 1)
+        self.assertNotIn("cd", f.refusal_program["user-rejected"])
+
+    def test_the_two_gates_are_counted_separately(self):
+        """A human declining and a policy declining are different facts, and
+        conflating them loses the only interesting thing here."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as t:
+            f = self._session(t, [
+                self._call("t1", command="git push"), self._refusal("t1", "user-rejected"),
+                self._call("t2", command="export TOKEN=x"), self._refusal("t2", "automode-blocked"),
+            ])
+        self.assertEqual(f.refusal_program["user-rejected"]["git"], 1)
+        self.assertEqual(f.refusal_program["automode-blocked"]["export"], 1)
+        self.assertNotIn("export", f.refusal_program["user-rejected"])
+
+    def test_an_unjoinable_refusal_is_still_counted(self):
+        """Counted as a refusal, not counted as joined. Silently dropping it
+        would understate refusals; silently joining it would invent data."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as t:
+            f = self._session(t, [self._refusal("nonexistent")])
+        self.assertEqual(f.refusals, 1)
+        self.assertEqual(f.refusals_joined, 0)
+
+    def test_non_bash_refusals_record_the_tool_but_no_program(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as t:
+            f = self._session(t, [self._call("t1", name="Write"), self._refusal("t1")])
+        self.assertEqual(f.refusal_tool["user-rejected"]["Write"], 1)
+        self.assertEqual(sum(f.refusal_program["user-rejected"].values()), 0)
+
+    def test_refusals_are_bucketed_by_week(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as t:
+            f = self._session(t, [self._call("t1"), self._refusal("t1")])
+        self.assertEqual(sum(sum(v.values()) for v in f.refusal_week.values()), 1)
+
+    def test_command_text_never_leaves(self):
+        """Same rule the rest of the tool follows: the commands people refuse
+        are exactly the ones least suited to being pasted into an issue."""
+        import tempfile
+        # Self-describing filler rather than a provider-shaped key: a realistic
+        # one trips GitHub push protection, which is correct of it.
+        secret = "export API_TOKEN=notarealtokenjustafixture02"
+        with tempfile.TemporaryDirectory() as t:
+            f = self._session(t, [self._call("t1", command=secret), self._refusal("t1")])
+        blob = json.dumps(af.to_json(f))
+        self.assertNotIn("notarealtokenjustafixture02", blob)
+        self.assertNotIn("API_TOKEN=", blob)
+        self.assertIn("export", blob)   # the program name is the useful part
+
+    def test_the_scope_limit_is_stated_in_the_output(self):
+        """One machine, not a fleet. If the output does not say so, someone
+        will read a per-machine count as an organisation-wide one."""
+        payload = af.to_json(af.Fleet())
+        self.assertIn("scope_note", payload["refusals"])
+        self.assertIn("machine", payload["refusals"]["scope_note"])

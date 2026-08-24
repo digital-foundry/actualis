@@ -38,6 +38,7 @@ that and prints a warning.
 | `redacted` | whether values were masked (`true` unless `--no-redact`) |
 | `permission_modes` | turns per permission mode |
 | `denials` | rejections by kind |
+| `refusals` | what was stopped and by which gate, joined to the blocked command. See below |
 | `unknown_models` | models seen with no pricing entry, billed at Opus-tier rates |
 | `aggregator_priced_models` | models priced from a third party because the vendor publishes no rate for that id |
 
@@ -147,6 +148,33 @@ an empty collection.
   "projects": ["…"], "active_days": 5,
   "first_seen": "2026-05-06", "last_seen": "2026-06-02" }
 ```
+
+## `refusals`
+
+```json
+{ "total": 359, "joined_to_a_command": 359,
+  "by_gate":    { "user-rejected": { "Bash": 100, "AskUserQuestion": 18 } },
+  "by_program": { "user-rejected": { "git": 36, "ls": 26, "find": 19 } },
+  "by_project": { "user-rejected": { "some-project": 12 } },
+  "by_week":    { "2026-W31": { "user-rejected": 40 } } }
+```
+
+A refusal is its own record, carrying `toolDenialKind`. It holds no `tool_use`
+block of its own — it points back at the call it blocked through `tool_use_id`
+on its `tool_result`. Reading the refusal record alone tells you that something
+was refused and nothing about what.
+
+Three gates: `user-rejected` is a human declining, `automode-blocked` is the
+auto-mode policy, and `automode-unavailable` means the deciding model was
+unreachable.
+
+**Program names only, never command text.** The commands people refuse are the
+ones least suited to being pasted into an issue.
+
+Two limits worth stating. This is **one machine**: refusals are not deduplicated
+across developers, so the same policy firing on ten laptops counts ten times.
+And a refusal is **not a verdict** — it records that a gate fired, not that
+firing was correct.
 
 ## `subagents`
 
