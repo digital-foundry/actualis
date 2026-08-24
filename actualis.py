@@ -511,9 +511,27 @@ _ASSIGN_SUBST = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=[\"']?(?:\$\(|`)([A-Za-z0-9
 #   2060-2064  word joiner and invisible operators
 #   2066-2069  bidi isolates
 #   feff       zero-width no-break space (BOM)
+# Built from a named table rather than one opaque class, so a reader can audit
+# what is stripped and why without decoding hex ranges -- and so that adding a
+# range later requires stating a reason.
+_STRIPPED_RANGES = (
+    (0x00, 0x08, "C0 controls below tab"),
+    (0x0B, 0x1F, "C0 controls above newline, including ESC (0x1B) and CR (0x0D)"),
+    (0x7F, 0x9F, "DEL and the C1 control block"),
+    (0x200B, 0x200F, "zero-width space and joiners, LRM and RLM"),
+    (0x2028, 0x202E, "line and paragraph separators, bidi embedding and override"),
+    (0x2060, 0x2064, "word joiner and the invisible operators"),
+    (0x2066, 0x2069, "bidi isolates"),
+    (0xFEFF, 0xFEFF, "zero-width no-break space, the BOM"),
+)
+
+# Tab (0x09) and newline (0x0A) are the only whitespace controls that survive.
+# CARRIAGE RETURN DOES NOT. A bare \r returns the cursor to column zero, so a
+# command can overwrite what was already printed above it -- which is precisely
+# the hiding this module exists to prevent, and is why it is not treated as a
+# harmless newline.
 _CONTROL = re.compile(
-    "[\x00-\x08\x0b-\x1f\x7f-\x9f"
-    "\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u2069\ufeff]"
+    "[" + "".join(f"\\u{lo:04x}-\\u{hi:04x}" for lo, hi, _why in _STRIPPED_RANGES) + "]"
 )
 
 # Bound the work any single command can cause. audit_command runs ~40 patterns
@@ -529,7 +547,10 @@ MAX_SCAN_TOTAL = 32768
 
 
 def clean(text: str | None) -> str:
-    """Strip control characters from untrusted text. Tabs and newlines survive."""
+    """Strip control characters from untrusted text.
+
+    Tab and newline survive. Carriage return does not: see _STRIPPED_RANGES.
+    """
     if not text:
         return ""
     return _CONTROL.sub("", text.replace("\t", " "))

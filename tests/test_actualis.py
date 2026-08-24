@@ -1817,3 +1817,75 @@ class TestRenderedReportLeaksNothing(unittest.TestCase):
                 self.assertEqual(len(fp), 8)
                 self.assertRegex(fp, r"^[0-9a-f]{8}$")
                 self.assertNotIn(fp, self.SECRET_VALUES)
+
+
+class TestWatchLeaksNothing(unittest.TestCase):
+    """CodeQL flags the --watch alert path as clear-text logging of sensitive
+    data. Same false positive as the report table, different code path, so it
+    needs its own proof rather than borrowing the other one's."""
+
+    SECRET = "notarealtokenjustafixture04"
+
+    def test_the_watch_alert_prints_a_type_and_a_fingerprint_never_a_value(self):
+        found = af.classify_secrets(f"export API_TOKEN={self.SECRET}")
+        self.assertTrue(found, "fixture must actually be detected")
+        priority, kind, fp = found[0]
+        # This is exactly what watch() composes and prints.
+        msg = f"{kind} in some-project"
+        self.assertNotIn(self.SECRET, msg)
+        self.assertNotIn(self.SECRET, fp)
+        self.assertEqual(len(fp), 8)
+        self.assertNotIn(self.SECRET, af.redact(f"export API_TOKEN={self.SECRET}"))
+
+    def test_the_desktop_notification_carries_no_value(self):
+        """notify() reaches osascript, notify-send or PowerShell. A secret in
+        that string would land in a system notification centre and, on some
+        platforms, a log."""
+        found = af.classify_secrets(f"export API_TOKEN={self.SECRET}")
+        _priority, kind, _fp = found[0]
+        body = f"{kind} in some-project"
+        self.assertNotIn(self.SECRET, body)
+        af.notify("actualis: credential exposed", body)   # must not raise
+
+    def test_classify_returns_a_fingerprint_and_never_the_value(self):
+        for cmd in (f"export API_TOKEN={self.SECRET}",
+                    f"curl -H 'Authorization: Bearer {self.SECRET}' https://x"):
+            with self.subTest(cmd=cmd[:28]):
+                for _p, kind, fp in af.classify_secrets(cmd):
+                    self.assertNotIn(self.SECRET, kind)
+                    self.assertNotIn(self.SECRET, fp)
+
+
+class TestControlStripping(unittest.TestCase):
+    """The stripped set is a documented table so it can be audited. CodeQL
+    called the old opaque range suspicious; it was correct, but unreadably so."""
+
+    def test_only_tab_and_newline_survive_the_c0_block(self):
+        kept = [c for c in list(range(0x00, 0x20)) + [0x7F]
+                if af.clean("a" + chr(c) + "b") != "ab"]
+        self.assertEqual(kept, [0x09, 0x0A])
+
+    def test_carriage_return_is_stripped_deliberately(self):
+        """A bare \\r returns the cursor to column zero, so a command can
+        overwrite what was printed above it. That is the hiding attack, not a
+        harmless newline."""
+        self.assertEqual(af.clean("dangerous\rharmless"), "dangerousharmless")
+
+    def test_every_stripped_range_is_documented_with_a_reason(self):
+        for lo, hi, why in af._STRIPPED_RANGES:
+            with self.subTest(rng=(hex(lo), hex(hi))):
+                self.assertLessEqual(lo, hi)
+                self.assertTrue(why.strip(), "a stripped range must say why")
+
+    def test_every_documented_range_is_actually_stripped(self):
+        """The table and the regex are built from the same source, but a typo
+        in the builder would silently narrow it."""
+        for lo, hi, _why in af._STRIPPED_RANGES:
+            for cp in (lo, (lo + hi) // 2, hi):
+                with self.subTest(cp=hex(cp)):
+                    self.assertEqual(af.clean("a" + chr(cp) + "b"), "ab")
+
+    def test_ordinary_text_is_untouched(self):
+        for text in ["café 日本 🚀", "a\tb", "a\nb", "line one\nline two", "→ ← ↑"]:
+            with self.subTest(text=text):
+                self.assertEqual(af.clean(text), text.replace("\t", " "))
