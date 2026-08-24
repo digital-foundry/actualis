@@ -60,6 +60,36 @@ the button — that is the abuse control, not a comment on the change.
 Keep branches short-lived and rebase rather than merge, so history stays linear
 and `git log` reads as a sequence of changes rather than a merge diagram.
 
+### Maintainers currently bypass the rules
+
+The ruleset applies to everyone except the maintainer role, who can still push
+straight to `main`. That is deliberate while the project is one person: forcing
+a pull request on yourself adds ceremony without adding a reviewer.
+
+It should tighten the moment a second person has write access, or the first
+outside contribution lands — whichever comes first. Both mean a push to `main`
+can now surprise somebody.
+
+To tighten, remove the bypass and require a reviewed pull request:
+
+```sh
+gh api repos/digital-foundry/actualis/rulesets            # find the ruleset id
+gh api -X PUT repos/digital-foundry/actualis/rulesets/<id> --input - <<'JSON'
+{ "bypass_actors": [],
+  "rules": [ { "type": "deletion" },
+             { "type": "non_fast_forward" },
+             { "type": "required_status_checks", "parameters": { … } },
+             { "type": "pull_request",
+               "parameters": { "required_approving_review_count": 1,
+                               "dismiss_stale_reviews_on_push": true,
+                               "require_code_owner_review": false,
+                               "require_last_push_approval": true } } ] }
+JSON
+```
+
+Carry the existing `required_status_checks` block across unchanged, or the
+required checks are dropped in the same call that adds review.
+
 ## Supply chain
 
 Every GitHub Action is pinned to a full 40-character commit SHA, and the
