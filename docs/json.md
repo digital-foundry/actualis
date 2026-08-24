@@ -9,6 +9,7 @@ that and prints a warning.
 | key | contents |
 |---|---|
 | `schema_version` | integer. The contract version of this document. See [Compatibility](#compatibility) |
+| `report_sha256` | content address of this report. See [Verifying a report](#verifying-a-report) |
 | `version` | tool version. Changes far more often than `schema_version` and means something different |
 | `window` | `from`, `to`, `days`, `active_days` |
 | `scanned` | `files`, `bytes`, `roots[]` |
@@ -39,6 +40,53 @@ that and prints a warning.
 | `denials` | rejections by kind |
 | `unknown_models` | models seen with no pricing entry, billed at Opus-tier rates |
 | `aggregator_priced_models` | models priced from a third party because the vendor publishes no rate for that id |
+
+## Verifying a report
+
+Every report is content-addressed. `report_sha256` is the SHA-256 of the payload
+with that one key removed, serialised canonically. The report itself prints the
+first 16 characters, so a screenshot can be checked against the payload it came
+from.
+
+Recompute it yourself, without trusting this tool:
+
+```sh
+actualis --json > report.json
+
+python3 - <<'EOF'
+import hashlib, json
+p = json.load(open("report.json"))
+claimed = p.pop("report_sha256")
+canonical = json.dumps(p, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+actual = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+print("claimed:", claimed)
+print("actual :", actual)
+print("match  :", claimed == actual)
+EOF
+```
+
+Or in one line, if you have `jq` and prefer not to run Python:
+
+```sh
+jq -Sc 'del(.report_sha256)' report.json | tr -d '\n' | shasum -a 256
+```
+
+Three things about the canonical form, because they are the whole reason two
+runs agree:
+
+- **Keys are sorted.** Dict ordering must not change the digest.
+- **No incidental whitespace.** `separators=(",", ":")`.
+- **`ensure_ascii=False`.** Non-ASCII stays as UTF-8 rather than being escaped
+  into a second representation of the same text.
+
+The digest covers everything except itself, including `version`. So the same
+fleet scanned by two different releases produces two different digests, which
+is correct: the report is not the same report.
+
+This is deliberately the simplest possible form of the thing. It proves a
+payload has not been altered since it was produced. It does **not** prove when
+it was produced, or that a sequence of reports is complete — those need a chain
+and a countersignature, which is separate work.
 
 ## Compatibility
 

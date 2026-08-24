@@ -4,6 +4,18 @@
 
 ### Added
 
+- **Reports are content-addressed.** Every `--json` payload carries
+  `report_sha256`, the SHA-256 of itself with that one key removed, serialised
+  canonically (sorted keys, no incidental whitespace, UTF-8 rather than escaped
+  ASCII). The human report prints the first 16 characters, so a screenshot can
+  be checked against the payload it came from. docs/json.md gives the exact
+  recomputation procedure in both Python and `jq`; both were run against real
+  output, including non-ASCII project names, and agree.
+
+  This proves a payload has not been altered since it was produced. It does not
+  prove *when* it was produced or that a sequence of reports is complete — that
+  needs a chain and a countersignature, which is separate work.
+
 - **The `--json` output is now a frozen, versioned contract.** It carries
   `schema_version` (currently `1`), separate from the tool version, and
   `JSON_SCHEMA` in `actualis.py` declares every path and its type. The test
