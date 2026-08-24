@@ -334,6 +334,14 @@ _BODY_KEYWORDS = {"do", "then", "else", "fi", "done", "esac", "in", "{", "(", "!
 _PREFIX_WORDS = {"sudo", "env", "exec", "time", "nohup", "command", "builtin", "nice", "xargs"}
 _TAKES_PATH_ARG = {"cd", "pushd", "popd"}
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+# `2>/dev/null`, `>out`, `>>log`, `2>&1`, `<in` — a redirection is never the
+# program. Skipping `cd` plus its path argument used to leave the redirect as
+# the first surviving token, so `cd /tmp 2>/dev/null` reported `2>/dev/null`.
+_REDIRECT = re.compile(r"^\d*(?:>>?|<<?|&>|>&)")
+# `TOK=$(grep -oE … )` — the program is inside the substitution, not the
+# assignment. Skipping the whole token walked the parser onto the next one,
+# which is usually a flag, so this reported `-oE`.
+_ASSIGN_SUBST = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=[\"']?(?:\$\(|`)([A-Za-z0-9_./+-]+)")
 
 
 # --------------------------------------------------------------------------
@@ -568,11 +576,18 @@ def command_head(cmd: str) -> str | None:
                 skip_next = False
                 continue
             if _ASSIGNMENT.match(tok):
+                inner = _ASSIGN_SUBST.match(tok)
+                if inner:
+                    return inner.group(1)     # `TOK=$(grep …)` runs grep
                 continue                      # environment assignment
             if tok in _BODY_KEYWORDS or tok in _PREFIX_WORDS:
                 continue                      # `do tool …`, `sudo tool …`
             if tok == "\\":
                 continue                      # line continuation, not a program
+            if _REDIRECT.match(tok):
+                continue                      # redirection, not a program
+            if tok.startswith("-"):
+                continue                      # a flag is never the program
             if tok in _TAKES_PATH_ARG:
                 skip_next = True              # `cd /some/path && real-cmd`
                 continue

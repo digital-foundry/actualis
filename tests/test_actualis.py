@@ -1088,3 +1088,41 @@ class TestAuditFindings2026_08_24(unittest.TestCase):
         body = src[start:]
         self.assertIn("fleet.scan_codex([root]", body,
                       "--root --agent codex must use the Codex parser")
+
+
+class TestCommandHeadParsing(unittest.TestCase):
+    """Found by joining tool denials to the commands they blocked: `most_run`
+    was reporting `-oE`, `-E` and `2>/dev/null` as programs. Both appear in the
+    report and in the MCP shell_audit tool, so they are user-visible."""
+
+    def test_a_redirection_is_never_the_program(self):
+        """Skipping `cd` plus its path argument left the redirect as the first
+        surviving token."""
+        self.assertEqual(af.command_head("cd /tmp/x 2>/dev/null"), "cd")
+        self.assertEqual(af.command_head("cd /tmp/x 2>/dev/null\ngit status"), "git")
+        self.assertEqual(af.command_head("make test > out.log 2>&1"), "make")
+        self.assertEqual(af.command_head("cat < in.txt"), "cat")
+
+    def test_command_substitution_in_an_assignment_reports_the_inner_program(self):
+        """`TOK=$(grep …)` runs grep. Skipping the whole assignment token walked
+        onto the next one, which is a flag."""
+        self.assertEqual(
+            af.command_head('TOK=$(grep -oE "^export FOO=.*" ~/.zshrc)\necho hi'), "grep")
+        self.assertEqual(af.command_head("KEY=`openssl rand -hex 8`"), "openssl")
+        self.assertEqual(
+            af.command_head('cd /tmp\nPAT=$(grep -E "X=" ~/.zshrc | tail -1)\ncurl -sS https://x'),
+            "grep")
+
+    def test_a_flag_is_never_the_program(self):
+        self.assertNotEqual(af.command_head("cd /x\nVAR=$( grep -oE pat f"), "-oE")
+
+    def test_plain_assignments_are_still_skipped(self):
+        self.assertEqual(af.command_head("VAR=x cd path && for f in *.py; do ruff $f; done"), "ruff")
+        self.assertEqual(af.command_head("FOO=1 BAR=2 pytest -q"), "pytest")
+
+    def test_previously_correct_cases_did_not_regress(self):
+        for cmd, want in [("git status", "git"), ("npm run build", "npm"),
+                          ("cd /tmp", "cd"), ("sleep 30 && npm test", "sleep"),
+                          ("sudo systemctl restart nginx", "systemctl")]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(af.command_head(cmd), want)
