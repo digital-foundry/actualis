@@ -31,7 +31,7 @@ sys.modules["actualis"] = af
 spec.loader.exec_module(af)
 
 
-af.SRC_TEXT = (ROOT / "actualis.py").read_text()
+af.SRC_TEXT = (ROOT / "actualis.py").read_text(encoding="utf-8")
 af.SRC_PATH = ROOT / "actualis.py"
 
 
@@ -2926,10 +2926,23 @@ class TestSelfCheckWithoutACorpus(unittest.TestCase):
     """CI has no transcripts. The checks that do not need one must still run."""
 
     def _run_with_no_transcripts(self):
-        env = {"HOME": self.home, "PATH": os.environ.get("PATH", "")}
+        # Inherit the environment and override only what points at a corpus.
+        # A stripped env starves the interpreter on Windows -- it never starts,
+        # stdout is empty, and the assertions below then test nothing at all.
+        env = dict(os.environ)
+        env.pop("CLAUDE_CONFIG_DIR", None)
+        env.pop("CODEX_HOME", None)
+        env["HOME"] = self.home
+        # ntpath.expanduser consults USERPROFILE, never HOME.
+        env["USERPROFILE"] = self.home
+        env["HOMEDRIVE"], env["HOMEPATH"] = os.path.splitdrive(self.home)
         out = subprocess.run(
             [sys.executable, str(af.SRC_PATH), "--self-check"],
-            capture_output=True, text=True, env=env, cwd=self.home)
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=env, cwd=self.home)
+        self.assertTrue(out.stdout.strip(),
+                        f"--self-check produced no output at all "
+                        f"(rc={out.returncode}) stderr={out.stderr[:400]}")
         return out
 
     def setUp(self):
