@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Added
+
+- **Commands the audit could not read are now counted and reported.** "Pattern
+  matching has a ceiling" is true and vague: it does not distinguish *we looked
+  and found nothing* from *there was nothing here to look at*, and only the
+  second is a blind spot. A command that runs `$CMD`, evals a string, pipes a
+  download into a shell, or executes a script whose contents live elsewhere is
+  unreadable rather than unmatched. On a real corpus that is **3.11% of
+  commands**. Counted, never flagged — running a script is normal, and this is
+  a statement about what the audit could see rather than an accusation.
+
+- **Shell-audit findings can be suppressed too.** 0.1.3 gave credentials
+  `--suppress` and left 36 audit rules with no way to say they were wrong, which
+  is arbitrary from a user's side: an `rm -rf build` flagged every run forever
+  leaves only the options of ignoring the section or ignoring the tool. Flag ids
+  are keyed on severity, category and program rather than command text, so
+  suppressing one thing suppresses the class a person means. Same rule as
+  before: a suppressed flag is still counted, and `suppressed_flags` reports the
+  total.
+
+- **A vendor capability matrix**, in `--explain vendors`, in `--json`, and on
+  the site's limits page. Both agents are read and their transcripts do not
+  contain the same things — Claude Code records every refused tool call and
+  **Codex records none**, so that entire section is single-vendor. The report
+  now says so in place when a Codex session is present. Every row names the
+  transcript field it rests on, so a claim can be checked against the parser
+  rather than taken on trust. Comparing two projects on different agents
+  compares different measurements, and nothing previously said which.
+
 ### Changed
 
 - **Both detector lists were audited against a real corpus rather than against

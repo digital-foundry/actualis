@@ -372,6 +372,55 @@ COMPILED_RULES = [(sev, cat, re.compile(pat, re.IGNORECASE)) for sev, cat, pat i
 SEVERITY_ORDER = {"high": 0, "med": 1}
 
 
+# --------------------------------------------------------------------------
+# Commands whose real content is not in the transcript
+#
+# The README has always said pattern matching has a ceiling. That is true and
+# it is also vague: it does not distinguish "we looked and found nothing" from
+# "there was nothing here to look at". Those are different facts and only one
+# of them is a blind spot.
+#
+# A command that runs $CMD, evals a string, or executes a script whose contents
+# live in a file is UNREADABLE, not merely unmatched. Counting those turns a
+# silent gap into a stated one -- and on a real corpus it is 3.11% of commands,
+# which is a number worth printing instead of a caveat worth ignoring.
+#
+# Deliberately counted, never flagged. This is not an accusation: running a
+# script is normal. It is a statement about what the audit could and could not
+# see.
+# --------------------------------------------------------------------------
+
+UNREADABLE_SHAPES = (
+    ("runs a variable", re.compile(r"(?:^|[|&;(]\s*)\s*[\"']?\$[A-Za-z_{]")),
+    ("eval", re.compile(r"\beval\b")),
+    ("pipes a download to a shell",
+     re.compile(r"\b(?:curl|wget)\b[^|]*\|\s*(?:sudo\s+)?(?:ba|z|k|)sh\b")),
+    ("runs a local script",
+     re.compile(r"(?:^|[|&;]\s*)\s*\.?/[\w./-]+\.(?:sh|bash|zsh|py|rb|pl)\b")),
+    ("sources a file",
+     re.compile(r"(?:^|[|&;]\s*)\s*(?:source|\.)\s+[\w./$~-]+")),
+    ("shell -c with a variable", re.compile(r"\b(?:ba|z|)sh\s+-c\s+[\"']?\$")),
+)
+
+
+def flag_id(severity: str, categories: list[str], program: str) -> str:
+    """A stable id for a class of shell-audit finding.
+
+    Keyed on severity, category and program rather than on the command text, so
+    the id survives the command changing slightly and suppressing one thing
+    suppresses the class a person actually means: "rm being flagged destructive
+    is expected in this repository", not "this exact rm invocation".
+    """
+    basis = f"{severity}:{','.join(sorted(categories))}:{program}"
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:8]
+
+
+def unreadable_shapes(cmd: str) -> list[str]:
+    """Which parts of this command the transcript does not actually contain."""
+    text = cmd[:MAX_SCAN_TOTAL]
+    return [name for name, rx in UNREADABLE_SHAPES if rx.search(text)]
+
+
 def audit_command(cmd: str) -> list[tuple[str, str, str]]:
     """Return [(severity, category, matching_line)] for every rule that fires.
 
@@ -1222,6 +1271,15 @@ class Fleet:
         self.refusal_program: dict[str, Counter] = defaultdict(Counter)
         self.refusal_project: dict[str, Counter] = defaultdict(Counter)
         self.refusal_week: dict[str, Counter] = defaultdict(Counter)
+        # Commands the audit could not read, as opposed to commands it read and
+        # found nothing in. Counted, never flagged.
+        self.unreadable = 0
+        self.unreadable_shapes: Counter = Counter()
+        # A shell-audit finding can be wrong too. Secrets got suppression in
+        # 0.1.3 and flags did not, which is arbitrary from a user's side: an
+        # `rm -rf build` flagged every run forever leaves only the options of
+        # ignoring the section or ignoring the tool.
+        self.suppressed_flags = 0
         self.secret_exposures = 0
         self.secret_projects: Counter = Counter()
         # (priority, type, fingerprint) -> {uses, first, last, projects}
@@ -1539,6 +1597,12 @@ class Fleet:
         if head:
             self.bash_first_token[clean(head)[:40]] += 1
 
+        shapes = unreadable_shapes(cmd)
+        if shapes:
+            self.unreadable += 1
+            for name in shapes:
+                self.unreadable_shapes[name] += 1
+
         if contains_secret(cmd):
             self.secret_exposures += 1
             self.secret_projects[project] += 1
@@ -1569,13 +1633,23 @@ class Fleet:
             self.flag_counts[f"{sev}:{cat}"] += 1
         # Report the line that fired the worst rule, not line 1 of the script.
         evidence = next(ln for sev, _, ln in matches if sev == worst[0])
+        cats = sorted({c for _, c, _ in matches})
+        prog = clean(head or "?")[:40]
+        fid = flag_id(worst[0], cats, prog)
+        suppressed = fid in self.suppressions
+        if suppressed:
+            self.suppressed_flags += 1
         self.flags.append({
+            "id": fid,
             "severity": worst[0],
-            "categories": sorted({c for _, c, _ in matches}),
+            "categories": cats,
+            "program": prog,
             "project": project,
             "when": ts.isoformat() if ts else None,
             "evidence": evidence[:240],
             "had_secret": contains_secret(cmd),
+            "suppressed": suppressed,
+            "suppressed_reason": self.suppressions.get(fid, ""),
         })
 
     # -- scan --------------------------------------------------------------
@@ -1694,6 +1768,10 @@ class Fleet:
     @property
     def total_cost(self) -> float:
         return sum(self.cost_by_model.values())
+
+    @property
+    def actionable_flags(self) -> list:
+        return [f for f in self.flags if not f.get("suppressed")]
 
     @property
     def suppressed_secrets(self) -> int:
@@ -2219,6 +2297,50 @@ def _commands_in(rec: dict) -> list[str]:
 # what it measures, the formula, the assumptions, and an independent check.
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# What each vendor's transcript actually gives you
+#
+# Two agents are supported, unevenly, and until now nothing said how. Someone
+# comparing a Claude Code project against a Codex one was comparing different
+# measurements without being told which.
+#
+# Kept beside the code that consumes each field so a reader can check a claim
+# here against the parser that makes it. A test asserts every capability names
+# the field it depends on.
+# --------------------------------------------------------------------------
+
+YES, PARTIAL, NO = "yes", "partial", "no"
+
+VENDOR_CAPABILITIES = (
+    # capability,            claude,   codex,   the field it rests on
+    ("Cost and token usage", YES,      YES,     "message.usage / token_count"),
+    ("Per-message dedup",    YES,      PARTIAL, "message.id; Codex reports a cumulative "
+                                                "session total instead, so the max is taken"),
+    ("Shell command text",   YES,      YES,     "tool_use Bash / function_call shell_command"),
+    ("Project attribution",  YES,      YES,     "cwd"),
+    ("Git branch",           YES,      NO,      "gitBranch; Codex rollouts carry no branch, "
+                                                "so cost per ticket is Claude Code only"),
+    ("Tool refusals",        YES,      NO,      "toolDenialKind joined by tool_use_id; Codex "
+                                                "writes no per-refusal record at all"),
+    ("Permission mode",      YES,      YES,     "permissionMode / approval_policy"),
+    ("Sandbox policy",       NO,       YES,     "sandbox_policy; Claude Code has no equivalent"),
+    ("Subagent activity",    PARTIAL,  NO,      "toolUseResult.toolStats; command text is never "
+                                                "written to the parent transcript"),
+    ("Subagent cost",        NO,       NO,      "only each run's final message survives, so a "
+                                                "floor is reported and excluded from the total"),
+    ("Cache TTL split",      PARTIAL,  NO,      "cache_creation ephemeral_1h/5m; older records "
+                                                "carry a flat total and OpenAI has no equivalent"),
+    ("Reasoning effort",     YES,      NO,      "effort"),
+)
+
+
+def vendor_gaps(vendor: str) -> list[tuple[str, str]]:
+    """Capabilities this vendor does not fully provide, with the reason."""
+    idx = 1 if vendor == "claude" else 2
+    return [(cap, why) for cap, c, x, why in VENDOR_CAPABILITIES
+            if (c if idx == 1 else x) != YES]
+
+
 EXPLAIN: dict[str, dict[str, object]] = {
     "sources": {
         "measures": "Which files every number is derived from.",
@@ -2266,6 +2388,23 @@ EXPLAIN: dict[str, dict[str, object]] = {
         ],
         "verify": ("actualis --json | jq '.cost_usd, .duplicate_usage_records_skipped, "
                    ".cost_usd_from_unpriced_models'"),
+    },
+    "vendors": {
+        "measures": "What each agent's transcript actually contains, and what it does not.",
+        "formula": [
+            "capability                claude   codex",
+        ] + [f"  {cap:<24}{c:<9}{x}" for cap, c, x, _why in VENDOR_CAPABILITIES] + [
+            "",
+            "Every row names the transcript field it rests on; see",
+            "VENDOR_CAPABILITIES in the source.",
+        ],
+        "assumes": [
+            "Nothing. This is a statement about the data, not about the agents.",
+            "A section fed by a field one vendor does not write is single-vendor,",
+            "and comparing two projects on different agents compares different",
+            "measurements.",
+        ],
+        "verify": "actualis --json | jq '.vendors'",
     },
     "suppressions": {
         "measures": "Findings you have marked as false positives on this machine.",
@@ -3203,11 +3342,24 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
 
     # ---- shell audit -----------------------------------------------------
 
+    if fleet.unreadable:
+        pct = fleet.unreadable / fleet.bash_total * 100 if fleet.bash_total else 0
+        print(f"\n  {c.dim}unreadable{c.off}  {num(fleet.unreadable)} commands "
+              f"({pct:.1f}%) ran something this transcript does not contain")
+        for name, n in fleet.unreadable_shapes.most_common(6):
+            print(f"    {c.dim}{name:<30}{num(n):>7}{c.off}")
+        print(f"  {c.dim}Not a finding. A script is normal; this is what the audit "
+              f"could not see.{c.off}")
+
     if fleet.refusals:
         rule(c, "REFUSALS")
         print(f"  {c.dim}What was stopped, and by whom. A refused command is never "
               f"sent,{c.off}")
-        print(f"  {c.dim}so this exists only in your local transcripts.{c.off}\n")
+        print(f"  {c.dim}so this exists only in your local transcripts.{c.off}")
+        if "codex" in fleet.cost_by_agent:
+            print(f"  {c.yellow}▲{c.off} {c.dim}Claude Code only. Codex writes no "
+                  f"per-refusal record, so its sessions are absent here.{c.off}")
+        print()
         gates = sorted(fleet.refusal_tool,
                        key=lambda k: -sum(fleet.refusal_tool[k].values()))
         for kind in gates:
@@ -3292,12 +3444,14 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
             print(f"    {c.dim}Wrong for everyone, not just you? Report it:{c.off}")
             print(f"      {c.dim}{report_url(kinds, 'id ' + first_wrong)[:96]}…{c.off}")
 
-    highs = [f for f in fleet.flags if f["severity"] == "high"]
-    meds = [f for f in fleet.flags if f["severity"] == "med"]
+    highs = [f for f in fleet.actionable_flags if f["severity"] == "high"]
+    meds = [f for f in fleet.actionable_flags if f["severity"] == "med"]
 
     print(f"\n  {c.dim}flagged{c.off}   "
           f"{c.red}{len(highs)} high{c.off}   {c.yellow}{len(meds)} medium{c.off}   "
-          f"{c.dim}of {num(fleet.bash_total)} commands{c.off}")
+          f"{c.dim}of {num(fleet.bash_total)} commands"
+          + (f", {num(fleet.suppressed_flags)} suppressed" if fleet.suppressed_flags else "")
+          + f"{c.off}")
 
     if fleet.flag_counts:
         print(f"\n  {c.dim}by category{c.off}")
@@ -3519,6 +3673,10 @@ JSON_SCHEMA: dict[str, str] = {
     "bash.commands.*": "int",
     "bash.flag_counts.*": "int",
     "bash.flags": "array",
+    "bash.flags[].id": "str",
+    "bash.flags[].program": "str",
+    "bash.flags[].suppressed": "bool",
+    "bash.flags[].suppressed_reason": "str",
     "bash.flags[].severity": "str",
     "bash.flags[].categories": "array",
     "bash.flags[].categories[]": "str",
@@ -3551,6 +3709,17 @@ JSON_SCHEMA: dict[str, str] = {
     "redacted": "bool",
     "permission_modes.*": "int",
     "denials.*": "int",
+    "suppressed_flags": "int",
+    "vendors.capabilities": "array",
+    "vendors.capabilities[].capability": "str",
+    "vendors.capabilities[].claude": "str",
+    "vendors.capabilities[].codex": "str",
+    "vendors.capabilities[].depends_on": "str",
+    "vendors.note": "str",
+    "unreadable_commands.count": "int",
+    "unreadable_commands.pct_of_commands": "float",
+    "unreadable_commands.by_shape.*": "int",
+    "unreadable_commands.note": "str",
     "refusals.total": "int",
     "refusals.joined_to_a_command": "int",
     "refusals.join_note": "str",
@@ -3711,6 +3880,26 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
         "redacted": not raw,
         "permission_modes": dict(fleet.permission_modes),
         "denials": dict(fleet.denials),
+        "suppressed_flags": fleet.suppressed_flags,
+        "vendors": {
+            "capabilities": [
+                {"capability": cap, "claude": c, "codex": x, "depends_on": why}
+                for cap, c, x, why in VENDOR_CAPABILITIES
+            ],
+            "note": "a section fed by a field one vendor does not write is "
+                    "single-vendor. Comparing two projects on different agents "
+                    "compares different measurements.",
+        },
+        "unreadable_commands": {
+            "count": fleet.unreadable,
+            "pct_of_commands": float(round(
+                fleet.unreadable / fleet.bash_total * 100, 2)) if fleet.bash_total else 0.0,
+            "by_shape": dict(fleet.unreadable_shapes.most_common()),
+            "note": "the transcript does not contain what these commands actually "
+                    "ran -- a variable, an eval, a script whose contents live in a "
+                    "file. Counted, not flagged: this is what the audit could not "
+                    "see, not an accusation.",
+        },
         "refusals": {
             "total": fleet.refusals,
             "joined_to_a_command": fleet.refusals_joined,
