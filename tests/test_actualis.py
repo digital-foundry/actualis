@@ -2014,3 +2014,129 @@ class TestCorrectnessFindings(unittest.TestCase):
         f = self._fleet(600)
         ids = [c["id"] for c in af.to_json(f)["coach"]]
         self.assertIn("AF012", ids)
+
+
+class TestDetectorListReview(unittest.TestCase):
+    """Both lists were audited against a real corpus on 2026-08-26 rather than
+    against intuition. These hold the result, in both directions: a detector
+    that only widens is a detector on its way to being ignored.
+    """
+
+    # Reviewed by hand from 49 distinct name-based detections on the corpus.
+    # 18 were wrong. Each of these produced one of the exclusion rules.
+    MEASURED_FALSE_POSITIVES = [
+        "AUTHOR",                                    # AUTH starting a longer word
+        "COOKIELESS", "COOKIECOUNT",                 # COOKIE starting a compound
+        "SESSION_RECORDING_OPT_IN",                  # analytics config
+        "SESSION_RECORDING_SAMPLE_RATE",
+        "SESSION_RECORDING_MINIMUM_DURATION_MILLISECONDS",
+        "SESSION_REPLAY_CONFIG",
+        "AUTH_PROVIDER_ID", "_SESSION_ID",           # identifiers
+        "EMBED_TURNSTILE_SITE_KEY",                  # public by design
+        "__CIRQLE_TURNSTILE_SITE_KEY__",             # ... and wrapped as a placeholder
+        "DB_SESSION",                                # an object, not a value
+        "TINFOPLIST_KEY_LSAPPLICATIONCATEGORYTYPE",  # an Xcode build setting
+        "APPACCOUNTTOKEN",                           # Apple purchase identifier
+        "UNRECOGNIZED_KEYS",                         # a collection
+        "RUN_AND_PERSIST_IC_SESSION",                # a boolean flag
+    ]
+
+    MUST_STILL_FIRE = [
+        "STRIPE_SECRET_KEY", "STRIPE_KEY", "API_KEY", "APIKEY", "TOKEN", "SECRET",
+        "ACCESS_TOKEN", "GH_TOKEN", "AWS_SECRET_ACCESS_KEY", "CLIENTSECRET",
+        "PASSWORD", "ADMIN_INTERNAL_SECRET", "APP_SHARED_SECRET", "PAT",
+        "APP_IDENTITY_SIGNING_KEY", "TURNSTILE_SECRET", "FORM_EVENTS_HASH_SECRET",
+        "RESEND_API_KEY", "SUPABASE_ACCESS_TOKEN", "API_TOKEN", "BOARD_TOKEN",
+        "DSN", "COPPER_E2E_TOKEN", "SERVICE_CREDENTIALS", "SUPABASE_PAT",
+    ]
+
+    @staticmethod
+    def _fires(name):
+        return bool(af.classify_secrets(f"export {name}=notarealvaluejustafixture01"))
+
+    def test_the_measured_false_positives_are_silent(self):
+        for name in self.MEASURED_FALSE_POSITIVES:
+            with self.subTest(name=name):
+                self.assertFalse(self._fires(name))
+
+    def test_nothing_real_was_lost_silencing_them(self):
+        """Widening and quieting are the same job. An exclusion pass that costs
+        a true positive has made the tool worse, not tidier."""
+        for name in self.MUST_STILL_FIRE:
+            with self.subTest(name=name):
+                self.assertTrue(self._fires(name))
+
+    def test_a_credentials_bundle_is_not_treated_as_a_list(self):
+        """SERVICE_CREDENTIALS was briefly silenced by an over-broad plural
+        rule. CREDENTIALS and SECRETS routinely name a single blob; only KEYS
+        and TOKENS reliably name a list."""
+        self.assertTrue(self._fires("SERVICE_CREDENTIALS"))
+        self.assertTrue(self._fires("APP_SECRETS"))
+        self.assertFalse(self._fires("UNRECOGNIZED_KEYS"))
+        self.assertFalse(self._fires("ALLOWED_TOKENS"))
+
+    def test_a_placeholder_wrapper_does_not_defeat_an_exclusion(self):
+        """Templates wrap names: __X__, {{X}}, %X%. The decoration is not part
+        of the name, so one rule should cover every spelling."""
+        for wrapped in ("__EMBED_TURNSTILE_SITE_KEY__", "{{TURNSTILE_SITE_KEY}}",
+                        "%TURNSTILE_SITE_KEY%"):
+            with self.subTest(name=wrapped):
+                self.assertFalse(self._fires(wrapped))
+
+    # ---- the prefix list -------------------------------------------------
+    def test_supabase_tokens_are_detected(self):
+        """58 occurrences sat undetected in a real corpus. A Supabase PAT
+        carries full account authority."""
+        cmd = "export SUPABASE_PAT=sbp_" + "a1" * 20
+        found = af.classify_secrets(cmd)
+        self.assertTrue(found)
+        self.assertEqual(found[0][0], "critical")
+        self.assertEqual(found[0][1], "Supabase PAT")
+
+    def test_a_two_character_prefix_was_rejected_on_evidence(self):
+        """Resend keys start `re_`, but the corpus held 180 `re_` matches across
+        37 shapes, every one an ordinary identifier. Adding it would have been
+        180 false positives and zero true ones."""
+        for identifier in ("re_deploy-preview-branch", "re_export_all_symbols",
+                           "re_run_failed_jobs_now"):
+            with self.subTest(identifier=identifier):
+                self.assertFalse(af.classify_secrets(f"vercel {identifier}"))
+        self.assertNotIn("re_", af._TOKEN_PREFIXES)
+
+    def test_every_typed_detector_is_also_redacted(self):
+        """A detector added to SECRET_TYPES but not to the redaction prefixes is
+        counted and then printed. That happened while adding Supabase."""
+        for _pri, kind, rx in af.SECRET_TYPES:
+            prefix = self._literal_prefix(rx.pattern)
+            if not prefix:
+                continue
+            probe = "export X=" + prefix + "a1" * 30
+            if af.classify_secrets(probe):
+                with self.subTest(kind=kind):
+                    self.assertNotEqual(af.redact(probe), probe,
+                                        f"{kind} is counted but never masked")
+
+    @staticmethod
+    def _literal_prefix(pattern):
+        """The fixed characters a pattern starts with, before any class or group.
+
+        Deliberately simple: parsing a regex with a regex is how the last two
+        bugs in this file happened.
+        """
+        out = []
+        i = 0
+        if pattern.startswith(r"\b"):
+            i = 2
+        while i < len(pattern):
+            ch = pattern[i]
+            if ch in "([{|^$*+?":
+                break
+            if ch == "\\":
+                i += 1
+                if i < len(pattern):
+                    out.append(pattern[i])
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+        return "".join(out)
