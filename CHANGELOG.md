@@ -63,6 +63,12 @@
   journal and rotate with it; `--service newsyslog` covers macOS, which has no
   journal.
 
+  The unit names the build that generated it, taken from `argv[0]` rather than
+  from `PATH`. An install that is not on `PATH` — a venv, a pipx shim — would
+  otherwise produce a unit pointing at whatever `which` happened to find, and
+  the service would run a different version than the one that wrote it,
+  silently and possibly for months.
+
   Generating a unit writes nothing. The read-only guarantee gets no exception
   for convenience.
 

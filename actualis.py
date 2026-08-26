@@ -4385,11 +4385,26 @@ def _actualis_command() -> list[str]:
     """
     import shutil                      # local, as elsewhere in this file
 
-    script = Path(__file__).resolve()
+    # argv[0] first, because it is THIS build. Asking PATH instead means a
+    # venv or pipx install that is not on PATH generates a unit pointing at
+    # some other installation, and the service then runs a different version
+    # than the one that wrote it -- silently, and possibly for months.
+    argv0 = Path(sys.argv[0]) if sys.argv and sys.argv[0] else None
+    if argv0 and argv0.suffix != ".py":
+        try:
+            resolved = argv0.resolve()
+            if resolved.is_file() and os.access(resolved, os.X_OK):
+                return [str(resolved)]
+        except OSError:
+            pass
+
     entry = shutil.which("actualis")
     if entry:
         return [str(Path(entry).resolve())]
-    return [sys.executable, str(script)]
+
+    # Running from a source checkout: name the interpreter explicitly, since a
+    # service manager will not consult a shebang or a virtualenv for us.
+    return [sys.executable, str(Path(__file__).resolve())]
 
 
 def _xml_escape(text: str) -> str:

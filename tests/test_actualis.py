@@ -2844,6 +2844,32 @@ class TestBackgroundService(unittest.TestCase):
         argv = af._actualis_command()
         self.assertTrue(all(Path(a).is_absolute() for a in argv), argv)
 
+    def test_the_unit_names_the_build_that_generated_it(self):
+        """A venv install not on PATH used to generate a unit pointing at
+        whatever `which` found -- so the service ran a DIFFERENT version than
+        the one that wrote it, silently."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "actualis"
+            fake.write_text("#!/bin/sh\nexit 0\n")
+            fake.chmod(0o755)
+            old_argv = sys.argv[:]
+            try:
+                sys.argv = [str(fake), "--service", "launchd"]
+                self.assertEqual(af._actualis_command(), [str(fake.resolve())])
+            finally:
+                sys.argv = old_argv
+
+    def test_a_source_checkout_names_the_interpreter(self):
+        """`python3 actualis.py` is not something launchd can exec on its own."""
+        old_argv = sys.argv[:]
+        try:
+            sys.argv = ["actualis.py"]
+            argv = af._actualis_command()
+            # Either the interpreter pair, or a real `actualis` found on PATH.
+            self.assertTrue(argv[0] == sys.executable or Path(argv[0]).is_file())
+        finally:
+            sys.argv = old_argv
+
     def test_no_placeholder_survives_into_a_generated_unit(self):
         """The old template shipped __ACTUALIS__ and __HOME__ for sed to fill."""
         for kind in af.SERVICE_KINDS:
