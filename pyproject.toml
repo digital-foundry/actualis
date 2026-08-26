@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "actualis"
-version = "0.1.5"
+version = "0.1.6"
 description = "What actually ran. Local, read-only, honest about limits."
 readme = "README.md"
 requires-python = ">=3.9"

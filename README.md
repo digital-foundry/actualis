@@ -104,6 +104,7 @@ python3 actualis.py --agent codex    # one agent only (claude | codex | all)
 | `--coach` | findings and actions only |
 | `--share` | postable summary with nothing identifying in it |
 | `--json` | machine-readable ([schema](docs/json.md)) |
+| `--diff OLD.json` | compare against a saved `--json` report: what appeared, what went away, what got worse |
 | `--watch` | live monitor; alert on new secrets and risky commands |
 | `--interval SEC` | `--watch` poll interval, default 4 |
 | `--quiet` | `--watch`: notify on secrets only, not every flagged command |
@@ -116,7 +117,31 @@ python3 actualis.py --agent codex    # one agent only (claude | codex | all)
 | `--why AFxxx` | explain one finding against your actual numbers |
 | `--agents` | installed agent platforms and whether their binaries are validly signed |
 | `--mcp` | run as an MCP server over stdio ([below](#ask-the-agent-about-itself)) |
+| `--service KIND` | print a `launchd`, `systemd` or `newsyslog` unit for `--watch`, paths already resolved |
+| `--self-check` | verify the privacy claims on your own machine, by executing them |
+| `--completions SHELL` | print a shell completion script for `bash`, `zsh` or `fish` |
 | `--version` | print version |
+
+### Completions
+
+The script is generated from the parser, so it never drifts from the flags this
+build actually has. `--explain`, `--why`, `--agent` and `--fail-on` complete
+their real values.
+
+```sh
+# zsh — any directory on your fpath
+actualis --completions zsh > ~/.zsh/completions/_actualis
+
+# bash
+actualis --completions bash > ~/.local/share/bash-completion/completions/actualis
+
+# fish
+actualis --completions fish > ~/.config/fish/completions/actualis.fish
+```
+
+Regenerate after upgrading. `--suppress` is deliberately not completed: its
+values are finding ids from your own report, and producing them needs a full
+scan — a tab key that hangs the terminal is worse than one that does nothing.
 
 ### What the report contains
 
@@ -354,6 +379,24 @@ prints to stdout. The whole program is one readable file; if you're about to poi
 a tool at your session history, you should be able to audit it in a sitting, so it
 was written to be read.
 
+Those are claims, so the tool checks them for you rather than asking you to
+take them on faith:
+
+```sh
+actualis --self-check
+```
+
+It reads its own source and reports every module it imports (a Python process
+cannot open a network connection without `socket`), hashes a sample of your
+transcripts before and after a real scan to show they are byte-identical,
+confirms no file appeared or vanished under the transcript roots, names the only
+path it can ever write to, and prints its own sha256 so you can compare it with
+the published wheel. It exits non-zero if any of that fails.
+
+Passing is a floor, not a guarantee, and the output says so: it proves what this
+run did, not what every run could do. The stronger check is still to watch the
+process yourself, and `--self-check` prints the command for your platform.
+
 Every transcript directory it scanned is printed in the report header. It checks
 `~/.claude/projects` **and** `$CLAUDE_CONFIG_DIR/projects`, because a machine can
 have both, and a fleet report that silently covers half your fleet is worse than
@@ -577,33 +620,57 @@ macOS, Linux and Windows from one Go codebase, ~2 MB, no Electron and no
 webview. It is a thin shell over `--json`; all measurement stays in the CLI.
 See [tray-go/README.md](tray-go/README.md).
 
-## Running it in the background (macOS)
+## Running it in the background
 
 `--watch` tails the transcripts and raises a native notification when an agent
 runs a command carrying a new credential. To keep it running without a terminal,
-install the LaunchAgent:
+generate a unit for your service manager. The paths are resolved on the machine
+that will run it, so there is nothing to substitute:
 
 ```sh
-mkdir -p ~/Library/LaunchAgents
-sed "s|__ACTUALIS__|$(command -v actualis)|; s|__HOME__|$HOME|" \
-  packaging/app.actualis.watch.plist \
-  > ~/Library/LaunchAgents/app.actualis.watch.plist
-launchctl bootstrap gui/$(id -u) \
-  ~/Library/LaunchAgents/app.actualis.watch.plist
+# macOS
+actualis --service launchd > ~/Library/LaunchAgents/app.actualis.watch.plist &&
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/app.actualis.watch.plist
+
+# Linux
+actualis --service systemd > ~/.config/systemd/user/actualis-watch.service &&
+  systemctl --user daemon-reload &&
+  systemctl --user enable --now actualis-watch
 ```
 
-Check it, read it, stop it:
+Uninstall is one command too:
 
 ```sh
-launchctl print gui/$(id -u)/app.actualis.watch | head -20
-tail -f ~/Library/Logs/actualis-watch.log
-launchctl bootout gui/$(id -u)/app.actualis.watch
+launchctl bootout gui/$(id -u)/app.actualis.watch &&
+  rm ~/Library/LaunchAgents/app.actualis.watch.plist
+
+systemctl --user disable --now actualis-watch &&
+  rm ~/.config/systemd/user/actualis-watch.service && systemctl --user daemon-reload
+```
+
+The unit goes to stdout and the install, uninstall and log commands go to
+stderr — so redirecting to a file gives you a working file and still prints
+what to do with it. Run `actualis --service launchd` with no redirect to read
+them.
+
+Both units set `PYTHONUNBUFFERED=1`. Under a service manager stdout is a file
+or a pipe rather than a terminal, so Python block-buffers it, and without this
+an alert about a leaked credential can sit unwritten for hours.
+
+Logs: on Linux they go to the journal and rotate with it
+(`journalctl --user -u actualis-watch -f`). macOS has no journal, so output
+goes to `~/Library/Logs/actualis-watch.log`; only events are written, never the
+heartbeat, so it grows slowly. Rotation there is opt-in and needs root:
+
+```sh
+actualis --service newsyslog | sudo tee /etc/newsyslog.d/actualis.conf
 ```
 
 It is a LaunchAgent rather than a LaunchDaemon on purpose: it must run inside
 your logged-in session for notifications to post at all, and it should hold
-exactly your permissions and no more. Only events are logged — the heartbeat is
-suppressed when stdout is not a terminal — so the log stays small.
+exactly your permissions and no more. The systemd unit is a **user** unit for
+the same reason, and declares `ProtectSystem=strict` and `ProtectHome=read-only`
+so the service manager enforces the read-only guarantee too.
 
 If notifications do not appear, allow them for **Script Editor** in
 System Settings → Notifications. `osascript` posts under that identity.

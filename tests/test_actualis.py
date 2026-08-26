@@ -11,6 +11,10 @@ documentation key), or self-describing. A tool that detects secrets cannot be
 tested without them. See .gitleaksignore.
 """
 
+import argparse
+import contextlib
+import io
+import tempfile
 import importlib.util
 import json
 import os
@@ -802,7 +806,9 @@ class TestExplainability(unittest.TestCase):
                    "BY TICKET": "tickets", "TOOL CALLS": "shell",
                    "SUBAGENTS": "subagents", "SHELL AUDIT": "shell",
                    "REFUSALS": "refusals", "SUPPRESSIONS": "suppressions",
-                   "COACH": "coach", "AGENT PLATFORMS": "agents", "EXPLAIN": "sources"}
+                   "COACH": "coach", "AGENT PLATFORMS": "agents",
+                   "EXPLAIN": "sources", "DIFF": "diff",
+                   "SELF CHECK": "verify"}
         for sec in sections:
             with self.subTest(section=sec):
                 self.assertIn(sec, mapping, f"{sec} has no explain topic")
@@ -2486,3 +2492,386 @@ class TestFailOn(unittest.TestCase):
         self.assertEqual(af.failing_findings(after, "critical"), [])
         self.assertTrue(af.failing_findings(after, "high"),
                         "a high-severity flag should still fail the high gate")
+
+
+class TestDiffTwoRuns(unittest.TestCase):
+    """A diff that is wrong is worse than no diff: it invents movement."""
+
+    def _report(self, **over):
+        base = {"schema_version": af.JSON_SCHEMA_VERSION, "version": af.__version__,
+                "window": {"from": "2026-01-01T00:00:00+00:00",
+                           "to": "2026-01-08T00:00:00+00:00"},
+                "secrets": [], "coach": [], "bash": {"flags": []},
+                "cost_usd": 10.0, "messages": 100, "report_sha256": "a" * 64}
+        base.update(over)
+        return base
+
+    def _write(self, payload):
+        fh = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump(payload, fh)
+        fh.close()
+        self.addCleanup(os.unlink, fh.name)
+        return Path(fh.name)
+
+    def test_refuses_a_baseline_from_another_schema(self):
+        path = self._write(self._report(schema_version=af.JSON_SCHEMA_VERSION + 1))
+        with self.assertRaises(ValueError) as cm:
+            af.load_report(path)
+        self.assertIn("schema_version", str(cm.exception))
+
+    def test_refuses_a_file_that_is_not_a_report(self):
+        for payload in ({"hello": "world"}, [1, 2, 3]):
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValueError):
+                    af.load_report(self._write(payload))
+
+    def test_refuses_invalid_json_without_traceback(self):
+        fh = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        fh.write("{not json")
+        fh.close()
+        self.addCleanup(os.unlink, fh.name)
+        with self.assertRaises(ValueError) as cm:
+            af.load_report(Path(fh.name))
+        self.assertIn("not valid JSON", str(cm.exception))
+
+    def test_appeared_and_resolved_are_not_confused(self):
+        old = self._report(secrets=[{"id": "aaaaaaaa", "priority": "high",
+                                     "types": ["AWS access key"], "projects": []}])
+        new = self._report(secrets=[{"id": "bbbbbbbb", "priority": "high",
+                                     "types": ["Stripe key"], "projects": []}])
+        fam = af.diff_reports(old, new)["families"]["secrets"]
+        self.assertEqual([r["id"] for r in fam["appeared"]], ["bbbbbbbb"])
+        self.assertEqual([r["id"] for r in fam["resolved"]], ["aaaaaaaa"])
+
+    def test_severity_movement_is_directional(self):
+        low = self._report(secrets=[{"id": "aaaaaaaa", "priority": "low",
+                                     "types": [], "projects": []}])
+        high = self._report(secrets=[{"id": "aaaaaaaa", "priority": "critical",
+                                      "types": [], "projects": []}])
+        worse = af.diff_reports(low, high)["families"]["secrets"]
+        self.assertEqual(len(worse["worse"]), 1)
+        self.assertEqual(worse["better"], [])
+        better = af.diff_reports(high, low)["families"]["secrets"]
+        self.assertEqual(len(better["better"]), 1)
+        self.assertEqual(better["worse"], [])
+
+    def test_a_flag_id_recurring_is_a_count_change_not_a_new_finding(self):
+        """Flag ids name a KIND of command; the same kind twice is not two kinds."""
+        flag = {"id": "cccccccc", "severity": "high", "program": "rm",
+                "categories": ["destructive"]}
+        old = self._report(bash={"flags": [flag]})
+        new = self._report(bash={"flags": [flag, dict(flag)]})
+        fam = af.diff_reports(old, new)["families"]["flags"]
+        self.assertEqual(fam["appeared"], [])
+        self.assertEqual(len(fam["moved"]), 1)
+        before, after = fam["moved"][0]
+        self.assertEqual((before["count"], after["count"]), (1, 2))
+
+    def test_identical_reports_report_nothing(self):
+        r = self._report(secrets=[{"id": "aaaaaaaa", "priority": "high",
+                                   "types": [], "projects": []}])
+        d = af.diff_reports(r, r)
+        for fam in d["families"].values():
+            self.assertEqual(fam["appeared"], [])
+            self.assertEqual(fam["resolved"], [])
+            self.assertEqual(fam["worse"], [])
+            self.assertEqual(fam["better"], [])
+            self.assertEqual(fam["moved"], [])
+
+    def test_render_never_raises_on_a_sparse_report(self):
+        """Old payloads may lack whole sections; a diff must not crash on them."""
+        bare = {"schema_version": af.JSON_SCHEMA_VERSION}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            af.render_diff(af.diff_reports(bare, bare), af.C(False))
+        self.assertIn("DIFF", buf.getvalue())
+
+    def test_diff_and_json_together_are_rejected(self):
+        """Silently letting one win would be a trap in CI."""
+        with self.assertRaises(SystemExit) as cm:
+            af.main(["--diff", "x.json", "--json"])
+        self.assertEqual(cm.exception.code, af.EXIT_USAGE)
+
+
+class TestDeadEndMessages(unittest.TestCase):
+    """The empty report is the most common first experience. It must teach."""
+
+    def test_no_transcripts_names_every_place_it_looked(self):
+        msg = af.no_transcripts_message()
+        self.assertIn("Looked in:", msg)
+        self.assertIn("projects", msg)
+        self.assertIn("sessions", msg)
+        self.assertIn("--root", msg)
+
+    def test_no_transcripts_never_blames_the_install(self):
+        msg = af.no_transcripts_message().lower()
+        for word in ("error", "failed", "invalid"):
+            self.assertNotIn(word, msg)
+
+    def test_a_filtered_out_run_names_the_filter_that_did_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "projects" / "proj"
+            root.mkdir(parents=True)
+            (root / "s.jsonl").write_text('{"type":"user"}\n')
+            fleet = af.Fleet()
+            fleet.roots.append(Path(tmp) / "projects")
+            args = argparse.Namespace(root=None, days=1, project=None, agent="all")
+            msg = af.dead_end_message(fleet, args)
+            self.assertIn("--days 1", msg)
+            self.assertIn("session file", msg)
+
+            args = argparse.Namespace(root=None, days=None, project="nope", agent="all")
+            self.assertIn("--project", af.dead_end_message(fleet, args))
+
+    def test_an_empty_directory_is_not_reported_as_a_filter_problem(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fleet = af.Fleet()
+            fleet.roots.append(Path(tmp))
+            args = argparse.Namespace(root=None, days=7, project=None, agent="all")
+            msg = af.dead_end_message(fleet, args)
+            self.assertIn("no session files", msg)
+            self.assertNotIn("--days", msg)
+
+
+class TestCommandHeadComments(unittest.TestCase):
+    """`#` and `verify()` were being reported as programs in the flag tables."""
+
+    def test_a_comment_runs_nothing(self):
+        for cmd in ("# just a note", "#!/bin/bash", "  # indented note"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(af.command_head(cmd))
+
+    def test_a_trailing_comment_does_not_hide_the_program(self):
+        self.assertEqual(af.command_head("curl https://x # fetch it"), "curl")
+
+    def test_a_quoted_hash_is_an_argument_not_a_comment(self):
+        self.assertEqual(af.command_head('grep -n "#" file'), "grep")
+
+    def test_a_function_definition_reports_the_body_not_the_name(self):
+        self.assertEqual(af.command_head("verify() { rm -rf /tmp/x; }"), "rm")
+
+    def test_no_command_head_output_is_ever_punctuation_only(self):
+        """The regression this class exists for: `#` reaching the flag tables."""
+        for cmd in ("# note", "### header", "#"):
+            head = af.command_head(cmd)
+            if head is not None:
+                self.assertTrue(any(ch.isalnum() for ch in head),
+                                f"{cmd!r} produced a punctuation-only program {head!r}")
+
+
+class TestShellCompletions(unittest.TestCase):
+    """A completion script that lies about the flags is worse than none."""
+
+    def test_every_shell_produces_a_script(self):
+        for shell in af.COMPLETION_SHELLS:
+            with self.subTest(shell=shell):
+                self.assertTrue(af.completion_script(shell).strip())
+
+    def test_every_parser_flag_appears_in_every_script(self):
+        """The whole point of generating them: a new flag cannot be missed."""
+        flags = [o for a in af.build_parser()._actions
+                 for o in a.option_strings if o.startswith("--")]
+        for shell in af.COMPLETION_SHELLS:
+            script = af.completion_script(shell)
+            for flag in flags:
+                with self.subTest(shell=shell, flag=flag):
+                    # fish writes `-l days`; bash and zsh write `--days`.
+                    needle = f"-l {flag[2:]}" if shell == "fish" else flag
+                    self.assertIn(needle, script)
+
+    def test_explain_topics_come_from_EXPLAIN_not_a_copy(self):
+        for shell in af.COMPLETION_SHELLS:
+            script = af.completion_script(shell)
+            for topic in af.EXPLAIN:
+                with self.subTest(shell=shell, topic=topic):
+                    self.assertIn(topic, script)
+
+    def test_finding_ids_come_from_the_source(self):
+        ids = af._finding_ids()
+        self.assertIn("AF001", ids)
+        self.assertEqual(ids, sorted(set(ids)))
+        emitted = {f.id for f in af.coach(af.Fleet())} | {"AF001"}
+        self.assertTrue(emitted.issubset(set(ids) | emitted),
+                        "coach() can emit an id the completions do not know")
+
+    def test_choices_are_completed_for_every_constrained_flag(self):
+        for shell in af.COMPLETION_SHELLS:
+            script = af.completion_script(shell)
+            for value in ("critical", "high", "any", "claude", "codex"):
+                with self.subTest(shell=shell, value=value):
+                    self.assertIn(value, script)
+
+    def test_zsh_compdef_is_the_first_line(self):
+        """zsh silently ignores the file otherwise."""
+        self.assertTrue(af.completion_script("zsh").startswith("#compdef actualis\n"))
+
+    def test_zsh_body_does_not_invoke_itself(self):
+        """An autoloaded compdef file is CALLED; self-invoking errors."""
+        self.assertNotIn('_actualis "$@"', af.completion_script("zsh"))
+
+    def test_suppress_is_left_uncompleted_on_purpose(self):
+        """Completing it means a full scan on every TAB. Documented, not forgotten."""
+        for shell in af.COMPLETION_SHELLS:
+            spec = dict((o, v) for o, v, _ in af._completion_spec())
+            self.assertEqual(spec["--suppress"], [])
+
+    def test_scripts_are_pure_text_with_no_secrets(self):
+        """Generated from the parser, so nothing from the corpus can leak in."""
+        for shell in af.COMPLETION_SHELLS:
+            script = af.completion_script(shell)
+            for hostile in (os.path.expanduser("~"), "sk-", "AKIA"):
+                with self.subTest(shell=shell, hostile=hostile):
+                    self.assertNotIn(hostile, script)
+
+
+class TestSelfCheck(unittest.TestCase):
+    """The privacy claims are the product, so the check on them must be real."""
+
+    def test_import_scan_catches_a_lazy_network_import(self):
+        """The evasion this exists for: `import socket` hidden inside a function."""
+        self.assertIn("socket", af.imports_in("def f():\n    import socket\n"))
+
+    def test_import_scan_catches_every_import_form(self):
+        cases = {
+            "import socket": "socket",
+            "import socket as s": "socket",
+            "from urllib.request import urlopen": "urllib",
+            "    import ssl  # lazy": "ssl",
+            "from http.client import HTTPSConnection": "http",
+        }
+        for src, want in cases.items():
+            with self.subTest(src=src):
+                self.assertIn(want, af.imports_in(src))
+
+    def test_import_scan_is_not_fooled_by_prose(self):
+        """A docstring reading 'from a non-zero exit' reported a module named 'a'."""
+        prose = ('    """Distinguish this from a non-zero exit and callers\n'
+                 '    must not import a module for it."""\n')
+        self.assertEqual(af.imports_in(prose), [])
+
+    def test_this_build_imports_no_networking_module(self):
+        """The claim itself, asserted against the shipped source."""
+        found = set(af.imports_in(af.SRC_TEXT))
+        offenders = sorted(found & set(af._NETWORK_MODULES))
+        self.assertEqual(offenders, [],
+                         f"this build imports networking modules: {offenders}")
+
+    def test_the_network_list_covers_the_obvious_ways_out(self):
+        for mod in ("socket", "ssl", "urllib", "http", "requests", "httpx", "asyncio"):
+            self.assertIn(mod, af._NETWORK_MODULES)
+
+    def test_a_scan_does_not_alter_the_files_it_reads(self):
+        """The integrity claim, run against real files in a temp corpus."""
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = Path(tmp) / "proj"
+            proj.mkdir()
+            f = proj / "s.jsonl"
+            f.write_text('{"type":"user","message":{"role":"user","content":"hi"}}\n')
+            before = af._digest_file(f)
+            fleet = af.Fleet()
+            fleet.scan([Path(tmp)], None, None, progress=False)
+            self.assertEqual(af._digest_file(f), before,
+                             "scanning changed the file it read")
+
+    def test_tree_state_notices_a_created_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            before = af._tree_state([root])
+            (root / "new").write_text("x")
+            after = af._tree_state([root])
+            self.assertEqual(sorted(set(after) - set(before)),
+                             [str(root / "new")])
+
+    def test_digest_of_a_missing_file_is_none_not_a_crash(self):
+        self.assertIsNone(af._digest_file(Path("/nonexistent-actualis-9187")))
+
+    def test_the_output_states_its_own_limits(self):
+        """A check that oversells itself is worse than no check."""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            af.self_check(af.C(False), days=1)
+        out = buf.getvalue()
+        self.assertIn("does not prove", out)
+        self.assertIn("floor, not a guarantee", out)
+
+    def test_the_only_write_path_is_the_suppression_file(self):
+        for p in af.suppression_paths():
+            self.assertIn("suppressions", str(p))
+
+
+class TestBackgroundService(unittest.TestCase):
+    """The units are generated so they cannot drift. Prove they are valid."""
+
+    def test_every_kind_produces_a_unit(self):
+        for kind in af.SERVICE_KINDS:
+            with self.subTest(kind=kind):
+                self.assertTrue(af.service_unit(kind).strip())
+
+    def test_the_launchd_plist_is_well_formed_xml(self):
+        import xml.parsers.expat          # test-only; not imported by the tool
+        parser = xml.parsers.expat.ParserCreate()
+        parser.Parse(af.service_unit("launchd"), True)   # raises if malformed
+
+    def test_the_systemd_unit_has_the_sections_systemd_requires(self):
+        import configparser
+        c = configparser.ConfigParser(strict=False)
+        c.read_string(af.service_unit("systemd"))
+        self.assertEqual({"Unit", "Service", "Install"}, set(c.sections()))
+        self.assertTrue(c["Service"]["ExecStart"])
+        self.assertIn("WantedBy", c["Install"])
+
+    def test_both_units_defeat_python_block_buffering(self):
+        """Without this an alert sits in an 8KB buffer until the next one."""
+        for kind in ("launchd", "systemd"):
+            with self.subTest(kind=kind):
+                self.assertIn("PYTHONUNBUFFERED", af.service_unit(kind))
+
+    def test_the_watch_event_paths_flush(self):
+        """The buffering fix in the code, not just in the unit."""
+        src = af.SRC_TEXT
+        body = src[src.index("def watch("):src.index("def _commands_in")]
+        for marker in ("▲ SECRET", "▲ {cats}"):
+            i = body.index(marker)
+            # the print call containing this marker must set flush
+            tail = body[i:i + 400]
+            self.assertIn("flush=True", tail.split("notify(")[0],
+                          f"the {marker!r} alert can be buffered indefinitely")
+
+    def test_the_command_is_absolute(self):
+        """A service manager has no PATH worth relying on."""
+        argv = af._actualis_command()
+        self.assertTrue(all(Path(a).is_absolute() for a in argv), argv)
+
+    def test_no_placeholder_survives_into_a_generated_unit(self):
+        """The old template shipped __ACTUALIS__ and __HOME__ for sed to fill."""
+        for kind in af.SERVICE_KINDS:
+            unit = af.service_unit(kind)
+            with self.subTest(kind=kind):
+                self.assertNotIn("__", unit.replace("__version__", ""))
+
+    def test_the_interval_is_written_as_a_plain_number(self):
+        self.assertIn("<string>4</string>", af.service_unit("launchd", 4.0))
+        self.assertIn("--interval 30", af.service_unit("systemd", 30.0))
+
+    def test_quiet_is_carried_into_the_unit(self):
+        self.assertIn("--quiet", af.service_unit("systemd", quiet=True))
+        self.assertNotIn("--quiet", af.service_unit("systemd", quiet=False))
+
+    def test_xml_special_characters_cannot_break_the_plist(self):
+        self.assertEqual(af._xml_escape('a&b<c>"d"'), "a&amp;b&lt;c&gt;&quot;d&quot;")
+
+    def test_every_kind_has_install_and_uninstall_notes(self):
+        for kind in af.SERVICE_KINDS:
+            notes = af.service_install_notes(kind)
+            with self.subTest(kind=kind):
+                self.assertIn("Install", notes)
+                self.assertIn("ninstall", notes)   # Uninstall / uninstall
+
+    def test_generating_a_unit_writes_nothing(self):
+        """The read-only guarantee gets no exception for convenience."""
+        with tempfile.TemporaryDirectory() as tmp:
+            before = af._tree_state([Path(tmp)])
+            for kind in af.SERVICE_KINDS:
+                af.service_unit(kind)
+                af.service_install_notes(kind)
+            self.assertEqual(af._tree_state([Path(tmp)]), before)
