@@ -406,6 +406,7 @@ _TOKEN_PREFIXES = [
     "github_pat_", "sk-ant-api", "sk-ant-", "dop_v1_", "glpat-", "xoxb-", "xoxp-",
     "shpat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "vcp_", "npm_", "sk-", "pk-",
     "AKIA", "ASIA", "AIza", "ya29.", "hf_", "lin_api_", "rk_live_", "sk_live_",
+    "sbp_",
 ]
 
 # ONE list of what a credential is called, used by both redaction and
@@ -666,7 +667,24 @@ SECRET_TYPES: list[tuple[str, str, "re.Pattern[str]"]] = [
     ("high",     "GitLab PAT",       re.compile(r"\bglpat-([A-Za-z0-9_\-]{16,})")),
     ("high",     "DigitalOcean",     re.compile(r"\bdop_v1_([a-f0-9]{32,})")),
     ("high",     "HuggingFace",      re.compile(r"\bhf_([A-Za-z0-9]{16,})")),
+    # Added 2026-08-26 from corpus evidence: 58 occurrences, one consistent
+    # shape, sbp_ followed by exactly 40 alphanumerics. A Supabase personal
+    # access token carries full account authority, so critical rather than high.
+    ("critical", "Supabase PAT",     re.compile(r"\bsbp_([A-Za-z0-9]{40})")),
 ]
+
+# Considered and REJECTED, 2026-08-26, with the measurement rather than a guess:
+#
+#   re_   Resend API keys start `re_`, and the corpus contains 180 matches for
+#         `re_` plus 16+ opaque characters -- across 37 distinct shapes, every
+#         one a lowercase word with separators (`re_deploy-preview-branch`).
+#         No digits, no mixed case, no entropy. All 180 are identifiers. A
+#         two-letter prefix is too generic to carry a detector, and adding it
+#         would have produced 180 false positives and zero true ones here.
+#
+# The general rule this encodes: a prefix earns a place by being distinctive
+# enough that ordinary text does not collide with it, not by belonging to a
+# provider somebody has heard of.
 
 # Connection strings. Loopback is dev credential churn, not an incident.
 _URL_CRED = re.compile(r"([a-z][a-z0-9+.\-]{0,20})://([^\s:/@]{1,128}):([^\s@/]{6,256})@([^\s/:\"']{1,255})")
@@ -708,6 +726,46 @@ _NOT_SECRET_NAMES = re.compile(
     r"|[a-z_]*(?:dedupe?|dedup|idempotenc[a-z]*|correlation|trace|request)_keys?"
     r"|key(?:board|word|stone|note|frame|space)[a-z_]*"
     r"|[a-z_]*monkey[a-z_]*"
+    # --- from a corpus review, 2026-08-26 -------------------------------
+    # 49 distinct name-based detections on a real corpus were reviewed by hand.
+    # 18 were wrong. They were not one-offs; they fell into these shapes, and
+    # each line below names the case that produced it.
+    #
+    # A trigger word that is only the START of a longer, ordinary word.
+    # AUTHOR matched because it begins with AUTH -- the same class of defect as
+    # KEY matching inside FORKEY.
+    r"|author[a-z_]*|[a-z_]*_author[a-z_]*"
+    r"|cookie(?:less|count|jar|name|path|domain|banner|consent)[a-z_]*"
+    # An identifier is not a credential. AUTH_PROVIDER_ID, _SESSION_ID.
+    r"|[a-z_]*(?:secret|token|session|auth|key|cookie|credential)s?_ids?"
+    r"|[a-z_]*_(?:provider|client|tenant|account|user|org)_ids?"
+    # Public by design. A Turnstile or reCAPTCHA SITE key is meant to ship to a
+    # browser; only its paired SECRET is secret. EMBED_TURNSTILE_SITE_KEY.
+    r"|[a-z_]*site_keys?"
+    # Configuration that happens to contain a trigger word.
+    # SESSION_RECORDING_SAMPLE_RATE, SESSION_REPLAY_CONFIG, COOKIELESS.
+    r"|[a-z_]*(?:session|cookie|token|auth)_(?:recording|replay|storage|timeout"
+    r"|duration|sample|config|enabled|disabled|mode|strategy|policy|ttl)[a-z_]*"
+    r"|[a-z_]*_(?:sample_rate|opt_in|opt_out|enabled|disabled|count|rate"
+    r"|duration_milliseconds|config)$"
+    # Build settings and tool-generated names, not application configuration.
+    # TINFOPLIST_KEY_LSAPPLICATIONCATEGORYTYPE.
+    r"|t?infoplist_[a-z_]*|[a-z_]*_build_settings?[a-z_]*"
+    # An object or handle in code, not a value. DB_SESSION.
+    r"|(?:db|database|sql|orm|http|requests?|client|async)_session[a-z_]*"
+    # Apple's appAccountToken is a UUID identifying a purchase, not a secret.
+    r"|app_?account_?token[a-z_]*"
+    # A PLURAL names a collection -- a list of accepted key names, a count --
+    # not one credential. The existing rule caught bare plurals; these are the
+    # qualified ones. UNRECOGNIZED_KEYS.
+    # Only `keys` and `tokens`: those plurals reliably name a list. CREDENTIALS,
+    # SECRETS and COOKIES routinely name a single blob -- a service-account
+    # bundle, a cookie jar -- and silencing SERVICE_CREDENTIALS would be a false
+    # negative on a real secret, which is the worse error of the two.
+    r"|[a-z_]*_(?:keys|tokens)"
+    # A name that reads as a boolean or an action is a flag, not a value.
+    # RUN_AND_PERSIST_IC_SESSION.
+    r"|(?:run|use|enable|disable|is|has|should|allow|skip|with|without)_[a-z_]*"
     r"|[a-z_]*(?:secret|token|password|key|credential)s?_(?:name|id|label|ref|alias|arn|uri|url|var)"
     # A bare plural names a COLLECTION (a list of prefixes, a count), not one
     # credential. Caught in the wild: this file's own regex literal listing
@@ -767,7 +825,10 @@ def classify_secrets(cmd: str) -> list[tuple[str, str, str]]:
 
     for m in _NAMED_SECRET.finditer(cmd):
         name, value = m.group(1), m.group(2)
-        if _NOT_SECRET_NAMES.match(name):
+        # Template placeholders arrive wrapped -- __X__, {{X}}, %X% -- and the
+        # decoration is not part of the name. Strip it so a single exclusion
+        # covers every spelling instead of one per template syntax.
+        if _NOT_SECRET_NAMES.match(name.strip("_{}%$<>")):
             continue
         add(_priority_for_name(name), clean(name.upper())[:48], value)
 

@@ -29,6 +29,7 @@ names is one secret carrying both names.
 | GitLab PAT | high | `glpat-…` |
 | DigitalOcean | high | `dop_v1_…` |
 | HuggingFace | high | `hf_…` |
+| **Supabase PAT** | critical | `sbp_` + 40 alphanumerics. Full account authority |
 
 ## Recognised by shape
 
@@ -75,3 +76,24 @@ floor on visibility. It is not a security boundary.**
 
 Subagent shell commands are not in the parent transcript at all, so no secret
 inside one can be detected. See [AF011](findings.md#af011).
+
+## How this list is maintained
+
+Detectors are added from evidence, not from a list of providers somebody has
+heard of. A prefix earns a place by being distinctive enough that ordinary text
+does not collide with it.
+
+**Supabase PAT** was added on 2026-08-26 after a corpus scan found 58
+occurrences with one consistent shape and no detector for them.
+
+**Resend (`re_`)** was considered on the same pass and rejected. The corpus
+contained 180 matches for `re_` plus sixteen or more opaque characters, across
+37 distinct shapes — every one an ordinary lowercase identifier
+(`re_deploy-preview-branch`), with no digits, no mixed case and no entropy.
+Adding it would have produced 180 false positives and zero true ones. A
+two-character prefix is too generic to carry a detector.
+
+Exclusions are maintained the same way. On 2026-08-26 all 49 distinct
+name-based detections on a real corpus were reviewed by hand; **18 were wrong**,
+and each exclusion added since names the case that produced it rather than
+describing a category in the abstract.

@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **Both detector lists were audited against a real corpus rather than against
+  intuition**, and the result went in both directions.
+
+  **Added: Supabase personal access tokens.** A corpus scan found 58
+  occurrences of `sbp_` followed by exactly 40 alphanumerics — one consistent
+  shape, no detector. A Supabase PAT carries full account authority, so it is
+  classified critical.
+
+  **Rejected: Resend (`re_`).** The same scan found 180 `re_` matches across 37
+  distinct shapes, every one an ordinary lowercase identifier
+  (`re_deploy-preview-branch`) with no digits, no mixed case and no entropy.
+  Adding it would have produced 180 false positives and zero true ones. A
+  two-character prefix is too generic to carry a detector, and the rejection is
+  recorded in the source with the measurement so it does not get re-proposed.
+
+  **18 false positives removed.** All 49 distinct name-based detections on the
+  corpus were reviewed by hand. The wrong ones were not one-offs — they fell
+  into shapes, and each exclusion added names the case that produced it:
+  `AUTHOR` (a trigger word starting a longer word, the same defect class as
+  `FORKEY`), `SESSION_RECORDING_SAMPLE_RATE` (analytics config),
+  `AUTH_PROVIDER_ID` (an identifier), `EMBED_TURNSTILE_SITE_KEY` (a site key is
+  public by design; only its paired secret is secret),
+  `TINFOPLIST_KEY_LSAPPLICATIONCATEGORYTYPE` (an Xcode build setting).
+
+  On the corpus this took distinct secrets from 128 to 112 and distinct kinds
+  from 61 to 45, with no true positive lost. Both batteries ship as tests.
+
+### Fixed
+
+- **A template placeholder no longer defeats an exclusion.** Names arrive
+  wrapped as `__X__`, `{{X}}` or `%X%`, and the decoration is not part of the
+  name, so one rule now covers every spelling.
+- **A detector could be counted without being masked.** Adding Supabase to
+  `SECRET_TYPES` without adding it to the redaction prefixes classified the
+  token and then printed it. A test now checks the invariant across every typed
+  detector, not just the named ones.
+
 ## 0.1.4 — 2026-08-26
 
 Four correctness defects, all reproduced before being fixed. Two of them made
