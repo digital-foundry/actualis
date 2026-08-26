@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.1.5 — 2026-08-26
+
+Both detector lists audited against 49,879 real commands rather than against
+intuition, and three things the tool asserted in prose that it can now show.
 
 ### Added
 
