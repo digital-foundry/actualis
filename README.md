@@ -118,7 +118,7 @@ python3 actualis.py --agent codex    # one agent only (claude | codex | all)
 | `--agents` | installed agent platforms and whether their binaries are validly signed |
 | `--mcp` | run as an MCP server over stdio ([below](#ask-the-agent-about-itself)) |
 | `--service KIND` | print a `launchd`, `systemd` or `newsyslog` unit for `--watch`, paths already resolved |
-| `--self-check` | verify the privacy claims on your own machine, by executing them |
+| `--self-check` | verify the privacy claims on your own machine, by executing them. Honours `--root` and `--days` |
 | `--completions SHELL` | print a shell completion script for `bash`, `zsh` or `fish` |
 | `--version` | print version |
 

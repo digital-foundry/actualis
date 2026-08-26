@@ -2985,16 +2985,35 @@ class TestLegacyTerminalEncoding(unittest.TestCase):
     subprocess writing to a pipe reproduces it, so these tests use one.
     """
 
+    def setUp(self):
+        # CI has no transcripts, so a bare run exits before printing anything.
+        # Build a corpus rather than assume one: a test that depends on the
+        # developer's own machine is a test that does not run in CI.
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        proj = Path(self._tmp.name) / "-Users-x-proj"
+        proj.mkdir()
+        (proj / "s.jsonl").write_text(json.dumps({
+            "timestamp": "2026-08-01T10:00:00Z", "type": "assistant", "uuid": "a",
+            "gitBranch": "main",
+            "message": {"id": "m1", "model": "claude-sonnet-5",
+                        "usage": {"input_tokens": 10, "output_tokens": 1000,
+                                  "cache_read_input_tokens": 0,
+                                  "cache_creation_input_tokens": 0}},
+        }) + "\n", encoding="utf-8")
+        self.root = str(Path(self._tmp.name))
+
     def _run(self, *args, encoding="cp1252"):
         env = dict(os.environ, PYTHONIOENCODING=encoding)
-        return subprocess.run([sys.executable, str(af.SRC_PATH), *args],
-                              capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", env=env)
+        return subprocess.run(
+            [sys.executable, str(af.SRC_PATH), "--root", self.root, *args],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", env=env)
 
     def test_no_mode_raises_on_a_codec_that_cannot_carry_the_glyphs(self):
-        for args in (["--days", "1"], ["--coach", "--days", "1"],
-                     ["--share", "--days", "1"], ["--bash", "--days", "1"],
-                     ["--explain", "cost"], ["--self-check", "--days", "1"],
+        for args in (["--days", "3650"], ["--coach", "--days", "3650"],
+                     ["--share", "--days", "3650"], ["--bash", "--days", "3650"],
+                     ["--explain", "cost"], ["--self-check"],
                      ["--completions", "zsh"], ["--service", "launchd"]):
             with self.subTest(args=args):
                 out = self._run(*args)
@@ -3013,6 +3032,13 @@ class TestLegacyTerminalEncoding(unittest.TestCase):
         self.assertEqual(missing, [],
                          f"no ASCII fallback for {missing}; add one to _GLYPH_FALLBACK")
 
+    def test_self_check_verifies_the_root_it_was_given(self):
+        """Ignoring --root meant it proved the integrity of a corpus the user
+        had not asked about."""
+        out = self._run("--self-check", encoding="utf-8")
+        self.assertIn("1 file", out.stdout)
+        self.assertIn("[pass]", out.stdout)
+
     def test_the_fallbacks_are_themselves_ascii(self):
         for glyph, repl in af._GLYPH_FALLBACK.items():
             with self.subTest(glyph=glyph):
@@ -3020,14 +3046,15 @@ class TestLegacyTerminalEncoding(unittest.TestCase):
 
     def test_json_is_never_rewritten_by_the_fallback(self):
         """Translating glyphs in --json would silently corrupt the data."""
-        out = self._run("--json", "--days", "1")
+        out = self._run("--json", "--days", "3650")
         payload = json.loads(out.stdout)
         self.assertIn("report_sha256", payload)
 
     def test_the_digest_does_not_depend_on_the_terminal_codec(self):
         """A content hash that moves with $PYTHONIOENCODING is not a content hash."""
-        legacy = json.loads(self._run("--json", "--days", "1").stdout)
-        utf8 = json.loads(self._run("--json", "--days", "1", encoding="utf-8").stdout)
+        legacy = json.loads(self._run("--json", "--days", "3650").stdout)
+        utf8 = json.loads(
+            self._run("--json", "--days", "3650", encoding="utf-8").stdout)
         self.assertEqual(legacy["report_sha256"], utf8["report_sha256"])
 
     def test_a_stream_with_no_encoding_is_left_alone(self):

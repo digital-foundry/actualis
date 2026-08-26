@@ -35,6 +35,10 @@
   only path this build can write to, and prints its own sha256 so you can
   compare it with the published wheel. It exits non-zero if any check fails.
 
+  It honours `--root`: if you name a directory to read, that is the directory
+  whose integrity gets proven. Ignoring it meant the check verified a corpus
+  the user had not asked about.
+
   On a machine with no transcripts — a CI runner, a fresh install — the checks
   that need a corpus are reported as **skipped, with the reason**, and the ones
   that do not still run. The verdict distinguishes the two: "every check that

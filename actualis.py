@@ -4723,8 +4723,13 @@ def _tree_state(roots: list[Path]) -> dict[str, tuple[int, float]]:
     return state
 
 
-def self_check(c: C, days: int | None = 7) -> int:
-    """Verify the privacy claims by executing them. Returns an exit code."""
+def self_check(c: C, days: int | None = 7, root: str | None = None) -> int:
+    """Verify the privacy claims by executing them. Returns an exit code.
+
+    Honours --root: if you tell the tool which directory to read, that is the
+    directory whose integrity you want proven. Ignoring it meant --self-check
+    verified a corpus the user had not asked about.
+    """
     rule(c, "SELF CHECK")
     ok = True
 
@@ -4748,7 +4753,8 @@ def self_check(c: C, days: int | None = 7) -> int:
         for line in _wrap(why, 78):
             print(f"          {c.dim}{line}{c.off}")
 
-    roots = transcript_roots() + codex_roots()
+    roots = ([Path(root).expanduser()] if root
+             else transcript_roots() + codex_roots())
 
     # 1. What this build imports at all. Read from the source, so it describes
     #    the shipped file rather than whatever is loaded right now.
@@ -4842,14 +4848,12 @@ def _self_check_corpus(roots: list[Path], sample: list[Path], result, c: C,
 
     fleet = Fleet()
     since = window_start(days, datetime.now(timezone.utc)) if days else None
-    fleet.scan(transcript_roots(), since, None, progress=False)
-    croots = codex_roots()
-    if croots:
-        fleet.scan_codex(croots, since, None)
+    fleet.scan(roots, since, None, progress=False)
 
     changed = [str(f) for f in sample if _digest_file(f) != before[f]]
     result(not changed,
-           f"transcripts unmodified by the scan ({len(sample)} files hashed)",
+           f"transcripts unmodified by the scan "
+           f"({len(sample)} file{'' if len(sample) == 1 else 's'} hashed)",
            "Content, size and mtime are identical before and after. "
            + ("Changed: " + ", ".join(changed[:3]) if changed
               else "A read-only tool leaves no trace, and this is that claim "
@@ -4864,7 +4868,8 @@ def _self_check_corpus(roots: list[Path], sample: list[Path], result, c: C,
                if tree_before[k] != tree_after[k]]
     result(not added and not removed,
            "no file created or deleted under the transcript roots",
-           f"{len(tree_before):,} files before, {len(tree_after):,} after."
+           f"{len(tree_before):,} file{'' if len(tree_before) == 1 else 's'} "
+           f"before, {len(tree_after):,} after."
            + (f" Added: {len(added)}, removed: {len(removed)}."
               if (added or removed) else ""))
     if touched:
@@ -5074,7 +5079,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_OK
 
     if args.self_check:
-        return self_check(C(use_color()), args.days)
+        return self_check(C(use_color()), args.days, args.root)
 
     if args.completions:
         print(completion_script(args.completions), end="")
