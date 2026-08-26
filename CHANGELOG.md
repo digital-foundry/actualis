@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.1.7 — 2026-08-26
+
+Documentation only. No code change; `actualis.py` is byte-identical to 0.1.6
+apart from the version string.
+
+### Changed
+
+- **The README's first screen is rewritten for someone who has never heard of
+  this.** The install command is above the fold, credential exposure moves from
+  the fifth of five bullets to the first, and `--self-check` appears on the
+  first screen rather than several hundred lines down in Privacy — it is the
+  most distinctive thing here and it was effectively hidden.
+
+  Nothing was cut: the five questions move to a **What it answers** section
+  after the sample output, and the four principles get their own section above
+  the licence, where the point about `--self-check` existing *because* of "tell
+  the truth, including limits" can actually be made.
+
+  Two claims were tightened while rewriting, both the kind of overclaim this
+  project exists to avoid. "Naive counting overstates cost by 2.13×" was an n=1
+  measurement stated as a general fact, and now says it overstated *this
+  author's* fleet. "This exists nowhere else" was false — another endpoint tool
+  could read the same files — and now makes the claim that actually holds:
+  nothing watching the API can see a refused command, because it is never sent.
+
+  This release exists so that the description rendered on PyPI matches the one
+  on GitHub. PyPI renders the README baked into the wheel, so documentation
+  cannot reach it without a version.
+
 ## 0.1.6 — 2026-08-26
 
 ### Added
