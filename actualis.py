@@ -835,6 +835,48 @@ _NOT_SECRET_NAMES = re.compile(
     r")$")
 
 
+# --------------------------------------------------------------------------
+# Vendor example credentials
+#
+# Every cloud vendor publishes a fake credential in its own documentation, and
+# those strings end up in tutorials, README files, test fixtures and issue
+# threads. They are not credentials and never were.
+#
+# Reporting one as critical is worse than a normal false positive. Since
+# --fail-on shipped, it fails somebody's pipeline; and it lands on the person
+# evaluating this tool for the first time, following the vendor's own docs,
+# who reasonably concludes the detector cries wolf. A security tool gets about
+# one false positive of this kind before it stops being trusted.
+#
+# Each entry names where it comes from, so the list can be checked rather than
+# believed.
+
+_VENDOR_EXAMPLES = {
+    # AWS publishes these throughout its CLI and SDK documentation.
+    "AKIAIOSFODNN7EXAMPLE",                      # AWS docs: access key id
+    "ASIAIOSFODNN7EXAMPLE",                      # AWS docs: temporary access key id
+    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",  # AWS docs: secret access key
+    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYzEXAMPLEKEY", # AWS docs: variant with 'z'
+    # Other vendors publish examples too (Google Maps, Stripe docs). They are
+    # deliberately absent: an entry here must be verifiable against the
+    # vendor's own documentation, and a plausible-looking string invented from
+    # memory is exactly the kind of unchecked claim this tool exists to avoid.
+    # Add them with a source, or not at all.
+}
+
+# AWS builds every example credential the same way: the body ends in EXAMPLE.
+# Matching that catches the ones not enumerated above without suppressing an
+# arbitrary string that merely contains the word. A real key ending in exactly
+# EXAMPLE has probability (1/36)^7, about one in 78 billion, which is a worse
+# risk than the false positive it removes only if you have 78 billion keys.
+_AWS_EXAMPLE = re.compile(r"^(?:AKIA|ASIA)[A-Z0-9]*EXAMPLE$")
+
+
+def is_vendor_example(value: str) -> bool:
+    """A credential the vendor itself publishes as fake."""
+    return value in _VENDOR_EXAMPLES or _AWS_EXAMPLE.match(value) is not None
+
+
 def _looks_like_placeholder(v: str) -> bool:
     low = v.lower()
     return (v.isdigit()
@@ -866,7 +908,7 @@ def classify_secrets(cmd: str) -> list[tuple[str, str, str]]:
     seen: set[str] = set()
 
     def add(priority: str, kind: str, value: str) -> None:
-        if _looks_like_placeholder(value):
+        if _looks_like_placeholder(value) or is_vendor_example(value):
             return
         fp = hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:8]
         if fp in seen:
@@ -2868,6 +2910,11 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "Pattern matching has a ceiling. Dynamically built values, secrets read",
             "from files, and anything inside a subagent are NOT detectable.",
             "This raises the floor on visibility. It is not a security boundary.",
+            "",
+            "Credentials a vendor publishes in its own documentation -- AWS's",
+            "AKIAIOSFODNN7EXAMPLE and the rest -- are excluded. They are not",
+            "secrets, and reporting one fails a build over a key that was never",
+            "valid. A real key that merely contains EXAMPLE is still reported.",
         ],
         "verify": "grep -rl 'sk_live_' ~/.claude/projects/ | head   # find them yourself",
     },

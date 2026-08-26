@@ -153,7 +153,11 @@ class TestSecretClassifier(unittest.TestCase):
 
     def test_identifies_by_type(self):
         self.assertIn("Stripe key", self.kinds("export K=sk_live_abcdefghijklmnopqrst"))
-        self.assertIn("AWS access key", self.kinds("AKIAIOSFODNN7EXAMPLE"))
+        # Deliberately NOT AKIAIOSFODNN7EXAMPLE. That is AWS's own documentation
+        # key, this test asserted it was a credential, and that is how the false
+        # positive in #51 got in and stayed in: the suite encoded the bug as
+        # correct behaviour. Fixtures use self-describing filler.
+        self.assertIn("AWS access key", self.kinds("AKIANOTAREALAWSKEY01"))
         self.assertIn("GitHub PAT", self.kinds("gh auth --with-token ghp_abcdefghijklmnopqrst"))
 
     def test_same_value_yields_one_fingerprint(self):
@@ -3075,3 +3079,63 @@ class TestLegacyTerminalEncoding(unittest.TestCase):
         class S:
             encoding = "not-a-real-codec"
         self.assertFalse(af._stream_handles_glyphs(S()))
+
+
+class TestVendorExampleCredentials(unittest.TestCase):
+    """A vendor's own documented fake key must not fail somebody's build.
+
+    Since --fail-on shipped, reporting AWS's documentation example as critical
+    breaks a pipeline over a key that was never valid -- and it lands on the
+    person evaluating this tool for the first time by following AWS's docs.
+    """
+
+    def _found(self, value):
+        return af.classify_secrets(f"export AWS_ACCESS_KEY_ID={value}")
+
+    def test_the_aws_documented_examples_are_not_credentials(self):
+        for value in ("AKIAIOSFODNN7EXAMPLE", "ASIAIOSFODNN7EXAMPLE"):
+            with self.subTest(value=value):
+                self.assertEqual(self._found(value), [],
+                                 "AWS's own documentation key reported as a credential")
+
+    def test_the_aws_secret_key_example_is_not_a_credential(self):
+        v = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        self.assertTrue(af.is_vendor_example(v))
+
+    def test_aws_construction_convention_is_matched_generally(self):
+        """AWS builds every example the same way; catch the ones not enumerated."""
+        self.assertTrue(af.is_vendor_example("AKIAQQQQQQQQQEXAMPLE"))
+        self.assertTrue(af.is_vendor_example("ASIAZZZZZZZZZEXAMPLE"))
+
+    def test_a_real_key_containing_EXAMPLE_is_still_detected(self):
+        """The exclusion must be a suffix rule, not a substring rule."""
+        for value in ("AKIAEXAMPLEBUTNOTATEND1", "AKIAEXAMPLE1234567890"):
+            with self.subTest(value=value):
+                self.assertTrue(self._found(value),
+                                f"{value} was suppressed; the rule is too broad")
+
+    def test_ordinary_keys_are_unaffected(self):
+        for value in ("AKIAIOSFODNN7REALKEY", "AKIA1234567890ABCDEF",
+                      "ASIAZZZZZZZZZZZZZZZZ"):
+            with self.subTest(value=value):
+                self.assertTrue(self._found(value), f"{value} stopped being detected")
+
+    def test_the_exclusion_is_exact_not_fuzzy(self):
+        """A near-miss of a listed example is a real string and must be reported."""
+        self.assertFalse(af.is_vendor_example("AKIAIOSFODNN7EXAMPL"))   # truncated
+        self.assertFalse(af.is_vendor_example("XKIAIOSFODNN7EXAMPLE"))  # wrong prefix
+
+    def test_every_listed_example_carries_a_source_comment(self):
+        """A list of magic strings nobody can check is worse than no list."""
+        src = af.SRC_TEXT
+        block = src[src.index("_VENDOR_EXAMPLES = {"):]
+        block = block[:block.index("}")]
+        entries = [ln for ln in block.splitlines() if '"' in ln]
+        self.assertTrue(entries)
+        for ln in entries:
+            with self.subTest(line=ln.strip()[:40]):
+                self.assertIn("#", ln, "every example must name where it comes from")
+
+    def test_lowercase_variants_are_not_silently_excluded(self):
+        """AWS keys are uppercase; a lowercase lookalike is a different string."""
+        self.assertFalse(af.is_vendor_example("akiaiosfodnn7example"))

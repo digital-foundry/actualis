@@ -56,6 +56,22 @@ cries wolf is worse than none.
 `SECRETS`, `KEYS`, `PASSWORDS`, `CREDENTIALS`. This tool's own source tripped
 that one.
 
+**Vendor example credentials.** Every cloud vendor publishes a fake credential
+in its own documentation, and those strings end up in tutorials, test fixtures
+and issue threads. `AKIAIOSFODNN7EXAMPLE` is AWS's, and it appears in AWS's CLI
+reference and a large share of every AWS tutorial written. It is not a
+credential and is not reported as one.
+
+AWS builds all of its examples the same way — the key body ends in `EXAMPLE` —
+so that shape is excluded generally, not just the enumerated strings. The rule
+is a suffix match, not a substring match: a real key that merely contains
+`EXAMPLE` is still reported. Each enumerated entry names the vendor
+documentation it comes from, so the list can be checked rather than believed.
+
+Other vendors publish examples too. They are deliberately absent until someone
+verifies them against the vendor's own docs — a plausible-looking string added
+from memory is the kind of unchecked claim this tool exists to avoid.
+
 **Placeholders and references:** `$SHELL_VAR`, `${VAR}`, `your_key_here`,
 `changeme`, `example`, `dummy`, `placeholder`, `test_`, `fake`, `todo`, bare
 numbers, and anything already redacted.
