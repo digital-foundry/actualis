@@ -666,6 +666,15 @@ heartbeat, so it grows slowly. Rotation there is opt-in and needs root:
 actualis --service newsyslog | sudo tee /etc/newsyslog.d/actualis.conf
 ```
 
+launchd holds the log file open, so after a rotation the agent keeps writing to
+the old file until it restarts. That is a property of launchd, not a bug here,
+and the generated config says so rather than leaving you to discover that
+logging quietly stopped. Kick the agent to pick up the new file:
+
+```sh
+launchctl kickstart -k gui/$(id -u)/app.actualis.watch
+```
+
 It is a LaunchAgent rather than a LaunchDaemon on purpose: it must run inside
 your logged-in session for notifications to post at all, and it should hold
 exactly your permissions and no more. The systemd unit is a **user** unit for

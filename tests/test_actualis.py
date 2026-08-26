@@ -14,6 +14,7 @@ tested without them. See .gitleaksignore.
 import argparse
 import contextlib
 import io
+import subprocess
 import tempfile
 import importlib.util
 import json
@@ -31,6 +32,7 @@ spec.loader.exec_module(af)
 
 
 af.SRC_TEXT = (ROOT / "actualis.py").read_text()
+af.SRC_PATH = ROOT / "actualis.py"
 
 
 def cats(cmd):
@@ -2875,3 +2877,45 @@ class TestBackgroundService(unittest.TestCase):
                 af.service_unit(kind)
                 af.service_install_notes(kind)
             self.assertEqual(af._tree_state([Path(tmp)]), before)
+
+
+class TestSelfCheckWithoutACorpus(unittest.TestCase):
+    """CI has no transcripts. The checks that do not need one must still run."""
+
+    def _run_with_no_transcripts(self):
+        env = {"HOME": self.home, "PATH": os.environ.get("PATH", "")}
+        out = subprocess.run(
+            [sys.executable, str(af.SRC_PATH), "--self-check"],
+            capture_output=True, text=True, env=env, cwd=self.home)
+        return out
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = self._tmp.name
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_the_machine_independent_checks_still_run(self):
+        out = self._run_with_no_transcripts()
+        self.assertIn("no networking module", out.stdout)
+        self.assertIn("the only write path", out.stdout)
+        self.assertIn("this build, by content", out.stdout)
+
+    def test_the_corpus_checks_are_marked_skipped_not_omitted(self):
+        """A check silently not run reads as a check that passed."""
+        out = self._run_with_no_transcripts()
+        self.assertIn("skip", out.stdout)
+        self.assertIn("Nothing was read", out.stdout)
+
+    def test_the_caveat_prints_even_with_nothing_to_scan(self):
+        out = self._run_with_no_transcripts()
+        self.assertIn("does not prove", out.stdout)
+        self.assertIn("floor, not a guarantee", out.stdout)
+
+    def test_it_does_not_claim_all_checks_passed_when_some_were_skipped(self):
+        out = self._run_with_no_transcripts()
+        self.assertNotIn("All checks passed", out.stdout)
+        self.assertIn("could not run", out.stdout)
+
+    def test_skipped_checks_do_not_fail_the_exit_code(self):
+        """Absence of a corpus is not evidence of a privacy failure."""
+        self.assertEqual(self._run_with_no_transcripts().returncode, af.EXIT_OK)

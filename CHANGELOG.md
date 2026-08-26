@@ -35,6 +35,12 @@
   only path this build can write to, and prints its own sha256 so you can
   compare it with the published wheel. It exits non-zero if any check fails.
 
+  On a machine with no transcripts — a CI runner, a fresh install — the checks
+  that need a corpus are reported as **skipped, with the reason**, and the ones
+  that do not still run. The verdict distinguishes the two: "every check that
+  could run passed, 2 could not run on this machine" rather than "all checks
+  passed", because a check silently not run reads as a check that passed.
+
   The output says what it does **not** prove: it describes the run you just
   made, not every run this build could make, and it prints the command to watch
   the process from outside instead.
