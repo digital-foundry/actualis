@@ -1034,6 +1034,7 @@ def command_head(cmd: str) -> str | None:
 # for the same reason.
 # --------------------------------------------------------------------------
 
+_FINGERPRINT = re.compile(r"[0-9a-f]{8}")
 _ADDED_MARKER = re.compile(r"\s*\(added \d{4}-\d{2}-\d{2}\)\s*$")
 
 SUPPRESSION_FILENAME = "suppressions"
@@ -1081,6 +1082,13 @@ def add_suppression(fingerprint: str, reason: str) -> Path:
     fingerprint = clean(fingerprint).strip()[:64]
     if not fingerprint:
         raise ValueError("a fingerprint is required")
+    # Every id this tool emits is sha256[:8]. Accepting anything else writes a
+    # suppression that can never match, and the user walks away believing they
+    # silenced something. Caught in testing when a shell passed seven ids as one.
+    if not _FINGERPRINT.fullmatch(fingerprint):
+        raise ValueError(
+            f"{fingerprint!r} is not an id from this tool. Ids are eight hex "
+            f"characters, shown beside each finding. One per --suppress.")
     reason = clean(reason).strip()[:200] or "(no reason given)"
     path = suppression_paths()[0]
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1930,7 +1938,11 @@ def coach(fleet: "Fleet") -> list[Finding]:
                 "that should never be touched."))
 
     # --- AF004 outstanding critical secrets --------------------------------
-    crit = [(fp, e) for fp, e in fleet.secrets.items() if e["priority"] == "critical"]
+    # actionable_secrets, not secrets: a finding derived from a suppressed one
+    # must be suppressed too, or suppression silences the symptom and leaves
+    # the diagnosis -- and --fail-on still breaks the build.
+    crit = [(fp, e) for fp, e in fleet.actionable_secrets.items()
+            if e["priority"] == "critical"]
     if crit:
         kinds = Counter(k for _, e in crit for k in e["kinds"])
         out.append(Finding(
@@ -1942,7 +1954,7 @@ def coach(fleet: "Fleet") -> list[Finding]:
             "Rotation fixes exposure; it does not clean the archive."))
 
     # --- AF005 how long a secret has been sitting there --------------------
-    dated = [(fp, e) for fp, e in fleet.secrets.items()
+    dated = [(fp, e) for fp, e in fleet.actionable_secrets.items()
              if e["first"] and e["priority"] != "low"]
     if dated and fleet.last_ts:
         oldest_fp, oldest = min(dated, key=lambda kv: kv[1]["first"])
@@ -3758,6 +3770,74 @@ def report_digest(payload: dict) -> str:
 
 REPORT_DIGEST_EXCLUDES = frozenset({"report_sha256"})
 
+# --------------------------------------------------------------------------
+# Exit codes
+#
+# A pipeline depends on these, so they are fixed and documented rather than
+# whatever the code happens to return.
+#
+#   0    nothing at or above the threshold, or no threshold was asked for
+#   1    the tool could not run: no transcripts, an unreadable --root
+#   2    a command line usage error -- argparse owns this one, not us
+#   3    findings at or above --fail-on
+#   130  interrupted
+#
+# Findings are 3, not 1 and not 2. 1 already meant "could not run" before
+# --fail-on existed. 2 is argparse's exit for a bad invocation, and a pipeline
+# that cannot tell "a credential is exposed" from "you mistyped a flag" will
+# eventually be told to ignore both.
+# --------------------------------------------------------------------------
+
+EXIT_OK = 0
+EXIT_CANNOT_RUN = 1
+EXIT_USAGE = 2        # argparse's, reserved rather than used
+EXIT_FINDINGS = 3
+
+# What each threshold includes. Ordered, so a lower threshold is a superset.
+FAIL_ON_LEVELS = ("critical", "high", "any")
+
+
+def failing_findings(fleet: Fleet, level: str) -> list[str]:
+    """Reasons this fleet trips `--fail-on LEVEL`, most severe first.
+
+    Only ACTIONABLE findings count. A suppressed finding is a decision someone
+    recorded with a reason; letting it fail a build anyway would make
+    suppression pointless and teach people to delete findings instead.
+    """
+    if level not in FAIL_ON_LEVELS:
+        return []
+    want_high = level in ("high", "any")
+    want_any = level == "any"
+    out = []
+
+    crit = [e for e in fleet.actionable_secrets.values() if e["priority"] == "critical"]
+    if crit:
+        out.append(f"{len(crit)} critical credential(s) in agent context")
+    if want_high:
+        high = [e for e in fleet.actionable_secrets.values() if e["priority"] == "high"]
+        if high:
+            out.append(f"{len(high)} high-priority credential(s)")
+    if want_any:
+        low = [e for e in fleet.actionable_secrets.values() if e["priority"] == "low"]
+        if low:
+            out.append(f"{len(low)} low-priority credential(s)")
+
+    for finding in coach(fleet):
+        if finding.severity == "critical" or (want_high and finding.severity == "high") \
+           or (want_any and finding.severity == "info"):
+            out.append(f"{finding.id} {finding.title}")
+
+    if want_high:
+        fl = [f for f in fleet.actionable_flags if f["severity"] == "high"]
+        if fl:
+            out.append(f"{len(fl)} high-severity shell command(s) flagged")
+    if want_any:
+        fl = [f for f in fleet.actionable_flags if f["severity"] == "med"]
+        if fl:
+            out.append(f"{len(fl)} medium-severity shell command(s) flagged")
+    return out
+
+
 def to_json(fleet: Fleet, raw: bool = False) -> dict:
     payload = _to_json_body(fleet, raw)
     payload["report_sha256"] = report_digest(payload)
@@ -3956,6 +4036,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="which agents to include (default: all)")
     ap.add_argument("--no-redact", action="store_true",
                     help="do NOT redact credentials from output (unsafe to share)")
+    ap.add_argument("--fail-on", metavar="LEVEL", choices=FAIL_ON_LEVELS,
+                    help="exit 2 if any unsuppressed finding is at or above "
+                         f"LEVEL ({', '.join(FAIL_ON_LEVELS)}). For gating a "
+                         "pipeline. Still changes nothing and blocks nothing.")
     ap.add_argument("--suppress", metavar="ID",
                     help="mark a finding as a false positive on this machine. "
                          "It stays counted; it leaves the actionable list.")
@@ -4058,7 +4142,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if fleet.messages == 0 and fleet.bash_total == 0:
         print("actualis: no matching activity found.", file=sys.stderr)
-        return 1
+        return EXIT_CANNOT_RUN
 
     if args.why:
         return render_why(args.why, fleet, C(use_color()))
@@ -4072,7 +4156,20 @@ def main(argv: list[str] | None = None) -> int:
         render_coach(coach(fleet), C(use_color()))
     else:
         render(fleet, C(use_color()), bash_only=args.bash, top=args.top, raw=args.no_redact)
-    return 0
+
+    if args.fail_on:
+        reasons = failing_findings(fleet, args.fail_on)
+        # stderr, so `--json` on stdout stays byte-identical and a pipeline can
+        # capture the report and the verdict separately.
+        if reasons:
+            print(f"actualis: FAIL at --fail-on {args.fail_on}", file=sys.stderr)
+            for r in reasons:
+                print(f"  - {r}", file=sys.stderr)
+            print(f"  {len(fleet.secrets) - len(fleet.actionable_secrets)} suppressed "
+                  f"finding(s) were not counted.", file=sys.stderr)
+            return EXIT_FINDINGS
+        print(f"actualis: PASS at --fail-on {args.fail_on}", file=sys.stderr)
+    return EXIT_OK
 
 
 if __name__ == "__main__":

@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`--fail-on` gates a pipeline on exposure.** An exit code is the smallest
+  possible CI integration and it fits the read-only promise exactly: the tool
+  returns a verdict and still changes nothing, blocks nothing, and writes
+  nothing.
+
+  ```sh
+  actualis --days 7 --fail-on critical
+  ```
+
+  Exit codes are fixed and documented, because a pipeline depends on them:
+  `0` clean, `1` could not run, `2` a usage error (argparse's), **`3` findings**,
+  `130` interrupted. Findings are 3 rather than 1 or 2 deliberately — a pipeline
+  that cannot tell *a credential is exposed* from *you mistyped a flag* will
+  eventually be told to ignore both.
+
+  The verdict goes to stderr, so `--json` on stdout stays **byte-identical**
+  with and without the flag and a pipeline can capture the report and the
+  outcome separately.
+
+### Fixed
+
+- **A suppressed credential still produced its coach finding.** Suppressing
+  silenced the direct report and left the diagnosis derived from it, so
+  `--fail-on` failed a build for something already reviewed and recorded.
+  Coach findings now read actionable secrets.
+
+- **A malformed suppression id was stored rather than refused.** Every id the
+  tool emits is `sha256[:8]`; anything else writes a suppression that can never
+  match, and the user walks away believing they silenced something. Found when a
+  shell passed seven ids to one `--suppress` as a single argument.
+
 ## 0.1.5 — 2026-08-26
 
 Both detector lists audited against 49,879 real commands rather than against
