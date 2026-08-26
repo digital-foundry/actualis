@@ -11,14 +11,36 @@ requires-python = ">=3.9"
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]
 authors = [{ name = "Digital Foundry Solutions, LLC" }]
-keywords = ["claude", "claude-code", "ai-agents", "cost", "observability", "audit"]
+keywords = [
+  # How people actually search PyPI for this: by the agent they run, by the
+  # problem they have, and by the shape of the tool.
+  "claude", "claude-code", "codex", "anthropic", "openai",
+  "ai-agents", "coding-agent", "agent-security", "llm", "llmops",
+  "secrets", "secret-detection", "credentials", "security", "devsecops",
+  "cost", "cost-tracking", "finops", "observability", "audit",
+  "cli", "terminal", "transcripts",
+]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
   "Intended Audience :: Developers",
+  "Intended Audience :: System Administrators",
+  "Intended Audience :: Information Technology",
+  "Operating System :: OS Independent",
+  # The README claims 3.9+ and cross-platform, and CI tests both ends of that
+  # range on three operating systems. Claims that CI proves belong here.
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Security",
   "Topic :: Software Development :: Quality Assurance",
   "Topic :: System :: Monitoring",
+  "Topic :: System :: Systems Administration",
+  "Topic :: Utilities",
   "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
 ]
 # No runtime dependencies, deliberately. This tool reads your session history;
