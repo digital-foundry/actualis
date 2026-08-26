@@ -4,27 +4,47 @@
 
 [actualis.app](https://actualis.app) · [Latest release](https://github.com/digital-foundry/actualis/releases/latest) · [Changelog](CHANGELOG.md) · [Security policy](SECURITY.md) · [Trade marks](TRADEMARKS.md)
 
-*Local. Read-only. Honest about limits.*
+Your coding agent writes down everything it did — every shell command, every
+token, every refused tool call — and then nothing reads it. `actualis` reads it.
 
-Actualis reads existing coding-agent logs and turns them into clear answers about
-**exposure, activity, and cost**.
+```sh
+uv tool install actualis     # or: pipx install actualis
+actualis
+```
 
-> **Measure, don't interfere.** · **Read what's already there.**
-> **Tell the truth, including limits.** · **Evidence over opinion.**
+No account, no config file, no network. It reads files already on your disk
+and prints a report, across **Claude Code** and **Codex** together.
 
-Terminal-native coding agents write a complete record of every session to your
-disk: token usage per turn, every tool call, every shell command. What they don't
-give you is a view across all of it. If you run agents in more than one project, or
-more than one agent, you cannot currently answer:
+**What it finds that you probably don't know:**
 
-- What did my agents cost last month?
-- Which project is burning the budget?
-- What did issue #412 cost?
-- What shell commands have my agents actually been running?
-- Did a credential ever end up in a command?
+- **Credentials that ended up in shell commands** your agent ran, grouped by
+  fingerprint and ranked for rotation. The value itself is never printed or
+  stored — only a hash of it.
+- **Every command the agent ran**, audited for the risky shapes: `rm -rf`,
+  piped installers, credential reads, egress to somewhere new.
+- **What was refused, and by whom** — you, or the auto-approval policy. A
+  refused command is never sent to a provider, so nothing watching the API can
+  see it. It exists only on your disk.
+- **What it cost**, per project, per model, per ticket — counted once per
+  billable message, not once per transcript record. A transcript re-emits the
+  same assistant record while a response streams; counting those repeats
+  overstated my own fleet's spend by 2.13×.
 
-`actualis` answers all five from data already on your machine,
-across **Claude Code** and **Codex**, in one report.
+### Don't trust it. Check it.
+
+```sh
+actualis --self-check
+```
+
+The claims above are the product, so the tool verifies them on your machine
+instead of asking you to believe them: which modules the shipped source
+imports at any depth, your transcripts hashed before and after a real scan to
+show they are byte-identical, nothing created or deleted, the only path it can
+write to, and its own sha256 to compare against the published wheel. It also
+prints what it does **not** prove. [More on privacy](#privacy).
+
+One file, no third-party dependencies, AGPL-3.0. If you are about to point
+something at your session history, you should be able to read it in a sitting.
 
 <p align="center">
   <img src="docs/img/actualis-report.svg" alt="An actualis report: fleet cost, spend by model and project, cache efficiency, and a table of exposed credentials ranked for rotation." width="700">
@@ -58,6 +78,21 @@ SHELL AUDIT ──────────────────────�
   ▲ 1,315 commands contained credential material
   flagged   340 high   148 medium   of 13,006 commands
 ```
+
+## What it answers
+
+Terminal-native coding agents write a complete record of every session to your
+disk: token usage per turn, every tool call, every shell command. What they
+don't give you is a view across all of it. If you run agents in more than one
+project, or more than one agent, you cannot currently answer:
+
+- What did my agents cost last month?
+- Which project is burning the budget?
+- What did issue #412 cost?
+- What shell commands have my agents actually been running?
+- Did a credential ever end up in a command?
+
+`actualis` answers all five from data already on your machine, in one report.
 
 ## Install
 
@@ -683,6 +718,14 @@ so the service manager enforces the read-only guarantee too.
 
 If notifications do not appear, allow them for **Script Editor** in
 System Settings → Notifications. `osascript` posts under that identity.
+
+## What this project is for
+
+> **Measure, don't interfere.** · **Read what's already there.**
+> **Tell the truth, including limits.** · **Evidence over opinion.**
+
+*Local. Read-only. Honest about limits.* Those four lines decide every design
+argument in this repo. `--self-check` exists because of the third one.
 
 ## License
 
