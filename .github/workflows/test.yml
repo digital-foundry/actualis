@@ -18,8 +18,15 @@ permissions:
 # runs to completion anyway, on three operating systems, and macOS bills at 10x
 # the Linux rate. Pushes to main are never cancelled: main's history has to
 # stay checkable.
+# The event is part of the group on purpose. A run can land in a state GitHub
+# will neither start nor let you cancel -- the API reports it `queued` while
+# force-cancel refuses with "cannot cancel a workflow run that has not been
+# queued yet". It then holds its group indefinitely and no further run is
+# created for the PR at all: the PR shows no checks, nothing fails, and there
+# is nothing to retry. Scoping by event lets a fresh group form instead of
+# waiting out a run that will never resolve.
 concurrency:
-  group: test-${{ github.ref }}
+  group: test-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
