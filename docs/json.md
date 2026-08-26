@@ -35,13 +35,16 @@ that and prints a warning.
 | `coach` | findings: `id`, `severity`, `title`, `evidence`, `action`, `impact` |
 | `secrets` | array; see below |
 | `secret_exposures` | commands containing credential material |
-| `suppressed_secrets` | findings marked as false positives on this machine |
+| `suppressed_secrets` | credential findings marked as false positives on this machine |
+| `suppressed_flags` | shell-audit findings marked as false positives on this machine |
 | `suppression_note` | why a suppressed finding is still counted here |
 | `secret_projects` | those commands per project |
 | `redacted` | whether values were masked (`true` unless `--no-redact`) |
 | `permission_modes` | turns per permission mode |
 | `denials` | rejections by kind |
 | `refusals` | what was stopped and by which gate, joined to the blocked command. See below |
+| `unreadable_commands` | commands whose real content the transcript does not contain. See below |
+| `vendors` | what each agent's transcript actually provides, and what it does not |
 | `unknown_models` | models seen with no pricing entry, billed at Opus-tier rates |
 | `aggregator_priced_models` | models priced from a third party because the vendor publishes no rate for that id |
 
@@ -218,6 +221,72 @@ number that makes the difference visible.
   "projects": ["…"], "active_days": 5,
   "first_seen": "2026-05-06", "last_seen": "2026-06-02" }
 ```
+
+## `vendors`
+
+Both agents are read; their transcripts do not contain the same things.
+
+| Capability | Claude Code | Codex |
+|---|---|---|
+| Cost and token usage | yes | yes |
+| Per-message dedup | yes | partial |
+| Shell command text | yes | yes |
+| Project attribution | yes | yes |
+| Git branch | yes | no |
+| Tool refusals | yes | no |
+| Permission mode | yes | yes |
+| Sandbox policy | no | yes |
+| Subagent activity | partial | no |
+| Subagent cost | no | no |
+| Cache TTL split | partial | no |
+| Reasoning effort | yes | no |
+
+Every row in the payload also carries `depends_on`, naming the transcript field
+the claim rests on, so it can be checked against the parser rather than taken on
+trust.
+
+The clearest case is refusals: Claude Code records every refused tool call with
+a joinable `tool_use_id`, and **Codex records none** — so that whole section is
+single-vendor, and the report says so in place when a Codex session is present.
+
+This matters because **comparing two projects on different agents compares
+different measurements**, and nothing previously said which.
+
+## Suppressing a shell-audit finding
+
+Each entry in `bash.flags[]` carries an `id`, keyed on **severity, category and
+program** rather than on the command text. So the id survives the command
+changing slightly, and suppressing one thing suppresses the class a person
+actually means — *"`rm` being flagged destructive is expected in this
+repository"* — rather than one exact invocation.
+
+```sh
+actualis --suppress 7ffabc7a --reason "build directory, every run"
+```
+
+Same rule as credentials: **a suppressed flag is still counted**, still appears
+in `bash.flags[]` with `suppressed: true` and its reason, and
+`suppressed_flags` reports the total. It leaves the actionable counts, it does
+not leave the report.
+
+## `unreadable_commands`
+
+```json
+{ "count": 1550, "pct_of_commands": 3.11,
+  "by_shape": { "runs a variable": 1357, "eval": 93, "runs a local script": 83 } }
+```
+
+"Pattern matching has a ceiling" is true and vague. It does not distinguish
+**we looked and found nothing** from **there was nothing here to look at**, and
+only the second is a blind spot.
+
+A command that runs `$CMD`, evals a string, pipes a download into a shell, or
+executes a script whose contents live elsewhere is **unreadable**, not merely
+unmatched. On a real corpus that is 3.11% of commands.
+
+**Counted, never flagged.** Running a script is normal; this is not an
+accusation. It is a statement about what the audit could and could not see, and
+it is here so a clean report cannot be mistaken for a complete one.
 
 ## `refusals`
 

@@ -2140,3 +2140,215 @@ class TestDetectorListReview(unittest.TestCase):
             out.append(ch)
             i += 1
         return "".join(out)
+
+
+class TestCommandHeadProperties(unittest.TestCase):
+    """command_head broke three times before anyone wrote these down, each time
+    found by accident. Unit tests cover the cases someone thought of; running it
+    across 49,873 real commands found 167 violations in shapes nobody had.
+
+    The corpus cannot ship, so the shapes it surfaced are fixtures here and the
+    invariants are asserted rather than the outputs.
+    """
+
+    # Every one of these is a real command shape from the corpus, reduced.
+    CORPUS_SHAPES = [
+        # a quoted path with a space, torn apart by a naive split
+        ('M="/Users/x/My Folder/f" && git push', "git"),
+        # the program itself is a quoted variable
+        ('"$P" --check docs/spec.md', "$P"),
+        ('"/usr/local/my app/bin/tool" --run', "/usr/local/my app/bin/tool"),
+        # a loop header reached mid-segment
+        ("( for i in $(seq 1 80); do git fetch origin; done )", "git"),
+        ("for i in $(seq 1 60); do if docker info; then echo up; fi; done", "docker"),
+        # `if CMD` tests a command; `for x in LIST` does not
+        ("if [ -f x ]; then cat x; fi", "cat"),
+        ("while read line; do echo $line; done", "read"),
+        # a substitution that opens with a loop header
+        ("out=$(for n in 1 2 3; do gh api x; done)\necho $out", "gh"),
+        # a substitution that opens with a program
+        ("TOK=$(grep -oE pat ~/.zshrc)\necho hi", "grep"),
+        ("KEY=`openssl rand -hex 8`", "openssl"),
+        # heredoc bodies are data, not commands
+        ("cat <<EOF > f.txt\ndocs/some/path.md\nplain text\nEOF\ngit add f.txt", "cat"),
+        ("python3 - <<'PY'\nimport os\nPY", "python3"),
+        # redirects and path-taking prefixes
+        ("cd /tmp/x 2>/dev/null", "cd"),
+        ("cd /tmp/x 2>/dev/null\ngit status", "git"),
+        ("make test > out.log 2>&1", "make"),
+        # ordinary shapes that must not regress
+        ("FOO=1 BAR=2 pytest -q", "pytest"),
+        ("sudo systemctl restart nginx", "systemctl"),
+        ("npm run build", "npm"),
+        ("echo \"a b c\"", "echo"),
+    ]
+
+    def test_the_corpus_shapes_resolve_correctly(self):
+        for cmd, want in self.CORPUS_SHAPES:
+            with self.subTest(cmd=cmd[:44]):
+                self.assertEqual(af.command_head(cmd), want)
+
+    def test_the_invariants_hold_for_every_shape(self):
+        """These are what must be true of ANY head, not what any one command
+        resolves to. A new shape can be added above without deciding its answer
+        and these still catch a nonsense result."""
+        import re as _re
+        keywords = af._HEADER_KEYWORDS | af._BODY_KEYWORDS
+        for cmd, _want in self.CORPUS_SHAPES:
+            head = af.command_head(cmd)
+            with self.subTest(cmd=cmd[:44]):
+                self.assertIsNotNone(head, "non-empty command yielded no head")
+                self.assertTrue(head.strip(), "head is blank")
+                self.assertFalse(head.startswith("-"), f"a flag: {head!r}")
+                self.assertNotIn(head, keywords, f"a shell keyword: {head!r}")
+                self.assertIsNone(_re.match(r"^\d*(?:>>?|<<?|&>|>&)", head),
+                                  f"a redirection: {head!r}")
+
+    def test_an_empty_command_yields_nothing(self):
+        for empty in ("", "   ", "\n\n", "\t"):
+            with self.subTest(cmd=repr(empty)):
+                self.assertIsNone(af.command_head(empty))
+
+    def test_a_heredoc_body_cannot_become_the_program(self):
+        """A heredoc carries data. Splitting the command on newlines turned each
+        of its lines into a candidate, so a path inside a document was returned
+        as the program on 121 real commands."""
+        cmd = ("cat > spec.md <<'MD'\n"
+               "docs/superpowers/specs/design.md\n"
+               "rm -rf /\n"          # even this is data, not a command
+               "MD\n"
+               "git add spec.md")
+        self.assertEqual(af.command_head(cmd), "cat")
+
+    def test_a_quoted_span_neither_splits_nor_disappears(self):
+        """Both mistakes have been made here. Splitting inside quotes returned a
+        path fragment; dropping quoted spans lost a program that was quoted."""
+        self.assertEqual(af._shell_tokens('M="/a b/c" git'), ["M=/a b/c", "git"])
+        self.assertEqual(af._shell_tokens('"$P" --check'), ["$P", "--check"])
+        self.assertEqual(af._shell_tokens("echo 'one two' three"),
+                         ["echo", "one two", "three"])
+
+
+class TestUnreadableCommands(unittest.TestCase):
+    """"Pattern matching has a ceiling" does not distinguish "we looked and
+    found nothing" from "there was nothing here to look at". Only the second is
+    a blind spot, and it is 3.11% of commands on a real corpus."""
+
+    SHAPES = [
+        ("$CMD --flag", "runs a variable"),
+        ('eval "$SCRIPT"', "eval"),
+        ("curl https://get.example.com | sh", "pipes a download to a shell"),
+        ("./deploy.sh --prod", "runs a local script"),
+        ("source ~/.env", "sources a file"),
+        ('bash -c "$PAYLOAD"', "shell -c with a variable"),
+    ]
+    READABLE = ["git status", "echo hello", "npm run build", "grep -r pat .",
+                "python3 script_name_mentioned.py --help"]
+
+    def test_each_unreadable_shape_is_recognised(self):
+        for cmd, shape in self.SHAPES:
+            with self.subTest(cmd=cmd):
+                self.assertIn(shape, af.unreadable_shapes(cmd))
+
+    def test_ordinary_commands_are_not_called_unreadable(self):
+        for cmd in self.READABLE:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(af.unreadable_shapes(cmd), [])
+
+    def test_it_is_counted_and_never_flagged(self):
+        """Running a script is normal. This is a statement about what the audit
+        could see, not an accusation, so it must not become a finding."""
+        f = af.Fleet()
+        f.add_tool("p", "Bash", {"command": "./deploy.sh"},
+                   datetime(2026, 8, 1, tzinfo=timezone.utc))
+        self.assertEqual(f.unreadable, 1)
+        self.assertEqual(f.flags, [])                 # not flagged
+        self.assertEqual([x.id for x in af.coach(f)], [])   # not a finding
+
+    def test_the_share_reaches_json(self):
+        f = af.Fleet()
+        ts = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        f.add_tool("p", "Bash", {"command": "./x.sh"}, ts)
+        f.add_tool("p", "Bash", {"command": "git status"}, ts)
+        u = af.to_json(f)["unreadable_commands"]
+        self.assertEqual(u["count"], 1)
+        self.assertEqual(u["pct_of_commands"], 50.0)
+
+
+class TestFlagSuppression(unittest.TestCase):
+    """Secrets got suppression and shell-audit flags did not, which is
+    arbitrary from a user's side."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = self._tmp.name
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = self._old
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _fleet(cmd="rm -rf build/"):
+        f = af.Fleet()
+        f.add_tool("p", "Bash", {"command": cmd}, datetime(2026, 8, 1, tzinfo=timezone.utc))
+        return f
+
+    def test_a_flag_id_is_stable_and_names_a_class(self):
+        """Keyed on severity, category and program -- not command text -- so it
+        survives the command changing and suppresses the class a person means."""
+        a = self._fleet("rm -rf build/").flags[0]["id"]
+        b = self._fleet("rm -rf dist/").flags[0]["id"]
+        self.assertEqual(a, b, "the same rule on the same program is one id")
+        self.assertEqual(len(a), 8)
+
+    def test_a_suppressed_flag_is_still_counted(self):
+        fid = self._fleet().flags[0]["id"]
+        af.add_suppression(fid, "build directory")
+        f = self._fleet()
+        self.assertEqual(len(f.flags), 1)            # still there
+        self.assertEqual(f.suppressed_flags, 1)
+        self.assertEqual(len(f.actionable_flags), 0)  # out of the actionable list
+        self.assertEqual(af.to_json(f)["suppressed_flags"], 1)
+        self.assertTrue(af.to_json(f)["bash"]["flags"][0]["suppressed"])
+
+    def test_an_unsuppressed_flag_is_actionable(self):
+        f = self._fleet()
+        self.assertEqual(f.suppressed_flags, 0)
+        self.assertEqual(len(f.actionable_flags), 1)
+
+
+class TestVendorCapabilities(unittest.TestCase):
+    """Two agents, supported unevenly, and nothing said how. Someone comparing
+    projects on different agents was comparing different measurements."""
+
+    def test_every_capability_names_the_field_it_rests_on(self):
+        """A matrix nobody can check against the parser is just a claim."""
+        for cap, c, x, why in af.VENDOR_CAPABILITIES:
+            with self.subTest(capability=cap):
+                self.assertIn(c, (af.YES, af.PARTIAL, af.NO))
+                self.assertIn(x, (af.YES, af.PARTIAL, af.NO))
+                self.assertTrue(why.strip(), "must name the field or the reason")
+
+    def test_the_refusal_gap_is_recorded(self):
+        """The clearest single-vendor case, and the one most likely to mislead."""
+        gaps = dict(af.vendor_gaps("codex"))
+        self.assertIn("Tool refusals", gaps)
+        self.assertNotIn("Tool refusals", dict(af.vendor_gaps("claude")))
+
+    def test_it_reaches_json_and_explain(self):
+        caps = af.to_json(af.Fleet())["vendors"]["capabilities"]
+        self.assertEqual(len(caps), len(af.VENDOR_CAPABILITIES))
+        self.assertIn("depends_on", caps[0])
+        self.assertIn("vendors", af.EXPLAIN)
+
+    def test_no_capability_claims_both_vendors_lack_it_without_saying_why(self):
+        for cap, c, x, why in af.VENDOR_CAPABILITIES:
+            if c == af.NO and x == af.NO:
+                with self.subTest(capability=cap):
+                    self.assertGreater(len(why), 30,
+                                       "a gap in both needs a real explanation")
