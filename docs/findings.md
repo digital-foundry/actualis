@@ -24,6 +24,8 @@ user, and it is why the thresholds below are mostly relative rather than absolut
 | [AF009](#af009) | info | one ticket cost >8× your median ticket |
 | [AF010](#af010) | info | >35% of spend cannot be tied to a ticket |
 | [AF011](#af011) | high | ≥10% of shell activity happened inside subagents |
+| [AF012](#af012) | critical | a scan of ≥500 messages collapsed zero repeated records |
+| [AF013](#af013) | high / info | the rate table has not been checked in over 90 days |
 
 ---
 
@@ -124,3 +126,52 @@ credentials or destructive operations at all.
 Subagents inherit the parent's permissions but not its visibility. If the audit
 matters, prefer doing shell work in the main loop, or treat subagent runs as
 unreviewed.
+
+## AF012
+
+**Deduplication collapsed nothing, which should be impossible.** An agent
+re-emits an assistant record while a response streams — same `message.id`, same
+usage block, a fresh record uuid — so a scan of any size normally collapses
+thousands of repeats. On a real corpus of 145,116 usage records, 50.9% were
+repeats.
+
+Zero repeats on a scan of 500 messages or more has not been observed in real
+transcripts. The likely cause is that the transcript format stopped carrying a
+message id, in which case every record is being billed again and **every cost
+figure is roughly double**.
+
+That is exactly the defect 0.1.0 shipped with, and this finding exists so it
+cannot come back silently through a vendor change rather than a code change.
+
+Check it directly:
+
+```sh
+actualis --json | jq '.duplicate_usage_records_skipped'
+cat ~/.claude/projects/*/*.jsonl \
+  | jq -r 'select(.message.usage) | .message.id' | sort -u | wc -l
+```
+
+Threshold: 500 messages, chosen so a small or brand-new install does not trip
+it. Below that, an absence of repeats is unremarkable.
+
+## AF013
+
+**The rate table has not been checked in a long time.** Every price is
+hardcoded and dated in the source. The tool makes no network calls, so it
+cannot know whether a rate changed — only how long it has been since anyone
+looked.
+
+`info` past 90 days, `high` past 180. Every cost figure in the report inherits
+that age, and `--json` carries it as `pricing.age_days` alongside
+`pricing.confident_pct`, which says how much of the total rests on a published
+price rather than an inference.
+
+Re-check the provider pages, or from a checkout:
+
+```sh
+python3 tools/price-check.py --fetch
+```
+
+That tool reports drift for a human to adjudicate. It deliberately does not
+parse prices and never writes one: a silently mis-parsed rate would carry the
+authority of a checked one.

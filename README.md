@@ -495,9 +495,14 @@ if handled like the other:
   return to over-counting. A repeat count of zero on a large scan is the signal
   that this has happened.
 - **Rates use active days**, not calendar span, so one stale session from months ago
-  doesn't silently divide your weekly burn rate by five.
-- **Cache TTL inference.** Older transcripts only record a flat cache-creation
-  total, which is assumed to be 5-minute TTL and may under-price slightly.
+  doesn't silently divide your weekly burn rate by five. `--days N` covers the last
+  N calendar days including today, in UTC, so active days can never exceed N.
+- **Cache TTL is inferred when a transcript omits it.** Older records carry only a
+  flat cache-creation total with no 1h/5m split. Measured across 71,903 records
+  that *do* carry the split, the real mix is **95.2% 1h / 4.8% 5m** — so the old
+  assumption of 5m under-priced that component by 57%. It now assumes 1h, the more
+  expensive reading, matching how unknown model rates are handled. The assumed
+  volume is counted separately and reported, so the adjustment is never silent.
 
 ## Verification
 

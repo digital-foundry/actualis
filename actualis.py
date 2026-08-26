@@ -35,7 +35,7 @@ from typing import NamedTuple
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 # --------------------------------------------------------------------------
 # Pricing
@@ -56,6 +56,19 @@ __version__ = "0.1.3"
 CACHE_READ_MULT = 0.10
 CACHE_WRITE_5M_MULT = 1.25
 CACHE_WRITE_1H_MULT = 2.00
+# Older transcripts record only a flat cache_creation_input_tokens with no TTL
+# split, so the multiplier has to be assumed. It used to assume 5m (1.25x) and
+# the README called the result "may under-price slightly".
+#
+# Measured 2026-08-26 across 71,903 deduplicated records that DO carry the
+# split: 95.2% of cache-write tokens are 1h, 4.8% are 5m. Assuming 5m where the
+# real mix is 95% 1h under-prices that component by 57%.
+#
+# So it assumes 1h. That is the more expensive reading, which matches how
+# unknown model rates are handled: a bill that surprises you downward is a
+# better failure than one that surprises you upward. The assumed volume is
+# counted and reported, so this is never a silent adjustment.
+CACHE_WRITE_ASSUMED_MULT = CACHE_WRITE_1H_MULT
 
 # Two providers, two cache conventions. Getting this backwards overcharges:
 #
@@ -240,6 +253,25 @@ def rates_for(model: str, when: datetime | None) -> tuple[float, float, str, boo
     """
     r = rate_for(model)
     return (r.input, r.output, r.provider, r.tier == VENDOR, r.tier)
+
+
+def window_start(days: int, now: datetime | None = None) -> datetime:
+    """The cutoff for `--days N`, snapped to a date boundary.
+
+    It used to be `now - N days`, a rolling timestamp that lands mid-day. That
+    let records from the partial start date AND N further dates survive, so a
+    seven-day window reported eight active days -- the denominator of a headline
+    rate exceeding its own window, on a tool that sells being honest about
+    limits.
+
+    `--days N` now means the last N calendar days INCLUDING today, in UTC, which
+    is both what people mean by it and the only reading that makes active_days
+    bounded by N. Every daily aggregate in this file is already keyed on a UTC
+    date, so this makes the cutoff agree with the buckets it filters.
+    """
+    now = now or datetime.now(timezone.utc)
+    start_of_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start_of_today - timedelta(days=max(days, 1) - 1)
 
 
 def pricing_age_days(today: datetime | None = None) -> int:
@@ -1084,9 +1116,11 @@ class Fleet:
         cc = usage.get("cache_creation") or {}
         w1h = cc.get("ephemeral_1h_input_tokens", 0) or 0
         w5m = cc.get("ephemeral_5m_input_tokens", 0) or 0
+        assumed = 0
         if not w1h and not w5m:
-            # older transcripts only carry the flat total; assume 5m TTL
-            w5m = usage.get("cache_creation_input_tokens", 0) or 0
+            # Older transcript with no TTL split. Priced at the 1h rate and
+            # counted separately so the assumption is visible in the report.
+            assumed = usage.get("cache_creation_input_tokens", 0) or 0
 
         inp = usage.get("input_tokens", 0) or 0
         out = usage.get("output_tokens", 0) or 0
@@ -1103,6 +1137,7 @@ class Fleet:
             + out / 1e6 * out_rate
             + w1h / 1e6 * in_rate * CACHE_WRITE_1H_MULT
             + w5m / 1e6 * in_rate * CACHE_WRITE_5M_MULT
+            + assumed / 1e6 * in_rate * CACHE_WRITE_ASSUMED_MULT
             + rd / 1e6 * in_rate * CACHE_READ_MULT
         )
 
@@ -1121,18 +1156,20 @@ class Fleet:
         self.tokens["output"] += out
         self.tokens["cache_w_1h"] += w1h
         self.tokens["cache_w_5m"] += w5m
+        self.tokens["cache_w_assumed"] += assumed
         self.tokens["cache_read"] += rd
         pt = self.tokens_by_project[project]
         pt["input"] += inp; pt["output"] += out
-        pt["cache_w"] += w1h + w5m; pt["cache_read"] += rd
+        pt["cache_w"] += w1h + w5m + assumed; pt["cache_read"] += rd
         self.msgs_by_project[project] += 1
 
         self.cache_actual[project] += (
             inp / 1e6 * in_rate
             + w1h / 1e6 * in_rate * CACHE_WRITE_1H_MULT
             + w5m / 1e6 * in_rate * CACHE_WRITE_5M_MULT
+            + assumed / 1e6 * in_rate * CACHE_WRITE_ASSUMED_MULT
             + rd / 1e6 * in_rate * CACHE_READ_MULT)
-        self.cache_uncached[project] += (inp + w1h + w5m + rd) / 1e6 * in_rate
+        self.cache_uncached[project] += (inp + w1h + w5m + assumed + rd) / 1e6 * in_rate
 
         bucket = branch_bucket(branch)
         self.cost_by_branch[bucket] += cost
@@ -1528,9 +1565,28 @@ class Fleet:
 
     @property
     def span_days(self) -> float:
+        """Elapsed time from first record to last, in days.
+
+        A duration, not a count of dates. Activity on the 1st and the 3rd spans
+        two days and touches three dates -- so this is deliberately NOT what the
+        report compares active_days against. See span_dates.
+        """
         if not (self.first_ts and self.last_ts):
             return 0.0
         return max((self.last_ts - self.first_ts).total_seconds() / 86400.0, 1.0)
+
+    @property
+    def span_dates(self) -> int:
+        """Calendar dates covered, inclusive of both ends.
+
+        The right denominator for active_days, which is also a count of dates.
+        Comparing a date count against an elapsed duration made a contiguous
+        window read as "30 active days of 29" -- off by one by construction,
+        every time, which reads as a bug because it looks like one.
+        """
+        if not (self.first_ts and self.last_ts):
+            return 0
+        return (self.last_ts.date() - self.first_ts.date()).days + 1
 
     @property
     def active_days(self) -> int:
@@ -1754,6 +1810,39 @@ def coach(fleet: "Fleet") -> list[Finding]:
                 "Subagents inherit the parent's permissions but not its visibility. If "
                 "the audit matters to you, prefer doing shell work in the main loop, or "
                 "treat these runs as unreviewed."))
+
+    # --- AF012 deduplication appears to have stopped working ---------------
+    # docs/json.md says a zero repeat count on a large scan is suspicious. That
+    # sentence was the only thing checking it, and a sentence checks nothing.
+    # If a transcript format stops emitting message ids, cost silently doubles
+    # -- the exact 0.1.0 defect, reintroduced by a vendor change rather than by
+    # us, with nothing to say so.
+    if fleet.messages >= 500 and fleet.duplicate_usage_records == 0:
+        out.append(Finding(
+            "AF012", "critical", "Deduplication collapsed nothing, which should be impossible",
+            f"{num(fleet.messages)} messages were counted and not one repeated record "
+            f"was collapsed. On a scan this size that has not been observed in real "
+            f"transcripts: an agent re-emits an assistant record while a response "
+            f"streams, so repeats are normal and their absence is not.",
+            "Most likely the transcript format stopped carrying a message id, in which "
+            "case every record is being billed again and cost is roughly double. Check "
+            "`actualis --json | jq '.duplicate_usage_records_skipped'` against a raw "
+            "count of distinct message ids before trusting any figure here."))
+
+    # --- AF013 the rate table is old ---------------------------------------
+    # The report already prints a staleness line, but a warning that exists only
+    # in rendered text is invisible to --coach, to --json and to the MCP server,
+    # which is where anything programmatic reads from.
+    age = pricing_age_days()
+    if age > PRICING_STALE_DAYS:
+        sev = "high" if age > PRICING_STALE_DAYS * 2 else "info"
+        out.append(Finding(
+            "AF013", sev, "The rate table has not been checked in a long time",
+            f"Prices were last verified {PRICING_VERIFIED}, {age} days ago. "
+            f"The tool makes no network calls, so it cannot know whether a rate "
+            f"changed -- only how long since anyone looked.",
+            "Re-check the provider pages, or run `python3 tools/price-check.py --fetch` "
+            "from a checkout. Every cost figure here inherits this age."))
 
     order = {"critical": 0, "high": 1, "info": 2}
     out.sort(key=lambda f: order.get(f.severity, 9))
@@ -2811,16 +2900,26 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
             per_day = fleet.total_cost / active
             print(f"  {c.dim}per active day {money(per_day)}"
                   f"   ·  per week {money(per_day * 7)}"
-                  f"   ·  {active} active days of {span:.0f}{c.off}")
+                  f"   ·  {active} active days of {fleet.span_dates}{c.off}")
 
         rule(c, "TOKENS")
         for k, label in (("input", "input"), ("output", "output"),
                          ("cache_w_1h", "cache write 1h  ×2.00"),
                          ("cache_w_5m", "cache write 5m  ×1.25"),
+                         ("cache_w_assumed", "cache write ?   ×2.00"),
                          ("cache_read", "cache read      ×0.10")):
             v = fleet.tokens.get(k, 0)
+            # The assumed bucket is only shown when it is non-zero: a row of
+            # zeroes explaining an inference nobody's data triggered is noise.
+            if k == "cache_w_assumed" and not v:
+                continue
             pct = (v / tok * 100) if tok else 0
             print(f"  {label:<22} {num(v):>16}  {c.dim}{pct:5.1f}%{c.off}")
+        if fleet.tokens.get("cache_w_assumed"):
+            print(f"  {c.dim}cache write ? is a record with no TTL split; priced at the "
+                  f"1h rate.{c.off}")
+            print(f"  {c.dim}See --explain cache. Measured mix on records that do carry "
+                  f"it: 95% 1h.{c.off}")
 
         if len(fleet.cost_by_agent) > 1:
             rule(c, "BY AGENT")
@@ -3530,7 +3629,7 @@ def main(argv: list[str] | None = None) -> int:
 
     since = None
     if args.days:
-        since = datetime.now(timezone.utc) - timedelta(days=args.days)
+        since = window_start(args.days)
 
     if args.suppressions:
         c = C(use_color())

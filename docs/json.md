@@ -20,7 +20,7 @@ that and prints a warning.
 | `pricing` | where each rate came from, how old the table is, and how much of the total rests on a published price. See [Rate provenance](#rate-provenance) |
 | `duplicate_usage_records_skipped` | repeated records for the same message, counted once |
 | `duplicate_note` | why repeats occur and how they are collapsed |
-| `tokens` | `input`, `output`, `cache_w_1h`, `cache_w_5m`, `cache_read` |
+| `tokens` | `input`, `output`, `cache_w_1h`, `cache_w_5m`, `cache_w_assumed`, `cache_read` |
 | `by_agent` | cost per agent (`claude-code`, `codex`) |
 | `subagents` | see below |
 | `cache` | `fleet_hit_rate_pct`, `saved_usd`, `by_project{}` |
@@ -44,6 +44,21 @@ that and prints a warning.
 | `refusals` | what was stopped and by which gate, joined to the blocked command. See below |
 | `unknown_models` | models seen with no pricing entry, billed at Opus-tier rates |
 | `aggregator_priced_models` | models priced from a third party because the vendor publishes no rate for that id |
+
+## Inferred cache TTL
+
+`tokens.cache_w_assumed` counts cache-write tokens from records that carry only
+a flat total with no 1h/5m split. There is nothing to read, so the multiplier is
+assumed.
+
+It assumes **1h (2.00×)**. Measured across 71,903 deduplicated records that do
+carry the split, the real mix is 95.2% 1h and 4.8% 5m — so the previous
+assumption of 5m under-priced that component by 57%. Assuming the more expensive
+reading matches how unknown model rates are handled: surprising someone downward
+is a better failure than surprising them upward.
+
+A non-zero value here means part of your cost rests on that assumption. On
+current transcripts it is zero.
 
 ## Rate provenance
 

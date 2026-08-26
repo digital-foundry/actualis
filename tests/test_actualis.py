@@ -303,10 +303,35 @@ class TestPricing(unittest.TestCase):
         self.assertAlmostEqual(f.total_cost, 46.75, places=6)
 
     def test_legacy_transcript_flat_cache_total(self):
-        """Older transcripts only carry the flat total; assume 5m TTL."""
+        """Older transcripts carry only a flat total with no TTL split, so the
+        multiplier is assumed.
+
+        It assumed 5m (1.25x) until 2026-08-26. Measured across 71,903
+        deduplicated records that DO carry the split, the real mix is 95.2% 1h
+        and 4.8% 5m -- so assuming 5m under-priced that component by 57%. It now
+        assumes 1h, the more expensive reading, matching how unknown model rates
+        are handled: surprising someone downward beats surprising them upward.
+        """
         f = af.Fleet()
         f.add_usage("p", "claude-opus-5", {"cache_creation_input_tokens": 1_000_000}, None)
-        self.assertAlmostEqual(f.total_cost, 6.25, places=6)
+        self.assertAlmostEqual(f.total_cost, 10.0, places=6)   # 1M x $5 x 2.00
+
+    def test_an_assumed_ttl_is_counted_so_it_is_never_silent(self):
+        """The adjustment has to be visible. A number that moved because of an
+        assumption, with nothing saying so, is the failure this tool exists to
+        prevent."""
+        f = af.Fleet()
+        f.add_usage("p", "claude-opus-5", {"cache_creation_input_tokens": 1_000_000}, None)
+        self.assertEqual(f.tokens["cache_w_assumed"], 1_000_000)
+        self.assertEqual(f.tokens["cache_w_1h"], 0)
+        self.assertEqual(f.tokens["cache_w_5m"], 0)
+
+    def test_a_split_ttl_record_is_not_counted_as_assumed(self):
+        f = af.Fleet()
+        f.add_usage("p", "claude-opus-5",
+                    {"cache_creation": {"ephemeral_1h_input_tokens": 1_000_000}}, None)
+        self.assertEqual(f.tokens["cache_w_assumed"], 0)
+        self.assertEqual(f.tokens["cache_w_1h"], 1_000_000)
 
 
 class TestCodex(unittest.TestCase):
@@ -1889,3 +1914,103 @@ class TestControlStripping(unittest.TestCase):
         for text in ["café 日本 🚀", "a\tb", "a\nb", "line one\nline two", "→ ← ↑"]:
             with self.subTest(text=text):
                 self.assertEqual(af.clean(text), text.replace("\t", " "))
+
+
+class TestWindowArithmetic(unittest.TestCase):
+    """`--days N` used to cut at a rolling timestamp that lands mid-day, so a
+    seven-day window reported eight active days: the denominator of a headline
+    rate exceeding its own window."""
+
+    def test_a_window_never_covers_more_dates_than_asked_for(self):
+        now = datetime(2026, 8, 26, 19, 30, tzinfo=timezone.utc)
+        for n in (1, 7, 14, 30, 90, 365):
+            with self.subTest(days=n):
+                start = af.window_start(n, now)
+                covered = (now.date() - start.date()).days + 1
+                self.assertEqual(covered, n)
+
+    def test_the_cutoff_is_a_date_boundary(self):
+        start = af.window_start(7, datetime(2026, 8, 26, 19, 30, tzinfo=timezone.utc))
+        self.assertEqual((start.hour, start.minute, start.second, start.microsecond),
+                         (0, 0, 0, 0))
+
+    def test_zero_and_negative_are_treated_as_one_day(self):
+        now = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+        for n in (0, -5):
+            with self.subTest(days=n):
+                self.assertEqual(af.window_start(n, now).date(), now.date())
+
+    def test_active_days_never_exceeds_the_dates_spanned(self):
+        """They are both counts of dates now. Comparing a date count against an
+        elapsed duration made a contiguous range read as '30 active days of 29'
+        -- off by one by construction, every time."""
+        from datetime import timedelta
+        base = datetime(2026, 8, 1, 9, 0, tzinfo=timezone.utc)
+        for gap in (1, 2, 7):
+            f = af.Fleet()
+            for i in range(4):
+                f.add_usage("p", "claude-opus-5", {"input_tokens": 10},
+                            base + timedelta(days=i * gap))
+            with self.subTest(gap=gap):
+                self.assertLessEqual(f.active_days, f.span_dates)
+
+    def test_span_dates_is_inclusive_of_both_ends(self):
+        from datetime import timedelta
+        base = datetime(2026, 8, 1, 9, 0, tzinfo=timezone.utc)
+        f = af.Fleet()
+        f.add_usage("p", "claude-opus-5", {"input_tokens": 10}, base)
+        f.add_usage("p", "claude-opus-5", {"input_tokens": 10}, base + timedelta(days=2))
+        self.assertEqual(f.span_dates, 3)     # the 1st, 2nd and 3rd
+        self.assertAlmostEqual(f.span_days, 2.0, places=6)
+
+
+class TestCorrectnessFindings(unittest.TestCase):
+    """AF012 and AF013 exist because both conditions were documented in prose
+    and checked by nothing. An alarm no code evaluates is not an alarm."""
+
+    @staticmethod
+    def _fleet(messages):
+        from datetime import timedelta
+        f = af.Fleet()
+        base = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        for i in range(messages):
+            f.add_usage("p", "claude-opus-5", {"input_tokens": 10, "output_tokens": 1},
+                        base + timedelta(hours=i))
+        return f
+
+    def test_af012_fires_when_a_large_scan_collapses_nothing(self):
+        ids = [x.id for x in af.coach(self._fleet(600))]
+        self.assertIn("AF012", ids)
+
+    def test_af012_is_quiet_on_a_small_scan(self):
+        """A new install with a handful of messages legitimately has no repeats."""
+        self.assertNotIn("AF012", [x.id for x in af.coach(self._fleet(20))])
+
+    def test_af012_is_quiet_when_deduplication_is_working(self):
+        f = self._fleet(600)
+        f.duplicate_usage_records = 4321
+        self.assertNotIn("AF012", [x.id for x in af.coach(f)])
+
+    def test_af012_is_critical_because_the_number_doubles(self):
+        found = [x for x in af.coach(self._fleet(600)) if x.id == "AF012"]
+        self.assertEqual(found[0].severity, "critical")
+
+    def test_af013_fires_only_when_the_table_is_stale(self):
+        f = self._fleet(5)
+        f.duplicate_usage_records = 1
+        original = af.PRICING_VERIFIED
+        try:
+            self.assertNotIn("AF013", [x.id for x in af.coach(f)])
+            af.PRICING_VERIFIED = "2026-01-01"
+            found = [x for x in af.coach(f) if x.id == "AF013"]
+            self.assertTrue(found)
+            self.assertEqual(found[0].severity, "high")   # well past 2x the threshold
+        finally:
+            af.PRICING_VERIFIED = original
+
+    def test_both_findings_reach_the_json_and_the_mcp_surface(self):
+        """A finding that only exists in rendered text is invisible to anything
+        programmatic, which is most of what reads this."""
+        f = self._fleet(600)
+        ids = [c["id"] for c in af.to_json(f)["coach"]]
+        self.assertIn("AF012", ids)
