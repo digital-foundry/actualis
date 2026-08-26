@@ -1,6 +1,20 @@
 # Changelog
 
-## Unreleased
+## 0.1.8 — 2026-08-26
+
+### Changed
+
+- **The package is findable on PyPI.** Keywords went from 6 to 23 and
+  classifiers from 7 to 19. People search by the agent they run
+  (`claude-code`, `codex`, `anthropic`), the problem they have (`secrets`,
+  `credentials`, `cost-tracking`, `finops`), or the shape of the tool (`cli`,
+  `terminal`); six keywords covered almost none of that. Classifiers now state
+  the Python versions and platforms CI actually proves, plus `Topic :: Security`.
+
+  A `Typing :: Typed` classifier was drafted and removed: no `py.typed` marker
+  ships in the wheel, so it would assert something the package does not
+  provide. All 19 were validated against pypi.org's live classifier list — an
+  invalid one fails the upload, and a release is the wrong moment to find out.
 
 ### Fixed
 
