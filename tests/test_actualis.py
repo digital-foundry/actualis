@@ -2975,3 +2975,76 @@ class TestSelfCheckWithoutACorpus(unittest.TestCase):
     def test_skipped_checks_do_not_fail_the_exit_code(self):
         """Absence of a corpus is not evidence of a privacy failure."""
         self.assertEqual(self._run_with_no_transcripts().returncode, af.EXIT_OK)
+
+
+class TestLegacyTerminalEncoding(unittest.TestCase):
+    """The report crashed on any stdout whose codec lacks box-drawing.
+
+    CI runs Windows, but every other test captures output through StringIO,
+    which has no codec and therefore cannot fail this way. Only a real
+    subprocess writing to a pipe reproduces it, so these tests use one.
+    """
+
+    def _run(self, *args, encoding="cp1252"):
+        env = dict(os.environ, PYTHONIOENCODING=encoding)
+        return subprocess.run([sys.executable, str(af.SRC_PATH), *args],
+                              capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", env=env)
+
+    def test_no_mode_raises_on_a_codec_that_cannot_carry_the_glyphs(self):
+        for args in (["--days", "1"], ["--coach", "--days", "1"],
+                     ["--share", "--days", "1"], ["--bash", "--days", "1"],
+                     ["--explain", "cost"], ["--self-check", "--days", "1"],
+                     ["--completions", "zsh"], ["--service", "launchd"]):
+            with self.subTest(args=args):
+                out = self._run(*args)
+                self.assertNotIn("UnicodeEncodeError", out.stderr)
+                self.assertNotIn("Traceback", out.stderr)
+
+    def test_the_fallback_is_readable_ascii_not_replacement_characters(self):
+        out = self._run("--explain", "cost")
+        self.assertNotIn("�", out.stdout)
+        self.assertNotIn("?????", out.stdout)
+
+    def test_every_glyph_the_source_uses_has_a_fallback(self):
+        """A glyph added later without a fallback would degrade to '?'."""
+        used = {ch for ch in af.SRC_TEXT if ord(ch) > 127}
+        missing = sorted(used - set(af._GLYPH_FALLBACK))
+        self.assertEqual(missing, [],
+                         f"no ASCII fallback for {missing}; add one to _GLYPH_FALLBACK")
+
+    def test_the_fallbacks_are_themselves_ascii(self):
+        for glyph, repl in af._GLYPH_FALLBACK.items():
+            with self.subTest(glyph=glyph):
+                repl.encode("ascii")          # raises if not
+
+    def test_json_is_never_rewritten_by_the_fallback(self):
+        """Translating glyphs in --json would silently corrupt the data."""
+        out = self._run("--json", "--days", "1")
+        payload = json.loads(out.stdout)
+        self.assertIn("report_sha256", payload)
+
+    def test_the_digest_does_not_depend_on_the_terminal_codec(self):
+        """A content hash that moves with $PYTHONIOENCODING is not a content hash."""
+        legacy = json.loads(self._run("--json", "--days", "1").stdout)
+        utf8 = json.loads(self._run("--json", "--days", "1", encoding="utf-8").stdout)
+        self.assertEqual(legacy["report_sha256"], utf8["report_sha256"])
+
+    def test_a_stream_with_no_encoding_is_left_alone(self):
+        """StringIO has no codec and needs no wrapping."""
+        self.assertTrue(af._stream_handles_glyphs(io.StringIO()))
+
+    def test_a_utf8_stream_is_left_alone(self):
+        class S:
+            encoding = "utf-8"
+        self.assertTrue(af._stream_handles_glyphs(S()))
+
+    def test_a_cp1252_stream_is_detected(self):
+        class S:
+            encoding = "cp1252"
+        self.assertFalse(af._stream_handles_glyphs(S()))
+
+    def test_an_unknown_codec_name_does_not_crash_the_check(self):
+        class S:
+            encoding = "not-a-real-codec"
+        self.assertFalse(af._stream_handles_glyphs(S()))

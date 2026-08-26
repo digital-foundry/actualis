@@ -3504,6 +3504,84 @@ def num(x: int) -> str:
     return f"{x:,}"
 
 
+# --------------------------------------------------------------------------
+# Output encoding
+#
+# The report uses a handful of non-ASCII glyphs. On a stream whose codec cannot
+# represent them -- a Windows console or a redirect under a legacy locale --
+# printing them raises UnicodeEncodeError and the whole run dies with a
+# traceback instead of a report. The README claims cross-platform, and CI does
+# test Windows, but only through in-process StringIO captures, which have no
+# codec at all; nothing ever wrote to a real pipe there.
+#
+# Rather than crash or emit replacement characters, degrade to ASCII that says
+# the same thing.
+
+_GLYPH_FALLBACK = {
+    "·": "*",      # separator between inline stats
+    "—": "--",
+    "…": "...",
+    "▲": "!",      # a --watch alert
+    "→": "->",
+    "×": "x",      # cache multiplier
+    "─": "-",      # section rule
+    "█": "#",      # bar chart
+}
+_GLYPH_TABLE = str.maketrans(_GLYPH_FALLBACK)
+
+
+def _stream_handles_glyphs(stream) -> bool:
+    enc = getattr(stream, "encoding", None)
+    if not enc:
+        return True                    # StringIO and friends: no codec to fail
+    try:
+        "".join(_GLYPH_FALLBACK).encode(enc)
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
+
+
+class _AsciiFallbackStream:
+    """A text stream that swaps glyphs its codec cannot encode.
+
+    Deliberately NOT used for --json: translating there would silently rewrite
+    the data (a project name containing a middle dot would come back changed),
+    and a machine-readable payload must be reproduced exactly.
+    """
+
+    def __init__(self, stream) -> None:
+        self._stream = stream
+
+    def write(self, text: str) -> int:
+        return self._stream.write(text.translate(_GLYPH_TABLE))
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def make_output_printable(json_mode: bool) -> None:
+    """Guarantee that printing a report cannot raise on this terminal."""
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is None or _stream_handles_glyphs(stream):
+            continue
+        if json_mode and name == "stdout":
+            # JSON is defined in terms of Unicode; give it a codec that can
+            # carry it rather than rewriting its content.
+            try:
+                stream.reconfigure(encoding="utf-8")
+                continue
+            except (AttributeError, OSError, ValueError):
+                pass
+        # errors="replace" is the backstop: it catches user data and any glyph
+        # not in the table above, so a stray character can never be fatal.
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
+        setattr(sys, name, _AsciiFallbackStream(stream))
+
+
 def rule(c: C, title: str = "", width: int = 74) -> None:
     if title:
         pad = width - len(title) - 3
@@ -4983,6 +5061,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     ap = build_parser()
     args = ap.parse_args(argv)
+
+    # Before ANY output: every mode below prints, and on a stream whose codec
+    # cannot carry the report's glyphs, printing raises rather than degrades.
+    make_output_printable(args.json)
 
     if args.service:
         # Unit to stdout, instructions to stderr: `> file` must yield a file

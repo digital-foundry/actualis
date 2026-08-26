@@ -100,6 +100,23 @@
 
 ### Fixed
 
+- **The report crashed on any terminal whose codec could not carry its
+  glyphs.** A Windows console, or a redirect under a legacy locale, raised
+  `UnicodeEncodeError` on the section rule and killed the run with a traceback
+  instead of printing a report. This affected every human-readable mode, not
+  one flag.
+
+  The glyphs now degrade to ASCII that says the same thing, with
+  `errors="replace"` behind it so a character in *your* data can never be fatal
+  either. `--json` is deliberately excluded from the substitution: rewriting a
+  glyph there would silently alter the payload, so it gets a codec that can
+  carry it instead. The report digest is identical under both.
+
+  The README claimed cross-platform and CI does test Windows, but every test
+  captured output through `StringIO`, which has no codec and structurally
+  cannot fail this way. It surfaced only when a new test ran the CLI as a real
+  subprocess writing to a pipe.
+
 - **`--watch` could hold a credential alert in a buffer for hours.** The event
   lines did not flush. On a terminal that is invisible, because Python
   line-buffers a tty — but under a service manager stdout is a file or a pipe
