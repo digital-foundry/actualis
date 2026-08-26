@@ -111,6 +111,7 @@ python3 actualis.py --agent codex    # one agent only (claude | codex | all)
 | `--suppress ID` | mark a finding as a false positive on this machine (it stays counted) |
 | `--reason TEXT` | why that suppression is correct, recorded for review |
 | `--suppressions` | list current suppressions and where they are read from |
+| `--fail-on LEVEL` | exit 3 if any unsuppressed finding is at or above `critical`, `high` or `any`. For gating a pipeline |
 | `--explain [TOPIC]` | how a number is computed, what it assumes, how to check it |
 | `--why AFxxx` | explain one finding against your actual numbers |
 | `--agents` | installed agent platforms and whether their binaries are validly signed |
@@ -408,6 +409,40 @@ The rules were tuned against 48,000 real agent commands, and tuning meant deleti
 rules as much as adding them. A rule matching `>/dev/null 2>&1` as "audit
 tampering" fired 1,206 times at essentially 100% false positive, so it's gone; a
 noisy rule destroys trust in the rules that matter. Current flag rate is about 3.8%.
+
+## Using it in CI
+
+An exit code is the smallest possible integration, and it fits the read-only
+promise exactly: the tool returns a verdict and still changes nothing.
+
+```sh
+actualis --days 7 --fail-on critical
+```
+
+| exit | means |
+|---|---|
+| `0` | nothing at or above the threshold |
+| `1` | could not run: no transcripts, an unreadable `--root` |
+| `2` | a command-line usage error (argparse's, not ours) |
+| `3` | findings at or above `--fail-on` |
+| `130` | interrupted |
+
+Findings are **3**, not 1 and not 2. `1` already meant "could not run", and `2`
+is what argparse returns for a bad invocation — a pipeline that cannot tell *a
+credential is exposed* from *you mistyped a flag* will eventually be told to
+ignore both.
+
+The verdict goes to **stderr**, so `--json` on stdout stays byte-identical and a
+pipeline can capture the report and the outcome separately:
+
+```sh
+actualis --json --fail-on high > report.json || echo "gate failed"
+```
+
+**Suppressed findings do not fail the build.** That is what suppression is for —
+if a recorded, reasoned decision still broke CI, people would delete findings
+instead of suppressing them. They remain counted in the report, and coach
+findings derived from a suppressed credential are suppressed with it.
 
 ## When it is wrong
 

@@ -2352,3 +2352,137 @@ class TestVendorCapabilities(unittest.TestCase):
                 with self.subTest(capability=cap):
                     self.assertGreater(len(why), 30,
                                        "a gap in both needs a real explanation")
+
+
+class TestFailOn(unittest.TestCase):
+    """An exit code is the smallest possible CI integration, and it fits the
+    read-only promise exactly: it returns a verdict and still changes nothing.
+    A pipeline depends on the codes, so they are fixed and tested."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = self._tmp.name
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = self._old
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _fleet_with_critical():
+        f = af.Fleet()
+        f.add_tool("p", "Bash",
+                   {"command": "export STRIPE_SECRET_KEY=sk_live_" + "a" * 30},
+                   datetime(2026, 8, 1, tzinfo=timezone.utc))
+        return f
+
+    def test_the_exit_codes_are_distinct_and_fixed(self):
+        """0 clean, 1 could not run, 2 argparse's usage error, 3 findings.
+
+        3 rather than 1 or 2 deliberately: a pipeline that cannot tell "a
+        credential is exposed" from "you mistyped a flag" will be told to
+        ignore both."""
+        self.assertEqual((af.EXIT_OK, af.EXIT_CANNOT_RUN, af.EXIT_USAGE, af.EXIT_FINDINGS),
+                         (0, 1, 2, 3))
+
+    def test_a_critical_finding_trips_every_level(self):
+        f = self._fleet_with_critical()
+        for level in af.FAIL_ON_LEVELS:
+            with self.subTest(level=level):
+                self.assertTrue(af.failing_findings(f, level))
+
+    def test_levels_are_ordered_supersets(self):
+        """`any` must include everything `high` does, and `high` everything
+        `critical` does. A threshold that is not monotonic is a trap."""
+        f = self._fleet_with_critical()
+        f.add_tool("p", "Bash", {"command": "rm -rf /tmp/x"},
+                   datetime(2026, 8, 1, tzinfo=timezone.utc))
+        crit = set(af.failing_findings(f, "critical"))
+        high = set(af.failing_findings(f, "high"))
+        any_ = set(af.failing_findings(f, "any"))
+        self.assertTrue(crit <= high <= any_)
+
+    def test_a_clean_fleet_trips_nothing(self):
+        f = af.Fleet()
+        f.add_tool("p", "Bash", {"command": "git status"},
+                   datetime(2026, 8, 1, tzinfo=timezone.utc))
+        for level in af.FAIL_ON_LEVELS:
+            with self.subTest(level=level):
+                self.assertEqual(af.failing_findings(f, level), [])
+
+    def test_a_suppressed_finding_does_not_fail_the_build(self):
+        """The whole point of suppression. If a recorded, reasoned decision
+        still broke CI, people would delete findings instead of suppressing
+        them -- which is the outcome suppression exists to prevent."""
+        before = self._fleet_with_critical()
+        self.assertTrue(af.failing_findings(before, "critical"))
+        for fp in before.secrets:
+            af.add_suppression(fp, "known test fixture in CI")
+        after = self._fleet_with_critical()
+        self.assertEqual(
+            [r for r in af.failing_findings(after, "critical") if "credential" in r], [],
+            "a suppressed credential still failed the gate")
+
+    def test_a_suppressed_finding_is_still_counted(self):
+        """Not failing the build is not the same as disappearing."""
+        before = self._fleet_with_critical()
+        for fp in before.secrets:
+            af.add_suppression(fp, "known test fixture in CI")
+        after = self._fleet_with_critical()
+        self.assertEqual(len(after.secrets), len(before.secrets))
+        self.assertEqual(after.suppressed_secrets, len(before.secrets))
+
+    def test_an_unknown_level_fails_nothing_rather_than_everything(self):
+        """argparse rejects a bad value first, but the function must not become
+        a silent always-fail if it is ever called directly."""
+        self.assertEqual(af.failing_findings(self._fleet_with_critical(), "bogus"), [])
+
+    def test_the_json_payload_is_unaffected(self):
+        """The flag adds a verdict; it must not change the report. A pipeline
+        that captures --json and gates on the exit code needs both to be true
+        at once."""
+        f = self._fleet_with_critical()
+        before = json.dumps(af.to_json(f), sort_keys=True)
+        af.failing_findings(f, "any")
+        self.assertEqual(json.dumps(af.to_json(f), sort_keys=True), before)
+
+    def test_the_reasons_name_what_tripped_it(self):
+        """A CI log saying only "failed" sends someone to run it locally."""
+        reasons = af.failing_findings(self._fleet_with_critical(), "critical")
+        self.assertTrue(any("credential" in r for r in reasons))
+        self.assertTrue(all(r.strip() for r in reasons))
+
+    def test_a_malformed_id_is_refused_rather_than_stored(self):
+        """A suppression that can never match is worse than an error: the user
+        walks away believing they silenced something. Caught when a shell passed
+        seven ids to one --suppress as a single argument."""
+        for bad in ("1a5d44a2 6942a7f5", "not-a-fingerprint", "ZZZZZZZZ",
+                    "1a5d44", "1a5d44a2b"):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError):
+                    af.add_suppression(bad, "reason")
+
+    def test_a_real_id_is_accepted(self):
+        af.add_suppression("1a5d44a2", "reviewed")
+        self.assertIn("1a5d44a2", af.load_suppressions())
+
+    def test_suppressing_a_lower_level_does_not_clear_a_higher_gate(self):
+        """Clearing `critical` must not quietly clear `high`."""
+        f = self._fleet_with_critical()
+        f.add_tool("p", "Bash", {"command": "rm -rf /tmp/x"},
+                   datetime(2026, 8, 1, tzinfo=timezone.utc))
+        for fp in list(f.secrets):
+            af.add_suppression(fp, "reviewed")
+        after = af.Fleet()
+        after.add_tool("p", "Bash",
+                       {"command": "export STRIPE_SECRET_KEY=sk_live_" + "a" * 30},
+                       datetime(2026, 8, 1, tzinfo=timezone.utc))
+        after.add_tool("p", "Bash", {"command": "rm -rf /tmp/x"},
+                       datetime(2026, 8, 1, tzinfo=timezone.utc))
+        self.assertEqual(af.failing_findings(after, "critical"), [])
+        self.assertTrue(af.failing_findings(after, "high"),
+                        "a high-severity flag should still fail the high gate")
