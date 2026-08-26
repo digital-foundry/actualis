@@ -2140,3 +2140,90 @@ class TestDetectorListReview(unittest.TestCase):
             out.append(ch)
             i += 1
         return "".join(out)
+
+
+class TestCommandHeadProperties(unittest.TestCase):
+    """command_head broke three times before anyone wrote these down, each time
+    found by accident. Unit tests cover the cases someone thought of; running it
+    across 49,873 real commands found 167 violations in shapes nobody had.
+
+    The corpus cannot ship, so the shapes it surfaced are fixtures here and the
+    invariants are asserted rather than the outputs.
+    """
+
+    # Every one of these is a real command shape from the corpus, reduced.
+    CORPUS_SHAPES = [
+        # a quoted path with a space, torn apart by a naive split
+        ('M="/Users/x/My Folder/f" && git push', "git"),
+        # the program itself is a quoted variable
+        ('"$P" --check docs/spec.md', "$P"),
+        ('"/usr/local/my app/bin/tool" --run', "/usr/local/my app/bin/tool"),
+        # a loop header reached mid-segment
+        ("( for i in $(seq 1 80); do git fetch origin; done )", "git"),
+        ("for i in $(seq 1 60); do if docker info; then echo up; fi; done", "docker"),
+        # `if CMD` tests a command; `for x in LIST` does not
+        ("if [ -f x ]; then cat x; fi", "cat"),
+        ("while read line; do echo $line; done", "read"),
+        # a substitution that opens with a loop header
+        ("out=$(for n in 1 2 3; do gh api x; done)\necho $out", "gh"),
+        # a substitution that opens with a program
+        ("TOK=$(grep -oE pat ~/.zshrc)\necho hi", "grep"),
+        ("KEY=`openssl rand -hex 8`", "openssl"),
+        # heredoc bodies are data, not commands
+        ("cat <<EOF > f.txt\ndocs/some/path.md\nplain text\nEOF\ngit add f.txt", "cat"),
+        ("python3 - <<'PY'\nimport os\nPY", "python3"),
+        # redirects and path-taking prefixes
+        ("cd /tmp/x 2>/dev/null", "cd"),
+        ("cd /tmp/x 2>/dev/null\ngit status", "git"),
+        ("make test > out.log 2>&1", "make"),
+        # ordinary shapes that must not regress
+        ("FOO=1 BAR=2 pytest -q", "pytest"),
+        ("sudo systemctl restart nginx", "systemctl"),
+        ("npm run build", "npm"),
+        ("echo \"a b c\"", "echo"),
+    ]
+
+    def test_the_corpus_shapes_resolve_correctly(self):
+        for cmd, want in self.CORPUS_SHAPES:
+            with self.subTest(cmd=cmd[:44]):
+                self.assertEqual(af.command_head(cmd), want)
+
+    def test_the_invariants_hold_for_every_shape(self):
+        """These are what must be true of ANY head, not what any one command
+        resolves to. A new shape can be added above without deciding its answer
+        and these still catch a nonsense result."""
+        import re as _re
+        keywords = af._HEADER_KEYWORDS | af._BODY_KEYWORDS
+        for cmd, _want in self.CORPUS_SHAPES:
+            head = af.command_head(cmd)
+            with self.subTest(cmd=cmd[:44]):
+                self.assertIsNotNone(head, "non-empty command yielded no head")
+                self.assertTrue(head.strip(), "head is blank")
+                self.assertFalse(head.startswith("-"), f"a flag: {head!r}")
+                self.assertNotIn(head, keywords, f"a shell keyword: {head!r}")
+                self.assertIsNone(_re.match(r"^\d*(?:>>?|<<?|&>|>&)", head),
+                                  f"a redirection: {head!r}")
+
+    def test_an_empty_command_yields_nothing(self):
+        for empty in ("", "   ", "\n\n", "\t"):
+            with self.subTest(cmd=repr(empty)):
+                self.assertIsNone(af.command_head(empty))
+
+    def test_a_heredoc_body_cannot_become_the_program(self):
+        """A heredoc carries data. Splitting the command on newlines turned each
+        of its lines into a candidate, so a path inside a document was returned
+        as the program on 121 real commands."""
+        cmd = ("cat > spec.md <<'MD'\n"
+               "docs/superpowers/specs/design.md\n"
+               "rm -rf /\n"          # even this is data, not a command
+               "MD\n"
+               "git add spec.md")
+        self.assertEqual(af.command_head(cmd), "cat")
+
+    def test_a_quoted_span_neither_splits_nor_disappears(self):
+        """Both mistakes have been made here. Splitting inside quotes returned a
+        path fragment; dropping quoted spans lost a program that was quoted."""
+        self.assertEqual(af._shell_tokens('M="/a b/c" git'), ["M=/a b/c", "git"])
+        self.assertEqual(af._shell_tokens('"$P" --check'), ["$P", "--check"])
+        self.assertEqual(af._shell_tokens("echo 'one two' three"),
+                         ["echo", "one two", "three"])

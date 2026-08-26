@@ -506,10 +506,21 @@ def contains_secret(text: str) -> bool:
 
 
 # Words that are never the command being run.
+# Two kinds of header, and they need opposite handling.
+# `for x in LIST`, `case x in`, `select x in` are followed by a variable and a
+# word list -- nothing there is a program, so the rest of the segment is
+# abandoned. `if CMD`, `while CMD`, `until CMD` are followed by a COMMAND whose
+# exit status is tested, so scanning must continue into it. Treating them alike
+# made `if docker info; then echo up` report `echo`.
 _HEADER_KEYWORDS = {"for", "while", "until", "if", "case", "select", "function", "elif"}
+_HEADERS_TAKING_A_WORD_LIST = {"for", "case", "select", "function"}
 _BODY_KEYWORDS = {"do", "then", "else", "fi", "done", "esac", "in", "{", "(", "!"}
 _PREFIX_WORDS = {"sudo", "env", "exec", "time", "nohup", "command", "builtin", "nice", "xargs"}
 _TAKES_PATH_ARG = {"cd", "pushd", "popd"}
+# `[` and `test` really are programs, but in `if [ -f x ]; then cat x` they are
+# the CONDITION and `cat` is the work. Reporting `[` as the most-run program is
+# technically true and useless.
+_CONDITION_WORDS = {"[", "[[", "]", "]]", "test"}
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 # `2>/dev/null`, `>out`, `>>log`, `2>&1`, `<in` — a redirection is never the
 # program. Skipping `cd` plus its path argument used to leave the redirect as
@@ -835,6 +846,71 @@ def classify_secrets(cmd: str) -> list[tuple[str, str, str]]:
     return out
 
 
+_HEREDOC = re.compile(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?")
+
+
+def _without_heredocs(cmd: str) -> str:
+    """Drop heredoc bodies before looking for a program.
+
+    A heredoc carries data -- a JSON payload, a commit message, a file being
+    written. Splitting the command on newlines turned each of those lines into
+    its own candidate segment, so a bare path inside a document became "the
+    program" on 121 real commands. The `cat <<EOF` line itself is kept; only
+    the body between it and its terminator is removed.
+    """
+    if "<<" not in cmd:
+        return cmd
+    out, lines = [], cmd.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        m = _HEREDOC.search(line)
+        i += 1
+        if not m:
+            continue
+        terminator = m.group(1)
+        while i < len(lines) and lines[i].strip() != terminator:
+            i += 1
+        i += 1                      # skip the terminator itself
+    return "\n".join(out)
+
+
+def _shell_tokens(segment: str) -> list[str]:
+    """Split on whitespace, treating a quoted span as part of its token.
+
+    Two mistakes are possible here and this file has made both.
+
+    `segment.split()` tears a quoted path apart, so
+    `M="/Users/x/My Folder/f"` yields `Folder/f"` -- and since the assignment
+    before it is skipped, that fragment gets returned as the program.
+
+    Dropping quoted spans instead loses the program when the program IS quoted:
+    `"$P" --check x.md` becomes `--check x.md`, and a filename is returned. The
+    content has to be kept and the quotes removed, so a quoted token stays one
+    token and stays readable.
+    """
+    out, buf, quote = [], [], ""
+    for ch in segment:
+        if quote:
+            if ch == quote:
+                quote = ""
+            else:
+                buf.append(ch)
+            continue
+        if ch in "\"'":
+            quote = ch
+            continue
+        if ch.isspace():
+            if buf:
+                out.append("".join(buf)); buf = []
+            continue
+        buf.append(ch)
+    if buf:
+        out.append("".join(buf))
+    return out
+
+
 def command_head(cmd: str) -> str | None:
     """The program actually being run.
 
@@ -845,12 +921,17 @@ def command_head(cmd: str) -> str | None:
     # Newlines delimit segments too: a `for … \n do …` loop has no `;` at all,
     # and without splitting on them the whole loop reads as one segment starting
     # with `for`, which then reports `for` as the program.
-    for segment in re.split(r"&&|\|\||;|\||\n", cmd.strip()):
-        tokens = segment.split()
+    for segment in re.split(r"&&|\|\||;|\||\n", _without_heredocs(cmd).strip()):
+        tokens = _shell_tokens(segment)
         if not tokens:
             continue
-        if tokens[0] in _HEADER_KEYWORDS:
-            continue  # loop/conditional header: the body is a later segment
+        if tokens[0] in _HEADERS_TAKING_A_WORD_LIST:
+            continue  # `for x in LIST`: the body is a later segment
+        if _CONDITION_WORDS.intersection(tokens):
+            # `if [ -f x ]` is its own segment once split on `;`, and every
+            # token in it belongs to the test rather than to the work. Skipping
+            # only the `[` returned its operand instead.
+            continue
         skip_next = False
         for tok in tokens:
             if skip_next:
@@ -859,10 +940,20 @@ def command_head(cmd: str) -> str | None:
             if _ASSIGNMENT.match(tok):
                 inner = _ASSIGN_SUBST.match(tok)
                 if inner:
+                    if inner.group(1) in _HEADERS_TAKING_A_WORD_LIST:
+                        # `out=$(for n in …)` opens the substitution with a loop
+                        # header, so what follows in this segment is the loop's
+                        # own operands. Abandon it, exactly as a bare header
+                        # does -- otherwise the loop VARIABLE is returned.
+                        break
                     return inner.group(1)     # `TOK=$(grep …)` runs grep
-                continue                      # environment assignment
+                continue                      # plain environment assignment
             if tok in _BODY_KEYWORDS or tok in _PREFIX_WORDS:
                 continue                      # `do tool …`, `sudo tool …`
+            if tok in _HEADERS_TAKING_A_WORD_LIST:
+                break                         # `for i in …`: operands, not a program
+            if tok in _HEADER_KEYWORDS:
+                continue                      # `if CMD`: the operand IS a program
             if tok == "\\":
                 continue                      # line continuation, not a program
             if _REDIRECT.match(tok):

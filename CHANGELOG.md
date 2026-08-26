@@ -33,6 +33,35 @@
 
 ### Fixed
 
+- **`command_head` was wrong on 167 real commands.** Running it across 49,879
+  distinct commands from a real corpus found violations in four shapes that
+  unit tests had no cases for:
+
+  - A **quoted path containing a space** was torn apart by a naive split, so a
+    path fragment became the program on 100 commands.
+  - **`for` and `if` were returned as programs** on 46, because header keywords
+    were only checked at the start of a segment — `( for i in …` and
+    `do if docker …` both reach one mid-segment.
+  - **Heredoc bodies were treated as commands** on 121. Splitting on newlines
+    made every line of a heredoc its own candidate, so a path inside a document
+    became "the program".
+  - **`if [ -f x ]`** returned the test's operand.
+
+  Down to one, and that one is a variable-expanded path — honest rather than
+  wrong. Distinct heads fell from 512 to 414, so roughly a hundred spurious
+  entries left `most_run`, which appears in the report and in the MCP
+  `shell_audit` tool.
+
+  Fixing it needed two distinctions the code did not previously make. A quoted
+  span must neither split nor disappear: dropping quoted spans lost the program
+  when the program itself was quoted (`"$P" --check`). And `for x in LIST` takes
+  a word list while `if CMD` takes a command, so the first abandons the rest of
+  its segment and the second must be scanned into.
+
+  The corpus cannot ship, so every shape it surfaced is now a fixture, and the
+  test asserts the invariants — never a flag, a redirect, a keyword or blank —
+  rather than only the expected answers.
+
 - **A template placeholder no longer defeats an exclusion.** Names arrive
   wrapped as `__X__`, `{{X}}` or `%X%`, and the decoration is not part of the
   name, so one rule now covers every spelling.
