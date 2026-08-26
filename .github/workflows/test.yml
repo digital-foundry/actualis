@@ -5,6 +5,11 @@ on:
   pull_request:
   schedule:
     - cron: "0 6 * * 1"   # weekly: a repo with no dependencies still rots
+  # A run can wedge in `queued` on GitHub's side and never start. It then holds
+  # the concurrency group below, so later pushes create no run at all and the
+  # PR simply reports no checks -- with nothing failing and nothing to cancel.
+  # This is the escape hatch: `gh workflow run test.yml --ref <branch>`.
+  workflow_dispatch:
 
 permissions:
   contents: read

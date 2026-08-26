@@ -1,8 +1,87 @@
 # Changelog
 
-## Unreleased
+## 0.1.6 — 2026-08-26
 
 ### Added
+
+- **`--diff` compares this run with a saved one.** Every report already carried
+  a `report_sha256`; nothing used it. *Three new critical credentials since
+  Monday* is a more actionable sentence than any absolute number.
+
+  ```sh
+  actualis --json > baseline.json     # today
+  actualis --diff baseline.json       # next week
+  ```
+
+  Credentials, coach findings and command kinds each diff by their own stable
+  id, reporting what appeared, what went away, and what changed severity. A
+  flag id names a *kind* of command rather than one occurrence, so the same
+  kind recurring shows as a count change, not as something new.
+
+  A baseline written by a different `schema_version` is **refused** rather than
+  compared: a renamed key is indistinguishable from a real change, and a diff
+  that invents movement is worse than no diff. `--diff` with `--json` is a
+  usage error rather than one silently winning, which in CI would be a trap.
+
+- **`--self-check` verifies the privacy claims by executing them.** The claims
+  are the product, and a page explaining how you *could* check them is a page
+  almost nobody reads.
+
+  It reports every module the shipped source imports at any depth — a Python
+  process cannot open a network connection without `socket`, which is stronger
+  evidence than "we never called `requests`" — hashes a sample of your
+  transcripts before and after a real scan to show they are byte-identical,
+  confirms no file appeared or vanished under the transcript roots, names the
+  only path this build can write to, and prints its own sha256 so you can
+  compare it with the published wheel. It exits non-zero if any check fails.
+
+  It honours `--root`: if you name a directory to read, that is the directory
+  whose integrity gets proven. Ignoring it meant the check verified a corpus
+  the user had not asked about.
+
+  On a machine with no transcripts — a CI runner, a fresh install — the checks
+  that need a corpus are reported as **skipped, with the reason**, and the ones
+  that do not still run. The verdict distinguishes the two: "every check that
+  could run passed, 2 could not run on this machine" rather than "all checks
+  passed", because a check silently not run reads as a check that passed.
+
+  The output says what it does **not** prove: it describes the run you just
+  made, not every run this build could make, and it prints the command to watch
+  the process from outside instead.
+
+- **`--service` generates a background unit with the paths already resolved.**
+  The README used to carry a plist with `__PLACEHOLDERS__` and a `sed` line to
+  fill them. That is a recipe, and recipes get mistyped.
+
+  ```sh
+  actualis --service launchd > ~/Library/LaunchAgents/app.actualis.watch.plist
+  actualis --service systemd > ~/.config/systemd/user/actualis-watch.service
+  ```
+
+  The unit goes to stdout and the install, uninstall and log commands to
+  stderr, so redirecting produces a file that works and still tells you what to
+  do with it. Install and uninstall are one command each. The launchd plist is
+  accepted by `plutil`; the systemd unit is accepted by `systemd-analyze
+  verify`, and declares `ProtectSystem=strict` and `ProtectHome=read-only` so
+  the service manager enforces the read-only guarantee too. Linux logs to the
+  journal and rotate with it; `--service newsyslog` covers macOS, which has no
+  journal.
+
+  The unit names the build that generated it, taken from `argv[0]` rather than
+  from `PATH`. An install that is not on `PATH` — a venv, a pipx shim — would
+  otherwise produce a unit pointing at whatever `which` happened to find, and
+  the service would run a different version than the one that wrote it,
+  silently and possibly for months.
+
+  Generating a unit writes nothing. The read-only guarantee gets no exception
+  for convenience.
+
+- **`--completions` for bash, zsh and fish**, generated from the parser rather
+  than hand-written, so a new flag cannot be missing from them and a renamed
+  `--explain` topic cannot go stale. `--explain`, `--why`, `--agent` and
+  `--fail-on` complete their real values. `--suppress` is deliberately left
+  uncompleted: its values need a full scan, and a tab key that hangs the
+  terminal is worse than one that does nothing.
 
 - **`--fail-on` gates a pipeline on exposure.** An exit code is the smallest
   possible CI integration and it fits the read-only promise exactly: the tool
@@ -24,6 +103,43 @@
   outcome separately.
 
 ### Fixed
+
+- **The report crashed on any terminal whose codec could not carry its
+  glyphs.** A Windows console, or a redirect under a legacy locale, raised
+  `UnicodeEncodeError` on the section rule and killed the run with a traceback
+  instead of printing a report. This affected every human-readable mode, not
+  one flag.
+
+  The glyphs now degrade to ASCII that says the same thing, with
+  `errors="replace"` behind it so a character in *your* data can never be fatal
+  either. `--json` is deliberately excluded from the substitution: rewriting a
+  glyph there would silently alter the payload, so it gets a codec that can
+  carry it instead. The report digest is identical under both.
+
+  The README claimed cross-platform and CI does test Windows, but every test
+  captured output through `StringIO`, which has no codec and structurally
+  cannot fail this way. It surfaced only when a new test ran the CLI as a real
+  subprocess writing to a pipe.
+
+- **`--watch` could hold a credential alert in a buffer for hours.** The event
+  lines did not flush. On a terminal that is invisible, because Python
+  line-buffers a tty — but under a service manager stdout is a file or a pipe
+  and is block-buffered, so the one message the feature exists to deliver could
+  sit unwritten until 8KB of other output pushed it out. Both alert paths now
+  flush, and both generated units set `PYTHONUNBUFFERED=1`.
+
+- **The empty report explained nothing.** `no matching activity found` covered
+  three unrelated situations: nothing installed, sessions present but filtered
+  out, and `--root` pointed somewhere wrong. Each now says which one it is —
+  naming every directory checked, or the filter that excluded everything, with
+  the newest session's date and the `--days` value that would include it.
+  `--root` is validated before the scan rather than after, so the actionable
+  message is not buried under a generic one.
+
+- **`command_head` reported `#` and `verify()` as programs.** A comment ran
+  nothing, and a function *definition* is not a function *call*; both were
+  reaching the shell-audit tables as if they were commands. A comment now
+  yields no program at all, and a definition reports the program in its body.
 
 - **A suppressed credential still produced its coach finding.** Suppressing
   silenced the direct report and left the diagnosis derived from it, so

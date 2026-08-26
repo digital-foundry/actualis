@@ -35,7 +35,7 @@ from typing import NamedTuple
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
 # --------------------------------------------------------------------------
 # Pricing
@@ -570,6 +570,7 @@ _TAKES_PATH_ARG = {"cd", "pushd", "popd"}
 # the CONDITION and `cat` is the work. Reporting `[` as the most-run program is
 # technically true and useless.
 _CONDITION_WORDS = {"[", "[[", "]", "]]", "test"}
+_FUNCTION_DEF = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\(\)$")
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 # `2>/dev/null`, `>out`, `>>log`, `2>&1`, `<in` — a redirection is never the
 # program. Skipping `cd` plus its path argument used to leave the redirect as
@@ -1005,6 +1006,12 @@ def command_head(cmd: str) -> str | None:
                 continue                      # `if CMD`: the operand IS a program
             if tok == "\\":
                 continue                      # line continuation, not a program
+            if tok.startswith("#"):
+                break                         # comment: nothing after it runs
+            if _FUNCTION_DEF.match(tok):
+                # `verify() { rm -rf x; }` defines a function; it does not run
+                # one. Skip the name so the body's real program is reported.
+                continue
             if _REDIRECT.match(tok):
                 continue                      # redirection, not a program
             if tok.startswith("-"):
@@ -1013,8 +1020,13 @@ def command_head(cmd: str) -> str | None:
                 skip_next = True              # `cd /some/path && real-cmd`
                 continue
             return tok
+    # Nothing in any segment looked like a program. Fall back to the first
+    # token, except when it opens a comment -- a command that is only a comment
+    # ran nothing, and reporting `#` as a program put it in the flag tables.
     first = cmd.strip().split()
-    return first[0] if first else None
+    if not first or first[0].startswith("#"):
+        return None
+    return first[0]
 
 
 # --------------------------------------------------------------------------
@@ -1149,6 +1161,105 @@ def report_url(kind: str, detail: str) -> str:
 # --------------------------------------------------------------------------
 # Transcript scanning
 # --------------------------------------------------------------------------
+
+def no_transcripts_message() -> str:
+    """Why nothing was found, and what to do about it.
+
+    The free tool is the distribution strategy, so its worst moment should not
+    be its first. `no transcripts found` then exit told a new user nothing about
+    what was looked for -- and it is the exact message someone sees if they
+    install before running an agent, or if their config lives somewhere the
+    defaults do not cover.
+    """
+    lines = ["actualis: no agent transcripts found.", "", "Looked in:"]
+    checked = [
+        (Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser() / "projects",
+         "Claude Code", "CLAUDE_CONFIG_DIR"),
+        (Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser() / "sessions",
+         "Codex", "CODEX_HOME"),
+    ]
+    for path, label, env in checked:
+        parent_exists = path.parent.is_dir()
+        if path.is_dir():
+            state = "exists but holds no sessions yet"
+        elif parent_exists:
+            state = f"{label} is installed but has not been run"
+        else:
+            state = f"no sign of {label} on this machine"
+        lines.append(f"  {path}")
+        lines.append(f"      {state}")
+        if os.environ.get(env):
+            lines.append(f"      (from ${env})")
+    lines += [
+        "",
+        "If your config lives elsewhere, point at it:",
+        "  CLAUDE_CONFIG_DIR=/path/to/config actualis",
+        "  CODEX_HOME=/path/to/codex actualis",
+        "  actualis --root /path/to/a/transcript/directory",
+        "",
+        "Nothing is wrong with the install. There is simply nothing to read yet:",
+        "this tool only reports on sessions an agent has already written.",
+    ]
+    return "\n".join(lines)
+
+
+def dead_end_message(fleet: "Fleet", args) -> str:
+    """Why this run found nothing, and what to change.
+
+    `no matching activity found` covered three unrelated situations: nothing
+    installed, sessions present but filtered out, and a --root pointed at the
+    wrong directory. Only the last two are the user's to fix, and the fix
+    differs. This runs only when the report is empty, so it can afford to go
+    back to disk and look.
+    """
+    roots = list(fleet.roots)
+    if not roots and not args.root:
+        return no_transcripts_message()
+
+    if args.root:
+        roots = [Path(args.root).expanduser()]
+
+    # What is actually on disk, ignoring every filter this run applied.
+    files, newest = 0, None
+    for root in roots:
+        for f in root.rglob("*.jsonl"):
+            files += 1
+            try:
+                mtime = f.stat().st_mtime
+            except OSError:
+                continue
+            if newest is None or mtime > newest:
+                newest = mtime
+
+    where = ", ".join(str(r) for r in roots)
+    if files == 0:
+        return (f"actualis: no session files under {where}.\n"
+                "  The directory exists but holds no .jsonl transcripts. If your agent\n"
+                "  stores sessions elsewhere, pass that directory with --root.")
+
+    # Files exist, so a filter removed all of them. Name the one that did it.
+    plural = "" if files == 1 else "s"
+    lines = [f"actualis: {files:,} session file{plural} found, "
+             "none matched this run's filters."]
+    if args.days is not None:
+        lines.append(f"  --days {args.days} keeps only sessions since "
+                     f"{window_start(args.days, datetime.now(timezone.utc)):%Y-%m-%d}.")
+        if newest is not None:
+            last = datetime.fromtimestamp(newest, timezone.utc)
+            age = (datetime.now(timezone.utc) - last).days
+            lines.append(f"  The newest session is {last:%Y-%m-%d} ({age} days ago). "
+                         f"Try --days {max(age + 1, 1)}.")
+    if args.project:
+        lines.append(f"  --project {args.project!r} matched no project name. "
+                     "Drop it to see every project.")
+    if args.agent != "all":
+        lines.append(f"  --agent {args.agent} reads only that vendor. "
+                     "Drop it to read both.")
+    if args.days is None and not args.project and args.agent == "all":
+        lines.append("  No filters were applied, so these files carry no usage records --\n"
+                     "  they may be from a different tool, or truncated.")
+    return "\n".join(lines)
+
 
 def transcript_roots() -> list[Path]:
     """Every Claude Code transcript directory on this machine.
@@ -2091,6 +2202,195 @@ def coach(fleet: "Fleet") -> list[Finding]:
     return out
 
 
+# --- comparing two runs -----------------------------------------------------
+
+# Severity vocabularies differ between the three entity families, so rank them
+# on one scale to say "got worse" rather than just "changed".
+DIFF_MAX_ROWS = 15
+
+_SEVERITY_RANK = {"low": 0, "info": 0, "med": 1, "medium": 1,
+                  "high": 2, "critical": 3}
+
+
+def _rank(severity: str) -> int:
+    return _SEVERITY_RANK.get(str(severity).lower(), -1)
+
+
+def load_report(path: Path) -> dict:
+    """Read a saved --json payload, refusing anything we cannot compare.
+
+    A diff against a payload from a different schema is worse than no diff: it
+    silently reports every renamed key as a change. Refuse instead.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"cannot read {path}: {exc.strerror or exc}") from None
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"{path} is not valid JSON: {exc}") from None
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} is not an actualis report (expected an object)")
+    if "schema_version" not in data:
+        raise ValueError(
+            f"{path} has no schema_version, so it is not an actualis --json report")
+    got = data["schema_version"]
+    if got != JSON_SCHEMA_VERSION:
+        raise ValueError(
+            f"{path} uses schema_version {got}; this build writes "
+            f"{JSON_SCHEMA_VERSION}. Regenerate the baseline with this version "
+            "rather than comparing across schemas.")
+    return data
+
+
+def _by_id(rows: object) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    if isinstance(rows, list):
+        for r in rows:
+            if isinstance(r, dict) and r.get("id"):
+                out[str(r["id"])] = r
+    return out
+
+
+def _flag_kinds(payload: dict) -> dict[str, dict]:
+    """Flag ids name a *kind* of command, not one occurrence, so count them."""
+    bash = payload.get("bash")
+    rows = bash.get("flags") if isinstance(bash, dict) else None
+    out: dict[str, dict] = {}
+    if isinstance(rows, list):
+        for r in rows:
+            if not isinstance(r, dict) or not r.get("id"):
+                continue
+            fid = str(r["id"])
+            cur = out.setdefault(fid, {"id": fid, "severity": r.get("severity", ""),
+                                       "program": r.get("program", ""),
+                                       "categories": r.get("categories") or [],
+                                       "count": 0})
+            cur["count"] += 1
+    return out
+
+
+def diff_reports(old: dict, new: dict) -> dict:
+    """What appeared, what went away, and what got worse."""
+    families = [
+        ("secrets", _by_id(old.get("secrets")), _by_id(new.get("secrets")),
+         "priority", "credential"),
+        ("findings", _by_id(old.get("coach")), _by_id(new.get("coach")),
+         "severity", "finding"),
+        ("flags", _flag_kinds(old), _flag_kinds(new), "severity", "command kind"),
+    ]
+    out: dict = {"families": {}, "totals": {}}
+    for name, o, n, sev_key, noun in families:
+        appeared = [n[k] for k in n if k not in o]
+        resolved = [o[k] for k in o if k not in n]
+        worse, better, moved = [], [], []
+        for k in n:
+            if k not in o:
+                continue
+            ro, rn = _rank(o[k].get(sev_key, "")), _rank(n[k].get(sev_key, ""))
+            if rn > ro:
+                worse.append((o[k], n[k]))
+            elif rn < ro:
+                better.append((o[k], n[k]))
+            elif "count" in n[k] and n[k]["count"] != o[k].get("count"):
+                moved.append((o[k], n[k]))
+        out["families"][name] = {"noun": noun, "sev_key": sev_key,
+                                 "appeared": appeared, "resolved": resolved,
+                                 "worse": worse, "better": better, "moved": moved}
+    for key in ("cost_usd", "messages"):
+        ov, nv = old.get(key), new.get(key)
+        if isinstance(ov, (int, float)) and isinstance(nv, (int, float)):
+            out["totals"][key] = (ov, nv)
+    out["windows"] = (
+        (old.get("window") or {}).get("from"), (old.get("window") or {}).get("to"),
+        (new.get("window") or {}).get("from"), (new.get("window") or {}).get("to"))
+    out["digests"] = (old.get("report_sha256"), new.get("report_sha256"))
+    return out
+
+
+def _label(row: dict, family: str) -> str:
+    if family == "secrets":
+        types = ", ".join(row.get("types") or []) or "unknown type"
+        where = ", ".join(row.get("projects") or [])
+        return f"{types}" + (f"  in {where}" if where else "")
+    if family == "findings":
+        return str(row.get("title") or "")
+    prog = row.get("program") or "?"
+    cats = ", ".join(row.get("categories") or [])
+    return f"{prog}" + (f"  ({cats})" if cats else "")
+
+
+def render_diff(d: dict, c: C) -> None:
+    rule(c, "DIFF")
+    of, ot, nf, nt = d["windows"]
+    print(f"  baseline   {of or '?'} → {ot or '?'}")
+    print(f"  this run   {nf or '?'} → {nt or '?'}")
+    od, nd = d["digests"]
+    if od and nd and od == nd:
+        print(f"\n  {c.ok}Identical report.{c.off} {c.dim}Same digest ({od[:16]}), "
+              f"so nothing below changed.{c.off}\n")
+        return
+
+    changed = False
+    for family, blk in d["families"].items():
+        noun = blk["noun"]
+        rows = []
+        for r in blk["appeared"]:
+            sev = r.get(blk["sev_key"], "")
+            rows.append((_rank(sev), "new", sev, _label(r, family), ""))
+        for r in blk["resolved"]:
+            sev = r.get(blk["sev_key"], "")
+            rows.append((_rank(sev), "gone", sev, _label(r, family), ""))
+        for ro, rn in blk["worse"]:
+            rows.append((_rank(rn.get(blk["sev_key"], "")), "worse",
+                         rn.get(blk["sev_key"], ""), _label(rn, family),
+                         f"was {ro.get(blk['sev_key'], '')}"))
+        for ro, rn in blk["better"]:
+            rows.append((_rank(rn.get(blk["sev_key"], "")), "better",
+                         rn.get(blk["sev_key"], ""), _label(rn, family),
+                         f"was {ro.get(blk['sev_key'], '')}"))
+        for ro, rn in blk["moved"]:
+            delta = rn["count"] - ro.get("count", 0)
+            rows.append((_rank(rn.get(blk["sev_key"], "")), "count",
+                         rn.get(blk["sev_key"], ""), _label(rn, family),
+                         f"{ro.get('count', 0)} → {rn['count']} ({delta:+d})"))
+        if not rows:
+            continue
+        changed = True
+        print(f"\n  {c.bold}{noun}s{c.off}")
+        ordered = sorted(rows, key=lambda r: (-r[0], r[1]))
+        shown, dropped = ordered[:DIFF_MAX_ROWS], len(ordered) - DIFF_MAX_ROWS
+        for _, kind, sev, label, note in shown:
+            col = (c.red if kind in ("new", "worse") and _rank(sev) >= 2
+                   else c.ok if kind in ("gone", "better")
+                   else c.yellow if kind in ("new", "worse") else c.dim)
+            mark = {"new": "+", "gone": "-", "worse": "^", "better": "v",
+                    "count": "~"}[kind]
+            tail = f"  {c.dim}{note}{c.off}" if note else ""
+            print(f"    {col}{mark}{c.off} {sev:<8} {label}{tail}")
+        if dropped > 0:
+            # Never truncate silently: a hidden row reads as "nothing there".
+            print(f"    {c.dim}... and {dropped} more, lowest severity first. "
+                  f"Compare the saved payloads directly to see every row.{c.off}")
+
+    if not changed:
+        print(f"\n  {c.dim}No credential, finding or command-kind changed. "
+              f"The digests differ on volume alone.{c.off}")
+
+    if d["totals"]:
+        print(f"\n  {c.bold}totals{c.off}")
+        for key, (ov, nv) in d["totals"].items():
+            delta = nv - ov
+            arrow = "+" if delta > 0 else ""
+            if key == "cost_usd":
+                print(f"    cost      ${ov:,.2f} → ${nv:,.2f}  "
+                      f"{c.dim}({arrow}{delta:,.2f}){c.off}")
+            else:
+                print(f"    {key:<9} {ov:,} → {nv:,}  {c.dim}({arrow}{delta:,}){c.off}")
+    print()
+
+
 def render_coach(findings: list[Finding], c: C) -> None:
     rule(c, "COACH")
     if not findings:
@@ -2247,8 +2547,12 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
                             seen_secrets.add(fp)
                             crit += 1
                             msg = f"{kind} in {project}"
+                            # flush: under a service manager stdout is a file,
+                            # so it is block-buffered. Without this an alert can
+                            # sit unwritten for hours -- which is the whole
+                            # point of the feature, lost to an 8KB buffer.
                             print(f"\r{c.red}▲ SECRET{c.off}  {msg}  {c.dim}{fp}{c.off}"
-                                  + " " * 20)
+                                  + " " * 20, flush=True)
                             notify("actualis: credential exposed", msg)
                         hits = audit_command(command)
                         high = [h for h in hits if h[0] == "high"]
@@ -2257,7 +2561,8 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
                             cats = ",".join(sorted({h[1] for h in high}))
                             line_txt = high[0][2] if raw else redact(high[0][2])
                             print(f"\r{c.yellow}▲ {cats}{c.off}  {line_txt[:88]}"
-                                  f"  {c.dim}{project[:28]}{c.off}" + " " * 10)
+                                  f"  {c.dim}{project[:28]}{c.off}" + " " * 10,
+                                  flush=True)
                             if not quiet:
                                 notify(f"actualis: {cats}", line_txt[:120])
 
@@ -2417,6 +2722,60 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "measurements.",
         ],
         "verify": "actualis --json | jq '.vendors'",
+    },
+    "diff": {
+        "measures": "What changed between a saved report and this one.",
+        "formula": [
+            "  actualis --json > baseline.json     # today",
+            "  actualis --diff baseline.json       # next week",
+            "",
+            "Three families are compared, each by a stable id:",
+            "  credentials    secrets[].id     fingerprint of the secret itself",
+            "  findings       coach[].id       AF0nn",
+            "  command kinds  bash.flags[].id  severity + categories + program",
+            "",
+            "  +  appeared since the baseline      -  no longer present",
+            "  ^  higher severity than before      v  lower severity",
+            "  ~  same severity, different count",
+            "",
+            "A flag id names a KIND of command, not one occurrence, so the same",
+            "id appearing more often shows as a count change rather than as new.",
+        ],
+        "assumes": [
+            "Both reports came from this schema version. A baseline written by a",
+            "different schema is refused rather than compared, because a renamed",
+            "key is indistinguishable from a real change.",
+            "Absence is not proof of rotation: a credential drops out when it stops",
+            "appearing in the window, which --days alone can cause.",
+        ],
+        "verify": "actualis --json > /tmp/a.json && actualis --diff /tmp/a.json  "
+                  "# identical run reports no change",
+    },
+    "verify": {
+        "measures": "Whether this build did what it claims: no network, no writes.",
+        "formula": [
+            "  actualis --self-check        # exits non-zero if any check fails",
+            "",
+            "imports    every module the shipped source imports, at any depth.",
+            "           A Python process cannot open a network connection without",
+            "           socket, so socket's absence is stronger evidence than",
+            "           'we never called requests'.",
+            "integrity  a sample of your transcripts, sha256 + size + mtime,",
+            "           taken before a real scan and again after.",
+            "tree       every file under the transcript roots, counted before and",
+            "           after, so a created or deleted file is visible.",
+            "writes     the only paths this build can write to, named in full.",
+            "identity   this file's own sha256, to compare with the published wheel.",
+        ],
+        "assumes": [
+            "That the interpreter and the operating system are honest. A compiled",
+            "extension, a patched interpreter, or a modified copy of this file",
+            "could defeat every check above.",
+            "Passing is a FLOOR, not a guarantee: it describes the run you just",
+            "made, not every run this build could make. The stronger check is to",
+            "watch the process from outside, which --self-check prints for you.",
+        ],
+        "verify": "actualis --self-check --days 1  # then read the source: one file",
     },
     "suppressions": {
         "measures": "Findings you have marked as false positives on this machine.",
@@ -3143,6 +3502,84 @@ def money(x: float) -> str:
 
 def num(x: int) -> str:
     return f"{x:,}"
+
+
+# --------------------------------------------------------------------------
+# Output encoding
+#
+# The report uses a handful of non-ASCII glyphs. On a stream whose codec cannot
+# represent them -- a Windows console or a redirect under a legacy locale --
+# printing them raises UnicodeEncodeError and the whole run dies with a
+# traceback instead of a report. The README claims cross-platform, and CI does
+# test Windows, but only through in-process StringIO captures, which have no
+# codec at all; nothing ever wrote to a real pipe there.
+#
+# Rather than crash or emit replacement characters, degrade to ASCII that says
+# the same thing.
+
+_GLYPH_FALLBACK = {
+    "·": "*",      # separator between inline stats
+    "—": "--",
+    "…": "...",
+    "▲": "!",      # a --watch alert
+    "→": "->",
+    "×": "x",      # cache multiplier
+    "─": "-",      # section rule
+    "█": "#",      # bar chart
+}
+_GLYPH_TABLE = str.maketrans(_GLYPH_FALLBACK)
+
+
+def _stream_handles_glyphs(stream) -> bool:
+    enc = getattr(stream, "encoding", None)
+    if not enc:
+        return True                    # StringIO and friends: no codec to fail
+    try:
+        "".join(_GLYPH_FALLBACK).encode(enc)
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
+
+
+class _AsciiFallbackStream:
+    """A text stream that swaps glyphs its codec cannot encode.
+
+    Deliberately NOT used for --json: translating there would silently rewrite
+    the data (a project name containing a middle dot would come back changed),
+    and a machine-readable payload must be reproduced exactly.
+    """
+
+    def __init__(self, stream) -> None:
+        self._stream = stream
+
+    def write(self, text: str) -> int:
+        return self._stream.write(text.translate(_GLYPH_TABLE))
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def make_output_printable(json_mode: bool) -> None:
+    """Guarantee that printing a report cannot raise on this terminal."""
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is None or _stream_handles_glyphs(stream):
+            continue
+        if json_mode and name == "stdout":
+            # JSON is defined in terms of Unicode; give it a codec that can
+            # carry it rather than rewriting its content.
+            try:
+                stream.reconfigure(encoding="utf-8")
+                continue
+            except (AttributeError, OSError, ValueError):
+                pass
+        # errors="replace" is the backstop: it catches user data and any glyph
+        # not in the table above, so a stray character can never be fatal.
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
+        setattr(sys, name, _AsciiFallbackStream(stream))
 
 
 def rule(c: C, title: str = "", width: int = 74) -> None:
@@ -4003,14 +4440,581 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
 
 
 # --------------------------------------------------------------------------
+# Background service
+#
+# The README used to carry a plist template with __PLACEHOLDERS__ and a sed
+# line to fill them. That is a recipe, and recipes get mistyped. These are
+# generated with the paths already resolved on the machine that will run them.
+#
+# The unit goes to stdout and the install commands to stderr, so
+# `actualis --service launchd > file` writes a valid file and still tells you
+# what to do with it. Nothing here writes anything: the read-only guarantee is
+# the product, and it does not get an exception for convenience.
 
-def main(argv: list[str] | None = None) -> int:
+SERVICE_KINDS = ("launchd", "systemd", "newsyslog")
+SERVICE_LABEL = "app.actualis.watch"
+SERVICE_LOG = "~/Library/Logs/actualis-watch.log"
+
+
+def _actualis_command() -> list[str]:
+    """How to invoke this build, resolved now rather than guessed later.
+
+    A service manager has no PATH worth relying on, so both parts are absolute.
+    """
+    import shutil                      # local, as elsewhere in this file
+
+    # argv[0] first, because it is THIS build. Asking PATH instead means a
+    # venv or pipx install that is not on PATH generates a unit pointing at
+    # some other installation, and the service then runs a different version
+    # than the one that wrote it -- silently, and possibly for months.
+    argv0 = Path(sys.argv[0]) if sys.argv and sys.argv[0] else None
+    if argv0 and argv0.suffix != ".py":
+        try:
+            resolved = argv0.resolve()
+            if resolved.is_file() and os.access(resolved, os.X_OK):
+                return [str(resolved)]
+        except OSError:
+            pass
+
+    entry = shutil.which("actualis")
+    if entry:
+        return [str(Path(entry).resolve())]
+
+    # Running from a source checkout: name the interpreter explicitly, since a
+    # service manager will not consult a shebang or a virtualenv for us.
+    return [sys.executable, str(Path(__file__).resolve())]
+
+
+def _xml_escape(text: str) -> str:
+    return (text.replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def service_unit(kind: str, interval: float = 4.0, quiet: bool = False) -> str:
+    # `--interval 4.0` is valid but reads like a mistake in a unit file.
+    secs = f"{interval:g}"
+    argv = _actualis_command() + ["--watch", "--interval", secs]
+    if quiet:
+        argv.append("--quiet")
+    log = Path(SERVICE_LOG).expanduser()
+
+    if kind == "launchd":
+        args = "\n".join(f"      <string>{_xml_escape(a)}</string>" for a in argv)
+        return f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Generated by actualis {__version__} on this machine; paths are already
+     resolved. A LaunchAgent, not a LaunchDaemon, on purpose: notifications
+     only post inside your logged-in session, and it should hold exactly your
+     permissions and no more. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{SERVICE_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+{args}
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- stdout is a file here, so Python would block-buffer it and an alert
+         could sit unwritten for hours. -->
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>{_xml_escape(str(log))}</string>
+  <key>StandardErrorPath</key>
+  <string>{_xml_escape(str(log))}</string>
+</dict>
+</plist>
+'''
+
+    if kind == "systemd":
+        cmd = " ".join(argv)
+        return f'''# Generated by actualis {__version__} on this machine.
+# A user unit, not a system one: it must run as you, with your permissions.
+# Logs go to the journal, which rotates on its own -- read them with
+#   journalctl --user -u actualis-watch -f
+[Unit]
+Description=actualis --watch: alert on credentials and risky commands
+Documentation=https://actualis.app
+After=default.target
+
+[Service]
+Type=simple
+ExecStart={cmd}
+Restart=always
+RestartSec=10
+# stdout is a pipe to the journal, so Python would block-buffer it.
+Environment=PYTHONUNBUFFERED=1
+# It only ever reads. Say so to the service manager as well as in the README.
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
+'''
+
+    # newsyslog: macOS has no journald, so rotation is opt-in and needs root.
+    #
+    # Flags are NC, not the usual GJ: G means "this path is a glob", which it is
+    # not, and there is no process to signal (N) because launchd -- not
+    # actualis -- opened this file. That has a consequence worth stating in the
+    # file itself rather than burying in a doc, so it is a comment below.
+    return f'''# Generated by actualis {__version__}. Optional: macOS log rotation.
+# Only events are logged (the heartbeat is suppressed when stdout is not a
+# terminal), so this file grows slowly -- but it grows.
+#
+# launchd holds this file open, so after a rotation the agent keeps writing to
+# the OLD file until it restarts. Rotation is therefore not fully automatic on
+# macOS. Kick the agent to make it pick up the new file:
+#
+#   launchctl kickstart -k gui/$(id -u)/{SERVICE_LABEL}
+#
+# On Linux this problem does not exist: the journal handles it.
+#
+# logfile                       owner:group  mode count size(KB) when flags
+{log}  {os.environ.get("USER", "root")}:staff  644  5  1024  *  NC
+'''
+
+
+def service_install_notes(kind: str) -> str:
+    log = Path(SERVICE_LOG).expanduser()
+    if kind == "launchd":
+        return f"""
+Install (one command):
+
+  actualis --service launchd > ~/Library/LaunchAgents/{SERVICE_LABEL}.plist &&
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/{SERVICE_LABEL}.plist
+
+Uninstall (one command):
+
+  launchctl bootout gui/$(id -u)/{SERVICE_LABEL} &&
+    rm ~/Library/LaunchAgents/{SERVICE_LABEL}.plist
+
+Check it, read it:
+
+  launchctl print gui/$(id -u)/{SERVICE_LABEL} | head -20
+  tail -f {log}
+
+Log rotation is opt-in on macOS and needs root:
+
+  actualis --service newsyslog | sudo tee /etc/newsyslog.d/actualis.conf
+
+launchd holds the log open, so after a rotation the agent keeps writing to the
+old file until it restarts. Kick it to pick up the new one:
+
+  launchctl kickstart -k gui/$(id -u)/{SERVICE_LABEL}
+
+If notifications do not appear, allow them for Script Editor in
+System Settings > Notifications.
+"""
+    if kind == "systemd":
+        return """
+Install (one command):
+
+  actualis --service systemd > ~/.config/systemd/user/actualis-watch.service &&
+    systemctl --user daemon-reload &&
+    systemctl --user enable --now actualis-watch
+
+Uninstall (one command):
+
+  systemctl --user disable --now actualis-watch &&
+    rm ~/.config/systemd/user/actualis-watch.service &&
+    systemctl --user daemon-reload
+
+Check it, read it:
+
+  systemctl --user status actualis-watch
+  journalctl --user -u actualis-watch -f
+
+Logs go to the journal and rotate with it; there is no file to prune.
+To keep it running after you log out:  loginctl enable-linger $USER
+"""
+    return """
+Install (needs root, because /etc does):
+
+  actualis --service newsyslog | sudo tee /etc/newsyslog.d/actualis.conf
+
+Uninstall:
+
+  sudo rm /etc/newsyslog.d/actualis.conf
+"""
+
+
+# --------------------------------------------------------------------------
+# Self-check
+#
+# docs/verify/ told a sceptic how they could verify the privacy claims. Almost
+# nobody follows a page of instructions, and the claims ARE the product. This
+# runs the checks instead, on the user's own machine, against their own files.
+#
+# It is a floor, not a guarantee, and it says so: it proves that THIS run did
+# not do the things claimed, not that no run ever could.
+
+# Any network operation in pure Python goes through socket. If socket was never
+# imported, this process could not have opened a connection -- which is a much
+# stronger statement than "we did not call requests".
+_NETWORK_MODULES = (
+    "socket", "ssl", "http", "urllib", "ftplib", "smtplib", "poplib",
+    "imaplib", "telnetlib", "xmlrpc", "asyncio", "selectors", "socketserver",
+    "requests", "httpx", "urllib3", "aiohttp",
+)
+
+# Both import forms, anchored so that prose in a docstring cannot masquerade
+# as one -- `from a non-zero exit and callers` matched a looser pattern and
+# reported a module named "a". Indented imports are matched too: a lazy
+# `import socket` inside a function is exactly what this check exists to catch.
+_IMPORT_RE = re.compile(
+    r"^[ \t]*(?:"
+    r"import[ \t]+([\w.]+)(?:[ \t]+as[ \t]+\w+)?[ \t]*(?:\#.*)?$"
+    r"|from[ \t]+([\w.]+)[ \t]+import[ \t]"
+    r")", re.M)
+
+
+def imports_in(src: str) -> list[str]:
+    """Top-level module names imported anywhere in a Python source string."""
+    names = set()
+    for a, b in _IMPORT_RE.findall(src):
+        name = (a or b).split(".")[0]
+        if name:
+            names.add(name)
+    return sorted(names)
+
+
+SELF_CHECK_SAMPLE = 200      # files hashed before and after; whole-corpus is slow
+
+
+def _digest_file(path: Path) -> tuple[str, int, float] | None:
+    try:
+        st = path.stat()
+        h = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest(), st.st_size, st.st_mtime
+    except OSError:
+        return None
+
+
+def _tree_state(roots: list[Path]) -> dict[str, tuple[int, float]]:
+    """Every file under the roots, by size and mtime. Cheap; no hashing."""
+    state: dict[str, tuple[int, float]] = {}
+    for root in roots:
+        try:
+            for f in root.rglob("*"):
+                if f.is_file():
+                    try:
+                        st = f.stat()
+                    except OSError:
+                        continue
+                    state[str(f)] = (st.st_size, st.st_mtime)
+        except OSError:
+            continue
+    return state
+
+
+def self_check(c: C, days: int | None = 7, root: str | None = None) -> int:
+    """Verify the privacy claims by executing them. Returns an exit code.
+
+    Honours --root: if you tell the tool which directory to read, that is the
+    directory whose integrity you want proven. Ignoring it meant --self-check
+    verified a corpus the user had not asked about.
+    """
+    rule(c, "SELF CHECK")
+    ok = True
+
+    def result(passed: bool, label: str, detail: str) -> None:
+        nonlocal ok
+        if not passed:
+            ok = False
+        mark = f"{c.ok}pass{c.off}" if passed else f"{c.red}FAIL{c.off}"
+        print(f"  [{mark}]  {c.bold}{label}{c.off}")
+        for line in _wrap(detail, 78):
+            print(f"          {c.dim}{line}{c.off}")
+
+    skips = 0
+
+    def skipped(label: str, why: str) -> None:
+        nonlocal skips
+        skips += 1
+        # "Prints what it checked AND what it could not" -- a check silently
+        # not run reads as a check that passed.
+        print(f"  [{c.dim}skip{c.off}]  {c.bold}{label}{c.off}")
+        for line in _wrap(why, 78):
+            print(f"          {c.dim}{line}{c.off}")
+
+    roots = ([Path(root).expanduser()] if root
+             else transcript_roots() + codex_roots())
+
+    # 1. What this build imports at all. Read from the source, so it describes
+    #    the shipped file rather than whatever is loaded right now.
+    try:
+        imported = imports_in(Path(__file__).read_text(encoding="utf-8"))
+    except OSError:
+        imported = []
+    net_in_source = [m for m in imported if m in _NETWORK_MODULES]
+    result(not net_in_source,
+           "no networking module is imported by this build",
+           f"imports: {', '.join(imported) or 'none'}. "
+           + ("Networking found: " + ", ".join(net_in_source) if net_in_source
+              else "None of these can open a socket."))
+
+    # 2. Sample the transcripts, hash them, scan, hash again. The checks below
+    #    need a corpus; the ones above and below them do not, and skipping the
+    #    whole run when there is nothing to read would hide the ones that are
+    #    always meaningful.
+    sample: list[Path] = []
+    for root in roots:
+        for f in root.rglob("*.jsonl"):
+            sample.append(f)
+            if len(sample) >= SELF_CHECK_SAMPLE:
+                break
+        if len(sample) >= SELF_CHECK_SAMPLE:
+            break
+    if not roots or not sample:
+        why = ("No transcript directories on this machine."
+               if not roots else
+               "Transcript directories exist but hold no session files yet.")
+        skipped("transcripts unmodified by the scan",
+                why + " Nothing was read, so there is nothing to compare. "
+                "Run an agent, then run this again.")
+        skipped("no file created or deleted under the transcript roots",
+                "Same reason: there is no tree to compare.")
+    else:
+        _self_check_corpus(roots, sample, result, c, days)
+
+    # 3. Where this build is allowed to write, named explicitly.
+    writable = [str(p) for p in suppression_paths()]
+    result(True, "the only write path in this build",
+           "Suppressions, and only when you pass --suppress: "
+           + "; ".join(writable))
+
+    # 4. What the binary itself is, so it can be compared with what was published.
+    try:
+        me = Path(__file__)
+        d = _digest_file(me)
+        if d:
+            result(True, "this build, by content",
+                   f"{me.name} {d[1]:,} bytes, sha256 {d[0][:32]}... "
+                   "Compare with the published wheel to confirm you are running "
+                   "what was released.")
+    except OSError:
+        pass
+
+    print(f"\n  {c.bold}What this does not prove{c.off}")
+    for line in (
+        "This checked THIS run on THIS machine. It is a floor, not a guarantee.",
+        "It cannot rule out a compiled extension, a modified copy, or anything "
+        "the operating system did on the tool's behalf.",
+        "For a stronger answer, watch the process yourself. On macOS: "
+        "sudo lsof -p $(pgrep -f actualis) | grep -i tcp   -- expect nothing. "
+        "On Linux: strace -f -e trace=network actualis --days 1.",
+    ):
+        for out in _wrap(line, 78):
+            print(f"    {c.dim}{out}{c.off}")
+    # "All checks passed" while two were skipped is the exact kind of overclaim
+    # this whole feature exists to avoid.
+    if not ok:
+        verdict = f"{c.red}A check failed. Do not trust this build.{c.off}"
+    elif skips:
+        verdict = (f"{c.ok}Every check that could run passed{c.off}, "
+                   f"{c.yellow}{skips} could not run{c.off} on this machine.")
+    else:
+        verdict = f"{c.ok}All checks passed.{c.off}"
+    print(f"\n  {verdict}\n")
+    return EXIT_OK if ok else EXIT_FINDINGS
+
+
+def _self_check_corpus(roots: list[Path], sample: list[Path], result, c: C,
+                       days: int | None) -> None:
+    """The checks that need something to read.
+
+    Split out so that the checks which do NOT need a corpus -- the import scan,
+    the write path, this build's own digest -- are never skipped along with
+    them. A machine with no transcripts can still verify most of the claims.
+    """
+    before = {f: _digest_file(f) for f in sample}
+    tree_before = _tree_state(roots)
+
+    fleet = Fleet()
+    since = window_start(days, datetime.now(timezone.utc)) if days else None
+    fleet.scan(roots, since, None, progress=False)
+
+    changed = [str(f) for f in sample if _digest_file(f) != before[f]]
+    result(not changed,
+           f"transcripts unmodified by the scan "
+           f"({len(sample)} file{'' if len(sample) == 1 else 's'} hashed)",
+           "Content, size and mtime are identical before and after. "
+           + ("Changed: " + ", ".join(changed[:3]) if changed
+              else "A read-only tool leaves no trace, and this is that claim "
+                   "executed rather than asserted."))
+
+    tree_after = _tree_state(roots)
+    added = sorted(set(tree_after) - set(tree_before))
+    removed = sorted(set(tree_before) - set(tree_after))
+    # An agent writing to its own transcript DURING the check is expected and
+    # is not this tool's doing; report it as an observation rather than a fail.
+    touched = [k for k in set(tree_before) & set(tree_after)
+               if tree_before[k] != tree_after[k]]
+    result(not added and not removed,
+           "no file created or deleted under the transcript roots",
+           f"{len(tree_before):,} file{'' if len(tree_before) == 1 else 's'} "
+           f"before, {len(tree_after):,} after."
+           + (f" Added: {len(added)}, removed: {len(removed)}."
+              if (added or removed) else ""))
+    if touched:
+        print(f"          {c.dim}{len(touched)} file(s) changed while the check ran. "
+              f"A live agent session writes to its own transcript; that is the "
+              f"agent, not this tool.{c.off}")
+
+
+# --------------------------------------------------------------------------
+# Shell completions
+#
+# Generated from the parser rather than hand-written, so a new flag cannot be
+# missing from them and a renamed --explain topic cannot go stale. The one
+# thing deliberately NOT completed is --suppress: its values are finding ids
+# from the user's own report, and producing them means a full scan, which on a
+# real corpus takes minutes. A tab key that hangs the terminal is worse than a
+# tab key that does nothing.
+
+COMPLETION_SHELLS = ("bash", "zsh", "fish")
+
+_VALUE_HINT = {          # option -> how the shell should complete its argument
+    "--root": "dir",
+    "--diff": "file",
+}
+
+
+def _finding_ids() -> list[str]:
+    """Every AFxxx this build can emit, read out of the source, not a copy.
+
+    A hand-kept list here would drift from coach() silently. If the source is
+    unreadable (frozen build), complete nothing rather than complete wrongly.
+    """
+    try:
+        src = Path(__file__).read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return sorted(set(re.findall(r'"(AF\d{3})"', src)))
+
+
+def _completion_spec() -> list[tuple[str, list[str], str]]:
+    """(option, fixed values, value-hint) for every flag the parser defines."""
+    spec = []
+    for action in build_parser()._actions:
+        for opt in action.option_strings:
+            if opt.startswith("--") is False:
+                continue
+            values: list[str] = []
+            if action.choices:
+                values = [str(v) for v in action.choices]
+            elif opt == "--explain":
+                values = sorted(EXPLAIN)
+            elif opt == "--why":
+                values = _finding_ids()
+            takes_arg = action.nargs != 0
+            spec.append((opt, values, _VALUE_HINT.get(opt, "" if not takes_arg else "none")))
+    return spec
+
+
+def completion_script(shell: str) -> str:
+    spec = _completion_spec()
+    flags = [opt for opt, _, _ in spec]
+    header = (f"# actualis {shell} completion, generated by "
+              f"`actualis --completions {shell}` (v{__version__}).\n"
+              "# Regenerate after upgrading; do not edit by hand.\n")
+
+    if shell == "bash":
+        cases = []
+        for opt, values, hint in spec:
+            if values:
+                cases.append(f'        {opt}) COMPREPLY=($(compgen -W "'
+                             f'{" ".join(values)}" -- "$cur")); return;;')
+            elif hint == "dir":
+                cases.append(f'        {opt}) COMPREPLY=($(compgen -d -- "$cur")); return;;')
+            elif hint == "file":
+                cases.append(f'        {opt}) COMPREPLY=($(compgen -f -- "$cur")); return;;')
+        return header + (
+            "_actualis() {\n"
+            '    local cur prev\n'
+            '    cur="${COMP_WORDS[COMP_CWORD]}"\n'
+            '    prev="${COMP_WORDS[COMP_CWORD-1]}"\n'
+            "    case \"$prev\" in\n"
+            + "\n".join(cases) + "\n"
+            "    esac\n"
+            f'    COMPREPLY=($(compgen -W "{" ".join(flags)}" -- "$cur"))\n'
+            "}\n"
+            "complete -F _actualis actualis\n")
+
+    if shell == "zsh":
+        lines = []
+        for opt, values, hint in spec:
+            desc = ""
+            arg = ""
+            if values:
+                arg = f"=:value:({' '.join(values)})"
+            elif hint == "dir":
+                arg = "=:directory:_files -/"
+            elif hint == "file":
+                arg = "=:file:_files"
+            elif hint == "none":
+                arg = "=:value:"
+            lines.append(f"    '{opt}{arg}{desc}' \\")
+        # #compdef must be the very first line or zsh ignores the file, and
+        # the body runs bare: the completion system calls this file, so a
+        # self-invoking wrapper would run _arguments outside a completion
+        # context and error.
+        return ("#compdef actualis\n" + header
+                + "_arguments -s \\\n"
+                + "\n".join(lines) + "\n"
+                + "    && return 0\n")
+
+    # fish
+    out = [header]
+    for opt, values, hint in spec:
+        name = opt[2:]
+        base = f"complete -c actualis -l {name}"
+        if values:
+            out.append(f'{base} -x -a "{" ".join(values)}"')
+        elif hint == "dir":
+            out.append(f"{base} -r -F")
+        elif hint == "file":
+            out.append(f"{base} -r -F")
+        elif hint == "none":
+            out.append(f"{base} -x")
+        else:
+            out.append(base)
+    return "\n".join(out) + "\n"
+
+
+
+# --------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    """The parser, built separately so completions can be generated FROM it.
+
+    A completion script that hardcodes its own copy of the flag list is wrong
+    the moment a flag is added, and nothing fails to tell you.
+    """
     ap = argparse.ArgumentParser(
         prog="actualis",
         description="What actually ran. Local, read-only, honest about limits.",
     )
     ap.add_argument("--days", type=int, metavar="N", help="only the last N days")
     ap.add_argument("--project", metavar="SUBSTR", help="only projects matching SUBSTR")
+    ap.add_argument("--diff", metavar="OLD.json",
+                    help="compare against a saved --json report")
     ap.add_argument("--top", type=int, default=12, metavar="N", help="projects to list (default 12)")
     ap.add_argument("--bash", action="store_true", help="shell audit only")
     ap.add_argument("--coach", action="store_true", help="coaching findings only")
@@ -4049,8 +5053,42 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--suppressions", action="store_true",
                     help="list current suppressions and where they come from")
     ap.add_argument("--root", metavar="DIR", help="transcript directory")
+    ap.add_argument("--service", choices=SERVICE_KINDS, metavar="KIND",
+                    help="print a launchd, systemd or newsyslog unit for --watch")
+    ap.add_argument("--self-check", action="store_true",
+                    help="verify the privacy claims on your own machine")
+    ap.add_argument("--completions", choices=COMPLETION_SHELLS, metavar="SHELL",
+                    help="print a completion script for bash, zsh or fish")
     ap.add_argument("--version", action="version", version=f"actualis {__version__}")
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = build_parser()
     args = ap.parse_args(argv)
+
+    # Before ANY output: every mode below prints, and on a stream whose codec
+    # cannot carry the report's glyphs, printing raises rather than degrades.
+    make_output_printable(args.json)
+
+    if args.service:
+        # Unit to stdout, instructions to stderr: `> file` must yield a file
+        # that works, and still tell the user what to do with it.
+        print(service_unit(args.service, args.interval, args.quiet), end="")
+        print(service_install_notes(args.service), file=sys.stderr)
+        return EXIT_OK
+
+    if args.self_check:
+        return self_check(C(use_color()), args.days, args.root)
+
+    if args.completions:
+        print(completion_script(args.completions), end="")
+        return EXIT_OK
+
+    if args.diff and args.json:
+        ap.error("--diff renders a comparison; it cannot also emit --json. "
+                 "Save this run with --json, then diff the two files.")
+
 
     since = None
     if args.days:
@@ -4120,6 +5158,11 @@ def main(argv: list[str] | None = None) -> int:
         # --root to the Claude parser meant `--root X --agent codex` silently
         # parsed Codex rollouts as Claude transcripts and reported nothing.
         root = Path(args.root).expanduser()
+        if not root.is_dir():
+            # Checked here rather than after the scan: scan() would otherwise
+            # print its own generic "cannot read" first and bury this one.
+            sys.exit(f"actualis: {root} is not a directory.\n"
+                     "  --root takes a transcript directory, not a file or a project.")
         if args.agent == "codex":
             fleet.roots.append(root)
             fleet.scan_codex([root], since, args.project)
@@ -4131,18 +5174,28 @@ def main(argv: list[str] | None = None) -> int:
             if roots:
                 fleet.scan(roots, since, args.project, progress=progress)
             elif args.agent == "claude":
-                sys.exit("actualis: no Claude Code transcripts found.")
+                sys.exit(no_transcripts_message())
         if args.agent in ("all", "codex"):
             croots = codex_roots()
             if croots:
                 fleet.roots.extend(croots)
                 fleet.scan_codex(croots, since, args.project)
             elif args.agent == "codex":
-                sys.exit("actualis: no Codex sessions found under $CODEX_HOME/sessions.")
+                sys.exit(no_transcripts_message())
 
     if fleet.messages == 0 and fleet.bash_total == 0:
-        print("actualis: no matching activity found.", file=sys.stderr)
+        print(dead_end_message(fleet, args), file=sys.stderr)
         return EXIT_CANNOT_RUN
+
+    if args.diff:
+        try:
+            baseline = load_report(Path(args.diff).expanduser())
+        except ValueError as exc:
+            print(f"actualis: {exc}", file=sys.stderr)
+            return EXIT_CANNOT_RUN
+        render_diff(diff_reports(baseline, to_json(fleet, raw=args.no_redact)),
+                    C(use_color()))
+        return EXIT_OK
 
     if args.why:
         return render_why(args.why, fleet, C(use_color()))
