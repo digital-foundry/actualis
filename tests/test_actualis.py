@@ -2580,6 +2580,23 @@ class TestDiffTwoRuns(unittest.TestCase):
             self.assertEqual(fam["better"], [])
             self.assertEqual(fam["moved"], [])
 
+    def test_the_diff_never_prints_command_evidence(self):
+        """bash.flags rows carry `evidence`, which is raw command text. The
+        diff summarises kinds; printing evidence would make --diff a leak
+        channel that --no-redact does not govern."""
+        leaky = {"id": "cccccccc", "severity": "high", "program": "curl",
+                 "categories": ["egress"],
+                 "evidence": "curl -H 'Authorization: Bearer sk_live_TESTFILLER'"}
+        old = self._report(bash={"flags": []})
+        new = self._report(bash={"flags": [leaky]}, report_sha256="b" * 64)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            af.render_diff(af.diff_reports(old, new), af.C(False))
+        out = buf.getvalue()
+        self.assertIn("curl", out)                  # the program IS reported
+        self.assertNotIn("Authorization", out)      # the command is not
+        self.assertNotIn("sk_live_", out)
+
     def test_render_never_raises_on_a_sparse_report(self):
         """Old payloads may lack whole sections; a diff must not crash on them."""
         bare = {"schema_version": af.JSON_SCHEMA_VERSION}
