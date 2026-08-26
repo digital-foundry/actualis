@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **AWS's own documentation example key was reported as a critical
+  credential.** `AKIAIOSFODNN7EXAMPLE` appears in AWS's CLI reference and a
+  large share of every AWS tutorial ever written. It is not a credential and
+  never was.
+
+  This mattered more than an ordinary false positive. Since `--fail-on`
+  shipped in 0.1.6 it would fail a pipeline over a key that was never valid,
+  and it landed on the person evaluating this tool for the first time by
+  following AWS's own documentation — who would reasonably conclude the
+  detector cries wolf.
+
+  Vendor example credentials are now excluded. AWS builds all of its examples
+  the same way, with the key body ending in `EXAMPLE`, so that shape is
+  excluded generally rather than only the enumerated strings. The rule is a
+  **suffix** match, not a substring match: a real key that merely contains
+  `EXAMPLE` is still reported, and there is a test for it. Each enumerated
+  entry names the vendor documentation it comes from.
+
+  Measured on a 145k-record corpus: three fingerprints removed, all three
+  confirmed AWS documentation examples, and **none added**. Critical findings
+  went from 43 to 40.
+
+  Two things worth recording about how this got in and stayed in. The bug was
+  found by a tool built on top of this one, not by this one — it named a
+  critical AWS key whose entire exposure window was the single session where
+  it had been typed as a test fixture. And the test suite had encoded the bug
+  as correct behaviour: `test_identifies_by_type` used AWS's example key as
+  its fixture and asserted it was a credential. A drafted entry for another
+  vendor was deleted rather than shipped, because it could not be verified
+  against that vendor's documentation.
+
 ## 0.1.7 — 2026-08-26
 
 Documentation only. No code change; `actualis.py` is byte-identical to 0.1.6
