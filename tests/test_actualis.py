@@ -3285,3 +3285,90 @@ class TestIncidentSchemaFreeze(unittest.TestCase):
         inc = self._incident()
         self.assertEqual(inc["document"], "incident")
         self.assertEqual(inc["schema_version"], af.INCIDENT_SCHEMA_VERSION)
+
+
+class TestNoRawSecretReachesAnyOutput(unittest.TestCase):
+    """CodeQL flags _wrap as clear-text logging of sensitive data.
+
+    It is right that data derived from secrets flows there, and wrong that the
+    values do: what travels is counts, type names and sha256[:8] fingerprints.
+    This class is the difference between believing that and knowing it, and it
+    covers every surface that can print, so the guarantee cannot regress into
+    a new one.
+    """
+
+    # AWS-shaped rather than Stripe-shaped: GitHub push protection blocks a
+    # Stripe-pattern literal in a commit, and clicking its allow-this-secret
+    # escape hatch to land a test fixture is the wrong habit to build. This is
+    # still detected by classify_secrets, which is what the test needs.
+    SECRET = "AKIANOTAREALAWSKEY01"
+
+    def _fleet(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        d = Path(self._tmp.name) / "proj"
+        d.mkdir()
+        rec = {"timestamp": "2026-06-01T10:00:00Z", "type": "assistant", "uuid": "u1",
+               "sessionId": "s1", "cwd": "/w/p", "gitBranch": "main", "version": "2.1",
+               "message": {"id": "m1", "model": "claude-sonnet-5",
+                           "usage": {"input_tokens": 5, "output_tokens": 50,
+                                     "cache_read_input_tokens": 0,
+                                     "cache_creation_input_tokens": 0},
+                           "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                                        "input": {"command":
+                                                  f"export AWS_ACCESS_KEY_ID={self.SECRET}"
+                                                  " && aws s3 ls s3://b"}}]}}
+        (d / "s.jsonl").write_text(json.dumps(rec) + "\n")
+        f = af.Fleet()
+        f.scan([Path(self._tmp.name)], None, None, progress=False)
+        return f
+
+    def _capture(self, fn):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            fn()
+        return buf.getvalue()
+
+    def test_the_full_report_never_prints_the_value(self):
+        f = self._fleet()
+        out = self._capture(lambda: af.render(f, af.C(False), bash_only=False, top=12))
+        self.assertNotIn(self.SECRET, out)
+        self.assertIn(af.classify_secrets(self.SECRET)[0][2], out,
+                      "the fingerprint should appear in its place")
+
+    def test_coach_never_prints_the_value(self):
+        f = self._fleet()
+        self.assertNotIn(self.SECRET,
+                         self._capture(lambda: af.render_coach(af.coach(f), af.C(False))))
+
+    def test_share_never_prints_the_value(self):
+        f = self._fleet()
+        self.assertNotIn(self.SECRET,
+                         self._capture(lambda: af.render_share(f, af.C(False))))
+
+    def test_json_never_carries_the_value(self):
+        f = self._fleet()
+        self.assertNotIn(self.SECRET, json.dumps(af.to_json(f)))
+
+    def test_the_incident_report_never_prints_the_value(self):
+        """The newest surface, and the one that handles credentials most directly."""
+        fp = af.classify_secrets(self.SECRET)[0][2]
+        base = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        cmd = f"export AWS_ACCESS_KEY_ID={self.SECRET} && aws s3 ls s3://b"
+        events = [af.ReplayEvent(base, cmd, "a", "p", "main", "claude", "/r"),
+                  af.ReplayEvent(base + timedelta(minutes=1), "psql -c select",
+                                 "a", "p", "main", "claude", "/r"),
+                  af.ReplayEvent(base + timedelta(minutes=2), cmd,
+                                 "a", "p", "main", "claude", "/r")]
+        inc = af.replay(fp, events)
+        self.assertNotIn(self.SECRET, json.dumps(inc))
+        self.assertNotIn(self.SECRET,
+                         self._capture(lambda: af.render_replay(inc, af.C(False))))
+
+    def test_no_redact_is_the_only_way_to_see_command_text(self):
+        """--no-redact exists and is documented as unsafe; it is the one path
+        that prints command text verbatim, and it must be explicit."""
+        f = self._fleet()
+        redacted = self._capture(
+            lambda: af.render(f, af.C(False), bash_only=True, top=12, raw=False))
+        self.assertNotIn(self.SECRET, redacted)
