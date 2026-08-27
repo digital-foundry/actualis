@@ -35,7 +35,7 @@ from typing import NamedTuple
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-__version__ = "0.1.8"
+__version__ = "0.1.9"
 
 # --------------------------------------------------------------------------
 # Pricing
