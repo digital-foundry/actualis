@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`--replay ID` turns a leaked credential into an incident report.** The
+  report tells you a credential was exposed. It could not tell you what
+  happened while it was live, which is the only question worth asking next.
+
+  ```sh
+  actualis --replay 7c31dab8          # the id from the credential table
+  actualis --replay 7c31dab8 --json   # an incident record
+  ```
+
+  Given one fingerprint it reconstructs the exposure window, then every command
+  that ran inside it — **graded by proximity, not by clock overlap**: same
+  session (had the credential in context), same project (other sessions), and
+  elsewhere (overlapped in time only, reported for completeness rather than as
+  exposure). Then it narrows to the commands worth actually reading: in-session
+  commands touching egress, credentials or a database.
+
+  The grading is the feature. On a real corpus, a four-day exposure window
+  contains 7,553 commands. Counting them produces a number nobody can act on.
+  The same incident graded by proximity is **42 commands to read**.
+
+  Works across Claude Code and Codex. Codex records no git branch, so those stay
+  empty rather than invented.
+
+  It runs its own targeted pass rather than reusing the report's scan: answering
+  it from the normal run would mean retaining every command with full
+  attribution on every invocation, tens of thousands of them, to serve an
+  operation almost nobody performs. Expect roughly fifteen seconds on a large
+  corpus; `--days` narrows it.
+
+  An incident is a different document from the fleet report, so it carries its
+  own `document: "incident"` marker, its own schema version, and its own frozen
+  schema with its own test. Every report ends with what it does **not**
+  establish — including that absence of a sighting after `last_seen` is not
+  evidence of rotation.
+
 ## 0.1.8 — 2026-08-26
 
 ### Changed

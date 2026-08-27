@@ -21,7 +21,7 @@ import json
 import os
 import sys
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -814,7 +814,7 @@ class TestExplainability(unittest.TestCase):
                    "REFUSALS": "refusals", "SUPPRESSIONS": "suppressions",
                    "COACH": "coach", "AGENT PLATFORMS": "agents",
                    "EXPLAIN": "sources", "DIFF": "diff",
-                   "SELF CHECK": "verify"}
+                   "SELF CHECK": "verify", "INCIDENT": "replay"}
         for sec in sections:
             with self.subTest(section=sec):
                 self.assertIn(sec, mapping, f"{sec} has no explain topic")
@@ -3139,3 +3139,236 @@ class TestVendorExampleCredentials(unittest.TestCase):
     def test_lowercase_variants_are_not_silently_excluded(self):
         """AWS keys are uppercase; a lowercase lookalike is a different string."""
         self.assertFalse(af.is_vendor_example("akiaiosfodnn7example"))
+
+
+class TestBlastRadiusReplay(unittest.TestCase):
+    """An incident report that overstates is worse than no incident report."""
+
+    def _ev(self, ts, cmd, session="s1", project="p1", branch="main",
+            vendor="claude", root="/r"):
+        return af.ReplayEvent(datetime(2026, 6, 1, tzinfo=timezone.utc)
+                              + timedelta(minutes=ts),
+                              cmd, session, project, branch, vendor, root)
+
+    SECRET = "export AWS_ACCESS_KEY_ID=AKIANOTAREALAWSKEY01"
+
+    def _fp(self):
+        return af.classify_secrets(self.SECRET)[0][2]
+
+    def test_a_fingerprint_that_never_appears_returns_nothing(self):
+        self.assertEqual(af.replay("deadbeef", [self._ev(0, "ls")]), {})
+
+    def test_the_window_is_first_to_last_sighting(self):
+        fp = self._fp()
+        events = [self._ev(0, self.SECRET), self._ev(30, "ls"),
+                  self._ev(60, self.SECRET), self._ev(90, "pwd")]
+        inc = af.replay(fp, events)
+        self.assertEqual(inc["window"]["sightings"], 2)
+        # 60 minutes between first and last sighting. days is rounded to 2dp
+        # in the payload, so compare against the rounded value deliberately.
+        self.assertEqual(inc["window"]["days"], round(60 / 1440, 2))
+
+    def test_commands_after_last_sighting_are_outside_the_window(self):
+        fp = self._fp()
+        events = [self._ev(0, self.SECRET),
+                  self._ev(10, "ls"),                 # inside: between sightings
+                  self._ev(20, self.SECRET),
+                  self._ev(999, "rm -rf /tmp/x")]     # outside: after last sighting
+        inc = af.replay(fp, events)
+        self.assertEqual(inc["blast_radius"]["same_session"]["commands"], 3)
+
+    def test_proximity_grading_separates_context_from_coincidence(self):
+        """The whole point: a command elsewhere is not blast radius."""
+        fp = self._fp()
+        events = [
+            self._ev(0, self.SECRET, session="a", project="mine"),
+            self._ev(1, "psql -c select", session="a", project="mine"),
+            self._ev(2, "ls", session="b", project="mine"),
+            self._ev(3, "ls", session="c", project="unrelated"),
+            self._ev(4, self.SECRET, session="a", project="mine"),
+        ]
+        br = af.replay(fp, events)["blast_radius"]
+        self.assertEqual(br["same_session"]["commands"], 3)
+        self.assertEqual(br["same_project"]["commands"], 1)
+        self.assertEqual(br["elsewhere"]["commands"], 1)
+        self.assertEqual(br["elsewhere"]["projects"], ["unrelated"])
+
+    def test_investigate_is_scoped_to_sessions_that_saw_it(self):
+        """A risky command in an unrelated project is not an investigation lead."""
+        fp = self._fp()
+        events = [
+            self._ev(0, self.SECRET, session="a", project="mine"),
+            self._ev(1, "psql $DATABASE_URL -c 'select 1'", session="a", project="mine"),
+            self._ev(2, "psql $DATABASE_URL -c 'select 2'", session="z", project="other"),
+            self._ev(3, self.SECRET, session="a", project="mine"),
+        ]
+        inc = af.replay(fp, events)
+        self.assertEqual(inc["investigate"]["commands"], 1)
+
+    def test_no_raw_credential_material_reaches_the_incident(self):
+        fp = self._fp()
+        inc = af.replay(fp, [self._ev(0, self.SECRET), self._ev(1, self.SECRET)])
+        blob = json.dumps(inc)
+        self.assertNotIn("AKIANOTAREALAWSKEY01", blob)
+        self.assertIn(fp, blob)
+
+    def test_the_limits_are_always_present(self):
+        """A report that omits what it cannot establish is a report that lies."""
+        fp = self._fp()
+        inc = af.replay(fp, [self._ev(0, self.SECRET), self._ev(1, "ls")])
+        self.assertEqual(len(inc["limits"]), len(af.INCIDENT_LIMITS))
+        joined = " ".join(inc["limits"]).lower()
+        self.assertIn("not evidence of rotation", joined)
+
+    def test_codex_events_carry_no_invented_branch(self):
+        fp = self._fp()
+        events = [self._ev(0, self.SECRET, vendor="codex", branch=""),
+                  self._ev(1, "ls", vendor="codex", branch="")]
+        inc = af.replay(fp, events)
+        self.assertEqual(inc["exposure"]["branches"], [])
+        self.assertEqual(inc["exposure"]["vendors"], ["codex"])
+
+    def test_both_vendors_appear_when_both_saw_it(self):
+        fp = self._fp()
+        events = [self._ev(0, self.SECRET, vendor="claude", session="a"),
+                  self._ev(1, self.SECRET, vendor="codex", session="b", branch="")]
+        self.assertEqual(af.replay(fp, events)["exposure"]["vendors"],
+                         ["claude", "codex"])
+
+    def test_render_does_not_raise(self):
+        fp = self._fp()
+        inc = af.replay(fp, [self._ev(0, self.SECRET), self._ev(1, "ls")])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            af.render_replay(inc, af.C(False))
+        self.assertIn("INCIDENT", buf.getvalue())
+
+    def test_a_malformed_fingerprint_is_a_usage_error(self):
+        with self.assertRaises(SystemExit) as cm:
+            af.main(["--replay", "not-a-fingerprint"])
+        self.assertEqual(cm.exception.code, af.EXIT_USAGE)
+
+
+class TestIncidentSchemaFreeze(unittest.TestCase):
+    """An incident is an export artifact. Its shape is a contract too."""
+
+    def _incident(self):
+        secret = "export AWS_ACCESS_KEY_ID=AKIANOTAREALAWSKEY01"
+        fp = af.classify_secrets(secret)[0][2]
+        base = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        ev = lambda m, c, s="a", p="p", b="main", v="claude": af.ReplayEvent(
+            base + timedelta(minutes=m), c, s, p, b, v, "/r")
+        return af.replay(fp, [ev(0, secret), ev(1, "curl https://x/y"),
+                              ev(2, "ls", s="b"), ev(3, "ls", s="c", p="other"),
+                              ev(4, secret)])
+
+    def test_every_documented_key_is_present_and_typed(self):
+        inc = self._incident()
+        paths = dict(TestJSONSchemaFreeze._walk(inc))
+        for path, want in af.INCIDENT_SCHEMA.items():
+            if path.endswith(".*") or want == "*":
+                continue
+            with self.subTest(path=path):
+                self.assertIn(path, paths, f"{path} declared but missing")
+
+    def test_no_undeclared_key_ships(self):
+        inc = self._incident()
+        declared = set(af.INCIDENT_SCHEMA)
+        for path, _ in TestJSONSchemaFreeze._walk(inc):
+            if any(path.startswith(d.rstrip("*").rstrip(".")) for d in declared
+                   if d.endswith("*")):
+                continue
+            with self.subTest(path=path):
+                self.assertIn(path, declared, f"{path} ships but is not declared")
+
+    def test_the_document_identifies_itself(self):
+        inc = self._incident()
+        self.assertEqual(inc["document"], "incident")
+        self.assertEqual(inc["schema_version"], af.INCIDENT_SCHEMA_VERSION)
+
+
+class TestNoRawSecretReachesAnyOutput(unittest.TestCase):
+    """CodeQL flags _wrap as clear-text logging of sensitive data.
+
+    It is right that data derived from secrets flows there, and wrong that the
+    values do: what travels is counts, type names and sha256[:8] fingerprints.
+    This class is the difference between believing that and knowing it, and it
+    covers every surface that can print, so the guarantee cannot regress into
+    a new one.
+    """
+
+    # AWS-shaped rather than Stripe-shaped: GitHub push protection blocks a
+    # Stripe-pattern literal in a commit, and clicking its allow-this-secret
+    # escape hatch to land a test fixture is the wrong habit to build. This is
+    # still detected by classify_secrets, which is what the test needs.
+    SECRET = "AKIANOTAREALAWSKEY01"
+
+    def _fleet(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        d = Path(self._tmp.name) / "proj"
+        d.mkdir()
+        rec = {"timestamp": "2026-06-01T10:00:00Z", "type": "assistant", "uuid": "u1",
+               "sessionId": "s1", "cwd": "/w/p", "gitBranch": "main", "version": "2.1",
+               "message": {"id": "m1", "model": "claude-sonnet-5",
+                           "usage": {"input_tokens": 5, "output_tokens": 50,
+                                     "cache_read_input_tokens": 0,
+                                     "cache_creation_input_tokens": 0},
+                           "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                                        "input": {"command":
+                                                  f"export AWS_ACCESS_KEY_ID={self.SECRET}"
+                                                  " && aws s3 ls s3://b"}}]}}
+        (d / "s.jsonl").write_text(json.dumps(rec) + "\n")
+        f = af.Fleet()
+        f.scan([Path(self._tmp.name)], None, None, progress=False)
+        return f
+
+    def _capture(self, fn):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            fn()
+        return buf.getvalue()
+
+    def test_the_full_report_never_prints_the_value(self):
+        f = self._fleet()
+        out = self._capture(lambda: af.render(f, af.C(False), bash_only=False, top=12))
+        self.assertNotIn(self.SECRET, out)
+        self.assertIn(af.classify_secrets(self.SECRET)[0][2], out,
+                      "the fingerprint should appear in its place")
+
+    def test_coach_never_prints_the_value(self):
+        f = self._fleet()
+        self.assertNotIn(self.SECRET,
+                         self._capture(lambda: af.render_coach(af.coach(f), af.C(False))))
+
+    def test_share_never_prints_the_value(self):
+        f = self._fleet()
+        self.assertNotIn(self.SECRET,
+                         self._capture(lambda: af.render_share(f, af.C(False))))
+
+    def test_json_never_carries_the_value(self):
+        f = self._fleet()
+        self.assertNotIn(self.SECRET, json.dumps(af.to_json(f)))
+
+    def test_the_incident_report_never_prints_the_value(self):
+        """The newest surface, and the one that handles credentials most directly."""
+        fp = af.classify_secrets(self.SECRET)[0][2]
+        base = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        cmd = f"export AWS_ACCESS_KEY_ID={self.SECRET} && aws s3 ls s3://b"
+        events = [af.ReplayEvent(base, cmd, "a", "p", "main", "claude", "/r"),
+                  af.ReplayEvent(base + timedelta(minutes=1), "psql -c select",
+                                 "a", "p", "main", "claude", "/r"),
+                  af.ReplayEvent(base + timedelta(minutes=2), cmd,
+                                 "a", "p", "main", "claude", "/r")]
+        inc = af.replay(fp, events)
+        self.assertNotIn(self.SECRET, json.dumps(inc))
+        self.assertNotIn(self.SECRET,
+                         self._capture(lambda: af.render_replay(inc, af.C(False))))
+
+    def test_no_redact_is_the_only_way_to_see_command_text(self):
+        """--no-redact exists and is documented as unsafe; it is the one path
+        that prints command text verbatim, and it must be explicit."""
+        f = self._fleet()
+        redacted = self._capture(
+            lambda: af.render(f, af.C(False), bash_only=True, top=12, raw=False))
+        self.assertNotIn(self.SECRET, redacted)
