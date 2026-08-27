@@ -2433,6 +2433,136 @@ def render_diff(d: dict, c: C) -> None:
     print()
 
 
+def replay(fingerprint: str, events: list[ReplayEvent]) -> dict:
+    """The incident: what the credential saw, and what ran while it was live."""
+    sightings = [e for e in events
+                 if any(f == fingerprint for _, _, f in classify_secrets(e.cmd))]
+    if not sightings:
+        return {}
+
+    first, last = sightings[0].ts, sightings[-1].ts
+    window = [e for e in events if first <= e.ts <= last]
+
+    kinds: set[str] = set()
+    for e in sightings:
+        for pri, kind, f in classify_secrets(e.cmd):
+            if f == fingerprint:
+                kinds.add(f"{pri} {kind}")
+
+    # Proximity, not clock overlap. A command in an unrelated project that
+    # merely ran during the window almost certainly never had this credential
+    # in context, and counting it as blast radius overstates the incident.
+    # An incident report that overstates is worse than none.
+    seen_sessions = {e.session for e in sightings if e.session}
+    seen_projects = {e.project for e in sightings if e.project}
+
+    same_session = [e for e in window if e.session and e.session in seen_sessions]
+    same_project = [e for e in window
+                    if e.project in seen_projects
+                    and not (e.session and e.session in seen_sessions)]
+    elsewhere = [e for e in window
+                 if e.project not in seen_projects
+                 and not (e.session and e.session in seen_sessions)]
+
+    investigate = [e for e in same_session
+                   if any(cat in REACHABLE_CATEGORIES
+                          for _, cat, _ in audit_command(e.cmd))]
+
+    def programs(rows: list[ReplayEvent], n: int) -> dict:
+        c: Counter = Counter()
+        for e in rows:
+            head = command_head(e.cmd)
+            if head:
+                c[head] += 1
+        return dict(c.most_common(n))
+
+    def strs(rows, attr) -> list:
+        return sorted({getattr(e, attr) for e in rows if getattr(e, attr)})
+
+    return {
+        "document": "incident",
+        "schema_version": INCIDENT_SCHEMA_VERSION,
+        "version": __version__,
+        "fingerprint": fingerprint,
+        "types": sorted(kinds),
+        "window": {
+            "first_seen": first.isoformat(),
+            "last_seen": last.isoformat(),
+            "days": round((last - first).total_seconds() / 86400, 2),
+            "sightings": len(sightings),
+        },
+        "exposure": {
+            "sessions": strs(sightings, "session"),
+            "projects": strs(sightings, "project"),
+            "branches": strs(sightings, "branch"),
+            "vendors": strs(sightings, "vendor"),
+        },
+        "blast_radius": {
+            "note": "graded by proximity, not by time alone. same_session had the "
+                    "credential in context; elsewhere merely overlapped the window "
+                    "and is reported for completeness, not as exposure",
+            "same_session": {"commands": len(same_session),
+                             "projects": strs(same_session, "project"),
+                             "branches": strs(same_session, "branch")},
+            "same_project": {"commands": len(same_project)},
+            "elsewhere": {"commands": len(elsewhere),
+                          "projects": strs(elsewhere, "project")},
+            "programs": programs(same_session, 15),
+        },
+        "investigate": {
+            "commands": len(investigate),
+            "note": "commands in the sessions that saw it which touch egress, "
+                    "credentials or a database -- the subset that could plausibly "
+                    "have used the credential rather than merely coexisted with it",
+            "programs": programs(investigate, 10),
+        },
+        "limits": list(INCIDENT_LIMITS),
+    }
+
+
+def render_replay(inc: dict, c: C) -> None:
+    w, ex, br, iv = inc["window"], inc["exposure"], inc["blast_radius"], inc["investigate"]
+    rule(c, f"INCIDENT  {inc['fingerprint']}")
+    print(f"  credential   {c.red}{', '.join(inc['types']) or 'unclassified'}{c.off}")
+    print(f"  first seen   {w['first_seen'][:19].replace('T', ' ')}")
+    print(f"  last seen    {w['last_seen'][:19].replace('T', ' ')}")
+    print(f"  exposed for  {c.bold}{w['days']} days{c.off} across {w['sightings']} appearances")
+
+    print(f"\n  {c.bold}WHERE IT APPEARED{c.off}")
+    for label, key in (("projects", "projects"), ("branches", "branches"),
+                       ("sessions", "sessions"), ("vendors", "vendors")):
+        vals = ex[key]
+        if not vals:
+            continue
+        shown = ", ".join(vals[:3]) + (f"  (+{len(vals)-3} more)" if len(vals) > 3 else "")
+        print(f"    {label:<10} {len(vals):>4}   {c.dim}{shown[:62]}{c.off}")
+
+    ss, sp, el = br["same_session"], br["same_project"], br["elsewhere"]
+    print(f"\n  {c.bold}BLAST RADIUS{c.off}  {c.dim}graded by proximity, not clock overlap{c.off}")
+    print(f"    same session  {ss['commands']:>6}   had the credential in context")
+    if ss["branches"]:
+        print(f"      branches    {len(ss['branches']):>6}   {c.dim}{', '.join(ss['branches'][:4])[:56]}{c.off}")
+    print(f"    same project  {sp['commands']:>6}   {c.dim}other sessions, same project{c.off}")
+    print(f"    elsewhere     {el['commands']:>6}   {c.dim}overlapped in time only, "
+          f"{len(el['projects'])} unrelated projects{c.off}")
+    if br["programs"]:
+        top = "  ".join(f"{k}:{v}" for k, v in list(br["programs"].items())[:8])
+        print(f"    programs      {c.dim}{top[:66]}{c.off}")
+
+    denom = ss["commands"] or 1
+    print(f"\n  {c.bold}INVESTIGATE{c.off}  {c.dim}in-session, touching egress, credentials or a database{c.off}")
+    print(f"    commands      {c.yellow}{iv['commands']:>6}{c.off}   "
+          f"{c.dim}({iv['commands']/denom*100:.1f}% of the {ss['commands']} in-session){c.off}")
+    if iv["programs"]:
+        print(f"    programs      {c.dim}" + "  ".join(f"{k}:{v}" for k, v in iv["programs"].items())[:66] + f"{c.off}")
+
+    print(f"\n  {c.bold}WHAT THIS DOES NOT ESTABLISH{c.off}")
+    for lim in inc["limits"]:
+        for i, chunk in enumerate(_wrap(lim, 70)):
+            print(f"    {c.dim}{'- ' if i == 0 else '  '}{chunk}{c.off}")
+    print()
+
+
 def render_coach(findings: list[Finding], c: C) -> None:
     rule(c, "COACH")
     if not findings:
@@ -2818,6 +2948,38 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "watch the process from outside, which --self-check prints for you.",
         ],
         "verify": "actualis --self-check --days 1  # then read the source: one file",
+    },
+    "replay": {
+        "measures": "What happened while one leaked credential was live.",
+        "formula": [
+            "  actualis --replay <id>          # id from the credential table",
+            "  actualis --replay <id> --json   # an incident record",
+            "",
+            "window     first sighting of that fingerprint -> last sighting",
+            "exposure   the sessions, projects and branches it appeared in",
+            "radius     every command inside the window, GRADED BY PROXIMITY:",
+            "             same session   had the credential in context",
+            "             same project   other sessions, same project",
+            "             elsewhere      overlapped in time only",
+            "investigate  in-session commands touching egress, credentials or",
+            "             a database -- the subset worth actually reading",
+            "",
+            "Graded rather than counted because a command in an unrelated",
+            "project that merely ran during the window almost certainly never",
+            "had the credential in context. Counting it would turn 42 things",
+            "worth reading into 7,553 things nobody will read.",
+        ],
+        "assumes": [
+            "That the window bounds the exposure. A credential created before",
+            "the first sighting, or used outside an agent session, is invisible.",
+            "That proximity approximates access. It is a strong heuristic and",
+            "not a proof: same-session means the credential was in that",
+            "session's context, not that any particular command used it.",
+            "Absence of a sighting after last_seen is NOT evidence of rotation.",
+            "Neither vendor records a machine identity, so 'where' is a working",
+            "directory and a transcript root, never a host.",
+        ],
+        "verify": "actualis --json | jq -r '.secrets[0].id' | xargs actualis --replay",
     },
     "suppressions": {
         "measures": "Findings you have marked as false positives on this machine.",
@@ -4926,6 +5088,186 @@ def _self_check_corpus(roots: list[Path], sample: list[Path], result, c: C,
 
 
 # --------------------------------------------------------------------------
+# Blast-radius replay
+#
+# The report tells you a credential was exposed. It cannot tell you what
+# happened while it was live, which is the only question a security person
+# actually has. This answers it: one fingerprint in, an incident report out.
+#
+# It runs its own pass over the transcripts rather than reusing the scan.
+# Answering it from the normal report would mean retaining every command with
+# full attribution on every run -- tens of thousands of them -- to serve an
+# operation almost nobody performs. A rare, targeted question gets a targeted
+# read.
+#
+# An incident is a different document from the fleet report, so it carries its
+# own version and its own frozen schema.
+
+INCIDENT_SCHEMA_VERSION = 1
+
+INCIDENT_SCHEMA = {
+    "document": "str",
+    "schema_version": "int",
+    "version": "str",
+    "fingerprint": "str",
+    "types": "array",
+    "types[]": "str",
+    "window.first_seen": "str",
+    "window.last_seen": "str",
+    "window.days": "float",
+    "window.sightings": "int",
+    "exposure.sessions": "array",
+    "exposure.sessions[]": "str",
+    "exposure.projects": "array",
+    "exposure.projects[]": "str",
+    "exposure.branches": "array",
+    "exposure.branches[]": "str",
+    "exposure.vendors": "array",
+    "exposure.vendors[]": "str",
+    "blast_radius.note": "str",
+    "blast_radius.same_session.commands": "int",
+    "blast_radius.same_session.projects": "array",
+    "blast_radius.same_session.projects[]": "str",
+    "blast_radius.same_session.branches": "array",
+    "blast_radius.same_session.branches[]": "str",
+    "blast_radius.same_project.commands": "int",
+    "blast_radius.elsewhere.commands": "int",
+    "blast_radius.elsewhere.projects": "array",
+    "blast_radius.elsewhere.projects[]": "str",
+    "blast_radius.programs": "*",
+    "blast_radius.programs.*": "int",
+    "investigate.commands": "int",
+    "investigate.note": "str",
+    "investigate.programs": "*",
+    "investigate.programs.*": "int",
+    "limits": "array",
+    "limits[]": "str",
+}
+
+# Reachability: which commands could plausibly have USED the credential rather
+# than merely coexisted with it. Narrows an investigation; proves nothing.
+REACHABLE_CATEGORIES = ("egress", "credentials", "database")
+
+INCIDENT_LIMITS = (
+    "The window is first-seen to last-seen in recorded transcripts. A credential "
+    "created earlier, or used outside an agent session, is not visible here.",
+    "Neither vendor records a machine identity. Transcript root and working "
+    "directory are the closest available proxy and are reported as such.",
+    "Reachability is a heuristic over command shape, not proof of use. It "
+    "narrows what to investigate; it does not establish what happened.",
+    "Absence of a sighting after last_seen is not evidence of rotation.",
+)
+
+
+class ReplayEvent:
+    """One recorded shell command, with everything the transcript attributes."""
+
+    __slots__ = ("ts", "cmd", "session", "project", "branch", "vendor", "root")
+
+    def __init__(self, ts, cmd, session, project, branch, vendor, root):
+        self.ts = ts
+        self.cmd = cmd
+        self.session = session
+        self.project = project
+        self.branch = branch
+        self.vendor = vendor
+        self.root = root
+
+
+def _claude_events(roots: list[Path], since: datetime | None) -> list[ReplayEvent]:
+    out: list[ReplayEvent] = []
+    for root in roots:
+        for f in sorted(root.rglob("*.jsonl")):
+            project = pretty_project(f.parent.name)
+            try:
+                fh = f.open(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            with fh:
+                for line in fh:
+                    if '"Bash"' not in line:
+                        continue          # cheap prefilter; most records are not
+                    try:
+                        rec = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if not isinstance(rec, dict):
+                        continue
+                    ts = parse_ts(rec.get("timestamp"))
+                    if ts is None or (since and ts < since):
+                        continue
+                    for cmd in _commands_in(rec):
+                        if cmd:
+                            out.append(ReplayEvent(
+                                ts, cmd,
+                                rec.get("sessionId") or rec.get("session_id") or "",
+                                project, rec.get("gitBranch") or "",
+                                "claude", str(root)))
+    return out
+
+
+def _codex_events(roots: list[Path], since: datetime | None) -> list[ReplayEvent]:
+    """Codex records no git branch, so those stay empty rather than invented."""
+    out: list[ReplayEvent] = []
+    for root in roots:
+        for f in sorted(root.rglob("rollout-*.jsonl")):
+            cwd = ""
+            try:
+                fh = f.open(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            with fh:
+                for line in fh:
+                    if "shell_command" not in line and "session_meta" not in line \
+                            and "turn_context" not in line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if not isinstance(rec, dict):
+                        continue
+                    payload = rec.get("payload")
+                    if not isinstance(payload, dict):
+                        continue
+                    if rec.get("type") in ("session_meta", "turn_context"):
+                        cwd = payload.get("cwd") or cwd
+                        continue
+                    if payload.get("type") != "function_call" or \
+                            payload.get("name") != "shell_command":
+                        continue
+                    ts = parse_ts(rec.get("timestamp"))
+                    if ts is None or (since and ts < since):
+                        continue
+                    try:
+                        args = json.loads(payload.get("arguments") or "{}")
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    cmd = args.get("command") if isinstance(args, dict) else None
+                    if isinstance(cmd, list):
+                        cmd = " ".join(str(x) for x in cmd)
+                    if cmd:
+                        out.append(ReplayEvent(
+                            ts, str(cmd), f.stem,
+                            pretty_project(Path(cwd).name if cwd else "codex"),
+                            "", "codex", str(root)))
+    return out
+
+
+def replay_events(since: datetime | None = None,
+                  root: str | None = None) -> list[ReplayEvent]:
+    """Every recorded command across both vendors, oldest first."""
+    if root:
+        base = [Path(root).expanduser()]
+        events = _claude_events(base, since) + _codex_events(base, since)
+    else:
+        events = _claude_events(transcript_roots(), since)
+        events += _codex_events(codex_roots(), since)
+    events.sort(key=lambda e: e.ts)
+    return events
+
+
+# --------------------------------------------------------------------------
 # Shell completions
 #
 # Generated from the parser rather than hand-written, so a new flag cannot be
@@ -5067,6 +5409,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--coach", action="store_true", help="coaching findings only")
     ap.add_argument("--explain", nargs="?", const="", metavar="TOPIC",
                     help="how a number is computed, what it assumes, how to check it")
+    ap.add_argument("--replay", metavar="ID",
+                    help="incident report for one credential fingerprint")
     ap.add_argument("--why", metavar="AFxxx",
                     help="explain one coach finding against your actual numbers")
     ap.add_argument("--agents", action="store_true",
@@ -5132,6 +5476,11 @@ def main(argv: list[str] | None = None) -> int:
         print(completion_script(args.completions), end="")
         return EXIT_OK
 
+    if args.replay:
+        if not _FINGERPRINT.fullmatch(args.replay):
+            ap.error(f"--replay takes a credential fingerprint: eight hex "
+                     f"characters, as printed in the report. Got {args.replay!r}.")
+
     if args.diff and args.json:
         ap.error("--diff renders a comparison; it cannot also emit --json. "
                  "Save this run with --json, then diff the two files.")
@@ -5196,6 +5545,26 @@ def main(argv: list[str] | None = None) -> int:
             w_codex = codex_roots() if args.agent in ("all", "codex") else []
         return watch(w_roots, w_codex, max(args.interval, 0.5),
                      C(use_color()), args.quiet, args.no_redact)
+
+    if args.replay:
+        since_r = window_start(args.days, datetime.now(timezone.utc)) if args.days else None
+        if not args.json and sys.stderr.isatty():
+            print("  reading transcripts...", end="", file=sys.stderr, flush=True)
+        events = replay_events(since_r, args.root)
+        if not args.json and sys.stderr.isatty():
+            print("\r" + " " * 30 + "\r", end="", file=sys.stderr, flush=True)
+        inc = replay(args.replay, events)
+        if not inc:
+            print(f"actualis: {args.replay} does not appear in these transcripts.\n"
+                  "  Fingerprints come from the report's credential table, or "
+                  "`actualis --json | jq -r '.secrets[].id'`.", file=sys.stderr)
+            return EXIT_CANNOT_RUN
+        if args.json:
+            json.dump(inc, sys.stdout, indent=2)
+            print()
+        else:
+            render_replay(inc, C(use_color()))
+        return EXIT_OK
 
     fleet = Fleet()
     progress = not args.json and sys.stderr.isatty()

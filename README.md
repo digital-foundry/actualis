@@ -79,6 +79,39 @@ SHELL AUDIT ──────────────────────�
   flagged   340 high   148 medium   of 13,006 commands
 ```
 
+## One credential, one incident report
+
+The report tells you a credential was exposed. It cannot tell you what happened
+while it was live, which is the only question worth asking next.
+
+```sh
+actualis --replay 7c31dab8        # the id from the credential table
+actualis --replay 7c31dab8 --json # an incident record
+```
+
+Given one fingerprint it reconstructs the exposure window, then every command
+that ran inside it — **graded by proximity, not by clock overlap**:
+
+| | |
+|---|---|
+| **same session** | had the credential in that session's context |
+| **same project** | other sessions in the same project |
+| **elsewhere** | overlapped in time only, reported for completeness |
+
+then narrows to the commands worth actually reading: in-session commands that
+touch egress, credentials or a database.
+
+That grading is the point. On a real corpus a four-day exposure window contains
+7,553 commands, and counting them all produces a number nobody can act on. The
+same incident graded by proximity is **42 commands to read**.
+
+Works across Claude Code and Codex. Codex records no git branch, so those stay
+empty rather than invented.
+
+Every report ends with what it does **not** establish — including that absence
+of a sighting after `last_seen` is not evidence of rotation.
+
+
 ## What it answers
 
 Terminal-native coding agents write a complete record of every session to your
@@ -149,6 +182,7 @@ python3 actualis.py --agent codex    # one agent only (claude | codex | all)
 | `--suppressions` | list current suppressions and where they are read from |
 | `--fail-on LEVEL` | exit 3 if any unsuppressed finding is at or above `critical`, `high` or `any`. For gating a pipeline |
 | `--explain [TOPIC]` | how a number is computed, what it assumes, how to check it |
+| `--replay ID` | incident report for one credential: what ran while it was live, graded by proximity |
 | `--why AFxxx` | explain one finding against your actual numbers |
 | `--agents` | installed agent platforms and whether their binaries are validly signed |
 | `--mcp` | run as an MCP server over stdio ([below](#ask-the-agent-about-itself)) |
