@@ -22,6 +22,10 @@ and prints a report, across **Claude Code** and **Codex** together.
   stored — only a hash of it.
 - **Every command the agent ran**, audited for the risky shapes: `rm -rf`,
   piped installers, credential reads, egress to somewhere new.
+- **What happened while a credential was live.** Give it one fingerprint and
+  it reconstructs the incident: the exposure window, every command that ran
+  inside it, and the subset worth actually reading. A four-day window holds
+  thousands of commands; graded by proximity it is usually a few dozen.
 - **What was refused, and by whom** — you, or the auto-approval policy. A
   refused command is never sent to a provider, so nothing watching the API can
   see it. It exists only on your disk.
