@@ -174,6 +174,7 @@ python3 actualis.py --agent codex    # one agent only (claude | codex | all)
 | `--root DIR` | read one specific transcript directory instead of discovering them |
 | `--bash` | shell audit only |
 | `--coach` | findings and actions only |
+| `--aisvs` | which OWASP AISVS controls your transcripts show are **not** holding |
 | `--share` | postable summary with nothing identifying in it |
 | `--json` | machine-readable ([schema](docs/json.md)) |
 | `--diff OLD.json` | compare against a saved `--json` report: what appeared, what went away, what got worse |
