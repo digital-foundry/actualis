@@ -3250,6 +3250,45 @@ class TestBlastRadiusReplay(unittest.TestCase):
         self.assertEqual(cm.exception.code, af.EXIT_USAGE)
 
 
+class TestReplayLinesReadAsAbbreviatedNotCorrupted(unittest.TestCase):
+    """A hard character slice made output look like a bug, not a summary.
+
+    The replay report cut list-like lines with `[:62]` and friends. That left a
+    session id ending "-bdf3-", a program list ending "mak", and -- worst --
+    the overflow marker itself sliced to "(+2 mo", so the one element whose job
+    was to say "there is more" was the element destroyed.
+    """
+
+    def test_clip_cuts_at_a_separator(self):
+        self.assertEqual(af.clip("git:118  export:59  npm:56", 18), "git:118\u2026")
+        self.assertEqual(af.clip("a, b, c, d", 7), "a, b\u2026")
+
+    def test_clip_leaves_short_text_alone(self):
+        self.assertEqual(af.clip("short", 40), "short")
+        self.assertEqual(af.clip("x" * 10, 10), "x" * 10)
+
+    def test_clip_never_exceeds_the_width(self):
+        for w in range(4, 40):
+            with self.subTest(width=w):
+                self.assertLessEqual(len(af.clip("alpha, beta, gamma, delta", w)), w)
+
+    def test_clip_marks_that_it_cut(self):
+        out = af.clip("alpha, beta, gamma, delta", 12)
+        self.assertTrue(out.endswith("\u2026"), out)
+        self.assertNotIn(",\u2026", out)
+
+    def test_an_unsplittable_token_still_gets_an_ellipsis(self):
+        out = af.clip("a" * 90, 20)
+        self.assertEqual(len(out), 20)
+        self.assertTrue(out.endswith("\u2026"))
+
+    def test_the_ellipsis_survives_a_legacy_codec(self):
+        """Every human-readable mode must still print on a cp1252 stdout."""
+        self.assertIn("\u2026", af._GLYPH_FALLBACK)
+        cooked = af.clip("alpha, beta, gamma", 12).translate(af._GLYPH_TABLE)
+        cooked.encode("cp1252")
+
+
 class TestIncidentSchemaFreeze(unittest.TestCase):
     """An incident is an export artifact. Its shape is a contract too."""
 

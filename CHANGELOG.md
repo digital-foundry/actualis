@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.12 — 2026-08-30
+
+### Fixed
+
+- **`--replay` cut its list lines mid-token, so the report read as corrupted
+  rather than abbreviated.** Four lines were sliced at a fixed character count.
+  That left a session id ending `-bdf3-`, a program list ending `mak`, and —
+  worst — the overflow marker itself sliced to `(+2 mo`, so the one element
+  whose entire job was to say *there is more* was the element destroyed.
+
+  Lines now cut at a separator and end in an ellipsis, and the overflow
+  marker's width is reserved before the values are clipped, so `(+11 more)`
+  survives instead of being the first casualty. The ellipsis was already in the
+  legacy-codec fallback table, and a test pins that so a cp1252 terminal keeps
+  working.
+
+  Found while rendering marketing frames from the report, which is a harsher
+  reviewer of output formatting than a terminal is.
+
 ## 0.1.11 — 2026-08-30
 
 ### Fixed
