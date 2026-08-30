@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.10 — 2026-08-30
 
 ### Added
 
@@ -30,6 +30,39 @@
   chain) and `12.1.1` (interaction logging). Control text is quoted from the
   AISVS repository; the levels are theirs. A test pins the control ids, because
   a wrong id does not merely mislead — it misquotes a standard.
+
+### Changed
+
+- **The README first screen leads with an incident report.** The first screen
+  used to describe what the tool is. It now shows `--replay` output: a
+  credential fingerprint, the window it was live, and the commands that ran
+  inside that window. What the tool *does* is a weaker opening than what it
+  *found*, and this is the artifact nobody else can produce.
+
+  This also fixes a lag that had gone unnoticed: pypi.org renders the README
+  from the published package, so documentation changes only reach it on a
+  release. The first-screen rework landed on `main` on 2026-08-27 and has been
+  invisible on PyPI ever since.
+
+### Fixed
+
+- **The PyPI upload was not gated on a tag.** The `pypi` job in `release.yml`
+  ran on any trigger that reached the workflow, including a manual
+  `workflow_dispatch` against `main`. A dispatch on 2026-08-30 attempted a
+  real upload of an untagged build; it failed only because PyPI refuses to
+  reuse a filename and `actualis-0.1.9-py3-none-any.whl` already existed.
+
+  Nothing was published, and nothing needed yanking. But the protection was
+  accidental — PyPI's filename rule, not anything in this repository. Had the
+  version on `main` been bumped ahead of its tag, an unreviewed,
+  unreleased build would have gone out under a version number nobody had
+  approved, and PyPI filenames can never be reused to correct it.
+
+  `pypi` and `github-release` now both carry
+  `if: startsWith(github.ref, 'refs/tags/')`, matching the gate the build job
+  already had on its tag step. Found by dispatching the workflow deliberately
+  to see what would happen, which is the only way this class of bug surfaces
+  before it fires.
 
 ## 0.1.9 — 2026-08-26
 
