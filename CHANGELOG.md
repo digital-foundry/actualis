@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.1.11 — 2026-08-30
+
+### Fixed
+
+- **`bypassPermissions` did not count as ungated in the AISVS 9.2.1 mapping.**
+  The tool disagreed with itself. The coach's AF003 matched any permission mode
+  whose name contains `auto` or `bypass`; the 9.2.1 mapping matched the literal
+  key `"auto"` plus `codex:never`.
+
+  Claude Code writes `auto` on some builds and `bypassPermissions` on others,
+  and `bypassPermissions` is the value its own `--permission-mode` flag takes.
+  So a corpus that had never once stopped for approval was reported as
+  **consistent** with 9.2.1 while AF003 flagged the same corpus as
+  unsupervised. Understating a failing control is the worse direction of error
+  for a tool whose whole claim is that it falsifies rather than verifies.
+
+  There is one definition now, `ungated_modes()`, used by both, and a test that
+  fails if they diverge again.
+
+  Found by running the mapping against a synthetic corpus rather than against
+  the author's own, which happens to use the `auto` alias and therefore hid it.
+  A corpus you did not write is a different test than a corpus you did.
+
 ## 0.1.10 — 2026-08-30
 
 ### Added
