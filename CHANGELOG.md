@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`--aisvs` maps what is measured onto OWASP AISVS controls.** AISVS 1.0
+  (June 2026) is a numbered, levelled, pass/fail requirement set for AI
+  systems; chapter C9 covers agentic action and appendix C covers AI coding
+  tools. It is the closest published thing to a standard for operating these
+  tools.
+
+  What it deliberately lacks is an audit procedure. Every requirement says
+  "Verify that ..." and stops, because AISVS is vendor-neutral and cannot name
+  a config file — and its scope section hands host hardening to CIS
+  Benchmarks, which do not cover coding agents at all. That gap is where this
+  sits.
+
+  **It falsifies rather than verifies, and says so.** Almost every AISVS
+  control is about enforcement — that a runtime blocks, that a filter strips.
+  This tool reads outcomes and cannot inspect a runtime. So a control can be
+  shown to be **not holding**, which is a hard claim backed by evidence in
+  your own transcripts; it can never be shown to pass. `consistent` and `no
+  evidence` are reported as exactly that, and the report states in full what
+  it is not.
+
+  Seven controls are mapped today: `9.5.4` (secrets in observable context),
+  `9.2.1` (approval gates), `9.2.2` (approval parameters), `9.3.1`
+  (least-privilege sandbox), `AC.3.2` (context stripping), `AC.5.1` (replayable
+  chain) and `12.1.1` (interaction logging). Control text is quoted from the
+  AISVS repository; the levels are theirs. A test pins the control ids, because
+  a wrong id does not merely mislead — it misquotes a standard.
+
 ## 0.1.9 — 2026-08-26
 
 ### Added

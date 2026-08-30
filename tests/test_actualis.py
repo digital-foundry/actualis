@@ -814,7 +814,8 @@ class TestExplainability(unittest.TestCase):
                    "REFUSALS": "refusals", "SUPPRESSIONS": "suppressions",
                    "COACH": "coach", "AGENT PLATFORMS": "agents",
                    "EXPLAIN": "sources", "DIFF": "diff",
-                   "SELF CHECK": "verify", "INCIDENT": "replay"}
+                   "SELF CHECK": "verify", "INCIDENT": "replay",
+                   "OWASP AISVS": "aisvs"}
         for sec in sections:
             with self.subTest(section=sec):
                 self.assertIn(sec, mapping, f"{sec} has no explain topic")
@@ -3372,3 +3373,88 @@ class TestNoRawSecretReachesAnyOutput(unittest.TestCase):
         redacted = self._capture(
             lambda: af.render(f, af.C(False), bash_only=True, top=12, raw=False))
         self.assertNotIn(self.SECRET, redacted)
+
+
+class TestAisvsMapping(unittest.TestCase):
+    """The mapping falsifies; it must never read as a passing audit.
+
+    Almost every AISVS control verifies enforcement -- that a runtime blocks,
+    that a filter strips. This tool reads outcomes. Claiming a control is MET
+    would be the exact overstatement the project exists to avoid.
+    """
+
+    SECRET = "AKIANOTAREALAWSKEY01"
+
+    def _fleet(self, cmds=(), modes=None, refusals=0):
+        f = af.Fleet()
+        for cmd in cmds:
+            f.add_tool("proj", "Bash", {"command": cmd},
+                       datetime(2026, 6, 1, tzinfo=timezone.utc))
+        for mode, n in (modes or {}).items():
+            f.permission_modes[mode] += n
+        f.refusals = refusals
+        f.refusals_joined = refusals
+        return f
+
+    def test_a_credential_falsifies_9_5_4(self):
+        f = self._fleet([f"export AWS_ACCESS_KEY_ID={self.SECRET}"])
+        got = {x.control: x for x in af.aisvs_findings(f)}
+        self.assertEqual(got["9.5.4"].state, af.FAILING)
+        self.assertIn("credential", got["9.5.4"].detail.lower())
+
+    def test_no_credential_is_consistent_not_passing(self):
+        got = {x.control: x for x in af.aisvs_findings(self._fleet(["ls -la"]))}
+        self.assertEqual(got["9.5.4"].state, af.CONSISTENT)
+        self.assertNotEqual(got["9.5.4"].state, "pass")
+        self.assertIn("not proof", got["9.5.4"].detail)
+
+    def test_mostly_auto_mode_falsifies_the_approval_gate_control(self):
+        f = self._fleet(modes={"auto": 95, "default": 5})
+        got = {x.control: x for x in af.aisvs_findings(f)}
+        self.assertEqual(got["9.2.1"].state, af.FAILING)
+        self.assertIn("95.0%", got["9.2.1"].detail)
+
+    def test_mostly_gated_is_consistent(self):
+        f = self._fleet(modes={"auto": 5, "default": 95})
+        got = {x.control: x for x in af.aisvs_findings(f)}
+        self.assertEqual(got["9.2.1"].state, af.CONSISTENT)
+
+    def test_absent_evidence_is_unknown_not_consistent(self):
+        """Silence must not be scored as compliance."""
+        got = {x.control: x for x in af.aisvs_findings(af.Fleet())}
+        self.assertEqual(got["9.2.1"].state, af.UNKNOWN)
+        self.assertEqual(got["12.1.1"].state, af.UNKNOWN)
+
+    def test_no_finding_ever_claims_a_control_passes(self):
+        f = self._fleet([f"export K={self.SECRET}", "rm -rf /tmp/x"],
+                        modes={"auto": 10}, refusals=2)
+        for x in af.aisvs_findings(f):
+            with self.subTest(control=x.control):
+                self.assertIn(x.state, (af.FAILING, af.CONSISTENT, af.UNKNOWN))
+                for word in ("compliant", "passes", "verified", "certified"):
+                    self.assertNotIn(word, x.detail.lower(),
+                                     f"{x.control} claims more than it can show")
+
+    def test_every_control_carries_its_id_level_and_text(self):
+        for x in af.aisvs_findings(self._fleet(["ls"])):
+            with self.subTest(control=x.control):
+                self.assertRegex(x.control, r"^(9|12|AC)\.\d+(\.\d+)?$")
+                self.assertIn(x.level, (1, 2, 3))
+                self.assertGreater(len(x.text), 40, "control text must be quoted")
+
+    def test_the_render_states_what_it_is_not(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            af.render_aisvs(af.aisvs_findings(self._fleet(["ls"])), af.C(False))
+        # Collapse wrapping before asserting on prose, or the test breaks
+        # every time a sentence reflows.
+        out = " ".join(buf.getvalue().split())
+        self.assertIn("neither means pass", out)
+        self.assertIn("It cannot show one is met", out)
+        self.assertIn(af.AISVS_SOURCE, out)
+
+    def test_control_ids_are_real_aisvs_ids(self):
+        """A wrong control id is worse than no mapping: it misquotes a standard."""
+        # Verified against github.com/OWASP/AISVS at 1.0 on 2026-08-29.
+        real = {"9.5.4", "9.2.1", "9.2.2", "9.3.1", "AC.3.2", "AC.5.1", "12.1.1"}
+        self.assertEqual({c for c, _, _, _ in af.AISVS_MAP}, real)

@@ -2563,6 +2563,47 @@ def render_replay(inc: dict, c: C) -> None:
     print()
 
 
+def render_aisvs(findings: list[AisvsFinding], c: C) -> None:
+    rule(c, "OWASP AISVS")
+    print(f"  {c.dim}Mapped against AISVS {AISVS_VERSION}. AISVS says what to verify and,")
+    print(f"  being vendor-neutral, never how. This is the how, for the part a")
+    print(f"  transcript can answer.{c.off}\n")
+
+    mark = {FAILING: (c.red, "NOT HOLDING"), CONSISTENT: (c.ok, "consistent"),
+            UNKNOWN: (c.dim, "no evidence")}
+    for f in findings:
+        col, label = mark[f.state]
+        print(f"  {col}{label:<12}{c.off} {c.bold}{f.control:<7}{c.off} "
+              f"{c.dim}L{f.level}{c.off}")
+        for line in _wrap("Verify that " + f.text + ".", 68):
+            print(f"               {c.dim}{line}{c.off}")
+        for i, line in enumerate(_wrap(f.detail, 68)):
+            print(f"               {'-> ' if i == 0 else '   '}{line}")
+        print()
+
+    failing = sum(1 for f in findings if f.state == FAILING)
+    lead = (f"{failing} of {len(findings)} controls are demonstrably NOT holding on "
+            "this machine. That is a hard claim: the evidence is in your transcripts."
+            if failing else
+            f"Nothing in these transcripts contradicts any of the {len(findings)} "
+            "controls. That is not the same as meeting them, and on a small or "
+            "empty corpus it mostly means there was nothing to see.")
+    print(f"  {c.bold}What this is and is not{c.off}")
+    for line in (
+        lead,
+        "The rest are marked consistent or no-evidence, and neither means pass. "
+        "Almost every AISVS control verifies ENFORCEMENT -- that a runtime blocks, "
+        "that a filter strips. This tool reads what already happened and cannot "
+        "inspect a runtime.",
+        "So it falsifies. It can show a control is broken. It cannot show one is "
+        "met, and it does not claim to.",
+        f"Control text quoted from {AISVS_SOURCE} at {AISVS_VERSION}. Levels are theirs.",
+    ):
+        for line2 in _wrap(line, 72):
+            print(f"    {c.dim}{line2}{c.off}")
+        print()
+
+
 def render_coach(findings: list[Finding], c: C) -> None:
     rule(c, "COACH")
     if not findings:
@@ -2948,6 +2989,39 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "watch the process from outside, which --self-check prints for you.",
         ],
         "verify": "actualis --self-check --days 1  # then read the source: one file",
+    },
+    "aisvs": {
+        "measures": "Which OWASP AISVS controls your transcripts show are NOT holding.",
+        "formula": [
+            "  actualis --aisvs",
+            "",
+            "AISVS 1.0 is a numbered, levelled, pass/fail requirement set for AI",
+            "systems. Chapter C9 covers agentic action; Appendix C covers AI",
+            "coding tools. It says what to verify and, being vendor-neutral,",
+            "never how -- and it hands host hardening to CIS Benchmarks, which",
+            "do not cover coding agents at all.",
+            "",
+            "This maps what is already measured onto the controls a transcript",
+            "can speak to:",
+            "  9.5.4   secrets not in observable context  <- secrets[]",
+            "  9.2.1   approval gates block high impact   <- permission_modes",
+            "  9.2.2   approvals show full parameters     <- refusals join",
+            "  9.3.1   least-privilege tool sandbox       <- flagged commands",
+            "  AC.3.2  context stripping is enforced      <- secrets[]",
+            "  AC.5.1  the chain can be replayed          <- --replay",
+            "  12.1.1  interactions are logged            <- transcripts read",
+        ],
+        "assumes": [
+            "Nothing, and that is the point. It FALSIFIES rather than verifies.",
+            "Almost every AISVS control is about ENFORCEMENT -- that a runtime",
+            "blocks, that a filter strips. This tool reads what already happened",
+            "and cannot inspect a runtime.",
+            "So `not holding` is a hard claim backed by evidence in your own",
+            "transcripts. `consistent` and `no evidence` are NOT passes, and",
+            "nothing here should be reported as a passing audit.",
+            "Control text is quoted from the AISVS repository; levels are theirs.",
+        ],
+        "verify": "actualis --aisvs   # then read the control text at github.com/OWASP/AISVS",
     },
     "replay": {
         "measures": "What happened while one leaked credential was live.",
@@ -5088,6 +5162,161 @@ def _self_check_corpus(roots: list[Path], sample: list[Path], result, c: C,
 
 
 # --------------------------------------------------------------------------
+# OWASP AISVS mapping
+#
+# AISVS 1.0 (24 June 2026) is a numbered, levelled, pass/fail requirement set
+# for AI systems. Chapter C9 covers agentic action and Appendix C covers AI
+# coding tools specifically. It is the closest published thing to a standard
+# for how these tools should be operated.
+#
+# What it does NOT have, by design, is an audit procedure. Every requirement
+# says "Verify that ..." and stops, because AISVS is vendor-neutral and cannot
+# name a config file. Its scope section hands host hardening to CIS
+# Benchmarks, which do not cover coding agents at all.
+#
+# That gap is where this sits. But the claim has to be exact, because almost
+# every AISVS control verifies ENFORCEMENT -- "the runtime blocks", "controls
+# automatically strip" -- and this tool observes OUTCOMES. It reads what
+# already happened; it cannot inspect a runtime.
+#
+# So this FALSIFIES. When a credential appears in a recorded command, 9.5.4 is
+# demonstrably not holding, and that is a harder claim than any verification.
+# When nothing appears, that is consistent with 9.5.4 holding and is not proof
+# of it -- the same distinction the secret detector already makes between
+# "nothing matched" and "nothing is there".
+#
+# Control text is quoted from the AISVS repository at 1.0. Levels are theirs.
+
+AISVS_VERSION = "1.0"
+AISVS_SOURCE = "https://github.com/OWASP/AISVS"
+
+# state -> how the report should read it
+FAILING = "failing"        # direct counter-evidence: the control is not holding
+CONSISTENT = "consistent"  # nothing contradicts it; NOT a pass
+UNKNOWN = "unknown"        # this tool cannot see the answer
+
+
+class AisvsFinding(NamedTuple):
+    control: str
+    level: int
+    text: str
+    state: str
+    detail: str
+
+
+def _aisvs_9_5_4(fleet: "Fleet") -> tuple[str, str]:
+    live = fleet.actionable_secrets
+    if not live:
+        return CONSISTENT, ("no credential appeared in any recorded command. "
+                            "That is consistent with the control, not proof of "
+                            "it: detection is pattern-based and a bespoke "
+                            "token has no shape to match.")
+    crit = sum(1 for e in live.values() if e["priority"] == "critical")
+    return FAILING, (f"{len(live)} distinct credentials appeared in recorded "
+                     f"commands, {crit} critical. A credential in a tool call "
+                     f"parameter is exactly what this control forbids.")
+
+
+def _aisvs_9_2_1(fleet: "Fleet") -> tuple[str, str]:
+    modes = fleet.permission_modes
+    total = sum(modes.values())
+    if not total:
+        return UNKNOWN, "no permission mode was recorded in these transcripts."
+    ungated = modes.get("auto", 0) + modes.get("codex:never", 0)
+    pct = ungated / total * 100
+    if pct >= 50:
+        return FAILING, (f"{pct:.1f}% of {total:,} recorded turns ran in a mode "
+                         f"that does not stop for approval. A gate that is off "
+                         f"cannot block anything.")
+    return CONSISTENT, (f"{100-pct:.1f}% of {total:,} turns ran in a mode that "
+                        f"can require approval. Whether the runtime actually "
+                        f"blocked is not visible from a transcript.")
+
+
+def _aisvs_9_2_2(fleet: "Fleet") -> tuple[str, str]:
+    if not fleet.refusals:
+        return UNKNOWN, ("no refusal was recorded, so there is nothing to show "
+                         "an approval prompt was ever presented.")
+    joined = fleet.refusals_joined
+    return CONSISTENT, (f"{fleet.refusals} refusals recorded, {joined} "
+                        f"joined back to the exact command that was blocked. "
+                        f"The command text was therefore available at the gate.")
+
+
+def _aisvs_9_3_1(fleet: "Fleet") -> tuple[str, str]:
+    high = sum(v for k, v in fleet.flag_counts.items() if k.startswith("high:"))
+    if not fleet.bash_total:
+        return UNKNOWN, "no shell activity recorded."
+    if high:
+        return FAILING, (f"{high:,} commands matched high-severity shapes "
+                         f"(destructive, egress, credential reads) out of "
+                         f"{fleet.bash_total:,}. Those ran; a least-privilege "
+                         f"sandbox that permits them is not least-privilege "
+                         f"for this agent.")
+    return CONSISTENT, f"no high-severity command shape in {fleet.bash_total:,} commands."
+
+
+def _aisvs_ac_3_2(fleet: "Fleet") -> tuple[str, str]:
+    live = fleet.actionable_secrets
+    if not live:
+        return CONSISTENT, "nothing matched, which is not the same as nothing present."
+    return FAILING, (f"{len(live)} credentials reached the context anyway. If a "
+                     f"stripping control is deployed it is not catching these.")
+
+
+def _aisvs_ac_5_1(fleet: "Fleet") -> tuple[str, str]:
+    if not fleet.messages:
+        return UNKNOWN, "nothing recorded."
+    return CONSISTENT, (f"{fleet.messages:,} messages are on disk and readable, "
+                        f"and `--replay` reconstructs the chain for any one "
+                        f"credential fingerprint. Retention beyond this "
+                        f"machine is not visible.")
+
+
+def _aisvs_12_1_1(fleet: "Fleet") -> tuple[str, str]:
+    if not fleet.files_scanned:
+        return UNKNOWN, "no transcripts found."
+    unread = fleet.unreadable
+    detail = (f"{fleet.files_scanned:,} transcript files carry session context "
+              f"and per-message telemetry.")
+    if unread:
+        detail += (f" {unread:,} commands could not be parsed by this tool, so "
+                   f"logging exists but is not fully machine-readable.")
+    return CONSISTENT, detail
+
+
+AISVS_MAP = (
+    ("9.5.4", 2, "secrets and credentials required by an agent at runtime are not "
+                 "exposed within the model's observable context, including the "
+                 "context window, system prompts, or tool call parameters",
+     _aisvs_9_5_4),
+    ("9.2.1", 1, "the agent runtime blocks execution of privileged, high-impact, "
+                 "or irreversible actions until explicit human approval is "
+                 "received and verified", _aisvs_9_2_1),
+    ("9.2.2", 1, "approval requests display canonicalized and complete action "
+                 "parameters, such as diffs, commands, recipients, amounts",
+     _aisvs_9_2_2),
+    ("9.3.1", 1, "each tool/plugin executes in a least-privilege sandbox or is "
+                 "otherwise isolated from model operations", _aisvs_9_3_1),
+    ("AC.3.2", 1, "technical controls automatically strip sensitive material from "
+                  "any context window sent to an AI tool", _aisvs_ac_3_2),
+    ("AC.5.1", 1, "prompt-and-response pairs are logged with stable correlation "
+                  "identifiers, so that an investigator can later replay the "
+                  "whole chain", _aisvs_ac_5_1),
+    ("12.1.1", 1, "AI interactions are logged with session context and "
+                  "AI-specific telemetry", _aisvs_12_1_1),
+)
+
+
+def aisvs_findings(fleet: "Fleet") -> list[AisvsFinding]:
+    out = []
+    for control, level, text, fn in AISVS_MAP:
+        state, detail = fn(fleet)
+        out.append(AisvsFinding(control, level, text, state, detail))
+    return out
+
+
+# --------------------------------------------------------------------------
 # Blast-radius replay
 #
 # The report tells you a credential was exposed. It cannot tell you what
@@ -5407,6 +5636,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--top", type=int, default=12, metavar="N", help="projects to list (default 12)")
     ap.add_argument("--bash", action="store_true", help="shell audit only")
     ap.add_argument("--coach", action="store_true", help="coaching findings only")
+    ap.add_argument("--aisvs", action="store_true",
+                    help="map findings to OWASP AISVS controls")
     ap.add_argument("--explain", nargs="?", const="", metavar="TOPIC",
                     help="how a number is computed, what it assumes, how to check it")
     ap.add_argument("--replay", metavar="ID",
@@ -5621,6 +5852,8 @@ def main(argv: list[str] | None = None) -> int:
         print()
     elif args.share:
         render_share(fleet, C(use_color()))
+    elif args.aisvs:
+        render_aisvs(aisvs_findings(fleet), C(use_color()))
     elif args.coach:
         render_coach(coach(fleet), C(use_color()))
     else:
