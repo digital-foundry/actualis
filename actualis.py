@@ -2076,8 +2076,7 @@ def coach(fleet: "Fleet") -> list[Finding]:
                     f"~{money(waste)} of avoidable spend at current volume"))
 
     # --- AF003 unsupervised execution --------------------------------------
-    auto = sum(v for k, v in fleet.permission_modes.items()
-               if "auto" in k.lower() or "bypass" in k.lower())
+    auto = ungated_modes(fleet.permission_modes)
     modes = sum(fleet.permission_modes.values())
     if modes > 500:
         pct = auto / modes * 100
@@ -5217,12 +5216,28 @@ def _aisvs_9_5_4(fleet: "Fleet") -> tuple[str, str]:
                      f"parameter is exactly what this control forbids.")
 
 
+def ungated_modes(modes: "Counter") -> int:
+    """Turns recorded in a mode that does not stop for approval.
+
+    One definition, because there were two and they disagreed. The coach
+    matched `auto`/`bypass` as substrings; the AISVS 9.2.1 mapping matched the
+    literal key `"auto"` plus `codex:never`. Claude Code writes `auto` on some
+    builds and `bypassPermissions` on others -- the documented CLI value is
+    `bypassPermissions` -- so a corpus using the documented name was reported
+    as *consistent* with a control it plainly failed. Understating a failing
+    control is the worse direction of error for this tool.
+    """
+    return sum(v for k, v in modes.items()
+               if "auto" in k.lower() or "bypass" in k.lower()
+               or k == "codex:never")
+
+
 def _aisvs_9_2_1(fleet: "Fleet") -> tuple[str, str]:
     modes = fleet.permission_modes
     total = sum(modes.values())
     if not total:
         return UNKNOWN, "no permission mode was recorded in these transcripts."
-    ungated = modes.get("auto", 0) + modes.get("codex:never", 0)
+    ungated = ungated_modes(modes)
     pct = ungated / total * 100
     if pct >= 50:
         return FAILING, (f"{pct:.1f}% of {total:,} recorded turns ran in a mode "

@@ -3414,6 +3414,35 @@ class TestAisvsMapping(unittest.TestCase):
         self.assertEqual(got["9.2.1"].state, af.FAILING)
         self.assertIn("95.0%", got["9.2.1"].detail)
 
+    def test_bypass_permissions_falsifies_the_gate_like_auto_does(self):
+        """The documented CLI mode name must count, not just the alias.
+
+        Claude Code writes `auto` on some builds and `bypassPermissions` on
+        others; `bypassPermissions` is the value its own --permission-mode flag
+        takes. Matching only the literal key `auto` reported a corpus that had
+        never once stopped for approval as *consistent* with 9.2.1 -- the
+        coach's AF003 flagged the same corpus, so the tool disagreed with
+        itself. Understating a failing control is the worse error here.
+        """
+        f = self._fleet(modes={"bypassPermissions": 90, "default": 10})
+        got = {x.control: x for x in af.aisvs_findings(f)}
+        self.assertEqual(got["9.2.1"].state, af.FAILING)
+        self.assertIn("90.0%", got["9.2.1"].detail)
+
+    def test_the_coach_and_the_aisvs_mapping_count_the_same_modes(self):
+        """One definition. They drifted apart once and must not again."""
+        for modes in ({"auto": 9, "default": 1},
+                      {"bypassPermissions": 9, "default": 1},
+                      {"codex:never": 9, "default": 1},
+                      {"acceptEdits": 9, "default": 1}):
+            with self.subTest(modes=modes):
+                counter = af.Counter(modes)
+                ungated = af.ungated_modes(counter)
+                expected = sum(v for k, v in modes.items()
+                               if "auto" in k.lower() or "bypass" in k.lower()
+                               or k == "codex:never")
+                self.assertEqual(ungated, expected)
+
     def test_mostly_gated_is_consistent(self):
         f = self._fleet(modes={"auto": 5, "default": 95})
         got = {x.control: x for x in af.aisvs_findings(f)}
