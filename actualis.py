@@ -35,7 +35,7 @@ from typing import NamedTuple
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-__version__ = "0.1.11"
+__version__ = "0.1.12"
 
 # --------------------------------------------------------------------------
 # Pricing
@@ -2519,6 +2519,23 @@ def replay(fingerprint: str, events: list[ReplayEvent]) -> dict:
     }
 
 
+def clip(text: str, width: int) -> str:
+    """Cut a list-like line to width at a separator, not mid-token.
+
+    A hard slice produced output that reads as corrupted rather than
+    abbreviated: a session id ending "...-bdf3-", a program list ending "mak",
+    and worst, the overflow marker itself sliced to "(+2 mo" -- so the one
+    element whose job was to say "there is more" was the element destroyed.
+    """
+    if len(text) <= width:
+        return text
+    cut = text[:width - 1]
+    best = max((cut.rfind(sep) for sep in (", ", "  ", " ")), default=-1)
+    if best > 0:
+        return cut[:best].rstrip(" ,") + "\u2026"
+    return cut.rstrip(" ,") + "\u2026"
+
+
 def render_replay(inc: dict, c: C) -> None:
     w, ex, br, iv = inc["window"], inc["exposure"], inc["blast_radius"], inc["investigate"]
     rule(c, f"INCIDENT  {inc['fingerprint']}")
@@ -2533,27 +2550,30 @@ def render_replay(inc: dict, c: C) -> None:
         vals = ex[key]
         if not vals:
             continue
-        shown = ", ".join(vals[:3]) + (f"  (+{len(vals)-3} more)" if len(vals) > 3 else "")
-        print(f"    {label:<10} {len(vals):>4}   {c.dim}{shown[:62]}{c.off}")
+        # Reserve the overflow marker's width before clipping the values, so
+        # "and there are more" survives instead of being the first casualty.
+        marker = f"  (+{len(vals)-3} more)" if len(vals) > 3 else ""
+        shown = clip(", ".join(vals[:3]), 62 - len(marker)) + marker
+        print(f"    {label:<10} {len(vals):>4}   {c.dim}{shown}{c.off}")
 
     ss, sp, el = br["same_session"], br["same_project"], br["elsewhere"]
     print(f"\n  {c.bold}BLAST RADIUS{c.off}  {c.dim}graded by proximity, not clock overlap{c.off}")
     print(f"    same session  {ss['commands']:>6}   had the credential in context")
     if ss["branches"]:
-        print(f"      branches    {len(ss['branches']):>6}   {c.dim}{', '.join(ss['branches'][:4])[:56]}{c.off}")
+        print(f"      branches    {len(ss['branches']):>6}   {c.dim}{clip(', '.join(ss['branches'][:4]), 56)}{c.off}")
     print(f"    same project  {sp['commands']:>6}   {c.dim}other sessions, same project{c.off}")
     print(f"    elsewhere     {el['commands']:>6}   {c.dim}overlapped in time only, "
           f"{len(el['projects'])} unrelated projects{c.off}")
     if br["programs"]:
         top = "  ".join(f"{k}:{v}" for k, v in list(br["programs"].items())[:8])
-        print(f"    programs      {c.dim}{top[:66]}{c.off}")
+        print(f"    programs      {c.dim}{clip(top, 66)}{c.off}")
 
     denom = ss["commands"] or 1
     print(f"\n  {c.bold}INVESTIGATE{c.off}  {c.dim}in-session, touching egress, credentials or a database{c.off}")
     print(f"    commands      {c.yellow}{iv['commands']:>6}{c.off}   "
           f"{c.dim}({iv['commands']/denom*100:.1f}% of the {ss['commands']} in-session){c.off}")
     if iv["programs"]:
-        print(f"    programs      {c.dim}" + "  ".join(f"{k}:{v}" for k, v in iv["programs"].items())[:66] + f"{c.off}")
+        print(f"    programs      {c.dim}" + clip("  ".join(f"{k}:{v}" for k, v in iv["programs"].items()), 66) + f"{c.off}")
 
     print(f"\n  {c.bold}WHAT THIS DOES NOT ESTABLISH{c.off}")
     for lim in inc["limits"]:
