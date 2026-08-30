@@ -75,6 +75,15 @@ jobs:
 
   pypi:
     needs: build
+    # Tags only. workflow_dispatch exists so an existing tag can be re-published,
+    # and dispatching against a TAG still satisfies this. Dispatching against a
+    # BRANCH previously reached the upload step with no version guard at all --
+    # the tag-matches-pyproject check above is itself tag-gated, so a branch run
+    # skipped the check and then tried to publish whatever version main happened
+    # to carry. It was survivable only because the version already existed on
+    # PyPI. A PyPI filename cannot be reused, so that is not a mistake you get
+    # to make twice.
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: pypi          # must match the pending publisher config
