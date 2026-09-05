@@ -172,6 +172,7 @@ python3 actualis.py --agent codex    # one agent only (claude | codex | all)
 | `--top N` | how many projects and tickets to list (default 12) |
 | `--agent {all,claude,codex}` | which agents to include (default all) |
 | `--root DIR` | read one specific transcript directory instead of discovering them |
+| `--ci-log FILE` | audit a Claude Code Action execution log on a CI runner, instead of discovering transcript directories |
 | `--bash` | shell audit only |
 | `--coach` | findings and actions only |
 | `--aisvs` | which OWASP AISVS controls your transcripts show are **not** holding |
@@ -555,6 +556,41 @@ pipeline can capture the report and the outcome separately:
 ```sh
 actualis --json --fail-on high > report.json || echo "gate failed"
 ```
+
+### Auditing an agent that ran *in* CI
+
+The commands above audit a runner's own transcript directories. If the agent
+ran in the job itself, there aren't any — the
+[Claude Code Action](https://github.com/anthropics/claude-code-action) drives
+Claude Code through the SDK and writes every event to a single JSON array,
+exposing the path as its `execution_file` output.
+
+```yaml
+- id: claude
+  uses: anthropics/claude-code-action@v1
+  with:
+    prompt: "Fix the failing test"
+
+- run: pipx install actualis && actualis --ci-log "$LOG" --fail-on critical
+  env:
+    LOG: ${{ steps.claude.outputs.execution_file }}
+```
+
+`--ci-log` reads that documented output rather than guessing at `~/.claude` on
+the runner. The action drives Claude Code through the SDK, so whether a
+transcript directory exists there at all is an internal detail that could
+change without notice; `execution_file` is a published contract.
+
+The records inside are the same ones the local parser reads — their own README
+describes them as "top-level events with `type`; assistant text is nested under
+`message.content`" — so one code path understands both, and a change to what a
+record *means* cannot apply to one source and not the other.
+
+**What this does and does not cover.** An execution log is one job's events. It
+carries the tool calls, the token usage and the commands, so credential
+detection, the shell audit and cost all work. It is not a fleet: there is no
+history before this run, so `--diff` against a saved baseline is the way to ask
+what changed, and blast-radius replay is bounded by the single job.
 
 **Suppressed findings do not fail the build.** That is what suppression is for —
 if a recorded, reasoned decision still broke CI, people would delete findings

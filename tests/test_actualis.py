@@ -3414,6 +3414,134 @@ class TestNoRawSecretReachesAnyOutput(unittest.TestCase):
         self.assertNotIn(self.SECRET, redacted)
 
 
+class TestCiExecutionLog(unittest.TestCase):
+    """The Claude Code Action writes a JSON array, not JSONL.
+
+    Same records, different framing. The whole point of the shared ingest path
+    is that a change to what a record *means* cannot apply to one source and
+    not the other, so the load-bearing test here is the equivalence one.
+    """
+
+    SECRET = "AKIANOTAREALAWSKEY01"
+
+    def _records(self):
+        """Records shaped the way the SDK emits them."""
+        ts = "2026-06-01T10:00:00Z"
+        return [
+            {"type": "assistant", "timestamp": ts, "permissionMode": "auto",
+             "message": {"id": "msg_1", "model": "claude-sonnet-5",
+                         "role": "assistant",
+                         "usage": {"input_tokens": 100, "output_tokens": 50,
+                                   "cache_read_input_tokens": 900}}},
+            # The same billable message re-emitted while streaming.
+            {"type": "assistant", "timestamp": ts, "permissionMode": "auto",
+             "message": {"id": "msg_1", "model": "claude-sonnet-5",
+                         "role": "assistant",
+                         "usage": {"input_tokens": 100, "output_tokens": 50,
+                                   "cache_read_input_tokens": 900}}},
+            {"type": "assistant", "timestamp": ts, "permissionMode": "auto",
+             "message": {"id": "msg_2", "model": "claude-sonnet-5",
+                         "role": "assistant",
+                         "content": [{"type": "tool_use", "id": "t1",
+                                      "name": "Bash",
+                                      "input": {"command":
+                                                f"export AWS_ACCESS_KEY_ID={self.SECRET}"}}]}},
+        ]
+
+    def _log(self, td, records=None):
+        f = Path(td) / "claude-execution-output.json"
+        f.write_text(json.dumps(records if records is not None else self._records()),
+                     encoding="utf-8")
+        return f
+
+    def test_the_two_serialisations_agree(self):
+        """A JSON array and the equivalent JSONL must produce the same numbers.
+
+        This is the test that stops the CI path and the local path drifting.
+        """
+        recs = self._records()
+        with tempfile.TemporaryDirectory() as td:
+            array = self._log(td)
+            a = af.Fleet()
+            a.scan_execution_log(array, "proj", None)
+
+            lines = Path(td) / "session.jsonl"
+            lines.write_text("\n".join(json.dumps(r) for r in recs) + "\n",
+                             encoding="utf-8")
+            b = af.Fleet()
+            b._scan_file(lines, "proj", None)
+
+        self.assertEqual(a.messages, b.messages)
+        self.assertEqual(a.duplicate_usage_records, b.duplicate_usage_records)
+        self.assertEqual(round(a.total_cost, 8), round(b.total_cost, 8))
+        self.assertEqual(a.bash_total, b.bash_total)
+        self.assertEqual(dict(a.permission_modes), dict(b.permission_modes))
+        self.assertEqual(sorted(a.secrets), sorted(b.secrets))
+
+    def test_a_credential_in_a_ci_run_is_found(self):
+        with tempfile.TemporaryDirectory() as td:
+            f = af.Fleet()
+            f.scan_execution_log(self._log(td), "proj", None)
+        self.assertTrue(f.secrets, "a credential in a CI log must still be found")
+
+    def test_streaming_repeats_are_still_counted_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            f = af.Fleet()
+            f.scan_execution_log(self._log(td), "proj", None)
+        # `messages` counts billable messages, not records: msg_1 once
+        # despite being emitted twice, and msg_2 carries no usage block.
+        self.assertEqual(f.messages, 1)
+        self.assertEqual(f.duplicate_usage_records, 1)
+
+    def test_a_json_object_instead_of_an_array_is_ignored_not_crashed(self):
+        with tempfile.TemporaryDirectory() as td:
+            p2 = Path(td) / "x.json"
+            p2.write_text('{"not": "an array"}', encoding="utf-8")
+            f = af.Fleet()
+            f.scan_execution_log(p2, "proj", None)
+        self.assertEqual(f.messages, 0)
+
+    def test_malformed_json_is_ignored_not_crashed(self):
+        with tempfile.TemporaryDirectory() as td:
+            p2 = Path(td) / "x.json"
+            p2.write_text("{{{ not json", encoding="utf-8")
+            f = af.Fleet()
+            f.scan_execution_log(p2, "proj", None)
+        self.assertEqual(f.messages, 0)
+
+    def test_non_dict_entries_in_the_array_are_skipped(self):
+        with tempfile.TemporaryDirectory() as td:
+            f = af.Fleet()
+            f.scan_execution_log(
+                self._log(td, ["a string", 42, None] + self._records()),
+                "proj", None)
+        self.assertEqual(f.messages, 1)
+
+    def _cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(af.SRC_PATH), *args],
+            capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+    def test_a_missing_file_is_reported_not_traced(self):
+        out = self._cli("--ci-log", "/nonexistent/claude-execution-output.json")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("is not a file", out.stderr)
+        self.assertNotIn("Traceback", out.stderr)
+
+    def test_a_directory_is_reported_not_traced(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = self._cli("--ci-log", td)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("is not a file", out.stderr)
+        self.assertNotIn("Traceback", out.stderr)
+
+    def test_fail_on_gates_a_ci_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            f = self._log(td)
+            out = self._cli("--ci-log", str(f), "--fail-on", "critical")
+        self.assertEqual(out.returncode, 3, out.stderr[:400])
+
+
 class TestAisvsMapping(unittest.TestCase):
     """The mapping falsifies; it must never read as a passing audit.
 

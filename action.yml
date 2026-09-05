@@ -1,0 +1,137 @@
+name: "Actualis — audit what your coding agent actually did"
+description: >-
+  Read the execution log a Claude Code Action run leaves on the runner and
+  report exposed credentials, risky shell activity and cost. Local, read-only,
+  no network, no account.
+author: "Digital Foundry Solutions, LLC"
+
+branding:
+  icon: shield
+  color: orange
+
+inputs:
+  execution-file:
+    description: >-
+      Path to the Claude Code Action's execution log. Pass the upstream step's
+      `execution_file` output. This is a published contract of that action;
+      reading it is more reliable than guessing at ~/.claude on the runner,
+      because the action drives Claude Code through the SDK.
+    required: true
+
+  fail-on:
+    description: >-
+      Fail the job when any unsuppressed finding is at or above this level:
+      `critical`, `high`, or `any`. Set to `none` to report without gating.
+    required: false
+    default: "critical"
+
+  version:
+    description: >-
+      Version of actualis to install, e.g. `0.1.12`. Empty installs the latest.
+      Pin it: an audit step that silently changes what it flags is worse than
+      one that does not run.
+    required: false
+    default: ""
+
+  json-report:
+    description: >-
+      Optional path to write the machine-readable report to. Credentials are
+      redacted; the value of a secret is never written, only a hash of it.
+      Useful as a `--diff` baseline on the next run.
+    required: false
+    default: ""
+
+  summary:
+    description: >-
+      Write the report to the GitHub job summary. Redacted, but the summary is
+      as visible as the job log, so set to `false` on a public repository if
+      command text alone is sensitive.
+    required: false
+    default: "true"
+
+outputs:
+  exit-code:
+    description: "0 clean, 3 findings at or above fail-on, 1 could not run."
+    value: ${{ steps.audit.outputs.exit-code }}
+  findings:
+    description: "Number of unsuppressed findings, or empty if the scan could not run."
+    value: ${{ steps.audit.outputs.findings }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install actualis
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        if [ -n "$VERSION" ]; then
+          python3 -m pip install --quiet --disable-pip-version-check "actualis==$VERSION"
+        else
+          python3 -m pip install --quiet --disable-pip-version-check actualis
+        fi
+        echo "actualis $(actualis --version | awk '{print $2}') installed"
+
+    - name: Audit the agent session
+      id: audit
+      shell: bash
+      env:
+        EXECUTION_FILE: ${{ inputs.execution-file }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        JSON_REPORT: ${{ inputs.json-report }}
+        SUMMARY: ${{ inputs.summary }}
+      run: |
+        set -uo pipefail
+
+        if [ -z "${EXECUTION_FILE}" ] || [ ! -f "${EXECUTION_FILE}" ]; then
+          echo "::error::execution-file not found: '${EXECUTION_FILE}'"
+          echo "Pass the upstream step's execution_file output, e.g."
+          echo "  execution-file: \${{ steps.claude.outputs.execution_file }}"
+          echo "If Claude Code did not run in this job there is no log to audit."
+          exit 1
+        fi
+
+        work="${RUNNER_TEMP:-.}"
+
+        args=(--ci-log "${EXECUTION_FILE}")
+        [ "${FAIL_ON}" != "none" ] && args+=(--fail-on "${FAIL_ON}")
+
+        # The human-readable report, for the log and the summary. This run
+        # carries the gate, so its exit code is the one that matters.
+        set +e
+        actualis "${args[@]}" > "${work}/report.txt" 2> "${work}/verdict.txt"
+        rc=$?
+        set -e
+        cat "${work}/report.txt"
+        cat "${work}/verdict.txt" >&2
+
+        # The machine-readable one, once, without --fail-on: a gating exit
+        # code must not truncate a report the user asked to keep. Everything
+        # downstream reads this file rather than re-scanning.
+        actualis --ci-log "${EXECUTION_FILE}" --json > "${work}/report.json" 2>/dev/null || true
+        if [ -n "${JSON_REPORT}" ] && [ "${JSON_REPORT}" != "${work}/report.json" ]; then
+          cp "${work}/report.json" "${JSON_REPORT}" && echo "wrote ${JSON_REPORT}"
+        fi
+
+        # Coach findings plus unsuppressed credentials. Suppressed ones are
+        # excluded here for the same reason they do not fail the build: a
+        # recorded, reasoned decision should not keep showing up as a number.
+        findings=$(python3 -c "import json; d=json.load(open('${work}/report.json')); print(len(d.get('coach', [])) + len([s for s in d.get('secrets', []) if not s.get('suppressed')]))" 2>/dev/null || echo "")
+
+        echo "exit-code=${rc}" >> "$GITHUB_OUTPUT"
+        echo "findings=${findings}" >> "$GITHUB_OUTPUT"
+
+        if [ "${SUMMARY}" = "true" ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+          {
+            echo "## Actualis — what the agent actually did"
+            echo
+            echo '```'
+            cat "${work}/report.txt"
+            echo '```'
+            echo
+            sed 's/^/> /' "${work}/verdict.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+        exit "${rc}"
