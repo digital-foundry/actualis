@@ -1874,55 +1874,106 @@ class Fleet:
                     if not isinstance(rec, dict):
                         continue
 
-                    ts = parse_ts(rec.get("timestamp"))
-                    if since and ts and ts < since:
-                        continue
-
-                    mode = rec.get("permissionMode")
-                    if mode:
-                        self.permission_modes[mode] += 1
-                    denial = rec.get("toolDenialKind")
-                    if denial:
-                        self.denials[denial] += 1
-                        self.denials_by_project[project] += 1
-                        self.add_refusal(str(denial), rec, project, ts, calls)
-                    eff = rec.get("effort")
-                    if eff:
-                        self.effort_mix[str(eff)] += 1
-
-                    msg = rec.get("message")
-                    if not isinstance(msg, dict):
-                        continue
-
-                    usage = msg.get("usage")
-                    if isinstance(usage, dict):
-                        # One billable message, however many records carry it.
-                        mid = msg.get("id")
-                        if mid and mid in self.seen_message_ids:
-                            self.duplicate_usage_records += 1
-                        else:
-                            if mid:
-                                self.seen_message_ids.add(mid)
-                            self.add_usage(project, msg.get("model") or "unknown",
-                                           usage, ts, rec.get("gitBranch"))
-
-                    tur = rec.get("toolUseResult")
-                    if isinstance(tur, dict) and tur.get("toolStats") is not None:
-                        self.add_subagent(tur, ts)
-
-                    content = msg.get("content")
-                    if isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "tool_use":
-                                self.add_tool(project, block.get("name") or "?",
-                                              block.get("input") or {}, ts)
-                                if block.get("id"):
-                                    calls[block["id"]] = (
-                                        block.get("name") or "?",
-                                        ((block.get("input") or {}).get("command") or "")
-                                        [:MAX_SCAN_LINE])
+                    self._ingest_claude(rec, project, since, calls)
         except OSError:
             return
+
+    def _ingest_claude(self, rec: dict, project: str, since: "datetime | None",
+                       calls: dict) -> None:
+        """Ingest one Claude Code record, whatever framed it.
+
+        Split out because the same records reach us two ways: the `.jsonl`
+        transcripts on a developer's disk, and the JSON array the Claude Code
+        GitHub Action writes on a CI runner. Same records, different framing --
+        so this stays the only place that knows what a record *means*, and a
+        change to that meaning cannot apply to one source and not the other.
+        """
+        ts = parse_ts(rec.get("timestamp"))
+        if since and ts and ts < since:
+            return
+
+        mode = rec.get("permissionMode")
+        if mode:
+            self.permission_modes[mode] += 1
+        denial = rec.get("toolDenialKind")
+        if denial:
+            self.denials[denial] += 1
+            self.denials_by_project[project] += 1
+            self.add_refusal(str(denial), rec, project, ts, calls)
+        eff = rec.get("effort")
+        if eff:
+            self.effort_mix[str(eff)] += 1
+
+        msg = rec.get("message")
+        if not isinstance(msg, dict):
+            return
+
+        usage = msg.get("usage")
+        if isinstance(usage, dict):
+            # One billable message, however many records carry it.
+            mid = msg.get("id")
+            if mid and mid in self.seen_message_ids:
+                self.duplicate_usage_records += 1
+            else:
+                if mid:
+                    self.seen_message_ids.add(mid)
+                self.add_usage(project, msg.get("model") or "unknown",
+                               usage, ts, rec.get("gitBranch"))
+
+        tur = rec.get("toolUseResult")
+        if isinstance(tur, dict) and tur.get("toolStats") is not None:
+            self.add_subagent(tur, ts)
+
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    self.add_tool(project, block.get("name") or "?",
+                                  block.get("input") or {}, ts)
+                    if block.get("id"):
+                        calls[block["id"]] = (
+                            block.get("name") or "?",
+                            ((block.get("input") or {}).get("command") or "")
+                            [:MAX_SCAN_LINE])
+
+    def scan_execution_log(self, path: Path, project: str,
+                           since: "datetime | None") -> None:
+        """Scan the execution log a CI run leaves behind.
+
+        The Claude Code GitHub Action writes every SDK event to
+        $RUNNER_TEMP/claude-execution-output.json and exposes the path as its
+        `execution_file` output. It is a JSON array rather than
+        newline-delimited, but the records are the ones _ingest_claude already
+        understands -- their own README describes them as "top-level events
+        with `type`; assistant text is nested under `message.content`".
+
+        Reading that documented output rather than guessing at ~/.claude on the
+        runner is deliberate. The action drives Claude Code through the SDK, so
+        whether a transcript directory exists there at all is an internal
+        detail that could change without notice. `execution_file` is a
+        published contract.
+
+        No substring prefilter here. The JSONL path skips lines before parsing
+        because a real fleet is thousands of files; one execution log is a
+        single document that must be parsed whole regardless.
+        """
+        try:
+            st = path.stat()
+        except OSError:
+            return
+        self.files_scanned += 1
+        self.bytes_scanned += st.st_size
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                records = json.load(fh)
+        except (OSError, json.JSONDecodeError, ValueError, RecursionError):
+            return
+        if not isinstance(records, list):
+            return
+        calls: dict[str, tuple[str, str]] = {}
+        for rec in records:
+            if isinstance(rec, dict):
+                self._ingest_claude(rec, project, since, calls)
 
     # -- derived -----------------------------------------------------------
 
@@ -5545,6 +5596,7 @@ COMPLETION_SHELLS = ("bash", "zsh", "fish")
 
 _VALUE_HINT = {          # option -> how the shell should complete its argument
     "--root": "dir",
+    "--ci-log": "file",
     "--diff": "file",
 }
 
@@ -5710,6 +5762,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--suppressions", action="store_true",
                     help="list current suppressions and where they come from")
     ap.add_argument("--root", metavar="DIR", help="transcript directory")
+    ap.add_argument("--ci-log", metavar="FILE",
+                    help="audit a Claude Code Action execution log (JSON array)")
     ap.add_argument("--service", choices=SERVICE_KINDS, metavar="KIND",
                     help="print a launchd, systemd or newsyslog unit for --watch")
     ap.add_argument("--self-check", action="store_true",
@@ -5835,7 +5889,23 @@ def main(argv: list[str] | None = None) -> int:
     fleet = Fleet()
     progress = not args.json and sys.stderr.isatty()
 
-    if args.root:
+    if args.ci_log:
+        # A CI runner has no transcript directory to discover -- the agent ran
+        # in this job and the action wrote one JSON array. Handled before
+        # --root because the two are different shapes, and the --root error
+        # message says so explicitly ("not a file").
+        log = Path(args.ci_log).expanduser()
+        if not log.is_file():
+            sys.exit(f"actualis: {log} is not a file.\n"
+                     "  --ci-log takes the Claude Code Action's execution_file "
+                     "output,\n  normally $RUNNER_TEMP/claude-execution-output.json.")
+        # Name the project after the repository when CI tells us, so the report
+        # reads like the thing being audited rather than a temp path.
+        repo = os.environ.get("GITHUB_REPOSITORY") or ""
+        project = clean(repo.split("/")[-1]) if repo else "ci"
+        fleet.roots.append(log)
+        fleet.scan_execution_log(log, project, since)
+    elif args.root:
         # --root names a directory; --agent says how to read it. Routing every
         # --root to the Claude parser meant `--root X --agent codex` silently
         # parsed Codex rollouts as Claude transcripts and reported nothing.

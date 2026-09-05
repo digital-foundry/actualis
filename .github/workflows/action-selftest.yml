@@ -1,0 +1,82 @@
+name: action self-test
+
+# The action wraps a PUBLISHED package: its install step runs
+# `pip install actualis`. Testing it on every push would therefore test the
+# last release against the current action.yml -- a chicken-and-egg problem that
+# fails for real reasons nobody can fix inside the PR.
+#
+# So it runs after a release, when the version it installs is the version this
+# repository just shipped, plus on demand and weekly.
+on:
+  release: { types: [published] }
+  workflow_dispatch:
+  schedule:
+    - cron: "0 7 * * 1"   # the action can break without this repo changing
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      # A real Claude Code Action run costs an API key and a model call on
+      # every self-test. The contract we depend on is the *file*, not the run
+      # that produced it, so synthesise one in exactly the documented shape:
+      # a JSON array of SDK events, top-level `type`, `message.content` nested.
+      - name: Synthesise an execution log
+        run: |
+          python3 - "$RUNNER_TEMP/claude-execution-output.json" <<'PY'
+          import json, sys, string, random
+          rng = random.Random(11)
+          body = "".join(rng.choice(string.ascii_uppercase + string.digits) for _ in range(16))
+          key = "AK" + "IA" + body          # shaped, generated, never a real credential
+          recs = []
+          for i, cmd in enumerate(["npm ci", "npm test",
+                                   f"export AWS_ACCESS_KEY_ID={key} && aws s3 ls",
+                                   "rm -rf dist/"], start=1):
+              ts = f"2026-09-05T10:{i:02d}:00Z"
+              recs.append({"type": "assistant", "timestamp": ts,
+                           "permissionMode": "bypassPermissions",
+                           "message": {"id": f"m{i}", "model": "claude-sonnet-5",
+                                       "role": "assistant",
+                                       "usage": {"input_tokens": 100 * i,
+                                                 "output_tokens": 40 * i}}})
+              recs.append({"type": "assistant", "timestamp": ts,
+                           "permissionMode": "bypassPermissions",
+                           "message": {"id": f"m{i}", "model": "claude-sonnet-5",
+                                       "role": "assistant",
+                                       "content": [{"type": "tool_use", "id": f"t{i}",
+                                                    "name": "Bash",
+                                                    "input": {"command": cmd}}]}})
+          json.dump(recs, open(sys.argv[1], "w"))
+          PY
+
+      - name: Run the action — expect the gate to fire
+        id: audit
+        continue-on-error: true
+        uses: ./
+        with:
+          execution-file: ${{ runner.temp }}/claude-execution-output.json
+          fail-on: critical
+          json-report: ${{ runner.temp }}/report.json
+
+      - name: Assert the contract
+        run: |
+          set -euo pipefail
+          rc='${{ steps.audit.outputs.exit-code }}'
+          findings='${{ steps.audit.outputs.findings }}'
+          echo "exit-code=$rc findings=$findings"
+
+          [ "$rc" = "3" ] || { echo "::error::planted credential did not fail the gate (rc=$rc)"; exit 1; }
+          [ -n "$findings" ] && [ "$findings" -gt 0 ] || { echo "::error::no findings reported"; exit 1; }
+          [ -s "$RUNNER_TEMP/report.json" ] || { echo "::error::json-report was not written"; exit 1; }
+
+          # The load-bearing safety property: the tool redacts, so no artifact
+          # the action produces may contain the credential it just found.
+          if grep -qE 'AKIA[A-Z0-9]{16}' "$RUNNER_TEMP/report.json"; then
+            echo "::error::RAW CREDENTIAL LEAKED into the JSON report"; exit 1
+          fi
+          echo "ok: gate fired, findings reported, nothing leaked"

@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`--ci-log FILE` audits an agent that ran inside CI, and a GitHub Action
+  wraps it.** Until now the tool audited a developer's laptop. Agents
+  increasingly run *in* CI, where the record lands on org infrastructure by
+  construction — which is the population this was always aimed at and could not
+  reach.
+
+  On a runner there is no transcript directory to discover: the agent ran in
+  this job. The [Claude Code Action](https://github.com/anthropics/claude-code-action)
+  drives Claude Code through the SDK and writes every event to a single JSON
+  array at `$RUNNER_TEMP/claude-execution-output.json`, exposing the path as
+  its `execution_file` output. `--ci-log` reads that.
+
+  **Reading the documented output rather than guessing at `~/.claude` on the
+  runner is the deliberate part.** Whether a transcript directory exists there
+  at all is an SDK internal that could change without notice; `execution_file`
+  is a published contract.
+
+  The records inside are the ones the local parser already understands — the
+  action's own README describes them as "top-level events with `type`;
+  assistant text is nested under `message.content`". So the record-level
+  ingest is now shared: `_ingest_claude` is the only place that knows what a
+  record *means*, and a change to that meaning cannot apply to one
+  serialisation and not the other. There is a test asserting the two agree on
+  message count, dedup, cost, commands, permission modes and credentials.
+
+  `action.yml` at the repository root wraps it: pass the upstream step's
+  `execution_file`, get a gate, a job summary and an optional JSON report.
+  Credentials are redacted, and the self-test fails the build if a raw
+  credential ever reaches an artifact the action produces.
+
+  What this does **not** cover: an execution log is one job's events. Cost, the
+  shell audit and credential detection all work; there is no history before the
+  run, so `--diff` against a saved baseline is how to ask what changed, and
+  blast-radius replay is bounded by the single job.
+
 ## 0.1.12 — 2026-08-30
 
 ### Fixed
