@@ -576,6 +576,13 @@ exposing the path as its `execution_file` output.
     LOG: ${{ steps.claude.outputs.execution_file }}
 ```
 
+The action's outputs are available whether or not the gate fires:
+
+| output | meaning |
+|---|---|
+| `exit-code` | `0` clean, `3` findings at or above `fail-on`, `1` could not run |
+| `findings` | coach findings plus unsuppressed credentials |
+
 `--ci-log` reads that documented output rather than guessing at `~/.claude` on
 the runner. The action drives Claude Code through the SDK, so whether a
 transcript directory exists there at all is an internal detail that could

@@ -5,10 +5,15 @@ name: action self-test
 # last release against the current action.yml -- a chicken-and-egg problem that
 # fails for real reasons nobody can fix inside the PR.
 #
-# So it runs after a release, when the version it installs is the version this
-# repository just shipped, plus on demand and weekly.
+# So it runs once the release workflow has finished publishing.
+#
+# `workflow_run`, not `release: published`. A release created by a workflow
+# using the default GITHUB_TOKEN does not trigger other workflows -- GitHub
+# blocks that to prevent recursion -- so the release trigger never fired once.
 on:
-  release: { types: [published] }
+  workflow_run:
+    workflows: ["release"]
+    types: [completed]
   workflow_dispatch:
   schedule:
     - cron: "0 7 * * 1"   # the action can break without this repo changing
@@ -19,6 +24,12 @@ permissions:
 jobs:
   selftest:
     runs-on: ubuntu-latest
+    # A failed release publishes nothing, so there is no new version to test.
+    # workflow_dispatch and schedule carry no upstream conclusion, hence the
+    # explicit event check rather than a bare conclusion test.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
@@ -56,6 +67,9 @@ jobs:
 
       - name: Run the action — expect the gate to fire
         id: audit
+        # The action is *supposed* to fail here: a credential was planted.
+        # continue-on-error keeps the job alive so the next step can check
+        # that it failed for the right reason and still reported its outputs.
         continue-on-error: true
         uses: ./
         with:
@@ -68,9 +82,15 @@ jobs:
           set -euo pipefail
           rc='${{ steps.audit.outputs.exit-code }}'
           findings='${{ steps.audit.outputs.findings }}'
-          echo "exit-code=$rc findings=$findings"
+          outcome='${{ steps.audit.outcome }}'
+          echo "outcome=$outcome exit-code=$rc findings=$findings"
 
-          [ "$rc" = "3" ] || { echo "::error::planted credential did not fail the gate (rc=$rc)"; exit 1; }
+          # The action must fail the job when the gate fires...
+          [ "$outcome" = "failure" ] || { echo "::error::planted credential did not fail the job (outcome=$outcome)"; exit 1; }
+          # ...AND still report its outputs. It did not, before 0.1.14: a
+          # composite action that exits non-zero drops them, so exit-code and
+          # findings came back empty exactly when there was something to say.
+          [ "$rc" = "3" ] || { echo "::error::exit-code output missing or wrong (rc='$rc')"; exit 1; }
           [ -n "$findings" ] && [ "$findings" -gt 0 ] || { echo "::error::no findings reported"; exit 1; }
           [ -s "$RUNNER_TEMP/report.json" ] || { echo "::error::json-report was not written"; exit 1; }
 

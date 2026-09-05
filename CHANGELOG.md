@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.1.14 — 2026-09-05
+
+### Fixed
+
+- **The GitHub Action reported nothing back exactly when it had something to
+  say.** A composite action that exits non-zero does not propagate its outputs,
+  so `exit-code` and `findings` came back **empty whenever `fail-on` fired** —
+  the one case a caller most needs them. The gate worked; the reporting did
+  not.
+
+  The audit step now always exits 0 and a separate `Gate` step does the
+  failing, so the outputs come from a step that succeeded. The self-test now
+  asserts both halves of the contract: that the job fails, *and* that the
+  outputs survive.
+
+  Found by the self-test on the first run against a published release, which is
+  what it was written for. It had never run automatically, because of the
+  second bug below.
+
+- **The action self-test could never trigger.** It listened for
+  `release: published`, but a release created by a workflow using the default
+  `GITHUB_TOKEN` does not trigger other workflows — GitHub blocks that to
+  prevent recursion. It now runs on `workflow_run` when the release workflow
+  completes, and skips when that release failed, since a failed release
+  publishes nothing to test.
+
 ## 0.1.13 — 2026-09-05
 
 ### Added
