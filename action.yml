@@ -134,4 +134,29 @@ runs:
           } >> "$GITHUB_STEP_SUMMARY"
         fi
 
-        exit "${rc}"
+        # Deliberately exits 0 even when the gate should fire. A composite
+        # action that exits non-zero does not propagate its outputs, so failing
+        # here blanked `exit-code` and `findings` exactly when there was
+        # something to report. The next step does the failing.
+        exit 0
+
+    - name: Gate
+      if: ${{ inputs.fail-on != 'none' }}
+      shell: bash
+      env:
+        RC: ${{ steps.audit.outputs.exit-code }}
+        FINDINGS: ${{ steps.audit.outputs.findings }}
+      run: |
+        set -uo pipefail
+        if [ "${RC}" = "0" ]; then
+          echo "actualis: nothing at or above the threshold."
+          exit 0
+        fi
+        if [ "${RC}" = "3" ]; then
+          echo "::error::actualis found ${FINDINGS} finding(s) at or above the threshold."
+          exit 1
+        fi
+        # 1 could not run, 2 a usage error. Neither is a clean pass, and
+        # neither should be reported as findings.
+        echo "::error::actualis could not complete the audit (exit ${RC})."
+        exit 1
