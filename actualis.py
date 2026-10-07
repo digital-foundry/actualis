@@ -29,10 +29,12 @@ import hashlib
 import json
 import os
 import re
+import struct
 import sys
+import zlib
 from collections import Counter, OrderedDict, defaultdict
 from typing import NamedTuple
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 __version__ = "0.1.14"
@@ -1095,6 +1097,51 @@ SUPPRESSION_FILENAME = "suppressions"
 PROJECT_SUPPRESSIONS = ".actualis-suppressions"
 
 
+
+_TEST_PROGRAMS = frozenset({"pytest", "jest", "vitest", "mocha", "rspec",
+                            "phpunit", "tox", "nox", "ava", "karma"})
+# Programs whose `test` subcommand runs a test suite.
+_TEST_SUBCOMMAND = frozenset({"npm", "pnpm", "yarn", "bun", "go", "cargo", "make",
+                              "dotnet", "deno", "mix", "swift", "gradle", "mvn"})
+_INSTALLERS = {   # program -> the subcommands that install something
+    "pip": {"install"}, "pip3": {"install"}, "pipx": {"install"},
+    "brew": {"install", "upgrade"}, "apt": {"install"}, "apt-get": {"install"},
+    "dnf": {"install"}, "yum": {"install"}, "apk": {"add"}, "gem": {"install"},
+    "npm": {"install", "i", "ci", "add"}, "pnpm": {"install", "i", "add"},
+    "yarn": {"install", "add"}, "bun": {"install", "i", "add"},
+    "cargo": {"install", "add"}, "go": {"install", "get"}, "uv": {"add", "sync"},
+}
+
+
+def command_category(cmd: str) -> str:
+    """git, test, install or other: the only shape of a command a card shows.
+
+    A command head can identify (`./acme-deploy`); four fixed words cannot. The
+    head alone is not enough -- `npm test` and `npm i` share it -- so the token
+    after the program decides.
+    """
+    head = command_head(cmd)
+    if not head:
+        return "other"
+    if head == "git":
+        return "git"
+    toks = cmd.split()
+    names = [t.rsplit("/", 1)[-1] for t in toks]
+    rest = toks[names.index(head) + 1:] if head in names else []
+    sub = rest[0] if rest else ""
+    if head in _TEST_PROGRAMS:
+        return "test"
+    if head.startswith("python") and rest[:2] in (["-m", "pytest"], ["-m", "unittest"]):
+        return "test"
+    if head in _TEST_SUBCOMMAND and (
+            sub == "test" or (sub == "run" and len(rest) > 1 and rest[1].startswith("test"))):
+        return "test"
+    if head == "uv" and rest[:2] in (["pip", "install"], ["tool", "install"]):
+        return "install"
+    if sub in _INSTALLERS.get(head, ()):
+        return "install"
+    return "other"
+
 def suppression_paths() -> list[Path]:
     """Where suppressions are read from, least specific first.
 
@@ -1419,6 +1466,17 @@ class Fleet:
         self.tools: Counter = Counter()
         self.bash_total = 0
         self.bash_first_token: Counter = Counter()
+        # Shell commands per UTC date, and how many ran in a mode that does not
+        # stop for approval. bash_moded_by_day is the denominator: a command
+        # whose mode was never recorded is neither supervised nor unsupervised,
+        # and guessing either way would bias the card's headline number.
+        self.bash_by_day: Counter = Counter()
+        self.bash_moded_by_day: Counter = Counter()
+        self.unsupervised_by_day: Counter = Counter()
+        self.bash_categories: Counter = Counter()
+        self.agents_seen: set[str] = set()
+        # The permission mode in force, carried across records within one file.
+        self._mode: str | None = None
         self.flags: list[dict] = []
         self.flag_counts: Counter = Counter()
         self.permission_modes: Counter = Counter()
@@ -1518,6 +1576,7 @@ class Fleet:
         self.models_by_tier[src].add(model)
 
         self.messages += 1
+        self.agents_seen.add("claude-code")
         self.cost_by_agent["claude-code"] += cost
         self.units_by_agent["claude-code"] += 1
         self.msgs_by_model[model] += 1
@@ -1577,6 +1636,7 @@ class Fleet:
             self.cost_unknown += cost
 
         self.messages += 1
+        self.agents_seen.add("codex")
         self.cost_by_agent["codex"] += cost
         self.units_by_agent["codex"] += 1
         self.msgs_by_model[model] += 1
@@ -1611,10 +1671,11 @@ class Fleet:
         self.files_scanned += 1
 
         cwd = model = None
+        policy: str | None = None
         best: dict | None = None
         best_total = -1
         last_ts: datetime | None = None
-        pending: list[tuple[str, datetime | None]] = []
+        pending: list[tuple[str, datetime | None, str | None]] = []
 
         try:
             with path.open("r", encoding="utf-8", errors="replace") as fh:
@@ -1638,7 +1699,8 @@ class Fleet:
                         model = payload.get("model") or model
                         pol = payload.get("approval_policy")
                         if pol:
-                            self.permission_modes[f"codex:{pol}"] += 1
+                            policy = f"codex:{pol}"
+                            self.permission_modes[policy] += 1
                         sb = payload.get("sandbox_policy")
                         if isinstance(sb, dict) and sb.get("type"):
                             self.permission_modes[f"sandbox:{sb['type']}"] += 1
@@ -1659,7 +1721,7 @@ class Fleet:
                             continue
                         cmd = args.get("command")
                         if cmd:
-                            pending.append((cmd, ts))
+                            pending.append((cmd, ts, policy))
                             cwd = args.get("workdir") or cwd
         except OSError:
             return
@@ -1670,10 +1732,10 @@ class Fleet:
         if project_filter and project_filter.lower() not in project.lower():
             return
 
-        for cmd, ts in pending:
+        for cmd, ts, mode in pending:
             # Normalise Codex's shell_command onto the same "Bash" tool name the
             # Claude Code path uses, so the audit is one cross-agent view.
-            self.add_tool(project, "Bash", {"command": cmd}, ts)
+            self.add_tool(project, "Bash", {"command": cmd}, ts, mode)
 
         if best:
             self.add_codex_session(project, model or "unknown", best, last_ts)
@@ -1743,7 +1805,8 @@ class Fleet:
                 + (cc.get("ephemeral_5m_input_tokens", 0) or 0) / 1e6 * in_rate * CACHE_WRITE_5M_MULT
                 + (u.get("cache_read_input_tokens", 0) or 0) / 1e6 * in_rate * CACHE_READ_MULT)
 
-    def add_tool(self, project: str, name: str, tool_input: dict, ts: datetime | None) -> None:
+    def add_tool(self, project: str, name: str, tool_input: dict, ts: datetime | None,
+                 mode: str | None = None) -> None:
         project = clean(project)[:120] or "unknown"
         name = clean(name)[:48] or "?"
         self.tools[name] += 1
@@ -1754,6 +1817,14 @@ class Fleet:
             return
         self.bash_total += 1
         self.bash_by_project[project] += 1
+        self.bash_categories[command_category(cmd)] += 1
+        if ts:
+            day = ts.date().isoformat()
+            self.bash_by_day[day] += 1
+            if mode:
+                self.bash_moded_by_day[day] += 1
+                if is_ungated_mode(mode):
+                    self.unsupervised_by_day[day] += 1
         head = command_head(cmd)
         if head:
             self.bash_first_token[clean(head)[:40]] += 1
@@ -1856,6 +1927,7 @@ class Fleet:
         # tool_use_id -> (tool name, command). Scoped to this file: a refusal
         # always answers a tool call in the same session, so nothing needs to
         # survive across files and memory stays bounded on a large fleet.
+        self._mode = None
         calls: dict[str, tuple[str, str]] = {}
         try:
             with path.open("r", encoding="utf-8", errors="replace") as fh:
@@ -1889,10 +1961,14 @@ class Fleet:
         change to that meaning cannot apply to one source and not the other.
         """
         ts = parse_ts(rec.get("timestamp"))
+        mode = rec.get("permissionMode")
+        if mode:
+            # Stays in force for the tool calls that follow it, even when this
+            # record is itself older than the window.
+            self._mode = str(mode)
         if since and ts and ts < since:
             return
 
-        mode = rec.get("permissionMode")
         if mode:
             self.permission_modes[mode] += 1
         denial = rec.get("toolDenialKind")
@@ -1929,7 +2005,7 @@ class Fleet:
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "tool_use":
                     self.add_tool(project, block.get("name") or "?",
-                                  block.get("input") or {}, ts)
+                                  block.get("input") or {}, ts, self._mode)
                     if block.get("id"):
                         calls[block["id"]] = (
                             block.get("name") or "?",
@@ -1970,6 +2046,7 @@ class Fleet:
             return
         if not isinstance(records, list):
             return
+        self._mode = None
         calls: dict[str, tuple[str, str]] = {}
         for rec in records:
             if isinstance(rec, dict):
@@ -4319,8 +4396,7 @@ def render_share(fleet: "Fleet", c: C) -> None:
     conc = (projects[0] / fleet.total_cost * 100) if projects and fleet.total_cost else 0
 
     modes = sum(fleet.permission_modes.values())
-    unsup = sum(v for k, v in fleet.permission_modes.items()
-                if "auto" in k.lower() or "bypass" in k.lower())
+    unsup = ungated_modes(fleet.permission_modes)
     unsup_pct = (unsup / modes * 100) if modes else 0
 
     sub_bash = fleet.sub_tools.get("bashCount", 0)
@@ -5287,6 +5363,16 @@ def _aisvs_9_5_4(fleet: "Fleet") -> tuple[str, str]:
                      f"parameter is exactly what this control forbids.")
 
 
+def is_ungated_mode(key: str) -> bool:
+    """One permission-mode key that does not stop for approval.
+
+    The single definition. ungated_modes, --share and --card all read it, so
+    the three cannot disagree about what "unsupervised" means again.
+    """
+    k = key.lower()
+    return "auto" in k or "bypass" in k or key == "codex:never"
+
+
 def ungated_modes(modes: "Counter") -> int:
     """Turns recorded in a mode that does not stop for approval.
 
@@ -5298,9 +5384,7 @@ def ungated_modes(modes: "Counter") -> int:
     as *consistent* with a control it plainly failed. Understating a failing
     control is the worse direction of error for this tool.
     """
-    return sum(v for k, v in modes.items()
-               if "auto" in k.lower() or "bypass" in k.lower()
-               or k == "codex:never")
+    return sum(v for k, v in modes.items() if is_ungated_mode(k))
 
 
 def _aisvs_9_2_1(fleet: "Fleet") -> tuple[str, str]:
