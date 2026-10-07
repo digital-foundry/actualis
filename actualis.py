@@ -1073,31 +1073,6 @@ def command_head(cmd: str) -> str | None:
     return first[0]
 
 
-# --------------------------------------------------------------------------
-# Suppressions
-#
-# A detector that cries wolf gets ignored, so there has to be a way to tell it
-# it is wrong. Two rules shape this:
-#
-# A suppression NEVER removes a finding from the count. If suppressing something
-# deleted it, the report would start lying by omission and a reader could not
-# tell a clean scan from a heavily suppressed one. Suppressed findings stay
-# counted, stay in --json, and the total is stated.
-#
-# The format is a plain text file rather than JSON or TOML: it has to be
-# greppable, diffable, reviewable in a pull request, and editable by hand six
-# months later by someone who did not write it. Every entry carries a reason
-# for the same reason.
-# --------------------------------------------------------------------------
-
-_FINGERPRINT = re.compile(r"[0-9a-f]{8}")
-_ADDED_MARKER = re.compile(r"\s*\(added \d{4}-\d{2}-\d{2}\)\s*$")
-
-SUPPRESSION_FILENAME = "suppressions"
-PROJECT_SUPPRESSIONS = ".actualis-suppressions"
-
-
-
 _TEST_PROGRAMS = frozenset({"pytest", "jest", "vitest", "mocha", "rspec",
                             "phpunit", "tox", "nox", "ava", "karma"})
 # Programs whose `test` subcommand runs a test suite.
@@ -1141,6 +1116,31 @@ def command_category(cmd: str) -> str:
     if sub in _INSTALLERS.get(head, ()):
         return "install"
     return "other"
+
+
+# --------------------------------------------------------------------------
+# Suppressions
+#
+# A detector that cries wolf gets ignored, so there has to be a way to tell it
+# it is wrong. Two rules shape this:
+#
+# A suppression NEVER removes a finding from the count. If suppressing something
+# deleted it, the report would start lying by omission and a reader could not
+# tell a clean scan from a heavily suppressed one. Suppressed findings stay
+# counted, stay in --json, and the total is stated.
+#
+# The format is a plain text file rather than JSON or TOML: it has to be
+# greppable, diffable, reviewable in a pull request, and editable by hand six
+# months later by someone who did not write it. Every entry carries a reason
+# for the same reason.
+# --------------------------------------------------------------------------
+
+_FINGERPRINT = re.compile(r"[0-9a-f]{8}")
+_ADDED_MARKER = re.compile(r"\s*\(added \d{4}-\d{2}-\d{2}\)\s*$")
+
+SUPPRESSION_FILENAME = "suppressions"
+PROJECT_SUPPRESSIONS = ".actualis-suppressions"
+
 
 def suppression_paths() -> list[Path]:
     """Where suppressions are read from, least specific first.
@@ -3724,8 +3724,7 @@ def _mcp_call(name: str, args: dict, cache: _MCPCache) -> dict:
         for t in f.tokens_by_project.values():
             ctx.update(t)
         modes = sum(f.permission_modes.values())
-        unsup = sum(v for k, v in f.permission_modes.items()
-                    if "auto" in k.lower() or "bypass" in k.lower())
+        unsup = ungated_modes(f.permission_modes)
         top = sorted(f.cost_by_project.items(), key=lambda kv: -kv[1])[:8]
         return {
             "window": {"from": f.first_ts.isoformat() if f.first_ts else None,

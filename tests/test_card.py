@@ -111,6 +111,17 @@ class TestPerCommandSupervision(unittest.TestCase):
             af.render_share(f, af.C(False))
         self.assertIn("50% of turns ran unsupervised", buf.getvalue())
 
+    def test_mcp_fleet_summary_agrees_with_share(self):
+        f = af.Fleet()
+        f.permission_modes.update({"codex:never": 1, "default": 1})
+
+        class Stub:
+            def fleet(self, days, project):
+                return f
+
+        out = af._mcp_call("fleet_summary", {}, Stub())
+        self.assertEqual(out["unsupervised_pct"], 50.0)
+
     def test_agents_seen(self):
         f = af.Fleet()
         f.add_usage("p", "claude-opus-5", {"output_tokens": 1}, self.TS)
