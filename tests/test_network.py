@@ -397,3 +397,91 @@ class TestFleetFixRound1(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTrust(unittest.TestCase):
+    def test_parse(self):
+        self.assertEqual(af.parse_trust(["NPMjs.org", "github.com/digital-foundry/", " ", "pypi.org/simple"]),
+                         [("npmjs.org", ""), ("github.com", "/digital-foundry"), ("pypi.org", "/simple")])
+
+    def test_rejects(self):
+        for bad in ("https://npmjs.org", "npmjs.org:443", "*.npmjs.org", "localhost", "a b"):
+            with self.assertRaises(ValueError, msg=bad):
+                af.parse_trust([bad])
+
+    def test_trust_boundaries(self):
+        trust = af.parse_trust(["npmjs.org", "github.com/digital-foundry"])
+        def t(**kw):
+            return af.network_trusted(af._net_item("fetch", "x", **kw), trust)
+        self.assertTrue(t(host="registry.npmjs.org"))
+        self.assertTrue(t(host="npmjs.org"))
+        self.assertFalse(t(host="evilnpmjs.org"))
+        self.assertTrue(t(host="github.com", url="https://github.com/digital-foundry/actualis.git"))
+        self.assertTrue(t(host="github.com", url="https://github.com/digital-foundry"))
+        self.assertFalse(t(host="github.com", url="https://github.com/digital-foundry-evil/x"))
+        self.assertFalse(t(host="github.com", url="https://github.com/other/x"))
+        self.assertFalse(t(host=None, dynamic=True))
+        go = af._net_item("install", "go", ecosystem="go", package="github.com/digital-foundry/x", host="github.com")
+        self.assertTrue(af.network_trusted(go, trust))
+
+    def test_file_and_flag_merge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / af.NETWORK_TRUST_FILE).write_text("# team list\npypi.org  # registry\n\n")
+            self.assertEqual(af.load_network_trust(["npmjs.org,crates.io"], Path(tmp)),
+                             [("npmjs.org", ""), ("crates.io", ""), ("pypi.org", "")])
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(af.load_network_trust(None, Path(tmp)), [])
+
+
+class TestStrict(unittest.TestCase):
+    def fleet(self):
+        f = af.Fleet()
+        f.suppressions = {}
+        for cmd, mode in (("npm i lodash", "auto"), ("npm i react", "auto"),
+                          ("curl https://evil.io/x", "default"), ("curl https://ok.io/x", "copilot:prompted"),
+                          ("pip install requests", "auto")):
+            f.add_tool("p", "Bash", {"command": cmd}, TS, mode)
+        return f
+
+    def test_off_by_default(self):
+        f = self.fleet()
+        af.apply_network_policy(f, af.parse_trust(["pypi.org"]), strict=False)
+        self.assertEqual(f.flags, [])
+        self.assertEqual([i["trusted"] for i in f.network_items], [False, False, False, False, True])
+
+    def test_strict_groups_and_ids(self):
+        f = self.fleet()
+        af.apply_network_policy(f, af.parse_trust(["pypi.org"]), strict=True)
+        net = [fl for fl in f.flags if fl["categories"] == ["network-unasked"]]
+        self.assertEqual([(fl["program"], fl["severity"]) for fl in net], [("curl", "med"), ("npm", "med")])
+        self.assertEqual(net[1]["id"], af.flag_id("med", ["network-unasked"], "npm@registry.npmjs.org"))
+        self.assertRegex(net[0]["id"], r"^[0-9a-f]{8}$")
+        self.assertIn("2 unasked", net[1]["evidence"])
+        self.assertEqual(f.network_trust, ["pypi.org"])
+
+    def test_failed_and_asked_are_not_findings(self):
+        f = af.Fleet()
+        f.suppressions = {}
+        f.add_tool("p", "Bash", {"command": "curl https://ok.io/x"}, TS, "copilot:prompted")
+        f.add_tool("p", "Bash", {"command": "curl https://bad.io/x"}, TS, "auto", call_id="c", agent="claude")
+        f._network_outcome("claude:c", refused=False)
+        af.apply_network_policy(f, [], strict=True)
+        self.assertEqual(f.flags, [])
+
+    def test_fail_on_and_suppression(self):
+        f = self.fleet()
+        af.apply_network_policy(f, [], strict=True)
+        self.assertTrue(af.failing_findings(f, "any"))
+        self.assertEqual(af.failing_findings(f, "high"), [])
+        g = self.fleet()
+        g.suppressions = {fl_id: "ok" for fl_id in (
+            af.flag_id("med", ["network-unasked"], "npm@registry.npmjs.org"),
+            af.flag_id("med", ["network-unasked"], "curl@evil.io"),
+            af.flag_id("med", ["network-unasked"], "pip@pypi.org"))}
+        af.apply_network_policy(g, [], strict=True)
+        self.assertEqual((g.suppressed_flags, af.failing_findings(g, "any")), (3, []))
+
+    def test_cli_rejects_bad_trust(self):
+        with self.assertRaises(SystemExit) as cm, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            af.main(["--network-trust", "https://x.io", "--json"])
+        self.assertEqual(cm.exception.code, 2)

@@ -1713,6 +1713,94 @@ def network_approval(mode: str | None) -> str:
     return "unasked" if mode and is_ungated_mode(mode) else "unknown"
 
 
+NETWORK_TRUST_FILE = ".actualis-network-trust"
+_TRUST_ENTRY = re.compile(r"^([a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+)"
+                          r"(/[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)*)?/?$")
+
+
+def parse_trust(entries: list[str]) -> list[tuple[str, str]]:
+    """Trust entries as (host, "/path" or ""). A bad entry is an error, never
+    a silent skip: a typo in a trust list would otherwise trust nothing, or
+    worse, be read as something broader than meant."""
+    out: list[tuple[str, str]] = []
+    for raw in entries:
+        e = raw.strip()
+        if not e:
+            continue
+        host, _, path = e.partition("/")
+        m = _TRUST_ENTRY.match(host.lower() + ("/" + path if path else ""))
+        if "://" in e or "*" in e or not m:
+            raise ValueError(f"network trust entry {raw.strip()!r} is not a host or host/path "
+                             "(no scheme, port or wildcard)")
+        out.append((m.group(1), (m.group(2) or "").rstrip("/")))
+    return out
+
+
+def load_network_trust(cli: list[str] | None, cwd: Path | None = None) -> list[tuple[str, str]]:
+    """--network-trust values (comma-separated, repeatable), then ./.actualis-network-trust."""
+    entries: list[str] = []
+    for value in cli or []:
+        entries += value.split(",")
+    try:
+        text = ((cwd or Path.cwd()) / NETWORK_TRUST_FILE).read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+    for line in text.splitlines():
+        entries.append(line.split("#", 1)[0])
+    return parse_trust(entries)
+
+
+def _net_item_path(item: dict) -> str:
+    if item.get("url"):
+        return url_path(item["url"])
+    pkg = item.get("package") or ""
+    if item.get("ecosystem") == "go" and "/" in pkg:
+        return "/" + pkg.split("/", 1)[1]
+    return ""
+
+
+def network_trusted(item: dict, trust: list[tuple[str, str]]) -> bool:
+    """Host suffix on a label boundary; path prefix on a segment boundary.
+    An item with no known host is never trusted."""
+    host = item.get("host")
+    if not host:
+        return False
+    path = _net_item_path(item)
+    for h, p in trust:
+        if host != h and not host.endswith("." + h):
+            continue
+        if not p or path == p or path.startswith(p + "/"):
+            return True
+    return False
+
+
+def apply_network_policy(fleet: "Fleet", trust: list[tuple[str, str]], strict: bool) -> None:
+    """Mark trusted items, and in strict mode turn each untrusted, unapproved,
+    not-failed group (program, host) into one medium shell-audit flag. Run once,
+    after the scan."""
+    fleet.network_trust = [h + p for h, p in trust]
+    fleet.network_strict = strict
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for item in fleet.network_items:
+        item["trusted"] = network_trusted(item, trust)
+        if strict and not item["trusted"] and item["approval"] != "asked" and item["failed"] is not True:
+            groups.setdefault((item["program"], item["host"] or "?"), []).append(item)
+    for (program, host), group in sorted(groups.items()):
+        fid = flag_id("med", ["network-unasked"], f"{program}@{host}")
+        suppressed = fid in fleet.suppressions
+        if suppressed:
+            fleet.suppressed_flags += 1
+        latest = max(group, key=lambda i: (i["ts"] or "", i["project"]))
+        where = "a URL built from a variable" if host == "?" else host
+        fleet.flags.append({
+            "id": fid, "severity": "med", "categories": ["network-unasked"],
+            "program": program, "project": latest["project"], "when": latest["ts"],
+            "evidence": f"{len(group)} unasked download(s) via {program} from {where}"[:240],
+            "had_secret": False, "suppressed": suppressed,
+            "suppressed_reason": fleet.suppressions.get(fid, ""),
+        })
+
+
 # --------------------------------------------------------------------------
 # Suppressions
 #
@@ -7460,6 +7548,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="exit 2 if any unsuppressed finding is at or above "
                          f"LEVEL ({', '.join(FAIL_ON_LEVELS)}). For gating a "
                          "pipeline. Still changes nothing and blocks nothing.")
+    ap.add_argument("--network-trust", metavar="HOST[/PATH],...", action="append",
+                    help="trusted download sources for --network-strict; also read from "
+                         "./.actualis-network-trust")
+    ap.add_argument("--network-strict", action="store_true",
+                    help="make every unasked download from an untrusted source a medium finding")
     ap.add_argument("--suppress", metavar="ID",
                     help="mark a finding as a false positive on this machine. "
                          "It stays counted; it leaves the actionable list.")
@@ -7534,6 +7627,11 @@ def main(argv: list[str] | None = None) -> int:
                  "Save this run with --json, then diff the two files.")
     if not args.card and (args.style != "hero" or args.out):
         ap.error("--style and --out apply only to --card.")
+
+    try:
+        network_trust = load_network_trust(args.network_trust)
+    except ValueError as exc:
+        ap.error(str(exc))
 
 
     since = None
@@ -7682,6 +7780,8 @@ def main(argv: list[str] | None = None) -> int:
     if fleet.messages == 0 and fleet.bash_total == 0:
         print(dead_end_message(fleet, args), file=sys.stderr)
         return EXIT_CANNOT_RUN
+
+    apply_network_policy(fleet, network_trust, args.network_strict)
 
     if args.diff:
         try:
