@@ -893,3 +893,65 @@ class TestReportFixes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHarnessFieldEscapes(unittest.TestCase):
+    """I4 and M14: model-written audit-config evidence and harness-written
+    fields (permission mode, denial kind, Codex model, approval policy,
+    sandbox type) never carry a stripped character to any output."""
+    BAD = "\x1b]52;c;ZXZpbA==\x07\x1b[2J\r\x9b31m‮evil"
+
+    def fleet(self, tmp):
+        bad = self.BAD
+        d = Path(tmp) / "claude" / "-Users-x-proj"
+        d.mkdir(parents=True)
+        recs = [
+            call("t1", f"echo x > .actualis-suppressions # {bad}\nsecond line", mode="auto" + bad),
+            call("t2", "rm -rf /tmp/build", mode="default"),
+            result("t2", True, "user-rejected" + bad),
+            {"timestamp": "2026-10-01T10:00:02Z", "type": "assistant", "uuid": "u3", "sessionId": "sess-1",
+             "message": {"id": "m3", "role": "assistant", "model": "claude-x" + bad, "content": [],
+                         "usage": {"input_tokens": 10, "output_tokens": 10}}},
+        ]
+        (d / "s.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+        cx = Path(tmp) / "codex"
+        cx.mkdir()
+        crecs = [
+            {"timestamp": "2026-10-01T10:00:00Z", "type": "session_meta", "payload": {"id": "cx-1", "cwd": "/Users/x/proj"}},
+            {"timestamp": "2026-10-01T10:00:00Z", "type": "turn_context", "payload": {
+                "cwd": "/Users/x/proj", "model": "gpt-x" + bad, "approval_policy": "never" + bad,
+                "sandbox_policy": {"type": "danger" + bad}}},
+            {"timestamp": "2026-10-01T10:00:01Z", "type": "response_item", "payload": {
+                "type": "function_call", "name": "shell_command", "call_id": "c1",
+                "arguments": json.dumps({"command": "ls"})}},
+            {"timestamp": "2026-10-01T10:00:02Z", "type": "event_msg", "payload": {
+                "type": "token_count", "info": {"total_token_usage": {
+                    "input_tokens": 100, "output_tokens": 10, "total_tokens": 110}}}},
+        ]
+        (cx / "rollout-2026-10-01T10-00-00-cx-1.jsonl").write_text("\n".join(json.dumps(r) for r in crecs) + "\n")
+        f = af.Fleet()
+        f.scan([Path(tmp) / "claude"], None, None, progress=False)
+        f.scan_codex([cx], None, None)
+        return f
+
+    def test_no_stripped_character_reaches_any_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = self.fleet(tmp)
+        [ev] = [fl["evidence"] for fl in f.flags if "audit-config" in fl["categories"]]
+        self.assertNotIn("\n", ev)
+        self.assertIn("second line", ev)
+        outs = {}
+        for name, fn in (("render", lambda: af.render(f, af.C(False), False, 12)),
+                         ("share", lambda: af.render_share(f, af.C(False)))):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                fn()
+            outs[name] = buf.getvalue()
+        for mode in ("cost", "supervision", "volume"):
+            outs["card-" + mode] = json.dumps(af.card_model(f, mode), ensure_ascii=False)
+        outs["json"] = json.dumps(af.to_json(f), ensure_ascii=False)
+        self.assertIn("never", outs["render"])
+        for name, text in outs.items():
+            for lo, hi, why in af._STRIPPED_RANGES:
+                for ch in text:
+                    self.assertFalse(lo <= ord(ch) <= hi, f"{name}: U+{ord(ch):04X} ({why})")

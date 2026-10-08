@@ -2676,14 +2676,16 @@ class Fleet:
                         session = payload.get("id") or session
                     elif kind == "turn_context":
                         cwd = payload.get("cwd") or cwd
-                        model = payload.get("model") or model
-                        pol = payload.get("approval_policy")
+                        # Harness-written, but a tampered file reaches the terminal
+                        # through these as surely as through a command: clean them.
+                        model = clean(payload.get("model"))[:48] or model
+                        pol = clean(payload.get("approval_policy"))[:48]
                         if pol:
                             policy = f"codex:{pol}"
                             self.permission_modes[policy] += 1
                         sb = payload.get("sandbox_policy")
                         if isinstance(sb, dict) and sb.get("type"):
-                            self.permission_modes[f"sandbox:{sb['type']}"] += 1
+                            self.permission_modes[f"sandbox:{clean(str(sb['type']))[:48]}"] += 1
                     elif kind == "event_msg" and payload.get("type") == "token_count":
                         info = payload.get("info") or {}
                         tot = info.get("total_token_usage")
@@ -3105,7 +3107,8 @@ class Fleet:
             cmd = tool_input.get("command")
             if isinstance(cmd, str) and ".actualis-" in cmd \
                and writes_audit_config(cmd):
-                evidence = redact(cmd)
+                # Model-written text: escapes and newlines out, as everywhere else.
+                evidence = clean(redact(cmd)).replace("\n", " ")
                 program = clean(command_head(cmd) or "Bash")[:40]
         elif name.lower() in _FILE_WRITE_TOOLS:
             for key in ("file_path", "path", "notebook_path"):
@@ -3141,7 +3144,7 @@ class Fleet:
         change to that meaning cannot apply to one source and not the other.
         """
         ts = parse_ts(rec.get("timestamp"))
-        mode = rec.get("permissionMode")
+        mode = clean(str(rec.get("permissionMode") or ""))[:48]
         if mode:
             # Stays in force for the tool calls that follow it, even when this
             # record is itself older than the window.
@@ -3152,11 +3155,11 @@ class Fleet:
 
         if mode:
             self.permission_modes[mode] += 1
-        denial = rec.get("toolDenialKind")
+        denial = clean(str(rec.get("toolDenialKind") or ""))[:48]
         if denial:
             self.denials[denial] += 1
             self.denials_by_project[project] += 1
-            self.add_refusal(str(denial), rec, project, ts, calls)
+            self.add_refusal(denial, rec, project, ts, calls)
         eff = rec.get("effort")
         if eff:
             self.effort_mix[str(eff)] += 1
