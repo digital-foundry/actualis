@@ -404,6 +404,19 @@ UNREADABLE_SHAPES = (
     ("sources a file",
      re.compile(r"(?:^|[|&;]\s*)\s*(?:source|\.)\s+[\w./$~-]+")),
     ("shell -c with a variable", re.compile(r"\b(?:ba|z|)sh\s+-c\s+[\"']?\$")),
+    # Roadmap S2: shapes that hide a download from every rule above. Each is
+    # linear: a start is a literal token and every repeat is bounded or cannot
+    # overlap the next start.
+    # $'\x63url' spells a program with escapes. Only a hex, unicode or octal
+    # escape can spell a letter, so IFS=$'\n' is not counted.
+    ("ANSI-C quoting", re.compile(r"\$'(?:[^'\\\n]|\\[^xuU0-7\n]){0,256}\\[xuU0-7]")),
+    ("pipes a substitution to a shell",
+     # The scan stops at the next `$(` or backtick, which is itself a start,
+     # so no character is scanned twice.
+     re.compile(r"(?:\$\(|`)(?:[^|\n`$]|\$(?!\()){0,512}\|\s*(?:sudo\s+)?(?:busybox\s+)?(?:ba|z|k|da|)sh\b")),
+    ("inline script reaching the network",
+     re.compile(r"(?m)^(?=[^\n]*?\b(?:python[0-9.]*|node|perl)\s+(?:-\S+\s+){0,8}?-[ce]\s)"
+                r"(?=[^\n]*(?:\b(?:urllib|requests|fetch|http\.client|socket)|LWP)\b)")),
 )
 
 
@@ -1253,6 +1266,11 @@ _NET_SHELL_FLAGS = re.compile(r"^-[A-Za-z]+$")
 
 def _net_shell_c(t: str) -> bool:
     return "c" in t and _NET_SHELL_FLAGS.match(t) is not None
+
+
+def _net_shell_c_index(tokens: list[str]) -> int:
+    """Where a shell's -c (or -lc, -xc, …) is, when a command string follows; else 0."""
+    return next((k for k in range(1, len(tokens) - 1) if _net_shell_c(tokens[k])), 0)
 _NET_SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
 _NET_BACKTICK = re.compile(r"`([^`]*)`")
 
@@ -1339,9 +1357,10 @@ def _net_positionals(args: list[str], takes_value: frozenset = frozenset()) -> t
     return pos, opts
 
 
-def _net_split(text: str) -> tuple[list[str], bool]:
+def _net_split(text: str, seps: list[str] | None = None) -> tuple[list[str], bool]:
     """Split on && || ; | and newline, outside quotes. Returns the parts and
-    whether a quote was left open (the last part is then unusable)."""
+    whether a quote was left open (the last part is then unusable). `seps`,
+    when given, receives the operator after each part ("" after the last)."""
     parts, buf, quote, i = [], [], "", 0
     while i < len(text):
         ch = text[i]
@@ -1358,6 +1377,8 @@ def _net_split(text: str) -> tuple[list[str], bool]:
             buf.append(ch)
         elif text.startswith(("&&", "||"), i):
             parts.append("".join(buf))
+            if seps is not None:
+                seps.append(text[i:i + 2])
             buf = []
             i += 2
             continue
@@ -1365,11 +1386,15 @@ def _net_split(text: str) -> tuple[list[str], bool]:
             buf.append(ch)                   # `>|` is a clobber redirection, not a pipe
         elif ch in ";|\n":
             parts.append("".join(buf))
+            if seps is not None:
+                seps.append(ch)
             buf = []
         else:
             buf.append(ch)
         i += 1
     parts.append("".join(buf))
+    if seps is not None:
+        seps.append("")
     return parts, bool(quote)
 
 
@@ -1507,12 +1532,13 @@ def _net_tokens(segment: str, operators: bool = False) -> list[str]:
     return out
 
 
-def _net_segments(cmd: str, depth: int = 0) -> tuple[list[tuple[list[str], bool]], int]:
+def _net_segments(cmd: str, depth: int = 0) -> tuple[list[tuple[list[str], bool, bool]], int]:
     """Token lists for every simple command in `cmd`, nested ones included
     ($(...), backticks, bash -lc "...", eval "..."), each with whether it ran
-    under xargs, and how many segments could not be tokenised because a quote
-    was left open or nesting went deeper than is read."""
-    out: list[tuple[list[str], bool]] = []
+    under xargs and whether its output is piped into a shell, and how many
+    segments could not be tokenised because a quote was left open or nesting
+    went deeper than is read."""
+    out: list[tuple[list[str], bool, bool]] = []
     unparsed = 0
     text = _without_heredocs(cmd)
     bodies, text = _net_substitutions(text)
@@ -1523,17 +1549,20 @@ def _net_segments(cmd: str, depth: int = 0) -> tuple[list[tuple[list[str], bool]
             unparsed += bad
     elif bodies:
         unparsed += 1                        # nested deeper than we read: say so
-    parts, open_quote = _net_split(text)
+    seps: list[str] = []
+    parts, open_quote = _net_split(text, seps)
     if open_quote:
         parts = parts[:-1]
         unparsed += 1
-    for segment in parts:
-        tokens, via_xargs = _net_strip_prefixes(_net_tokens(segment, operators=True))
+    stripped = [_net_strip_prefixes(_net_tokens(p, operators=True)) for p in parts]
+    for n, (tokens, via_xargs) in enumerate(stripped):
         if not tokens:
             continue
         prog = Path(tokens[0]).name
-        flag = next((k for k in range(1, len(tokens) - 1) if _net_shell_c(tokens[k])), 0) \
-            if prog in _NET_SHELLS else 0
+        flag = _net_shell_c_index(tokens) if prog in _NET_SHELLS else 0
+        # `curl … | sh`, `| sudo bash`, `| busybox sh`, on the dequoted names.
+        nxt = stripped[n + 1][0] if seps[n] == "|" and n + 1 < len(stripped) else []
+        into_shell = bool(nxt) and Path(nxt[0]).name in _NET_SHELLS and not _net_shell_c_index(nxt)
         # `eval ARGS` runs its arguments joined by spaces, as `bash -c` would.
         nested = (tokens[flag + 1] if flag else
                   " ".join(tokens[1:]) if prog == "eval" and len(tokens) > 1 else None)
@@ -1545,7 +1574,7 @@ def _net_segments(cmd: str, depth: int = 0) -> tuple[list[tuple[list[str], bool]
                 out += inner
                 unparsed += bad
                 continue
-        out.append((tokens, via_xargs))
+        out.append((tokens, via_xargs, into_shell))
     return out, unparsed
 
 
@@ -1830,15 +1859,22 @@ def _net_extract(tokens: list[str]) -> list[dict]:
     return []
 
 
-def network_items_from_command(cmd: str) -> tuple[list[dict], int]:
-    """Every download the command shows, and how many segments could not be read."""
+def network_items_from_command(cmd: str, piped_to_shell: list[str] | None = None
+                               ) -> tuple[list[dict], int]:
+    """Every download the command shows, and how many segments could not be read.
+
+    `piped_to_shell`, when given, receives the program of each curl or wget
+    fetch whose output is piped into a shell: remote code execution, seen on
+    the dequoted command (`cu''rl … | s''h`) that the audit regexes miss."""
     segments, unparsed = _net_segments((cmd or "")[:MAX_SCAN_TOTAL])
     found: list[dict] = []
-    for tokens, via_xargs in segments:
+    for tokens, via_xargs, into_shell in segments:
         got = _net_extract(tokens)
         prog = Path(tokens[0]).name
         if via_xargs and not got and prog in ("curl", "wget"):
             got = [_net_item("fetch", prog, dynamic=True)]   # the URLs came on stdin
+        if into_shell and piped_to_shell is not None and prog in ("curl", "wget") and got:
+            piped_to_shell.append(prog)
         found += got
     return found, unparsed
 
@@ -2542,6 +2578,9 @@ class Fleet:
         self.network_trust_sources: list[dict] = []
         self.network_strict = False
         self._net_by_call: dict[str, list[int]] = {}
+        # Set by _add_network for the command add_tool is reading: a curl or
+        # wget piped into a shell, on the dequoted tokens.
+        self._net_remote_exec = False
         self.flag_counts: Counter = Counter()
         self.permission_modes: Counter = Counter()
         self.denials: Counter = Counter()
@@ -3077,6 +3116,7 @@ class Fleet:
         project = clean(project)[:120] or "unknown"
         name = clean(name)[:48] or "?"
         self.tools[name] += 1
+        self._net_remote_exec = False
         self._add_network(project, name, tool_input or {}, ts, mode, session, call_id, agent)
         self._audit_config_write(project, name, tool_input or {}, ts)
         if name != "Bash":
@@ -3127,6 +3167,12 @@ class Fleet:
                 e["last"] = max(e["last"] or day, day)
 
         matches = audit_command(cmd)
+        # Roadmap S2: `cu''rl … | s''h` and `curl … | busybox sh` evade the
+        # remote-exec regex on the raw text; the network tokenizer reads them
+        # dequoted. One flag per command: added only when the rule did not fire.
+        if self._net_remote_exec and not any(cat == "remote-exec" for _, cat, _ in matches):
+            line = next((ln for ln in cmd.splitlines() if "|" in ln), cmd)
+            matches.append(("high", "remote-exec", clean(line[:MAX_SCAN_LINE].strip())))
         if not matches:
             return
         worst = min(matches, key=lambda m: SEVERITY_ORDER.get(m[0], 9))
@@ -3342,8 +3388,10 @@ class Fleet:
             cmd = tool_input.get("command")
             if not isinstance(cmd, str) or not cmd:
                 return
-            found, unparsed = network_items_from_command(cmd)
+            piped: list[str] = []
+            found, unparsed = network_items_from_command(cmd, piped)
             self.network_unparsed += unparsed
+            self._net_remote_exec = bool(piped)
         else:
             found = network_items_from_tool(name, tool_input)
         if not found:
