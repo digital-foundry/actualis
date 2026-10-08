@@ -553,11 +553,14 @@ and you can read every rule in the source. Categories: `destructive`, `privilege
 `remote-exec`, `credentials`, `egress`, `git`, `publish`, `database`, `audit`.
 
 One more category, `audit-config`, is always `high` and can never be suppressed. It
-fires when the agent writes `.actualis-network-trust` or `.actualis-suppressions`
-(through a file-write tool, or a shell command that mentions the file and redirects,
-`tee`s, `sed -i`s, moves, copies or deletes it). Those files decide what is reported,
-so an agent that could edit them could hide its own work; a suppression of this finding
-would be the same edit. Known limit: Codex `apply_patch` edits are not read.
+is a heuristic tripwire, not a prevention. It fires when the agent writes
+`.actualis-network-trust`, `.actualis-suppressions` or the user-level
+`~/.config/actualis/suppressions` (through a file-write tool, or a shell command that
+names the file and is not a known reader such as `cat` or `grep`), or runs
+`actualis --suppress`. Those files decide what is reported, so an agent that could
+edit them could hide its own work; a suppression of this finding would be the same
+edit, and `--suppress` refuses its id. Known limits: Codex `apply_patch` edits are not
+read, and neither is a write made by a script run from another file.
 
 **A flag means "worth looking at", not "wrong".** Most `rm -rf` calls are a build
 directory. The point is that you can see them at all.
@@ -615,11 +618,23 @@ exposing the path as its `execution_file` output.
     LOG: ${{ steps.claude.outputs.execution_file }}
 ```
 
+The action's inputs:
+
+| input | default | meaning |
+|---|---|---|
+| `execution-file` | required | path to the Claude Code Action's execution log; pass the upstream step's `execution_file` output |
+| `fail-on` | `critical` | fail the job at or above this level: `critical`, `high` or `any`; `none` reports without gating (a run that could not complete still prints a `::warning::`) |
+| `network-strict` | `false` | `"true"` makes every unasked download from a source not trusted a medium finding, which `fail-on: any` then fails on |
+| `network-trust` | empty | comma-separated trusted download sources, host or host/path (for example `npmjs.org,github.com/your-org`); added to `.actualis-network-trust` |
+| `version` | latest | actualis version to install; pin it |
+| `json-report` | empty | path to write the redacted `--json` report to, for use as a `--diff` baseline |
+| `summary` | `true` | write the report to the job summary; set `false` on a public repository if command text alone is sensitive |
+
 The action's outputs are available whether or not the gate fires:
 
 | output | meaning |
 |---|---|
-| `exit-code` | `0` clean, `3` findings at or above `fail-on`, `1` could not run |
+| `exit-code` | `0` clean, `3` findings at or above `fail-on`, `1` could not run, `2` usage error (for example a bad `network-trust` entry) |
 | `findings` | coach findings plus unsuppressed credentials |
 
 `--ci-log` reads that documented output rather than guessing at `~/.claude` on

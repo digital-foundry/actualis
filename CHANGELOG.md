@@ -13,8 +13,14 @@
   Action gains `network-strict` and `network-trust` inputs. `schema_version`
   stays 1.
 - **Audit-config finding.** A high-severity finding that cannot be suppressed
-  fires when an agent writes `.actualis-network-trust` or
-  `.actualis-suppressions`, the files that decide what the audit lets through.
+  fires when an agent writes `.actualis-network-trust`, `.actualis-suppressions`
+  or the user-level `~/.config/actualis/suppressions`, or runs
+  `actualis --suppress`. It is a heuristic tripwire, not a prevention: it reads
+  the commands and file-write tools the transcript shows (case-insensitively),
+  and any command that names a config file without being a known reader
+  (`cat`, `grep`, `git diff` and the like) trips it. It misses Codex
+  `apply_patch` edits, writes made by a script run from another file, and
+  anything built at run time. `actualis --suppress` refuses its id.
 - **Trust provenance.** The trust sources in force (`--network-trust`, or the
   file with its path and sha256) appear in the report and as
   `network.trust_sources` in `--json`.
@@ -31,6 +37,20 @@
   items,** so a crafted command cannot inject terminal escapes into the report.
 - **`bash.flags[].had_secret` is declared in the JSON schema.** It was always
   emitted.
+- **Counts rise against 0.2.2 baselines.** `secret_exposures` and
+  `secret_projects` now count usernames in URL userinfo (`postgres://admin@db`)
+  and credentials passed as option values (`curl -u user:pw`, `wget --password`),
+  so the same fleet reports more than it did in 0.2.2. Compare against a fresh
+  baseline, not a saved one.
+- **`pinned` means an exact version.** `npm i x@4`, `cargo add x@1.2` and
+  `go install m@v1.2` are ranges or prefixes, not pins. Image names are
+  normalised (`docker.io/library/nginx` is `nginx`), `npm i github:o/r` carries
+  a URL, an npm alias records its target (`alias` field), and `cargo add` and
+  `cargo install` are told apart in `program`.
+- **Strict mode no longer flags a remote name** (`git pull origin`). A remote
+  added or cloned earlier in the same session resolves to its host and is judged
+  normally.
+- **`-u user:pw` no longer masks a uid:gid** (`docker exec -u root:wheel`).
 
 ## 0.2.2 — 2026-10-08
 

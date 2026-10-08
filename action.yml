@@ -66,7 +66,7 @@ inputs:
 
 outputs:
   exit-code:
-    description: "0 clean, 3 findings at or above fail-on, 1 could not run."
+    description: "0 clean, 3 findings at or above fail-on, 1 could not run, 2 a usage error (a bad network-trust entry, say)."
     value: ${{ steps.audit.outputs.exit-code }}
   findings:
     description: "Number of unsuppressed findings, or empty if the scan could not run."
@@ -148,6 +148,12 @@ runs:
         # excluded here for the same reason they do not fail the build: a
         # recorded, reasoned decision should not keep showing up as a number.
         findings=$(python3 -c "import json; d=json.load(open('${work}/report.json')); print(len(d.get('coach', [])) + len([s for s in d.get('secrets', []) if not s.get('suppressed')]))" 2>/dev/null || echo "")
+
+        # With fail-on: none there is no Gate step, so a run that could not
+        # complete (1) or was refused as a usage error (2) would otherwise be green.
+        if [ "${rc}" = "1" ] || [ "${rc}" = "2" ]; then
+          echo "::warning::actualis could not complete the audit (exit ${rc})"
+        fi
 
         echo "exit-code=${rc}" >> "$GITHUB_OUTPUT"
         echo "findings=${findings}" >> "$GITHUB_OUTPUT"

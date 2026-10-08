@@ -45,6 +45,20 @@ class TestExpressionsAreComplete(unittest.TestCase):
         self.assertEqual(text.count(guarded), 2)
         self.assertIn(f'actualis --ci-log "${{EXECUTION_FILE}}" {guarded} --json', text)
 
+    def test_a_broken_run_warns_even_without_the_gate(self):
+        text = (ROOT / "action.yml").read_text(encoding="utf-8")
+        self.assertIn('echo "::warning::actualis could not complete the audit (exit ${rc})"', text)
+        self.assertLess(text.index("::warning::actualis could not complete"),
+                        text.index('echo "exit-code=${rc}"'))
+        outputs = text[text.index("outputs:"):text.index("runs:")]
+        self.assertIn("2 a usage error", outputs)
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("`2` usage error", readme)
+        inputs = re.findall(r"^  ([a-z-]+):\n    description", text[:text.index("outputs:")], re.M)
+        self.assertEqual(len(inputs), 7)
+        for name in inputs:
+            self.assertIn(f"| `{name}` |", readme)
+
     def test_the_checker_catches_what_broke_v0_2_0(self):
         bad = "          # a run: block interpolates ${{ }} inside"
         self.assertNotEqual(len(OPEN.findall(bad)), len(COMPLETE.findall(bad)))
