@@ -1120,6 +1120,471 @@ def command_category(cmd: str) -> str:
     return "other"
 
 
+# --- network inventory -------------------------------------------------------
+#
+# What an agent downloaded, and from where. Only commands and tool calls the
+# transcript shows are read; a script that downloads (`bash install.sh`,
+# `make`, `npm run x`, a postinstall hook) is out of sight and not guessed at.
+# The tokenizer is _shell_tokens(), the same one command_head() uses, so the
+# inventory and the audit agree on what a command is.
+
+NETWORK_REGISTRY: dict[str, str] = {
+    "npm": "registry.npmjs.org", "pypi": "pypi.org", "brew": "formulae.brew.sh",
+    "crates": "crates.io", "go": "proxy.golang.org", "oci": "registry-1.docker.io",
+}
+NETWORK_ITEMS_CAP = 2000
+
+_NET_URL = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+# scp-style git remote: [user@]host.tld:owner/repo
+_NET_SCP = re.compile(r"^(?:[^@/\s]+@)?([A-Za-z0-9.-]+\.[A-Za-z]{2,}):(?!//)(\S+)$")
+_NET_EXACT_VERSION = re.compile(r"^v?\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?$")
+_NET_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_NET_PREFIX_VALUE_FLAGS = {"sudo": {"-u", "-g", "-C", "-h", "-p"}, "nice": {"-n"}, "env": {"-u", "-C"}}
+_NET_SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
+_NET_SUBST = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
+
+
+def url_host(url: str) -> str | None:
+    """Lowercased host of a URL or scp-style git remote, without user or port.
+
+    None for anything that is not one: a remote name, a path, or a URL built
+    from a shell variable, whose host cannot be known from the transcript.
+    """
+    if not url or "$" in url or "`" in url:
+        return None
+    if _NET_URL.match(url):
+        rest = re.split(r"[/?#]", url.split("://", 1)[1], maxsplit=1)[0]
+        host = rest.rsplit("@", 1)[-1].split(":", 1)[0]
+        return host.lower() or None
+    m = _NET_SCP.match(url)
+    return m.group(1).lower() if m else None
+
+
+def url_path(url: str) -> str:
+    """The path of a URL or scp-style remote, starting with '/', or ''."""
+    if _NET_URL.match(url or ""):
+        rest = re.split(r"[?#]", url.split("://", 1)[1], maxsplit=1)[0]
+        return rest[rest.find("/"):] if "/" in rest else ""
+    m = _NET_SCP.match(url or "")
+    return "/" + m.group(2) if m else ""
+
+
+def _net_item(kind: str, program: str, **kw) -> dict:
+    item = {"kind": kind, "program": program, "host": None, "host_inferred": False,
+            "url": None, "dest": None, "source": None, "ecosystem": None, "package": None,
+            "version": None, "pinned": False, "exec": False, "dynamic": False}
+    item.update(kw)
+    return item
+
+
+def _net_url_item(kind: str, program: str, url: str, **kw) -> dict:
+    host = url_host(url)
+    return _net_item(kind, program, host=host, url=url,
+                     dynamic=host is None and ("$" in url or "`" in url), **kw)
+
+
+def _net_registry_item(program: str, ecosystem: str, name: str | None, version: str | None,
+                       registry: str | None, exec_: bool = False) -> dict:
+    host = url_host(registry) if registry else None
+    return _net_item("install", program, ecosystem=ecosystem, package=name, version=version,
+                     pinned=bool(version and _NET_EXACT_VERSION.match(version)), exec=exec_,
+                     host=host or NETWORK_REGISTRY[ecosystem], host_inferred=not host)
+
+
+def _net_lockfile(program: str, ecosystem: str, registry: str | None = None) -> dict:
+    item = _net_registry_item(program, ecosystem, None, None, registry)
+    item["pinned"] = True
+    return item
+
+
+def _net_positionals(args: list[str], takes_value: frozenset = frozenset()) -> tuple[list[str], dict]:
+    """Split argv into positionals and options. An option in `takes_value`
+    consumes the next token; `--opt=value` is split; everything after `--`
+    is positional."""
+    pos: list[str] = []
+    opts: dict[str, str] = {}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            pos += args[i + 1:]
+            break
+        if a.startswith("--") and "=" in a:
+            k, v = a.split("=", 1)
+            opts[k] = v
+        elif a.startswith("-") and len(a) > 1:
+            if a in takes_value and i + 1 < len(args):
+                opts[a] = args[i + 1]
+                i += 1
+            else:
+                opts[a] = ""
+        else:
+            pos.append(a)
+        i += 1
+    return pos, opts
+
+
+def _net_split(text: str) -> tuple[list[str], bool]:
+    """Split on && || ; | and newline, outside quotes. Returns the parts and
+    whether a quote was left open (the last part is then unusable)."""
+    parts, buf, quote, i = [], [], "", 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+            buf.append(ch)
+        elif text.startswith(("&&", "||"), i):
+            parts.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        elif ch in ";|\n":
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    return parts, bool(quote)
+
+
+def _net_strip_prefixes(tokens: list[str]) -> list[str]:
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if _NET_ASSIGN.match(t):
+            i += 1
+            continue
+        if t in ("sudo", "env", "time", "nice", "nohup", "command", "exec"):
+            takes = _NET_PREFIX_VALUE_FLAGS.get(t, set())
+            i += 1
+            while i < len(tokens) and tokens[i].startswith("-"):
+                i += 2 if tokens[i] in takes else 1
+            continue
+        break
+    return tokens[i:]
+
+
+def _net_segments(cmd: str, depth: int = 0) -> tuple[list[list[str]], int]:
+    """Token lists for every simple command in `cmd`, nested ones included
+    ($(...), backticks, bash -c "..."), and how many segments could not be
+    tokenised because a quote was left open."""
+    out: list[list[str]] = []
+    unparsed = 0
+    text = _without_heredocs(cmd)
+    if depth < 3:
+        for m in _NET_SUBST.finditer(text):
+            inner, bad = _net_segments(m.group(1) or m.group(2) or "", depth + 1)
+            out += inner
+            unparsed += bad
+    parts, open_quote = _net_split(_NET_SUBST.sub(" ", text))
+    if open_quote:
+        parts = parts[:-1]
+        unparsed += 1
+    for segment in parts:
+        tokens = _net_strip_prefixes(_shell_tokens(segment))
+        if not tokens:
+            continue
+        if (depth < 3 and Path(tokens[0]).name in _NET_SHELLS
+                and "-c" in tokens[1:-1]):
+            inner, bad = _net_segments(tokens[tokens.index("-c", 1) + 1], depth + 1)
+            out += inner
+            unparsed += bad
+            continue
+        out.append(tokens)
+    return out, unparsed
+
+
+_CURL_VALUE = frozenset(
+    "-o --output -H --header -d --data --data-raw --data-binary --data-urlencode -X --request "
+    "-u --user -A --user-agent -e --referer -b --cookie -c --cookie-jar -F --form -T --upload-file "
+    "-w --write-out -m --max-time --connect-timeout -x --proxy --retry -r --range --cacert --cert "
+    "--key -K --config --resolve --url -E".split())
+_WGET_VALUE = frozenset("-O --output-document -P --directory-prefix -o --output-file -U --user-agent "
+                        "--header -t --tries -T --timeout -e --execute".split())
+_GIT_GLOBAL_VALUE = frozenset({"-C", "-c", "--git-dir", "--work-tree"})
+_GIT_CLONE_VALUE = frozenset("--depth -b --branch -o --origin --reference --filter -c --config "
+                             "-j --jobs --template --separate-git-dir".split())
+_GH_DOWNLOAD_VALUE = frozenset({"-R", "--repo", "-p", "--pattern", "-D", "--dir", "-O", "--output",
+                                "-A", "--archive"})
+_NPM_VALUE = frozenset("--registry --prefix -w --workspace --tag --cache -C --dir --filter".split())
+_NPM_INSTALL = {"npm": {"i", "install", "add"}, "pnpm": {"add", "install", "i"},
+                "yarn": {"add", "install"}, "bun": {"add", "install", "i"}}
+_NPX_VALUE = frozenset({"-p", "--package", "--registry", "-c", "--call"})
+_PIP_VALUE = frozenset("-r --requirement -c --constraint -i --index-url --extra-index-url -t --target "
+                       "--prefix --root -e --editable -f --find-links --python -p --platform".split())
+_UVX_VALUE = frozenset({"--from", "--with", "-p", "--python", "--index-url", "-i"})
+_CARGO_VALUE = frozenset({"--version", "--vers", "--git", "--branch", "--tag", "--rev", "--path",
+                          "--registry", "--index", "-F", "--features", "--root"})
+_GO_VALUE = frozenset({"-C", "-modfile", "-tags", "-ldflags", "-o"})
+_DOCKER_VALUE = frozenset("-v --volume -e --env -p --publish --name -w --workdir --network --entrypoint "
+                          "-u --user --platform --env-file -l --label --mount -h --hostname --add-host "
+                          "--cpus -m --memory --restart --pull --log-driver --gpus".split())
+_PIP_SPEC = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)(\[[^\]]*\])?\s*(===|==|~=|>=|<=|!=|>|<)?\s*([^,;\s]*)")
+
+
+def _net_is_url_arg(a: str) -> bool:
+    return "://" in a or "$" in a or "`" in a
+
+
+def _net_curl(args: list[str]) -> list[dict]:
+    pos, opts = _net_positionals(args, _CURL_VALUE)
+    urls = [u for u in pos if _net_is_url_arg(u)] + ([opts["--url"]] if opts.get("--url") else [])
+    dest = opts.get("-o") or opts.get("--output") or (
+        "(remote name)" if "-O" in opts or "--remote-name" in opts else None)
+    return [_net_url_item("fetch", "curl", u, dest=dest) for u in urls]
+
+
+def _net_wget(args: list[str]) -> list[dict]:
+    pos, opts = _net_positionals(args, _WGET_VALUE)
+    dest = (opts.get("-O") or opts.get("--output-document") or opts.get("-P")
+            or opts.get("--directory-prefix"))
+    return [_net_url_item("fetch", "wget", u, dest=dest) for u in pos if _net_is_url_arg(u)]
+
+
+def _net_git(args: list[str]) -> list[dict]:
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        i += 2 if args[i] in _GIT_GLOBAL_VALUE else 1
+    if i >= len(args):
+        return []
+    sub, rest = args[i], args[i + 1:]
+    if sub == "clone":
+        pos, _ = _net_positionals(rest, _GIT_CLONE_VALUE)
+        if not pos:
+            return []
+        return [_net_url_item("clone", "git", pos[0], dest=pos[1] if len(pos) > 1 else None)]
+    if sub in ("fetch", "pull"):
+        pos, _ = _net_positionals(rest, frozenset({"--depth", "-j", "--jobs"}))
+        if pos and (_NET_URL.match(pos[0]) or url_host(pos[0])):
+            return [_net_url_item("clone", "git", pos[0])]
+        return [_net_item("clone", "git")]
+    if sub == "submodule" and rest[:1] == ["update"]:
+        return [_net_item("clone", "git")]
+    return []
+
+
+def _net_gh(args: list[str]) -> list[dict]:
+    if args[:2] == ["repo", "clone"] and len(args) > 2:
+        repo = args[2]
+        url = repo if "://" in repo or url_host(repo) else f"https://github.com/{repo}"
+        return [_net_url_item("clone", "gh", url)]
+    if args[:2] == ["release", "download"]:
+        _, opts = _net_positionals(args[2:], _GH_DOWNLOAD_VALUE)
+        dest = opts.get("-D") or opts.get("--dir") or opts.get("-O") or opts.get("--output")
+        repo = opts.get("-R") or opts.get("--repo")
+        if repo:
+            return [_net_url_item("fetch", "gh", f"https://github.com/{repo}", dest=dest)]
+        return [_net_item("fetch", "gh", host="github.com", dest=dest)]
+    return []
+
+
+def _net_npm_package(program: str, spec: str, registry: str | None, exec_: bool = False) -> dict | None:
+    forge = {"github": "github.com", "gitlab": "gitlab.com", "bitbucket": "bitbucket.org"}
+    prefix = spec.split(":", 1)[0]
+    if prefix in forge and ":" in spec and "://" not in spec:
+        return _net_item("install", program, ecosystem="npm", host=forge[prefix], package=spec, exec=exec_)
+    if "://" in spec:
+        url = spec[4:] if spec.startswith("git+") else spec
+        return _net_url_item("install", program, url, ecosystem="npm", exec=exec_)
+    if spec.startswith((".", "/", "~", "file:")):
+        return None
+    at = spec.find("@", 1)
+    name, version = (spec, None) if at < 0 else (spec[:at], spec[at + 1:] or None)
+    return _net_registry_item(program, "npm", name, version, registry, exec_)
+
+
+def _net_npm(prog: str, args: list[str]) -> list[dict]:
+    pos, opts = _net_positionals(args, _NPM_VALUE)
+    registry = opts.get("--registry")
+    lockfile = ((prog == "npm" and pos[:1] == ["ci"])
+                or (prog == "pnpm" and pos[:1] == ["install"] and "--frozen-lockfile" in opts)
+                or (prog == "yarn" and pos[:1] in ([], ["install"]) and "--immutable" in opts))
+    if lockfile:
+        return [_net_lockfile(prog, "npm", registry)]
+    if prog == "yarn" and not pos:
+        pos = ["install"]
+    if not pos or pos[0] not in _NPM_INSTALL[prog]:
+        return []
+    if len(pos) == 1:
+        return [_net_registry_item(prog, "npm", None, None, registry)]
+    found = (_net_npm_package(prog, s, registry) for s in pos[1:])
+    return [i for i in found if i]
+
+
+def _net_npx(prog: str, args: list[str]) -> list[dict]:
+    label = "pnpm dlx" if prog == "pnpm" else prog
+    if prog == "pnpm":
+        args = args[1:]                      # drop "dlx"
+    pos, opts = _net_positionals(args, _NPX_VALUE)
+    spec = opts.get("-p") or opts.get("--package") or (pos[0] if pos else None)
+    if not spec:
+        return []
+    item = _net_npm_package(label, spec, opts.get("--registry"), exec_=True)
+    return [item] if item else []
+
+
+def _net_pip_package(program: str, spec: str, registry: str | None, exec_: bool = False) -> dict | None:
+    if spec == "@" or spec.startswith((".", "/", "~")):
+        return None
+    if "://" in spec:
+        url = spec.split("+", 1)[1] if spec.startswith("git+") else spec
+        return _net_url_item("install", program, url, ecosystem="pypi", exec=exec_)
+    if "@" in spec:                          # uvx / pipx style name@version
+        name, _, ver = spec.partition("@")
+        spec = f"{name}=={ver}"
+    m = _PIP_SPEC.match(spec)
+    if not m:
+        return None
+    exact = m.group(3) in ("==", "===") and "*" not in m.group(4)
+    return _net_registry_item(program, "pypi", m.group(1), m.group(4) if exact else None, registry, exec_)
+
+
+def _net_pip(prog: str, args: list[str]) -> list[dict]:
+    pos, opts = _net_positionals(args, _PIP_VALUE)
+    if not pos or pos[0] != "install":
+        return []
+    registry = opts.get("-i") or opts.get("--index-url")
+    out: list[dict] = []
+    req = opts.get("-r") or opts.get("--requirement")
+    if req:
+        item = _net_registry_item(prog, "pypi", None, None, registry)
+        item["source"] = req
+        out.append(item)
+    for spec in pos[1:]:
+        item = _net_pip_package(prog, spec, registry)
+        if item:
+            out.append(item)
+    return out
+
+
+def _net_uv(args: list[str]) -> list[dict]:
+    if args[:2] == ["pip", "install"]:
+        return _net_pip("uv pip", args[1:])
+    if args[:1] == ["add"]:
+        return _net_pip("uv", ["install"] + args[1:])
+    if args[:1] == ["sync"]:
+        return [_net_lockfile("uv", "pypi")]
+    return []
+
+
+def _net_uvx(prog: str, args: list[str]) -> list[dict]:
+    exec_ = True
+    if prog == "pipx":
+        if not args or args[0] not in ("run", "install"):
+            return []
+        exec_, args = args[0] == "run", args[1:]
+    pos, opts = _net_positionals(args, _UVX_VALUE)
+    spec = opts.get("--from") or (pos[0] if pos else None)
+    if not spec:
+        return []
+    item = _net_pip_package(prog, spec, opts.get("-i") or opts.get("--index-url"), exec_=exec_)
+    return [item] if item else []
+
+
+def _net_brew(args: list[str]) -> list[dict]:
+    pos, _ = _net_positionals(args)
+    if not pos or pos[0] not in ("install", "reinstall", "tap"):
+        return []
+    return [_net_registry_item("brew", "brew", f, None, None) for f in pos[1:]]
+
+
+def _net_cargo(args: list[str]) -> list[dict]:
+    pos, opts = _net_positionals(args, _CARGO_VALUE)
+    if not pos or pos[0] not in ("install", "add") or opts.get("--path"):
+        return []
+    if opts.get("--git"):
+        return [_net_url_item("install", "cargo", opts["--git"], ecosystem="crates",
+                              package=pos[1] if len(pos) > 1 else None)]
+    version = opts.get("--version") or opts.get("--vers")
+    out = []
+    for spec in pos[1:]:
+        name, _, ver = spec.partition("@")
+        out.append(_net_registry_item("cargo", "crates", name, ver or version, None))
+    return out
+
+
+def _net_go(args: list[str]) -> list[dict]:
+    pos, _ = _net_positionals(args, _GO_VALUE)
+    if not pos or pos[0] not in ("install", "get"):
+        return []
+    out = []
+    for spec in pos[1:]:
+        mod, _, ver = spec.partition("@")
+        first = mod.split("/", 1)[0]
+        if spec.startswith((".", "/")) or "." not in first:
+            continue                         # local package or standard library
+        out.append(_net_item("install", "go", ecosystem="go", package=mod, version=ver or None,
+                             pinned=bool(ver and ver != "latest" and _NET_EXACT_VERSION.match(ver)),
+                             host=first.lower()))
+    return out
+
+
+def _net_docker(prog: str, args: list[str]) -> list[dict]:
+    if not args or args[0] not in ("pull", "run"):
+        return []
+    pos, _ = _net_positionals(args[1:], _DOCKER_VALUE)
+    if not pos:
+        return []
+    ref = pos[0]
+    name, _, digest = ref.partition("@")
+    first = name.split("/", 1)[0]
+    explicit = "/" in name and ("." in first or ":" in first or first == "localhost")
+    last = name.rsplit("/", 1)[-1]
+    tag = last.split(":", 1)[1] if ":" in last else None
+    pkg = name[:len(name) - len(tag) - 1] if tag else name
+    host = first.split(":", 1)[0].lower() if explicit else None
+    return [_net_item("install", prog, ecosystem="oci", package=pkg, version=digest or tag,
+                      pinned=digest.startswith("sha256:"),
+                      host=host or NETWORK_REGISTRY["oci"], host_inferred=not host)]
+
+
+def _net_extract(tokens: list[str]) -> list[dict]:
+    prog, args = Path(tokens[0]).name, tokens[1:]
+    if re.fullmatch(r"python(?:\d(?:\.\d+)?)?", prog) and args[:2] == ["-m", "pip"]:
+        prog, args = "pip", args[2:]
+    if prog == "curl":
+        return _net_curl(args)
+    if prog == "wget":
+        return _net_wget(args)
+    if prog == "git":
+        return _net_git(args)
+    if prog == "gh":
+        return _net_gh(args)
+    if prog in ("npx", "bunx") or (prog == "pnpm" and args[:1] == ["dlx"]):
+        return _net_npx(prog, args)
+    if prog in _NPM_INSTALL:
+        return _net_npm(prog, args)
+    if prog in ("pip", "pip3"):
+        return _net_pip(prog, args)
+    if prog == "uv":
+        return _net_uv(args)
+    if prog in ("uvx", "pipx"):
+        return _net_uvx(prog, args)
+    if prog == "brew":
+        return _net_brew(args)
+    if prog == "cargo":
+        return _net_cargo(args)
+    if prog == "go":
+        return _net_go(args)
+    if prog in ("docker", "podman"):
+        return _net_docker(prog, args)
+    return []
+
+
+def network_items_from_command(cmd: str) -> tuple[list[dict], int]:
+    """Every download the command shows, and how many segments could not be read."""
+    segments, unparsed = _net_segments((cmd or "")[:MAX_SCAN_TOTAL])
+    found: list[dict] = []
+    for tokens in segments:
+        found += _net_extract(tokens)
+    return found, unparsed
+
+
 # --------------------------------------------------------------------------
 # Suppressions
 #
