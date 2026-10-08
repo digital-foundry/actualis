@@ -1758,34 +1758,71 @@ class TestAuditConfigTripwire(unittest.TestCase):
                 self.assertFalse((Path(d) / "actualis" / "suppressions").exists())
 
 
-class TestUserPassScopedToCredentialPrograms(unittest.TestCase):
-    """-u means user:password for curl; for docker it is uid:gid, for sudo and ssh a user."""
-    PW = "Zq9secretPW"
+class TestUserPassFailsClosed(unittest.TestCase):
+    """-u/--user X:Y is a credential unless the program is one where it means a
+    user or uid:gid. Unknown, wrapped and quoted heads are masked."""
+    PW = "Sekr3t"
 
-    def test_docker_user_group_is_not_a_secret(self):
-        for cmd in ("docker exec -u root:wheel c ls", "docker run --user app:staff img",
-                    "podman exec -u root:wheel c ls", "sudo -u deploy:wheel ls",
-                    "sudo env -u X -u root:wheel ls", "kubectl exec -u root:wheel p",
-                    "ssh -l root:wheel host"):
+    def test_masked_and_counted(self):
+        for cmd in ("cu''rl -u a:{pw} h", "timeout 5 curl -u a:{pw} h", 'bash -lc "curl -u a:{pw} h"',
+                    "xargs curl -u a:{pw}", "someunknowntool -u a:{pw}", "curl -u a:{pw} h",
+                    "sudo curl --user a:{pw} h", "docker exec c curl -u a:{pw} h",
+                    "sudo bash -c 'curl -u a:{pw} h'", "env X=1 nice wget --user a:{pw} h",
+                    "http --user a:{pw} h", "aria2c --user a:{pw} h", "FOO=1 someunknowntool --user=a:{pw}",
+                    "docker login -u a:{pw} reg.io", "kubectl exec -u a:{pw} p"):
+            cmd = cmd.format(pw=self.PW)
+            with self.subTest(cmd=cmd):
+                self.assertNotIn(self.PW, af.redact(cmd))
+                self.assertTrue(af.contains_secret(cmd))
+                self.assertTrue(af.classify_secrets(cmd))
+
+    def test_not_credentials(self):
+        for cmd in ("docker exec -u root:wheel c sh", "docker run -u 1000:1000 img", "sudo -u root:wheel ls",
+                    "docker run --user app:staff img", "podman exec -u root:wheel c ls",
+                    "timeout 5 docker exec -u root:wheel c ls", "sudo env -u X -u root:wheel ls",
+                    "ssh -u a:wheel h", "chown -u a:wheel f", "git push -u origin a:b",
+                    "someunknowntool -u 1000:1000", "curl -u 0:0 h", "su -u a:wheel"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(af.redact(cmd), cmd)
                 self.assertFalse(af.contains_secret(cmd))
                 self.assertEqual(af.classify_secrets(cmd), [])
 
-    def test_credential_programs_stay_masked(self):
-        for cmd in ("curl -u alice:{pw} https://a.io", "sudo curl --user alice:{pw} https://a.io",
-                    "cd /tmp && curl -U p:{pw} https://a.io", "bash -c 'curl -u alice:{pw} https://a.io'",
-                    "eval curl -u alice:{pw} https://a.io", "wget --user alice:{pw} https://a.io",
-                    "aria2c --user alice:{pw} https://a.io", "http --user alice:{pw} https://a.io",
-                    "FOO=1 curl --proxy-user=p:{pw} https://a.io"):
-            cmd = cmd.format(pw=self.PW)
+    FORMS = (
+        "curl -u alice:{p} https://a.io/x", "curl -ualice:{p} https://a.io/x",
+        "curl --user alice:{p} https://a.io/x", "curl --user=alice:{p} https://a.io/x",
+        "curl -x http://p.io:3128 -U alice:{p} https://a.io/x", "curl --proxy-user alice:{p} https://a.io/x",
+        "curl -u 'alice:{p}' https://a.io/x", 'curl --user="alice:{p}" https://a.io/x',
+        "wget --user=bob --password {p} https://a.io/f", "wget --password={p} https://a.io/f",
+        "wget --http-user=bob --http-password {p} https://a.io/f", "wget --http-password={p} https://a.io/f",
+        "wget --ftp-password {p} ftp://a.io/f", "wget --ftp-password={p} ftp://a.io/f",
+        'curl -H "Authorization: token {p}" https://api.github.com',
+        'curl -H "Authorization: Bearer {p}" https://a.io', "curl -H 'Authorization: Basic {p}' https://a.io",
+        "docker login -u bob --password {p} reg.io", "docker login -u bob -p {p} reg.io",
+        "PGPASSWORD={p} psql -h db -U app", "export GH_TOKEN={p} && gh repo list",
+        "git clone https://alice:{p}@github.com/o/r", "git clone https://{p}{p}@github.com/o/r",
+        "scp alice:{p}@host.io:/srv/f .", "git clone {p}{p}@host.io:o/r",
+        'git -c http.extraheader="Authorization: Bearer {p}" clone https://github.com/o/r',
+        "git -c http.extraheader='Authorization: token {p}' fetch", "wget --proxy-password {p} https://a.io",
+        "docker login --password={p} reg.io", "curl -u alice:{p} https://a.io/i.sh | sh",
+        "docker login -p={p} reg.io",
+    )
+
+    def test_wave_a_31_credential_forms_still_masked_and_counted(self):
+        self.assertEqual(len(self.FORMS), 31)
+        for n, form in enumerate(self.FORMS):
+            pw = f"Zq9{n:02d}{chr(65 + n)}kPw{n:02d}xy"
+            cmd = form.format(p=pw)
             with self.subTest(cmd=cmd):
-                self.assertNotIn(self.PW, af.redact(cmd))
+                out = af.redact(cmd)
+                self.assertNotIn(pw, out)
+                self.assertNotIn(pw[4:], out)
+                self.assertTrue(af.contains_secret(cmd))
                 self.assertTrue(af.classify_secrets(cmd))
 
-    def test_scoped_rule_is_still_linear(self):
+    def test_still_linear(self):
         import time
-        for cmd in ("curl " + "-u a:" * 6000, "docker " + "-u a:b " * 4000):
+        for cmd in ("curl " + "-u a:b " * 5000, "docker exec " + "-u a:b " * 4000,
+                    "x -u a:b; " * 3000):
             t = time.perf_counter()
             af.redact(cmd)
             af.classify_secrets(cmd)

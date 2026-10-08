@@ -623,6 +623,7 @@ class _SecretLocations:
         self.cmd = cmd
         self.seps = [m.start() for m in _SEGMENT_SEP.finditer(cmd)]
         self.users: dict[int, str] = {}
+        self.heads: dict[int, tuple] = {}
 
     @staticmethod
     def make(basis: str) -> str:
@@ -665,21 +666,44 @@ class _SecretLocations:
         return self.make(f"opt:{program}:{option}:{user}")
 
 
-# Where `-u user:pw` is a credential. curl reads it from -u, --user, -U and
-# --proxy-user; the others only from --user. For docker and podman it is uid:gid, for
-# sudo, su and ssh a user name: masking `docker exec -u root:wheel` hid `wheel`.
-# A shell or eval wrapper hides the real program, and a program the segment does
-# not show leaves nothing to rule it out, so those keep masking.
-_USERPASS_ANY = frozenset({"curl"})
-_USERPASS_LONG = frozenset({"wget", "http", "https", "httpie", "aria2c"})
-_USERPASS_WRAPPERS = frozenset({"", "bash", "sh", "zsh", "dash", "ksh", "eval", "watch"})
+# `-u user:pw` fails CLOSED: it is masked and counted for every program except
+# these, where `-u`/`--user` means a user or uid:gid. Naming the credential-taking
+# programs instead would stop masking at any quoted name (cu''rl), wrapper
+# (timeout 5 curl, xargs curl, bash -lc "curl …") or tool left off the list.
+# The head is the first word, and the first word past prefixes and wrappers, in
+# the dequoted tokens the network extractor reads. A credential-taking tool named
+# anywhere in the segment (`docker exec c curl -u a:b`, `sudo curl -u a:b`) keeps
+# masking. A purely numeric pair (`1000:1000`) is never a credential.
+_USERPASS_NOT_CREDENTIAL = frozenset({
+    "docker", "podman", "sudo", "su", "ssh", "chown", "chgrp", "id", "useradd", "usermod",
+    "install", "ps", "kill", "pkill", "lsof", "crontab", "systemctl", "git"})
+_USERPASS_CONTAINER_SUBS = frozenset({"exec", "run", "create"})
+_USERPASS_CREDENTIAL_TOOLS = re.compile(r"(?<![A-Za-z0-9_-])(?:curl|wget|https?|httpie|aria2c|xargs|eval)(?![A-Za-z0-9_-])", re.I)
 
 
-def _userpass_program_ok(where: "_SecretLocations", m: "re.Match") -> bool:
-    program = where.program(m.start())
-    if program in _USERPASS_ANY or program in _USERPASS_WRAPPERS:
+def _userpass_exempt(where: "_SecretLocations", m: "re.Match") -> bool:
+    """True when this `-u X:Y` is not a credential: a uid:gid, or the option of a
+    program where it means something else."""
+    user, pw = m.group(4)[:-1], m.group(5)
+    if user.isdigit() and pw.isdigit():
         return True
-    return program in _USERPASS_LONG and m.group(1) in ("--user", "--proxy-user")
+    start, end = where.segment(m.start())
+    cached = where.heads.get(start)
+    if cached is None:
+        toks = _net_tokens(where.cmd[start:min(end, start + 512)])
+        stripped = _net_strip_prefixes(toks)[0]
+        raw = [t for t in toks if not _NET_ASSIGN.match(t)]
+        heads = {_net_base(x[0]).lower() for x in (raw, stripped) if x}
+        bases = bool(_USERPASS_CREDENTIAL_TOOLS.search(where.cmd[start:min(end, start + 512)]))
+        subs = {t.lower() for t in toks[:6]}
+        cached = where.heads[start] = (heads, bases, subs)
+    heads, bases, subs = cached
+    if bases:
+        return False
+    hit = heads & _USERPASS_NOT_CREDENTIAL
+    if not hit:
+        return False
+    return hit - {"docker", "podman"} != set() or bool(subs & _USERPASS_CONTAINER_SUBS)
 
 
 def _option_secret(value: str) -> bool:
@@ -691,7 +715,7 @@ def _option_secret(value: str) -> bool:
 def _option_mask(group: int, where: "_SecretLocations | None" = None):
     def sub(m: "re.Match") -> str:
         v = m.group(group)
-        if not _option_secret(v) or (where is not None and not _userpass_program_ok(where, m)):
+        if not _option_secret(v) or (where is not None and _userpass_exempt(where, m)):
             return m.group(0)
         return m.group(0)[:m.start(group) - m.start(0)] + _mask(v) + m.group(0)[m.end(group) - m.start(0):]
     return sub
@@ -1150,7 +1174,7 @@ def classify_secrets(cmd: str, value_digests: dict[str, set[str]] | None = None
     if _OPTION_HINT.search(cmd):
         for rx, group in _OPTION_SECRETS:
             for m in rx.finditer(cmd):
-                if rx is _OPT_USERPASS and not _userpass_program_ok(where, m):
+                if rx is _OPT_USERPASS and _userpass_exempt(where, m):
                     continue
                 add("high", "password option", m.group(group), where.option(m, rx), m.span(group))
         for m in _SECRET_PATTERNS[2].finditer(cmd):
