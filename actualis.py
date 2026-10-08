@@ -2310,7 +2310,11 @@ def apply_network_policy(fleet: "Fleet", trust: list[tuple[str, str]], strict: b
     groups: dict[tuple[str, str], list[dict]] = {}
     for item in fleet.network_items:
         item["trusted"] = network_trusted(item, trust)
-        if strict and not item["trusted"] and item["approval"] != "asked" and item["failed"] is not True:
+        # A remote name (`git pull origin`) has no host the transcript can show, and
+        # is not built from a variable: it stays in the inventory, never a finding.
+        hostless = item["host"] is None and not item["dynamic"]
+        if strict and not hostless and not item["trusted"] and item["approval"] != "asked" \
+           and item["failed"] is not True:
             groups.setdefault((item["program"], item["host"] or "?"), []).append(item)
     for (program, host), group in sorted(groups.items()):
         fid = flag_id("med", ["network-unasked"], f"{program}@{host}")

@@ -477,6 +477,27 @@ class TestStrict(unittest.TestCase):
         af.apply_network_policy(g, [], strict=True)
         self.assertEqual((g.suppressed_flags, af.failing_findings(g, "any")), (3, []))
 
+    def test_hostless_static_items_never_become_findings(self):
+        f = af.Fleet()
+        f.suppressions = {}
+        for cmd in ("git pull origin", "git fetch", "git submodule update", "git clone origin"):
+            f.add_tool("p", "Bash", {"command": cmd}, TS, "auto")
+        self.assertEqual(len(f.network_items), 4)
+        self.assertTrue(all(i["host"] is None and not i["dynamic"] for i in f.network_items))
+        af.apply_network_policy(f, [], strict=True)
+        self.assertEqual(f.flags, [])
+        self.assertEqual(len(f.network_items), 4)       # still in the inventory
+
+    def test_dynamic_items_still_become_findings(self):
+        f = af.Fleet()
+        f.suppressions = {}
+        f.add_tool("p", "Bash", {"command": "curl $URL"}, TS, "auto")
+        f.add_tool("p", "Bash", {"command": "git pull origin"}, TS, "auto")
+        af.apply_network_policy(f, [], strict=True)
+        net = [fl for fl in f.flags if fl["categories"] == ["network-unasked"]]
+        self.assertEqual([(fl["program"], "variable" in fl["evidence"]) for fl in net], [("curl", True)])
+        self.assertIn("1 unasked", net[0]["evidence"])
+
     def test_cli_rejects_bad_trust(self):
         with self.assertRaises(SystemExit) as cm, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             af.main(["--network-trust", "https://x.io", "--json"])
