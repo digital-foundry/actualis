@@ -714,5 +714,24 @@ class TestUserinfoRedaction(unittest.TestCase):
         self.assertEqual(af.redact(once), once)
 
 
+class TestRedactLinearAndMultiAt(unittest.TestCase):
+    def test_pathological_inputs_are_fast(self):
+        import time
+        for text in ("a@" + "b." * 15000, "b." * 16000, "x://" * 8000, "a@" * 16000):
+            t0 = time.perf_counter()
+            af.redact(text)
+            self.assertLess(time.perf_counter() - t0, 0.1, text[:12])
+
+    def test_every_at_in_the_authority_is_userinfo(self):
+        out = af.redact("curl https://user:p@ssZqTOKEN@host/x")
+        self.assertNotIn("ZqTOKEN", out)
+        self.assertNotIn("p@ss", out)
+        self.assertIn("host/x", out)
+        out = af.redact("curl https://ZqA@ZqB@host/x")
+        self.assertNotIn("ZqA", out)
+        self.assertNotIn("ZqB", out)
+        self.assertIn("host/x", out)
+
+
 if __name__ == "__main__":
     unittest.main()

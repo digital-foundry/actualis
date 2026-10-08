@@ -532,7 +532,9 @@ def _mask(s: str) -> str:
 
 
 # Userinfo in a URL, with or without a password: `https://TOKEN@host/`.
-_URL_USERINFO = re.compile(r"(\b[A-Za-z][A-Za-z0-9+.-]*://)([^/\s@'\"]+)@")
+# The lookbehind and the length cap keep the scheme scan linear; the userinfo runs
+# greedily to the LAST `@` before the path, as curl and url_host read it.
+_URL_USERINFO = re.compile(r"(?<![A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]{0,31}://)([^/?#\s'\"]+)@")
 # scp-style remote `[user[:secret]@]host:path`. Plain `git@host:` is not a secret,
 # so only a `:` in the userinfo or a long userinfo is masked.
 _SCP_USERINFO = re.compile(r"(?<![^\s'\"=])([^\s@:/'\"]+(?::[^\s@/'\"]*)?)@([A-Za-z0-9.-]+):")
