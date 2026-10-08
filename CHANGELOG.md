@@ -12,9 +12,9 @@ Actualis now reads Copilot CLI. Post your card.
   command, refusals, subagents and premium requests. `--agent copilot` reads it
   alone. Copilot reports `inputTokens` *including* cache reads and writes for
   every provider, and Claude model ids with dots; both are handled, and
-  `--explain copilot` says how. Refusal kinds are mapped from the event schema
-  because no real denial has been observed yet, and the report says so where a
-  Copilot refusal appears.
+  `--explain copilot` says how. A person declining a prompt is recorded as
+  `denied-interactively-by-user`, captured from a real denial, and is reported
+  as a human refusal.
 - **`--card`** writes a 1200×630 SVG and PNG to post: `supervision`, `cost` or
   `volume`, in a `hero` or `terminal` style. Standard library only. The SVG and
   PNG are drawn from one list of pixel runs, so they cannot disagree. Nothing

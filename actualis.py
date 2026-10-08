@@ -1451,9 +1451,12 @@ def _copilot_context(ctx: dict, cwd: str, branch: str) -> tuple[str, str]:
 
 
 # permission.completed result kinds that let the command run. Every other kind
-# is a refusal -- a mapping taken from the schema, because no denial has been
-# observed in a real session yet. --explain copilot says so.
+# is a refusal; a person declining arrives as denied-interactively-by-user.
 COPILOT_APPROVED = frozenset({"approved", "approved-for-location"})
+
+# Refusal kinds that mean a person said no, rather than a policy. Copilot's
+# value was captured from a real denial in a scratch session.
+HUMAN_REFUSALS = frozenset({"user-rejected", "copilot:denied-interactively-by-user"})
 
 
 def copilot_model(raw: str) -> str:
@@ -3272,8 +3275,8 @@ VENDOR_CAPABILITIES = (
     ("Tool refusals",        YES,     NO,      YES,     "toolDenialKind joined by tool_use_id; "
                                                         "Codex writes no per-refusal record at "
                                                         "all; Copilot's permission.completed "
-                                                        "result.kind is mapped from the schema, "
-                                                        "not yet from an observed denial"),
+                                                        "joined by toolCallId, where a person "
+                                                        "declining is denied-interactively-by-user"),
     ("Permission mode",      YES,     YES,     YES,     "permissionMode / approval_policy / "
                                                         "permission.requested per toolCallId; a "
                                                         "Copilot command allow-listed in config "
@@ -3384,8 +3387,11 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "Premium   session.shutdown totalPremiumRequests, never converted to dollars",
         ],
         "assumes": [
-            "Refusal kinds are mapped from the event schema. A denial has not been",
-            "observed in a real session yet, so one recorded some other way is missed.",
+            "A person declining a prompt is recorded as denied-interactively-by-user,",
+            "confirmed on a real session. Any other kind that is not approved is",
+            "counted as a refusal by the policy.",
+            "A denied command still has its tool.execution_start, so it counts as an",
+            "attempted shell command, as a refused Claude Code tool call does.",
             "A command allow-listed in Copilot's config is never prompted, so it",
             "counts as auto -- unsupervised -- even though a person approved the rule.",
             "A session with no session.shutdown record is counted unpriced. No cost",
@@ -4561,14 +4567,11 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
         if "codex" in fleet.cost_by_agent:
             print(f"  {c.yellow}▲{c.off} {c.dim}Codex writes no per-refusal record, so "
                   f"its sessions are absent here.{c.off}")
-        if any(k.startswith("copilot:") for k in fleet.denials):
-            print(f"  {c.yellow}▲{c.off} {c.dim}Copilot refusal kinds are mapped from its "
-                  f"event schema, not observed data. See --explain copilot.{c.off}")
         print()
         gates = sorted(fleet.refusal_tool,
                        key=lambda k: -sum(fleet.refusal_tool[k].values()))
         for kind in gates:
-            who = "a human" if kind == "user-rejected" else "the policy"
+            who = "a human" if kind in HUMAN_REFUSALS else "the policy"
             n = sum(fleet.refusal_tool[kind].values())
             print(f"  {c.bold}{kind}{c.off}  {c.dim}{n} · {who}{c.off}")
             tools = ", ".join(f"{t} {v}" for t, v in fleet.refusal_tool[kind].most_common(4))

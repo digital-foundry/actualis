@@ -74,10 +74,11 @@ SESSIONS = {
     B: [_start(B, "/home/dev/atlas-gateway", "main", "2026-09-03T10:00:00.000Z"),
         _bash("b1", "make build", "2026-09-03T10:01:00.000Z")],
     C: [_start(C, "/home/dev/mesa-scheduler", "feature/MSA-9", "2026-09-04T10:00:00.000Z"),
-        _ask("c1", "r1", "2026-09-04T10:01:00.000Z"),
-        # Placeholder until a real denial is captured -- see the release checklist.
-        _done("c1", "r1", "denied-by-user", "2026-09-04T10:01:05.000Z"),
-        _bash("c1", "rm -rf ./dist", "2026-09-04T10:01:06.000Z"),
+        # The order and result kind of a real denial: the call starts, the
+        # prompt is raised, and the person declines it.
+        _bash("c1", "rm -rf ./dist", "2026-09-04T10:01:00.000Z"),
+        _ask("c1", "r1", "2026-09-04T10:01:01.000Z"),
+        _done("c1", "r1", "denied-interactively-by-user", "2026-09-04T10:01:05.000Z"),
         _shutdown({}, 0, "2026-09-04T11:00:00.000Z")],
     D: [_start(D, "/home/dev/quarry-cli", "fix/QRY-9", "2026-09-05T10:00:00.000Z"),
         _bash("d1", f"export STRIPE_KEY={CANARY}", "2026-09-05T10:01:00.000Z"),

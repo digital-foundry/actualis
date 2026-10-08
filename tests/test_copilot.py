@@ -87,10 +87,10 @@ class TestCopilotReader(unittest.TestCase):
 
     def test_the_refusal_is_recorded_and_joined(self):
         f = _fleet(self.state, project="mesa")
-        self.assertEqual(f.denials["copilot:denied-by-user"], 1)
+        self.assertEqual(f.denials["copilot:denied-interactively-by-user"], 1)
         self.assertEqual(f.refusals, 1)
         self.assertEqual(f.refusals_joined, 1)
-        self.assertEqual(f.refusal_program["copilot:denied-by-user"]["rm"], 1)
+        self.assertEqual(f.refusal_program["copilot:denied-interactively-by-user"]["rm"], 1)
 
     def test_approved_is_not_a_refusal(self):
         self.assertEqual(_fleet(self.state, project="orbital").refusals, 0)
@@ -245,11 +245,11 @@ class TestCopilotCapabilities(unittest.TestCase):
         caps = af.to_json(af.Fleet())["vendors"]["capabilities"]
         self.assertTrue(all("copilot" in row for row in caps))
 
-    def test_explain_copilot_states_the_unverified_mapping(self):
+    def test_explain_copilot_states_the_confirmed_mapping(self):
         e = af.EXPLAIN["copilot"]
         text = " ".join(e["formula"] + e["assumes"])
         self.assertIn("approved-for-location", text)
-        self.assertIn("not been observed", text)
+        self.assertIn("denied-interactively-by-user", text)
         self.assertIn("unpriced", text)
 
     def test_explain_copilot_states_the_cache_ttl_assumption(self):
@@ -270,13 +270,13 @@ class TestCopilotCapabilities(unittest.TestCase):
             af.render(f, af.C(False), bash_only=False, top=10)
         self.assertIn("2 Copilot sessions unpriced (no shutdown record)", buf.getvalue())
 
-    def test_refusals_section_warns_about_copilot_kinds(self):
+    def test_a_copilot_denial_is_attributed_to_a_human(self):
         f = af.Fleet()
         f.add_usage("p", "claude-opus-5", {"output_tokens": 1},
                     datetime(2026, 9, 1, tzinfo=timezone.utc))
-        f.denials["copilot:denied-by-user"] += 1
-        f._record_refusal("copilot:denied-by-user", "p", None, ("Bash", "rm -rf x"))
+        f.denials["copilot:denied-interactively-by-user"] += 1
+        f._record_refusal("copilot:denied-interactively-by-user", "p", None, ("Bash", "rm -rf x"))
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             af.render(f, af.C(False), bash_only=False, top=5)
-        self.assertIn("--explain copilot", buf.getvalue())
+        self.assertIn("copilot:denied-interactively-by-user  1 · a human", buf.getvalue())

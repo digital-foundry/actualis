@@ -682,7 +682,7 @@ sitting in plaintext in your transcripts. Rotate anything live.
 |---|---|---|
 | **Claude Code** | yes | `~/.claude/projects/**/*.jsonl` |
 | **Codex** | yes | `$CODEX_HOME/sessions/**/rollout-*.jsonl` |
-| **GitHub Copilot CLI** | yes | `$COPILOT_HOME/session-state/*/events.jsonl` (default `~/.copilot`). Refusal kinds are mapped from the schema until a real denial is observed. |
+| **GitHub Copilot CLI** | yes | `$COPILOT_HOME/session-state/*/events.jsonl` (default `~/.copilot`). A person declining a prompt is recorded as `denied-interactively-by-user`. |
 | Cursor | **no** | Nothing to read. All `composerData` records are empty shells: `conversationMap {}`, `usageData {}`. The `ai_code_hashes` and `conversation_summaries` tables have zero rows. Content is server-side. |
 | Windsurf | **no** | `globalStorage` holds config and auth only. No conversation or usage store. Server-side. |
 | Cline, Aider | not yet | Both write local files. Untested, likely feasible. |
