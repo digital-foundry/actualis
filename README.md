@@ -160,7 +160,7 @@ python3 actualis.py --watch          # live alerting on new secrets
 python3 actualis.py --project svc    # filter to matching projects
 python3 actualis.py --json           # machine-readable
 python3 actualis.py --top 25         # show more projects
-python3 actualis.py --agent codex    # one agent only (claude | codex | all)
+python3 actualis.py --agent codex    # one agent only (claude | codex | copilot | all)
 ```
 
 ### All options
@@ -170,13 +170,16 @@ python3 actualis.py --agent codex    # one agent only (claude | codex | all)
 | `--days N` | only the last N days |
 | `--project SUBSTR` | only projects whose name contains SUBSTR |
 | `--top N` | how many projects and tickets to list (default 12) |
-| `--agent {all,claude,codex}` | which agents to include (default all) |
+| `--agent {all,claude,codex,copilot}` | which agents to include (default all) |
 | `--root DIR` | read one specific transcript directory instead of discovering them |
 | `--ci-log FILE` | audit a Claude Code Action execution log on a CI runner, instead of discovering transcript directories |
 | `--bash` | shell audit only |
 | `--coach` | findings and actions only |
 | `--aisvs` | which OWASP AISVS controls your transcripts show are **not** holding |
 | `--share` | postable summary with nothing identifying in it |
+| `--card [MODE]` | write a shareable 1200×630 SVG and PNG: `supervision` (default), `cost` or `volume`. Nothing identifying is on it, and it never overwrites |
+| `--style STYLE` | `--card` layout: `hero` (default) or `terminal` |
+| `--out DIR` | `--card`: the directory to write into (default: the current directory) |
 | `--json` | machine-readable ([schema](docs/json.md)) |
 | `--diff OLD.json` | compare against a saved `--json` report: what appeared, what went away, what got worse |
 | `--watch` | live monitor; alert on new secrets and risky commands |
@@ -362,6 +365,29 @@ The test suite plants identifying strings — a project name, a branch, a path, 
 live-shaped key, an internal hostname — and asserts that none of them can reach
 this output. Secret fingerprints are excluded too, since a hash is still an
 identifier that could be correlated.
+
+## Post your card
+
+`--share` prints a summary for people who read. `--card` draws one for people who scroll:
+
+    actualis --card                    # supervision: what % of shell commands nobody approved
+    actualis --card cost               # spend at API list price
+    actualis --card volume --style terminal
+
+<p align="center"><img src="docs/img/card-hero-supervision.png" width="600" alt="A hero card"> <img src="docs/img/card-terminal-cost.png" width="600" alt="A terminal card"></p>
+
+Each run writes `actualis-card.svg` and `actualis-card.png` (1200×630, the size social
+sites preview) to the current directory or `--out DIR`, and prints a caption you can
+paste beside it. It never overwrites; a second card is `actualis-card-2.*`.
+
+What is on it is counts, four command categories (`git`, `test`, `install`, `other`)
+and model names from the public price table. Everything else is `custom`. No project,
+branch, ticket, path, command, credential or fingerprint can reach it, and the test
+suite checks the SVG, the PNG pixels and the caption for each of them. The SVG has
+no text in it at all: every glyph is pixels.
+
+<sub>Images above are from the invented demo fleet. Regenerate with
+<code>tools/make-card-images.py</code>.</sub>
 
 ## Nothing is a black box
 
@@ -656,6 +682,7 @@ sitting in plaintext in your transcripts. Rotate anything live.
 |---|---|---|
 | **Claude Code** | yes | `~/.claude/projects/**/*.jsonl` |
 | **Codex** | yes | `$CODEX_HOME/sessions/**/rollout-*.jsonl` |
+| **GitHub Copilot CLI** | yes | `$COPILOT_HOME/session-state/*/events.jsonl` (default `~/.copilot`). A person declining a prompt is recorded as `denied-interactively-by-user`. |
 | Cursor | **no** | Nothing to read. All `composerData` records are empty shells: `conversationMap {}`, `usageData {}`. The `ai_code_hashes` and `conversation_summaries` tables have zero rows. Content is server-side. |
 | Windsurf | **no** | `globalStorage` holds config and auth only. No conversation or usage store. Server-side. |
 | Cline, Aider | not yet | Both write local files. Untested, likely feasible. |
@@ -676,6 +703,7 @@ if handled like the other:
   `reasoning_output_tokens` as a subset of `output_tokens`. Neither is an addition.
 - Codex's `total_token_usage` is **cumulative** across a session and its
   `token_count` events repeat, so the session total is the final value, never a sum.
+- **Copilot CLI** reports `inputTokens` *including* both cache reads and cache writes, for every provider, and writes one final per-model total at `session.shutdown`.
 
 ## Limitations
 - **Reporting only.** It observes; it does not enforce. Claude Code's own

@@ -16,12 +16,13 @@ that and prints a warning.
 | `messages` | count of assistant messages with usage |
 | `cost_usd` | total, at provider list prices |
 | `cost_usd_from_unpriced_models` | how much of `cost_usd` came from models with no published rate |
+| `copilot_unpriced_sessions` | Copilot sessions with no shutdown record, counted but not priced (not $0) |
 | `cost_note` | how unpriced models are rated, and in which direction that errs |
 | `pricing` | where each rate came from, how old the table is, and how much of the total rests on a published price. See [Rate provenance](#rate-provenance) |
 | `duplicate_usage_records_skipped` | repeated records for the same message, counted once |
 | `duplicate_note` | why repeats occur and how they are collapsed |
 | `tokens` | `input`, `output`, `cache_w_1h`, `cache_w_5m`, `cache_w_assumed`, `cache_read` |
-| `by_agent` | cost per agent (`claude-code`, `codex`) |
+| `by_agent` | cost per agent (`claude-code`, `codex`, `copilot`) |
 | `subagents` | see below |
 | `cache` | `fleet_hit_rate_pct`, `saved_usd`, `by_project{}` |
 | `by_ticket[]` | see below |
@@ -224,22 +225,22 @@ number that makes the difference visible.
 
 ## `vendors`
 
-Both agents are read; their transcripts do not contain the same things.
+Three agents are read; their transcripts do not contain the same things.
 
-| Capability | Claude Code | Codex |
-|---|---|---|
-| Cost and token usage | yes | yes |
-| Per-message dedup | yes | partial |
-| Shell command text | yes | yes |
-| Project attribution | yes | yes |
-| Git branch | yes | no |
-| Tool refusals | yes | no |
-| Permission mode | yes | yes |
-| Sandbox policy | no | yes |
-| Subagent activity | partial | no |
-| Subagent cost | no | no |
-| Cache TTL split | partial | no |
-| Reasoning effort | yes | no |
+| Capability | Claude Code | Codex | Copilot CLI |
+|---|---|---|---|
+| Cost and token usage | yes | yes | yes |
+| Per-message dedup | yes | partial | partial |
+| Shell command text | yes | yes | yes |
+| Project attribution | yes | yes | yes |
+| Git branch | yes | no | yes |
+| Tool refusals | yes | no | yes |
+| Permission mode | yes | yes | yes |
+| Sandbox policy | no | yes | no |
+| Subagent activity | partial | no | partial |
+| Subagent cost | no | no | no |
+| Cache TTL split | partial | no | no |
+| Reasoning effort | yes | no | no |
 
 Every row in the payload also carries `depends_on`, naming the transcript field
 the claim rests on, so it can be checked against the parser rather than taken on

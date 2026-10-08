@@ -29,10 +29,12 @@ import hashlib
 import json
 import os
 import re
+import struct
 import sys
+import zlib
 from collections import Counter, OrderedDict, defaultdict
 from typing import NamedTuple
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 __version__ = "0.1.14"
@@ -1071,6 +1073,51 @@ def command_head(cmd: str) -> str | None:
     return first[0]
 
 
+_TEST_PROGRAMS = frozenset({"pytest", "jest", "vitest", "mocha", "rspec",
+                            "phpunit", "tox", "nox", "ava", "karma"})
+# Programs whose `test` subcommand runs a test suite.
+_TEST_SUBCOMMAND = frozenset({"npm", "pnpm", "yarn", "bun", "go", "cargo", "make",
+                              "dotnet", "deno", "mix", "swift", "gradle", "mvn"})
+_INSTALLERS = {   # program -> the subcommands that install something
+    "pip": {"install"}, "pip3": {"install"}, "pipx": {"install"},
+    "brew": {"install", "upgrade"}, "apt": {"install"}, "apt-get": {"install"},
+    "dnf": {"install"}, "yum": {"install"}, "apk": {"add"}, "gem": {"install"},
+    "npm": {"install", "i", "ci", "add"}, "pnpm": {"install", "i", "add"},
+    "yarn": {"install", "add"}, "bun": {"install", "i", "add"},
+    "cargo": {"install", "add"}, "go": {"install", "get"}, "uv": {"add", "sync"},
+}
+
+
+def command_category(cmd: str) -> str:
+    """git, test, install or other: the only shape of a command a card shows.
+
+    A command head can identify (`./acme-deploy`); four fixed words cannot. The
+    head alone is not enough -- `npm test` and `npm i` share it -- so the token
+    after the program decides.
+    """
+    head = command_head(cmd)
+    if not head:
+        return "other"
+    if head == "git":
+        return "git"
+    toks = cmd.split()
+    names = [t.rsplit("/", 1)[-1] for t in toks]
+    rest = toks[names.index(head) + 1:] if head in names else []
+    sub = rest[0] if rest else ""
+    if head in _TEST_PROGRAMS:
+        return "test"
+    if head.startswith("python") and rest[:2] in (["-m", "pytest"], ["-m", "unittest"]):
+        return "test"
+    if head in _TEST_SUBCOMMAND and (
+            sub == "test" or (sub == "run" and len(rest) > 1 and rest[1].startswith("test"))):
+        return "test"
+    if head == "uv" and rest[:2] in (["pip", "install"], ["tool", "install"]):
+        return "install"
+    if sub in _INSTALLERS.get(head, ()):
+        return "install"
+    return "other"
+
+
 # --------------------------------------------------------------------------
 # Suppressions
 #
@@ -1219,6 +1266,8 @@ def no_transcripts_message() -> str:
          "Claude Code", "CLAUDE_CONFIG_DIR"),
         (Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser() / "sessions",
          "Codex", "CODEX_HOME"),
+        (Path(os.environ.get("COPILOT_HOME", "~/.copilot")).expanduser() / "session-state",
+         "Copilot CLI", "COPILOT_HOME"),
     ]
     for path, label, env in checked:
         parent_exists = path.parent.is_dir()
@@ -1237,6 +1286,7 @@ def no_transcripts_message() -> str:
         "If your config lives elsewhere, point at it:",
         "  CLAUDE_CONFIG_DIR=/path/to/config actualis",
         "  CODEX_HOME=/path/to/codex actualis",
+        "  COPILOT_HOME=/path/to/copilot actualis",
         "  actualis --root /path/to/a/transcript/directory",
         "",
         "Nothing is wrong with the install. There is simply nothing to read yet:",
@@ -1296,7 +1346,7 @@ def dead_end_message(fleet: "Fleet", args) -> str:
                      "Drop it to see every project.")
     if args.agent != "all":
         lines.append(f"  --agent {args.agent} reads only that vendor. "
-                     "Drop it to read both.")
+                     "Drop it to read every agent.")
     if args.days is None and not args.project and args.agent == "all":
         lines.append("  No filters were applied, so these files carry no usage records --\n"
                      "  they may be from a different tool, or truncated.")
@@ -1380,6 +1430,67 @@ def codex_session_cost(usage: dict, model: str) -> float:
     return total_in / 1e6 * in_rate + out / 1e6 * out_rate
 
 
+def copilot_roots() -> list[Path]:
+    """Copilot CLI writes one directory per session under $COPILOT_HOME/session-state."""
+    base = Path(os.environ.get("COPILOT_HOME", Path.home() / ".copilot")).expanduser()
+    sess = base / "session-state"
+    return [sess] if sess.is_dir() else []
+
+
+def _copilot_context(ctx: dict, cwd: str, branch: str) -> tuple[str, str]:
+    """Take cwd and branch from a Copilot context, only where they are non-empty strings."""
+    for key in ("gitRoot", "cwd"):
+        v = ctx.get(key)
+        if isinstance(v, str) and v:
+            cwd = v
+            break
+    b = ctx.get("branch")
+    if isinstance(b, str) and b:
+        branch = b
+    return cwd, branch
+
+
+# permission.completed result kinds that let the command run. Every other kind
+# is a refusal; a person declining arrives as denied-interactively-by-user.
+COPILOT_APPROVED = frozenset({"approved", "approved-for-location"})
+
+# Refusal kinds that mean a person said no, rather than a policy. Copilot's
+# value was captured from a real denial in a scratch session.
+HUMAN_REFUSALS = frozenset({"user-rejected", "copilot:denied-interactively-by-user"})
+
+
+def copilot_model(raw: str) -> str:
+    """Copilot writes Anthropic ids with dots (`claude-haiku-4.5`); the price
+    table uses dashes (`claude-haiku-4-5`). Without this, every Claude model run
+    through Copilot was priced as a family guess instead of its published rate."""
+    m = clean(raw)[:48] or "unknown"
+    if m.startswith("claude-"):
+        m = re.sub(r"(?<=\d)\.(?=\d)", "-", m)
+    return m
+
+
+def copilot_session_cost(usage: dict, model: str) -> float:
+    """Cost of one model's share of one Copilot session.
+
+    Measured on 17 local sessions: inputTokens INCLUDES cacheReadTokens and
+    cacheWriteTokens, for Anthropic and OpenAI models alike, and
+    reasoningTokens is a subset of outputTokens. Adding either back
+    double-counts. Cache writes carry no TTL, so they are priced at the same
+    assumed rate as a Claude record with no TTL split.
+    """
+    r = rate_for(model)
+    total_in = usage.get("inputTokens", 0) or 0
+    rd = usage.get("cacheReadTokens", 0) or 0
+    wr = usage.get("cacheWriteTokens", 0) or 0
+    out = usage.get("outputTokens", 0) or 0
+    fresh = max(total_in - rd - wr, 0)
+    read_mult = OPENAI_CACHED_MULT if r.provider == "openai" else CACHE_READ_MULT
+    return (fresh / 1e6 * r.input
+            + rd / 1e6 * r.input * read_mult
+            + wr / 1e6 * r.input * CACHE_WRITE_ASSUMED_MULT
+            + out / 1e6 * r.output)
+
+
 class Fleet:
     def __init__(self) -> None:
         self.messages = 0
@@ -1419,6 +1530,24 @@ class Fleet:
         self.tools: Counter = Counter()
         self.bash_total = 0
         self.bash_first_token: Counter = Counter()
+        # Shell commands per UTC date, and how many ran in a mode that does not
+        # stop for approval. bash_moded_by_day is the denominator: a command
+        # whose mode was never recorded is neither supervised nor unsupervised,
+        # and guessing either way would bias the card's headline number.
+        self.bash_by_day: Counter = Counter()
+        self.bash_moded_by_day: Counter = Counter()
+        self.unsupervised_by_day: Counter = Counter()
+        self.bash_categories: Counter = Counter()
+        self.agents_seen: set[str] = set()
+        # Copilot bills in premium requests as well as tokens. Fractional
+        # (0.33 per request on some models), and never converted to dollars:
+        # the conversion depends on a plan this tool cannot see.
+        self.premium_requests_by_agent: dict[str, float] = defaultdict(float)
+        # Copilot sessions with activity but no session.shutdown record. Their
+        # usage is unknowable, so they are counted rather than estimated.
+        self.copilot_unpriced = 0
+        # The permission mode in force, carried across records within one file.
+        self._mode: str | None = None
         self.flags: list[dict] = []
         self.flag_counts: Counter = Counter()
         self.permission_modes: Counter = Counter()
@@ -1518,6 +1647,7 @@ class Fleet:
         self.models_by_tier[src].add(model)
 
         self.messages += 1
+        self.agents_seen.add("claude-code")
         self.cost_by_agent["claude-code"] += cost
         self.units_by_agent["claude-code"] += 1
         self.msgs_by_model[model] += 1
@@ -1577,6 +1707,7 @@ class Fleet:
             self.cost_unknown += cost
 
         self.messages += 1
+        self.agents_seen.add("codex")
         self.cost_by_agent["codex"] += cost
         self.units_by_agent["codex"] += 1
         self.msgs_by_model[model] += 1
@@ -1586,6 +1717,54 @@ class Fleet:
         self.tokens["input"] += max((usage.get("input_tokens", 0) or 0) - cached, 0)
         self.tokens["cache_read"] += cached
         self.tokens["output"] += usage.get("output_tokens", 0) or 0
+        if ts:
+            self.cost_by_day[ts.date().isoformat()] += cost
+            if self.first_ts is None or ts < self.first_ts:
+                self.first_ts = ts
+            if self.last_ts is None or ts > self.last_ts:
+                self.last_ts = ts
+
+    def add_copilot_session(self, project: str, model: str, usage: dict,
+                            ts: datetime | None, branch: str | None = None) -> None:
+        """One model's usage in one Copilot session, from session.shutdown.
+
+        modelMetrics is the session's final per-model total, written once, so
+        each (session, model) pair is recorded exactly once -- the same guard
+        add_codex_session applies to Codex's cumulative totals.
+        """
+        project = clean(project)[:120] or "unknown"
+        model = copilot_model(model)
+        branch = (clean(branch)[:120] or None) if branch else None
+        cost = copilot_session_cost(usage, model)
+        _, _, _, known, tier = rates_for(model, None)
+        self.cost_by_tier[tier] += cost
+        self.models_by_tier[tier].add(model)
+        if not known:
+            self.unknown_models[model] += 1
+            self.cost_unknown += cost
+
+        self.messages += 1
+        self.agents_seen.add("copilot")
+        self.cost_by_agent["copilot"] += cost
+        self.msgs_by_model[model] += 1
+        self.cost_by_model[model] += cost
+        self.cost_by_project[project] += cost
+        rd = usage.get("cacheReadTokens", 0) or 0
+        wr = usage.get("cacheWriteTokens", 0) or 0
+        self.tokens["input"] += max((usage.get("inputTokens", 0) or 0) - rd - wr, 0)
+        self.tokens["cache_read"] += rd
+        self.tokens["cache_w_assumed"] += wr
+        self.tokens["output"] += usage.get("outputTokens", 0) or 0
+
+        self.cost_by_branch[branch_bucket(branch)] += cost
+        ticket = extract_ticket(branch)
+        if ticket:
+            self.cost_by_ticket[ticket] += cost
+            self.msgs_by_ticket[ticket] += 1
+            self.branches_by_ticket[ticket].add(branch)
+            self.projects_by_ticket[ticket].add(project)
+            if ts:
+                self.dates_by_ticket[ticket].append(ts.date().isoformat())
         if ts:
             self.cost_by_day[ts.date().isoformat()] += cost
             if self.first_ts is None or ts < self.first_ts:
@@ -1611,10 +1790,11 @@ class Fleet:
         self.files_scanned += 1
 
         cwd = model = None
+        policy: str | None = None
         best: dict | None = None
         best_total = -1
         last_ts: datetime | None = None
-        pending: list[tuple[str, datetime | None]] = []
+        pending: list[tuple[str, datetime | None, str | None]] = []
 
         try:
             with path.open("r", encoding="utf-8", errors="replace") as fh:
@@ -1638,7 +1818,8 @@ class Fleet:
                         model = payload.get("model") or model
                         pol = payload.get("approval_policy")
                         if pol:
-                            self.permission_modes[f"codex:{pol}"] += 1
+                            policy = f"codex:{pol}"
+                            self.permission_modes[policy] += 1
                         sb = payload.get("sandbox_policy")
                         if isinstance(sb, dict) and sb.get("type"):
                             self.permission_modes[f"sandbox:{sb['type']}"] += 1
@@ -1659,7 +1840,7 @@ class Fleet:
                             continue
                         cmd = args.get("command")
                         if cmd:
-                            pending.append((cmd, ts))
+                            pending.append((cmd, ts, policy))
                             cwd = args.get("workdir") or cwd
         except OSError:
             return
@@ -1670,13 +1851,143 @@ class Fleet:
         if project_filter and project_filter.lower() not in project.lower():
             return
 
-        for cmd, ts in pending:
+        for cmd, ts, mode in pending:
             # Normalise Codex's shell_command onto the same "Bash" tool name the
             # Claude Code path uses, so the audit is one cross-agent view.
-            self.add_tool(project, "Bash", {"command": cmd}, ts)
+            self.add_tool(project, "Bash", {"command": cmd}, ts, mode)
 
         if best:
             self.add_codex_session(project, model or "unknown", best, last_ts)
+
+    def scan_copilot(self, roots: list[Path], since: datetime | None,
+                     project_filter: str | None) -> None:
+        for root in roots:
+            for f in sorted(root.glob("*/events.jsonl")):
+                self._scan_copilot_file(f, since, project_filter)
+
+    def _scan_copilot_file(self, path: Path, since: datetime | None,
+                           project_filter: str | None) -> None:
+        """One Copilot CLI session. Two passes over memory, one over disk:
+        whether a command was prompted is only known once every
+        permission.requested in the session has been seen."""
+        try:
+            st = path.stat()
+        except OSError:
+            return
+        if since is not None and st.st_mtime < (since.timestamp() - 3600):
+            return
+        self.bytes_scanned += st.st_size
+        self.files_scanned += 1
+
+        cwd = branch = None
+        shutdown: dict | None = None
+        shutdown_ts: datetime | None = None
+        calls: list[tuple[str, str, str, datetime | None]] = []   # (id, tool, command, ts)
+        prompted: set[str] = set()
+        refusals: list[tuple[str, str, datetime | None]] = []     # (kind, id, ts)
+        subagents: list[tuple[dict, datetime | None]] = []
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    try:
+                        rec = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if not isinstance(rec, dict):
+                        continue
+                    data = rec.get("data")
+                    if not isinstance(data, dict):
+                        continue
+                    kind = rec.get("type")
+                    ts = parse_ts(rec.get("timestamp"))
+                    if kind in ("session.start", "session.context_changed"):
+                        ctx = data.get("context") if kind == "session.start" else data
+                        if isinstance(ctx, dict):
+                            cwd, branch = _copilot_context(ctx, cwd, branch)
+                    elif kind == "tool.execution_start":
+                        name = str(data.get("toolName") or "?")
+                        args = data.get("arguments")
+                        cmd = args.get("command") if isinstance(args, dict) else None
+                        cmd = cmd if name == "bash" and isinstance(cmd, str) else ""
+                        calls.append((str(data.get("toolCallId") or ""), name, cmd, ts))
+                    elif kind == "permission.requested":
+                        req = data.get("permissionRequest")
+                        if isinstance(req, dict) and req.get("kind") == "shell" \
+                                and req.get("toolCallId"):
+                            prompted.add(str(req["toolCallId"]))
+                    elif kind == "permission.completed":
+                        result = data.get("result")
+                        rk = result.get("kind") if isinstance(result, dict) else None
+                        if rk and rk not in COPILOT_APPROVED:
+                            refusals.append((f"copilot:{clean(str(rk))[:40]}",
+                                             str(data.get("toolCallId") or ""), ts))
+                    elif kind == "subagent.completed":
+                        subagents.append((data, ts))
+                    elif kind == "session.shutdown":
+                        shutdown, shutdown_ts = data, ts
+        except OSError:
+            return
+
+        project = pretty_project(cwd.lstrip("/").replace("/", "-")) if cwd else "copilot"
+        if project_filter and project_filter.lower() not in project.lower():
+            return
+
+        def in_window(t: datetime | None) -> bool:
+            return not (since and t and t < since)
+
+        active = False
+        joined: dict[str, tuple[str, str]] = {}
+        for call_id, name, cmd, ts in calls:
+            if not in_window(ts):
+                continue
+            active = True
+            if cmd:
+                mode = "copilot:prompted" if call_id in prompted else "copilot:auto"
+                self.permission_modes[mode] += 1
+                # Normalised onto "Bash", as Codex is, so the audit is one view.
+                self.add_tool(project, "Bash", {"command": cmd}, ts, mode)
+                if call_id:
+                    joined[call_id] = ("Bash", cmd[:MAX_SCAN_LINE])
+            else:
+                self.add_tool(project, name, {}, ts)
+                if call_id:
+                    joined[call_id] = (name, "")
+        for kind, call_id, ts in refusals:
+            if in_window(ts):
+                active = True
+                self.denials[kind] += 1
+                self.denials_by_project[project] += 1
+                self._record_refusal(kind, project, ts, joined.get(call_id))
+        for data, ts in subagents:
+            if in_window(ts):
+                # Copilot gives a token total with no input/output split, so no
+                # usage is passed and no cost floor is recorded.
+                self.add_subagent({"resolvedModel": copilot_model(str(data.get("model") or "")),
+                                   "status": "completed",
+                                   "totalDurationMs": data.get("durationMs") or 0,
+                                   "toolStats": {}}, ts)
+        if active:
+            self.agents_seen.add("copilot")
+
+        if shutdown is None:
+            if active:
+                self.copilot_unpriced += 1
+            return
+        if not in_window(shutdown_ts):
+            return
+        metrics = shutdown.get("modelMetrics")
+        priced = False
+        if isinstance(metrics, dict):
+            for model, m in metrics.items():
+                usage = m.get("usage") if isinstance(m, dict) else None
+                if isinstance(usage, dict):
+                    self.add_copilot_session(project, str(model), usage, shutdown_ts, branch)
+                    priced = True
+        if priced:
+            self.units_by_agent["copilot"] += 1
+        pr = shutdown.get("totalPremiumRequests")
+        if isinstance(pr, (int, float)) and not isinstance(pr, bool):
+            self.premium_requests_by_agent["copilot"] += float(pr)
 
     def add_refusal(self, kind: str, rec: dict, project: str,
                     ts: datetime | None, calls: dict[str, tuple[str, str]]) -> None:
@@ -1686,29 +1997,33 @@ class Fleet:
         through `tool_use_id` on its tool_result. Reading only the refusal
         record tells you a refusal happened and nothing about what was refused.
         """
+        hit = None
+        msg = rec.get("message")
+        blocks = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(blocks, list):
+            for b in blocks:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    hit = calls.get(b.get("tool_use_id") or "")
+                    if hit:
+                        break
+        self._record_refusal(kind, project, ts, hit)
+
+    def _record_refusal(self, kind: str, project: str, ts: datetime | None,
+                        call: tuple[str, str] | None) -> None:
+        """Count one refusal, and attribute it when the blocked call is known."""
         self.refusals += 1
         self.refusal_project[project][kind] += 1
         if ts:
             self.refusal_week[ts.strftime("%Y-W%V")][kind] += 1
-
-        msg = rec.get("message")
-        blocks = msg.get("content") if isinstance(msg, dict) else None
-        if not isinstance(blocks, list):
+        if not call:
             return
-        for b in blocks:
-            if not isinstance(b, dict) or b.get("type") != "tool_result":
-                continue
-            hit = calls.get(b.get("tool_use_id") or "")
-            if not hit:
-                continue
-            name, cmd = hit
-            self.refusals_joined += 1
-            self.refusal_tool[kind][clean(name)[:48] or "?"] += 1
-            if name == "Bash" and cmd:
-                head = command_head(cmd)
-                if head:
-                    self.refusal_program[kind][clean(head)[:40]] += 1
-            return
+        name, cmd = call
+        self.refusals_joined += 1
+        self.refusal_tool[kind][clean(name)[:48] or "?"] += 1
+        if name == "Bash" and cmd:
+            head = command_head(cmd)
+            if head:
+                self.refusal_program[kind][clean(head)[:40]] += 1
 
     def add_subagent(self, result: dict, ts: datetime | None) -> None:
         """One completed subagent run.
@@ -1743,7 +2058,8 @@ class Fleet:
                 + (cc.get("ephemeral_5m_input_tokens", 0) or 0) / 1e6 * in_rate * CACHE_WRITE_5M_MULT
                 + (u.get("cache_read_input_tokens", 0) or 0) / 1e6 * in_rate * CACHE_READ_MULT)
 
-    def add_tool(self, project: str, name: str, tool_input: dict, ts: datetime | None) -> None:
+    def add_tool(self, project: str, name: str, tool_input: dict, ts: datetime | None,
+                 mode: str | None = None) -> None:
         project = clean(project)[:120] or "unknown"
         name = clean(name)[:48] or "?"
         self.tools[name] += 1
@@ -1754,6 +2070,14 @@ class Fleet:
             return
         self.bash_total += 1
         self.bash_by_project[project] += 1
+        self.bash_categories[command_category(cmd)] += 1
+        if ts:
+            day = ts.date().isoformat()
+            self.bash_by_day[day] += 1
+            if mode:
+                self.bash_moded_by_day[day] += 1
+                if is_ungated_mode(mode):
+                    self.unsupervised_by_day[day] += 1
         head = command_head(cmd)
         if head:
             self.bash_first_token[clean(head)[:40]] += 1
@@ -1856,6 +2180,7 @@ class Fleet:
         # tool_use_id -> (tool name, command). Scoped to this file: a refusal
         # always answers a tool call in the same session, so nothing needs to
         # survive across files and memory stays bounded on a large fleet.
+        self._mode = None
         calls: dict[str, tuple[str, str]] = {}
         try:
             with path.open("r", encoding="utf-8", errors="replace") as fh:
@@ -1889,10 +2214,14 @@ class Fleet:
         change to that meaning cannot apply to one source and not the other.
         """
         ts = parse_ts(rec.get("timestamp"))
+        mode = rec.get("permissionMode")
+        if mode:
+            # Stays in force for the tool calls that follow it, even when this
+            # record is itself older than the window.
+            self._mode = str(mode)
         if since and ts and ts < since:
             return
 
-        mode = rec.get("permissionMode")
         if mode:
             self.permission_modes[mode] += 1
         denial = rec.get("toolDenialKind")
@@ -1929,7 +2258,7 @@ class Fleet:
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "tool_use":
                     self.add_tool(project, block.get("name") or "?",
-                                  block.get("input") or {}, ts)
+                                  block.get("input") or {}, ts, self._mode)
                     if block.get("id"):
                         calls[block["id"]] = (
                             block.get("name") or "?",
@@ -1970,6 +2299,7 @@ class Fleet:
             return
         if not isinstance(records, list):
             return
+        self._mode = None
         calls: dict[str, tuple[str, str]] = {}
         for rec in records:
             if isinstance(rec, dict):
@@ -2745,7 +3075,8 @@ def notify(title: str, message: str) -> None:
         pass  # a missing notifier must never take the watcher down
 
 
-def _jsonl_files(roots: list[Path], codex: list[Path]) -> list[Path]:
+def _jsonl_files(roots: list[Path], codex: list[Path],
+                 copilot: list[Path] | None = None) -> list[Path]:
     out: list[Path] = []
     for r in roots:
         try:
@@ -2757,11 +3088,16 @@ def _jsonl_files(roots: list[Path], codex: list[Path]) -> list[Path]:
             out.extend(r.rglob("rollout-*.jsonl"))
         except OSError:
             continue
+    for r in copilot or []:
+        try:
+            out.extend(r.glob("*/events.jsonl"))
+        except OSError:
+            continue
     return out
 
 
 def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
-          quiet: bool, raw: bool) -> int:
+          quiet: bool, raw: bool, copilot: list[Path] | None = None) -> int:
     import time
 
     # Python block-buffers stdout when it is not a terminal. For a watcher that
@@ -2773,7 +3109,7 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
         pass
 
     offsets: dict[Path, int] = {}
-    for f in _jsonl_files(roots, codex):
+    for f in _jsonl_files(roots, codex, copilot):
         try:
             offsets[f] = f.stat().st_size      # start at EOF: history is not news
         except OSError:
@@ -2783,7 +3119,7 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
     cmds = flagged = crit = 0
     started = datetime.now(timezone.utc)
 
-    srcs = ", ".join(str(r) for r in (roots + codex))
+    srcs = ", ".join(str(r) for r in (roots + codex + (copilot or [])))
     print(f"{c.bold}actualis watch{c.off} {c.dim}· {len(offsets)} files · every "
           f"{interval:g}s · ctrl-c to stop{c.off}")
     print(f"{c.dim}watching {srcs}{c.off}")
@@ -2791,7 +3127,7 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
 
     try:
         while True:
-            for f in _jsonl_files(roots, codex):
+            for f in _jsonl_files(roots, codex, copilot):
                 try:
                     size = f.stat().st_size
                 except OSError:
@@ -2812,9 +3148,11 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
                 except OSError:
                     continue
 
-                project = pretty_project(f.parent.name)
+                project = ("copilot" if f.name == "events.jsonl"
+                           else pretty_project(f.parent.name))
                 for line in chunk.splitlines():
-                    if '"tool_use"' not in line and '"function_call"' not in line:
+                    if ('"tool_use"' not in line and '"function_call"' not in line
+                            and '"tool.execution_start"' not in line):
                         continue
                     try:
                         rec = json.loads(line)
@@ -2866,7 +3204,7 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
 
 
 def _commands_in(rec: dict) -> list[str]:
-    """Every shell command in one transcript record, across both agent formats."""
+    """Every shell command in one transcript record, across every agent format."""
     out: list[str] = []
     msg = rec.get("message")
     if isinstance(msg, dict) and isinstance(msg.get("content"), list):
@@ -2883,6 +3221,13 @@ def _commands_in(rec: dict) -> list[str]:
             args = {}
         if args.get("command"):
             out.append(args["command"])
+    data = rec.get("data")
+    if rec.get("type") == "tool.execution_start" and isinstance(data, dict) \
+            and data.get("toolName") == "bash":
+        args = data.get("arguments")
+        cmd = args.get("command") if isinstance(args, dict) else None
+        if isinstance(cmd, str) and cmd:
+            out.append(cmd)
     return out
 
 
@@ -2900,7 +3245,7 @@ def _commands_in(rec: dict) -> list[str]:
 # --------------------------------------------------------------------------
 # What each vendor's transcript actually gives you
 #
-# Two agents are supported, unevenly, and until now nothing said how. Someone
+# Three agents are supported, unevenly, and until now nothing said how. Someone
 # comparing a Claude Code project against a Codex one was comparing different
 # measurements without being told which.
 #
@@ -2912,33 +3257,52 @@ def _commands_in(rec: dict) -> list[str]:
 YES, PARTIAL, NO = "yes", "partial", "no"
 
 VENDOR_CAPABILITIES = (
-    # capability,            claude,   codex,   the field it rests on
-    ("Cost and token usage", YES,      YES,     "message.usage / token_count"),
-    ("Per-message dedup",    YES,      PARTIAL, "message.id; Codex reports a cumulative "
-                                                "session total instead, so the max is taken"),
-    ("Shell command text",   YES,      YES,     "tool_use Bash / function_call shell_command"),
-    ("Project attribution",  YES,      YES,     "cwd"),
-    ("Git branch",           YES,      NO,      "gitBranch; Codex rollouts carry no branch, "
-                                                "so cost per ticket is Claude Code only"),
-    ("Tool refusals",        YES,      NO,      "toolDenialKind joined by tool_use_id; Codex "
-                                                "writes no per-refusal record at all"),
-    ("Permission mode",      YES,      YES,     "permissionMode / approval_policy"),
-    ("Sandbox policy",       NO,       YES,     "sandbox_policy; Claude Code has no equivalent"),
-    ("Subagent activity",    PARTIAL,  NO,      "toolUseResult.toolStats; command text is never "
-                                                "written to the parent transcript"),
-    ("Subagent cost",        NO,       NO,      "only each run's final message survives, so a "
-                                                "floor is reported and excluded from the total"),
-    ("Cache TTL split",      PARTIAL,  NO,      "cache_creation ephemeral_1h/5m; older records "
-                                                "carry a flat total and OpenAI has no equivalent"),
-    ("Reasoning effort",     YES,      NO,      "effort"),
+    # capability,            claude,  codex,   copilot, the field it rests on
+    ("Cost and token usage", YES,     YES,     YES,     "message.usage / token_count / "
+                                                        "session.shutdown modelMetrics; a Copilot "
+                                                        "session with no shutdown record is "
+                                                        "counted unpriced, never estimated"),
+    ("Per-message dedup",    YES,     PARTIAL, PARTIAL, "message.id; Codex reports a cumulative "
+                                                        "session total, so the max is taken; "
+                                                        "Copilot writes one final total per "
+                                                        "model at shutdown"),
+    ("Shell command text",   YES,     YES,     YES,     "tool_use Bash / function_call "
+                                                        "shell_command / tool.execution_start bash"),
+    ("Project attribution",  YES,     YES,     YES,     "cwd / session context gitRoot"),
+    ("Git branch",           YES,     NO,      YES,     "gitBranch / session context branch; "
+                                                        "Codex rollouts carry no branch, so cost "
+                                                        "per ticket excludes Codex"),
+    ("Tool refusals",        YES,     NO,      YES,     "toolDenialKind joined by tool_use_id; "
+                                                        "Codex writes no per-refusal record at "
+                                                        "all; Copilot's permission.completed "
+                                                        "joined by toolCallId, where a person "
+                                                        "declining is denied-interactively-by-user"),
+    ("Permission mode",      YES,     YES,     YES,     "permissionMode / approval_policy / "
+                                                        "permission.requested per toolCallId; a "
+                                                        "Copilot command allow-listed in config "
+                                                        "is never prompted and counts as auto"),
+    ("Sandbox policy",       NO,      YES,     NO,      "sandbox_policy; Claude Code and Copilot "
+                                                        "CLI have no equivalent"),
+    ("Subagent activity",    PARTIAL, NO,      PARTIAL, "toolUseResult.toolStats / "
+                                                        "subagent.completed totals; command text "
+                                                        "is never written to the parent transcript"),
+    ("Subagent cost",        NO,      NO,      NO,      "only each run's final message survives, "
+                                                        "so a floor is reported and excluded from "
+                                                        "the total; Copilot gives a token total "
+                                                        "with no input/output split"),
+    ("Cache TTL split",      PARTIAL, NO,      NO,      "cache_creation ephemeral_1h/5m; older "
+                                                        "records carry a flat total, and OpenAI "
+                                                        "and Copilot have no equivalent"),
+    ("Reasoning effort",     YES,     NO,      NO,      "effort"),
 )
+
+_VENDOR_COLUMN = {"claude": 1, "codex": 2, "copilot": 3}
 
 
 def vendor_gaps(vendor: str) -> list[tuple[str, str]]:
     """Capabilities this vendor does not fully provide, with the reason."""
-    idx = 1 if vendor == "claude" else 2
-    return [(cap, why) for cap, c, x, why in VENDOR_CAPABILITIES
-            if (c if idx == 1 else x) != YES]
+    idx = _VENDOR_COLUMN.get(vendor, 2)
+    return [(row[0], row[4]) for row in VENDOR_CAPABILITIES if row[idx] != YES]
 
 
 EXPLAIN: dict[str, dict[str, object]] = {
@@ -2947,6 +3311,7 @@ EXPLAIN: dict[str, dict[str, object]] = {
         "formula": [
             "Claude Code  ~/.claude/projects/**/*.jsonl  (plus $CLAUDE_CONFIG_DIR)",
             "Codex        $CODEX_HOME/sessions/**/rollout-*.jsonl",
+            "Copilot CLI  $COPILOT_HOME/session-state/*/events.jsonl  (default ~/.copilot)",
             "",
             "Files are opened read-only. Nothing is written, cached, or sent.",
             "Every directory actually scanned is printed in the report header.",
@@ -2992,8 +3357,8 @@ EXPLAIN: dict[str, dict[str, object]] = {
     "vendors": {
         "measures": "What each agent's transcript actually contains, and what it does not.",
         "formula": [
-            "capability                claude   codex",
-        ] + [f"  {cap:<24}{c:<9}{x}" for cap, c, x, _why in VENDOR_CAPABILITIES] + [
+            "capability                claude   codex    copilot",
+        ] + [f"  {cap:<24}{c:<9}{x:<9}{p}" for cap, c, x, p, _why in VENDOR_CAPABILITIES] + [
             "",
             "Every row names the transcript field it rests on; see",
             "VENDOR_CAPABILITIES in the source.",
@@ -3005,6 +3370,40 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "measurements.",
         ],
         "verify": "actualis --json | jq '.vendors'",
+    },
+    "copilot": {
+        "measures": "How a GitHub Copilot CLI session is read, and what it cannot show.",
+        "formula": [
+            "Source    $COPILOT_HOME/session-state/<session>/events.jsonl (~/.copilot)",
+            "Commands  tool.execution_start where toolName is bash",
+            "Project   session context gitRoot, else cwd; the latest value wins",
+            "Cost      session.shutdown modelMetrics, once per model per session.",
+            "          inputTokens already includes cache reads and writes, so",
+            "          fresh input = inputTokens - cacheReadTokens - cacheWriteTokens",
+            "Prompted  a bash call with a shell permission.requested for its toolCallId",
+            "Auto      every other bash call",
+            "Refusal   permission.completed whose result.kind is not approved or",
+            "          approved-for-location",
+            "Premium   session.shutdown totalPremiumRequests, never converted to dollars",
+        ],
+        "assumes": [
+            "A person declining a prompt is recorded as denied-interactively-by-user,",
+            "confirmed on a real session. Any other kind that is not approved is",
+            "counted as a refusal by the policy.",
+            "A denied command still has its tool.execution_start, so it counts as an",
+            "attempted shell command, as a refused Claude Code tool call does.",
+            "A command allow-listed in Copilot's config is never prompted, so it",
+            "counts as auto -- unsupervised -- even though a person approved the rule.",
+            "A session with no session.shutdown record is counted unpriced. No cost",
+            "is estimated for it.",
+            "Cache writes carry no TTL, so they are priced at the 1h rate, the same",
+            "assumption as a Claude record with no TTL split. If Copilot uses",
+            "5-minute caching, this overstates its cost (by about 12% on observed",
+            "sessions).",
+            "session.db is not read; events.jsonl carries everything used here.",
+        ],
+        "verify": ("jq -c 'select(.type==\"session.shutdown\") | .data.modelMetrics' "
+                   "~/.copilot/session-state/*/events.jsonl"),
     },
     "diff": {
         "measures": "What changed between a saved report and this one.",
@@ -3631,6 +4030,10 @@ class _MCPCache:
             if croots:
                 f.roots.extend(croots)
                 f.scan_codex(croots, since, project)
+            proots = copilot_roots()
+            if proots:
+                f.roots.extend(proots)
+                f.scan_copilot(proots, since, project)
             self._store[key] = f
             while len(self._store) > MCP_CACHE_MAX:
                 self._store.popitem(last=False)
@@ -3647,8 +4050,7 @@ def _mcp_call(name: str, args: dict, cache: _MCPCache) -> dict:
         for t in f.tokens_by_project.values():
             ctx.update(t)
         modes = sum(f.permission_modes.values())
-        unsup = sum(v for k, v in f.permission_modes.items()
-                    if "auto" in k.lower() or "bypass" in k.lower())
+        unsup = ungated_modes(f.permission_modes)
         top = sorted(f.cost_by_project.items(), key=lambda kv: -kv[1])[:8]
         return {
             "window": {"from": f.first_ts.isoformat() if f.first_ts else None,
@@ -3989,6 +4391,10 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
         print(f"  tokens        {num(tok)}")
         print(f"  {c.bold}cost{c.off}          {c.bold}{money(fleet.total_cost)}{c.off} "
               f"{c.dim}notional, at API list price{c.off}")
+        if fleet.copilot_unpriced:
+            n_u = fleet.copilot_unpriced
+            print(f"  {c.dim}{n_u} Copilot session{'s' if n_u != 1 else ''} "
+                  f"unpriced (no shutdown record){c.off}")
         if active >= 2:
             per_day = fleet.total_cost / active
             print(f"  {c.dim}per active day {money(per_day)}"
@@ -4159,13 +4565,13 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
               f"sent,{c.off}")
         print(f"  {c.dim}so this exists only in your local transcripts.{c.off}")
         if "codex" in fleet.cost_by_agent:
-            print(f"  {c.yellow}▲{c.off} {c.dim}Claude Code only. Codex writes no "
-                  f"per-refusal record, so its sessions are absent here.{c.off}")
+            print(f"  {c.yellow}▲{c.off} {c.dim}Codex writes no per-refusal record, so "
+                  f"its sessions are absent here.{c.off}")
         print()
         gates = sorted(fleet.refusal_tool,
                        key=lambda k: -sum(fleet.refusal_tool[k].values()))
         for kind in gates:
-            who = "a human" if kind == "user-rejected" else "the policy"
+            who = "a human" if kind in HUMAN_REFUSALS else "the policy"
             n = sum(fleet.refusal_tool[kind].values())
             print(f"  {c.bold}{kind}{c.off}  {c.dim}{n} · {who}{c.off}")
             tools = ", ".join(f"{t} {v}" for t, v in fleet.refusal_tool[kind].most_common(4))
@@ -4319,8 +4725,7 @@ def render_share(fleet: "Fleet", c: C) -> None:
     conc = (projects[0] / fleet.total_cost * 100) if projects and fleet.total_cost else 0
 
     modes = sum(fleet.permission_modes.values())
-    unsup = sum(v for k, v in fleet.permission_modes.items()
-                if "auto" in k.lower() or "bypass" in k.lower())
+    unsup = ungated_modes(fleet.permission_modes)
     unsup_pct = (unsup / modes * 100) if modes else 0
 
     sub_bash = fleet.sub_tools.get("bashCount", 0)
@@ -4369,9 +4774,14 @@ def render_share(fleet: "Fleet", c: C) -> None:
               f"history   {d}{num(crit)} critical, {num(rotate)} worth rotating{o}")
 
     if fleet.msgs_by_model:
+        # Through the same gate as the card: a fine-tune id is identifying.
+        shown: Counter = Counter()
+        for m, n in fleet.msgs_by_model.items():
+            if m != "<synthetic>":
+                shown[card_model_name(m)] += n
         print(f"\n  {d}models{o}  " + "   ".join(
             f"{m} {n / sum(fleet.msgs_by_model.values()) * 100:.0f}%"
-            for m, n in fleet.msgs_by_model.most_common(4) if m != "<synthetic>"))
+            for m, n in shown.most_common(4)))
 
     findings = coach(fleet)
     if findings:
@@ -4383,6 +4793,545 @@ def render_share(fleet: "Fleet", c: C) -> None:
     print(f"  paths, commands or identifiers are included in this summary.")
     print(f"  Costs are Anthropic and OpenAI list prices; a subscription bills a")
     print(f"  flat fee, so read this as consumption.{o}\n")
+
+
+# --------------------------------------------------------------------------
+# Card
+#
+# --share for people who scroll rather than read: one image, one number. The
+# pipeline is Fleet -> card_model -> layout -> draw ops -> SVG and PNG, and
+# only card_model reads Fleet. Everything it returns is a count, a fixed word,
+# or a public model name, which is what the leak test checks -- so the layouts
+# and writers below it cannot leak by construction.
+# --------------------------------------------------------------------------
+
+CARD_MODES = ("supervision", "cost", "volume")
+CARD_STYLES = ("hero", "terminal")
+CARD_INSTALL = "uv tool install actualis"
+CARD_MIN_TREND_DAYS = 3
+_CARD_CATEGORIES = ("git", "test", "install", "other")
+
+
+class CardError(Exception):
+    """This window cannot be drawn honestly in this mode. The message says why."""
+
+
+def card_model_name(model: str) -> str:
+    """A model id only when it is a public catalog name in the price table.
+
+    Everything else -- a fine-tune, a private deployment, a family guess -- is
+    `custom`. A family match would let `ft:gpt-5-acme-internal` through.
+    """
+    return model if model in PRICING else "custom"
+
+
+def _whole_money(x: float) -> str:
+    return f"${x:,.0f}"
+
+
+def _fraction(x: float) -> str:
+    return f"{x:,.2f}".rstrip("0").rstrip(".")
+
+
+def card_window(fleet: "Fleet", days: int | None, today: date | None = None) -> list[str]:
+    """ISO dates the card covers, oldest first. With --days, the last N dates
+    including today, matching window_start; otherwise first to last record."""
+    if days:
+        end = today or datetime.now(timezone.utc).date()
+        return [(end - timedelta(days=i)).isoformat() for i in range(days - 1, -1, -1)]
+    dates = sorted(set(fleet.cost_by_day) | set(fleet.bash_by_day))
+    if not dates:
+        return []
+    start = date.fromisoformat(dates[0])
+    span = (date.fromisoformat(dates[-1]) - start).days + 1
+    return [(start + timedelta(days=i)).isoformat() for i in range(span)]
+
+
+def card_model(fleet: "Fleet", mode: str, days: int | None = None,
+               today: date | None = None) -> dict:
+    """Every number and word a card shows, and nothing else."""
+    window = card_window(fleet, days, today)
+    n = len(window)
+    commands = fleet.bash_total
+    if mode in ("supervision", "volume") and commands == 0:
+        raise CardError("no shell commands in window — try --days or --card cost")
+    agents = str(len(fleet.agents_seen))
+    refused = num(fleet.refusals)
+    m: dict = {"mode": mode, "days": n, "label": f"ACTUALIS · LAST {n} DAYS"}
+
+    if mode == "supervision":
+        moded = sum(fleet.bash_moded_by_day.values())
+        unsup = sum(fleet.unsupervised_by_day.values())
+        if moded:
+            m["hero"] = f"{unsup / moded * 100:.0f}%"
+            m["caption"] = "of my agents' shell commands ran with nobody approving them"
+            m["share"] = (f"{m['hero']} of my coding agents' shell commands ran "
+                          f"unsupervised in the last {n} days. {CARD_INSTALL}")
+        else:
+            m["hero"] = "—"
+            m["caption"] = "no permission mode was recorded for these commands"
+            m["share"] = (f"My coding agents ran {num(commands)} shell commands in "
+                          f"the last {n} days. {CARD_INSTALL}")
+        m.update(header="SUPERVISION", hero_label="unsupervised",
+                 stats=[(num(commands), "commands"), (refused, "refused"), (agents, "agents")],
+                 bars=[("auto", float(unsup), num(unsup)),
+                       ("you", float(moded - unsup), num(moded - unsup)),
+                       ("refused", float(fleet.refusals), refused)],
+                 series=[(fleet.unsupervised_by_day[d] / fleet.bash_moded_by_day[d] * 100)
+                         if fleet.bash_moded_by_day[d] else None for d in window],
+                 series_max=100.0)
+    elif mode == "cost":
+        total = fleet.total_cost
+        saved = max(sum(fleet.cache_uncached.values()) - sum(fleet.cache_actual.values()), 0.0)
+        priced = total > 0
+        m["hero"] = _whole_money(total) if priced else "—"
+        m["caption"] = f"at API list price, last {n} days" if priced else "no priced usage in window"
+        m["share"] = (f"My coding agents used {m['hero']} of compute at API list price "
+                      f"in the last {n} days. {CARD_INSTALL}" if priced else
+                      f"What my coding agents actually ran, last {n} days. {CARD_INSTALL}")
+        stats = [(_whole_money(total / fleet.active_days) if priced else "—", "per active day"),
+                 (_whole_money(saved) if priced else "—", "cache saved"), (agents, "agents")]
+        premium = fleet.premium_requests_by_agent.get("copilot", 0.0)
+        if premium:
+            stats.append((_fraction(premium), "premium requests"))
+        by_name: Counter = Counter()
+        for model, cost in fleet.cost_by_model.items():
+            by_name[card_model_name(model)] += cost
+        m.update(header="COST", hero_label="at list price", stats=stats,
+                 bars=[(name, cost, _whole_money(cost)) for name, cost in by_name.most_common(3)],
+                 series=[fleet.cost_by_day.get(d, 0.0) for d in window])
+    elif mode == "volume":
+        tools = sum(fleet.tools.values())
+        m.update(header="SHELL", hero=num(commands), hero_label="commands",
+                 caption="shell commands my agents ran",
+                 share=(f"My coding agents ran {num(commands)} shell commands in the "
+                        f"last {n} days. {CARD_INSTALL}"),
+                 stats=[(f"{commands / tools * 100:.0f}%" if tools else "—", "of tool calls"),
+                        (refused, "refused"), (agents, "agents")],
+                 bars=[(cat, float(fleet.bash_categories[cat]), num(fleet.bash_categories[cat]))
+                       for cat in _CARD_CATEGORIES],
+                 series=[float(fleet.bash_by_day.get(d, 0)) for d in window])
+    else:
+        raise ValueError(f"unknown card mode {mode!r}")
+
+    if mode != "supervision":
+        m["series_max"] = max([v for v in m["series"] if v] or [1.0])
+    active = sum(1 for v in m["series"]
+                 if v is not None and (mode == "supervision" or v > 0))
+    m["trend"] = active >= CARD_MIN_TREND_DAYS
+    return m
+
+
+# CARD_FONT glyphs are from Spleen 2.2.0 (8x16), redistributed under its license:
+# Copyright (c) 2018-2026, Frederic Cambus
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+#   * Redistributions of source code must retain the above copyright
+#     notice, this list of conditions and the following disclaimer.
+#
+#   * Redistributions in binary form must reproduce the above copyright
+#     notice, this list of conditions and the following disclaimer in the
+#     documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS
+# BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+CARD_FONT: dict[str, str] = {
+    ' ': '00000000000000000000000000000000',
+    '!': '00001818181818181800181800000000',
+    '"': '00666666660000000000000000000000',
+    '#': '00006c6cfe6c6c6c6cfe6c6c00000000',
+    '$': '00107ed0d0d07c16161616fc10000000',
+    '%': '000006666c0c18183036666000000000',
+    '&': '0000386c6c6c3870dacccc7a00000000',
+    "'": '00181818180000000000000000000000',
+    '(': '000e183030606060603030180e000000',
+    ')': '0070180c0c060606060c0c1870000000',
+    '*': '00000000663c18ff183c660000000000',
+    '+': '000000000018187e1818000000000000',
+    ',': '00000000000000000000181830000000',
+    '-': '000000000000007e0000000000000000',
+    '.': '00000000000000000000181800000000',
+    '/': '0006060c0c181830306060c0c0000000',
+    '0': '00007cc6c6cedef6e6c6c67c00000000',
+    '1': '00001838785818181818187e00000000',
+    '2': '00007cc606060c183060c6fe00000000',
+    '3': '00007cc606063c060606c67c00000000',
+    '4': '0000c0c0ccccccccfe0c0c0c00000000',
+    '5': '0000fec6c0c0fc060606c67c00000000',
+    '6': '00007cc6c0c0fcc6c6c6c67c00000000',
+    '7': '0000fec606060c183030303000000000',
+    '8': '00007cc6c6c67cc6c6c6c67c00000000',
+    '9': '00007cc6c6c6c67e0606c67c00000000',
+    ':': '00000000001818000000181800000000',
+    ';': '00000000001818000000181830000000',
+    '<': '0000060c1830606030180c0600000000',
+    '=': '00000000007e00007e00000000000000',
+    '>': '00006030180c06060c18306000000000',
+    '?': '00007cc6060c18303000303000000000',
+    '@': '0000007cc2dadadadadec07c00000000',
+    'A': '00007cc6c6c6fec6c6c6c6c600000000',
+    'B': '0000fcc6c6c6fcc6c6c6c6fc00000000',
+    'C': '00007ec0c0c0c0c0c0c0c07e00000000',
+    'D': '0000fcc6c6c6c6c6c6c6c6fc00000000',
+    'E': '00007ec0c0c0f8c0c0c0c07e00000000',
+    'F': '00007ec0c0c0f8c0c0c0c0c000000000',
+    'G': '00007ec0c0c0dec6c6c6c67e00000000',
+    'H': '0000c6c6c6c6fec6c6c6c6c600000000',
+    'I': '00007e18181818181818187e00000000',
+    'J': '00007e1818181818181818f000000000',
+    'K': '0000c6c6c6ccf8ccc6c6c6c600000000',
+    'L': '0000c0c0c0c0c0c0c0c0c07e00000000',
+    'M': '0000c6eefed6c6c6c6c6c6c600000000',
+    'N': '0000c6c6e6e6d6d6cecec6c600000000',
+    'O': '00007cc6c6c6c6c6c6c6c67c00000000',
+    'P': '0000fcc6c6c6fcc0c0c0c0c000000000',
+    'Q': '00007cc6c6c6c6c6c6d6d67c180c0000',
+    'R': '0000fcc6c6c6fcc6c6c6c6c600000000',
+    'S': '00007ec0c0c07c06060606fc00000000',
+    'T': '0000ff18181818181818181800000000',
+    'U': '0000c6c6c6c6c6c6c6c6c67e00000000',
+    'V': '0000c6c6c6c6c6c6c66c381000000000',
+    'W': '0000c6c6c6c6c6c6d6feeec600000000',
+    'X': '0000c6c6c66c386cc6c6c6c600000000',
+    'Y': '0000c6c6c6c67e06060606fc00000000',
+    'Z': '0000fe06060c183060c0c0fe00000000',
+    '[': '003e303030303030303030303e000000',
+    '\\': '00c0c06060303018180c0c0606000000',
+    ']': '007c0c0c0c0c0c0c0c0c0c0c7c000000',
+    '^': '0010386cc60000000000000000000000',
+    '_': '0000000000000000000000000000fe00',
+    '`': '0030180c000000000000000000000000',
+    'a': '00000000007c067ec6c6c67e00000000',
+    'b': '0000c0c0c0fcc6c6c6c6c6fc00000000',
+    'c': '00000000007ec0c0c0c0c07e00000000',
+    'd': '00000606067ec6c6c6c6c67e00000000',
+    'e': '00000000007ec6c6fec0c07e00000000',
+    'f': '00001e3030307c303030303000000000',
+    'g': '00000000007ec6c6c6c6c67c0606fc00',
+    'h': '0000c0c0c0fcc6c6c6c6c6c600000000',
+    'i': '00001818003818181818181c00000000',
+    'j': '00001818001818181818181818187000',
+    'k': '0000c0c0c0ccd8f0f0d8ccc600000000',
+    'l': '00003030303030303030301c00000000',
+    'm': '0000000000ecd6d6d6d6c6c600000000',
+    'n': '0000000000fcc6c6c6c6c6c600000000',
+    'o': '00000000007cc6c6c6c6c67c00000000',
+    'p': '0000000000fcc6c6c6c6c6fcc0c0c000',
+    'q': '00000000007ec6c6c6c6c67e06060600',
+    'r': '00000000007ec6c0c0c0c0c000000000',
+    's': '00000000007ec0c07c0606fc00000000',
+    't': '00003030307c30303030301e00000000',
+    'u': '0000000000c6c6c6c6c6c67e00000000',
+    'v': '0000000000c6c6c6c66c381000000000',
+    'w': '0000000000c6c6d6d6d6d66e00000000',
+    'x': '0000000000c66c38386cc6c600000000',
+    'y': '0000000000c6c6c6c6c6c67e0606fc00',
+    'z': '0000000000fe060c183060fe00000000',
+    '{': '000e181818187070181818180e000000',
+    '|': '00181818181818181818181818000000',
+    '}': '0070181818180e0e1818181870000000',
+    '~': '000000000000327e4c00000000000000',
+    '\xb7': '00000000000000181800000000000000',
+    '\u2581': '0000000000000000000000000000ffff',
+    '\u2582': '000000000000000000000000ffffffff',
+    '\u2583': '00000000000000000000ffffffffffff',
+    '\u2584': '0000000000000000ffffffffffffffff',
+    '\u2585': '000000000000ffffffffffffffffffff',
+    '\u2586': '00000000ffffffffffffffffffffffff',
+    '\u2587': '0000ffffffffffffffffffffffffffff',
+    '\u2588': 'ffffffffffffffffffffffffffffffff',
+    '\u2591': '11441144114411441144114411441144',
+    '\u2500': '00000000000000ff0000000000000000',
+    '\u2014': '000000000000007e0000000000000000',
+}
+
+
+CARD_W, CARD_H = 1200, 630
+CARD_PALETTE = {"bg": "#0d1117", "fg": "#e6edf3", "muted": "#8b949e",
+                "rule": "#30363d", "accent": "#f0883e"}
+
+
+class Text(NamedTuple):
+    x: int
+    y: int
+    scale: int
+    colour: str
+    text: str
+
+
+class Rect(NamedTuple):
+    x: int
+    y: int
+    w: int
+    h: int
+    colour: str
+
+
+class Polyline(NamedTuple):
+    points: tuple
+    colour: str
+    width: int
+
+
+def _bresenham(x0: int, y0: int, x1: int, y1: int):
+    dx, dy = abs(x1 - x0), -abs(y1 - y0)
+    sx, sy = (1 if x0 < x1 else -1), (1 if y0 < y1 else -1)
+    err = dx + dy
+    while True:
+        yield x0, y0
+        if x0 == x1 and y0 == y1:
+            return
+        e2 = 2 * err
+        if e2 >= dy:
+            err += dy
+            x0 += sx
+        if e2 <= dx:
+            err += dx
+            y0 += sy
+
+
+def _runs(pixels: set) -> list[tuple[int, int, int, int]]:
+    out: list[tuple[int, int, int, int]] = []
+    for x, y in sorted(pixels, key=lambda p: (p[1], p[0])):
+        if out and out[-1][1] == y and out[-1][0] + out[-1][2] == x:
+            px, py, pw, ph = out[-1]
+            out[-1] = (px, py, pw + 1, ph)
+        else:
+            out.append((x, y, 1, 1))
+    return out
+
+
+def op_rects(op) -> list[tuple[int, int, int, int]]:
+    """The exact pixels one draw op covers, as (x, y, w, h) runs.
+
+    Both writers consume this and nothing else, so the SVG and the PNG cannot
+    disagree about a single pixel.
+    """
+    if isinstance(op, Rect):
+        return [(op.x, op.y, op.w, op.h)]
+    if isinstance(op, Text):
+        s, out = op.scale, []
+        for i, ch in enumerate(op.text):
+            bits = CARD_FONT.get(ch) or CARD_FONT["?"]
+            gx = op.x + i * 8 * s
+            for row in range(16):
+                byte, col = int(bits[row * 2:row * 2 + 2], 16), 0
+                while col < 8:
+                    if byte & (0x80 >> col):
+                        start = col
+                        while col < 8 and byte & (0x80 >> col):
+                            col += 1
+                        out.append((gx + start * s, op.y + row * s, (col - start) * s, s))
+                    else:
+                        col += 1
+        return out
+    # Polyline: integer Bresenham, every point stamped as a width x width square.
+    pixels: set = set()
+    half = op.width // 2
+    for (x0, y0), (x1, y1) in zip(op.points, op.points[1:]):
+        for x, y in _bresenham(x0, y0, x1, y1):
+            for dy in range(op.width):
+                for dx in range(op.width):
+                    pixels.add((x - half + dx, y - half + dy))
+    return _runs(pixels)
+
+
+def rasterize(ops) -> bytearray:
+    """RGB pixels, row-major from the top left. Ops paint in order, clipped."""
+    buf = bytearray(bytes.fromhex(CARD_PALETTE["bg"][1:]) * (CARD_W * CARD_H))
+    for op in ops:
+        px = bytes.fromhex(op.colour[1:])
+        for x, y, w, h in op_rects(op):
+            x0, y0 = max(x, 0), max(y, 0)
+            x1, y1 = min(x + w, CARD_W), min(y + h, CARD_H)
+            if x0 >= x1 or y0 >= y1:
+                continue
+            run = px * (x1 - x0)
+            for yy in range(y0, y1):
+                o = (yy * CARD_W + x0) * 3
+                buf[o:o + len(run)] = run
+    return buf
+
+
+def _png_chunk(tag: bytes, body: bytes) -> bytes:
+    return (struct.pack(">I", len(body)) + tag + body
+            + struct.pack(">I", zlib.crc32(tag + body) & 0xFFFFFFFF))
+
+
+def png_bytes(ops) -> bytes:
+    """An 8-bit RGB PNG of the ops, from the standard library alone."""
+    buf, stride = rasterize(ops), CARD_W * 3
+    raw = b"".join(b"\x00" + bytes(buf[y * stride:(y + 1) * stride]) for y in range(CARD_H))
+    ihdr = struct.pack(">IIBBBBB", CARD_W, CARD_H, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", ihdr)
+            + _png_chunk(b"IDAT", zlib.compress(raw, 9)) + _png_chunk(b"IEND", b""))
+
+
+def svg_text(ops) -> str:
+    """The same pixels as png_bytes, as integer-aligned paths in paint order.
+
+    No <text> elements: a glyph is pixels, so nothing on a card can be copied,
+    searched or indexed as text.
+    """
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{CARD_W}" height="{CARD_H}" '
+             f'viewBox="0 0 {CARD_W} {CARD_H}" shape-rendering="crispEdges">',
+             f'<rect width="{CARD_W}" height="{CARD_H}" fill="{CARD_PALETTE["bg"]}"/>']
+    for op in ops:
+        d = "".join(f"M{x} {y}h{w}v{h}h{-w}z" for x, y, w, h in op_rects(op))
+        if d:
+            parts.append(f'<path fill="{op.colour}" d="{d}"/>')
+    parts.append("</svg>")
+    return "\n".join(parts) + "\n"
+
+
+HERO_RULE_X = 856
+_HERO_LEFT, _HERO_WIDTH = 64, 768
+_SPARK_BOX = (64, 416, 768, 120)          # x, y, w, h
+TERM_X, TERM_Y, CELL_W, CELL_H, TERM_COLS = 24, 24, 24, 48, 48
+# Card glyphs are written as escapes: they only ever reach the card font, never
+# a terminal, so they have no _GLYPH_FALLBACK entry, and the source-glyph test
+# requires every literal non-ASCII character in this file to have one.
+_BLOCKS = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
+_BAR_FULL, _BAR_EMPTY = "\u2588", "\u2591"
+
+
+def _spark_points(series: list, vmax: float) -> tuple:
+    x, y, w, h = _SPARK_BOX
+    n = len(series)
+    pts = []
+    for i, v in enumerate(series):
+        if v is None:
+            continue
+        px = x + (i * w // (n - 1) if n > 1 else 0)
+        frac = min(max(v / vmax, 0.0), 1.0) if vmax else 0.0
+        pts.append((px, y + h - int(round(frac * h))))
+    return tuple(pts)
+
+
+def _blocks(series: list, vmax: float, width: int) -> str:
+    """One block per day, or per bucket of days when the window is wider."""
+    step = max(1, -(-len(series) // width))
+    cells = []
+    for i in range(0, len(series), step):
+        vals = [v for v in series[i:i + step] if v is not None]
+        if not vals:
+            cells.append(" ")
+            continue
+        level = min(7, int(max(vals) / vmax * 8)) if vmax else 0
+        cells.append(_BLOCKS[level])
+    return "".join(cells)
+
+
+def layout_hero(m: dict) -> list:
+    """Layout A: one big number, a caption, three or four stats, a trend."""
+    P = CARD_PALETTE
+    ops: list = [Text(64, 48, 2, P["muted"], m["label"])]
+    hero = m["hero"]
+    scale = next((s for s in (10, 8, 6) if len(hero) * 8 * s <= _HERO_WIDTH), 4)
+    ops.append(Text(_HERO_LEFT, 112, scale, P["accent"], hero))
+    for i, line in enumerate(_wrap(m["caption"], 32)[:2]):
+        ops.append(Text(_HERO_LEFT, 296 + i * 52, 3, P["fg"], line))
+    ops.append(Rect(HERO_RULE_X, 112, 2, 400, P["rule"]))
+    for i, (value, label) in enumerate(m["stats"][:4]):
+        y = 112 + i * 104
+        # x4 holds 9 characters before the canvas edge; a longer value drops
+        # to x3 (12) rather than being truncated into a different number.
+        ops.append(Text(888, y, 4 if len(value) <= 9 else 3, P["fg"], value[:12]))
+        ops.append(Text(888, y + 68, 2, P["muted"], label[:16]))
+    if m["trend"]:
+        ops.append(Polyline(_spark_points(m["series"], m["series_max"]), P["accent"], 4))
+    else:
+        ops.append(Text(_HERO_LEFT, 456, 2, P["muted"], "not enough days for a trend"))
+    ops.append(Text(_HERO_LEFT, 574, 2, P["muted"], CARD_INSTALL))
+    return ops
+
+
+def layout_terminal(m: dict) -> list:
+    """Layout C: the card as a terminal session, on a 24x48 character grid."""
+    P = CARD_PALETTE
+
+    def at(col: int, row: int, colour: str, s: str, scale: int = 3) -> Text:
+        return Text(TERM_X + col * CELL_W, TERM_Y + row * CELL_H, scale, colour, s)
+
+    header = m["header"]
+    ops: list = [at(0, 0, P["accent"], "$"),
+                 at(2, 0, P["muted"], f"actualis --card {m['mode']}"),
+                 at(0, 1, P["fg"], "ACTUALIS · what actually ran"),
+                 at(0, 2, P["muted"], header + " " + "─" * (TERM_COLS - len(header) - 1))]
+    hero_x, hero_y = TERM_X, TERM_Y + 3 * CELL_H
+    ops.append(Text(hero_x, hero_y, 6, P["accent"], m["hero"]))
+    label_col = len(m["hero"]) * 2 + 1          # a x6 glyph spans two x3 cells
+    ops.append(at(label_col, 4, P["fg"], m["hero_label"][:TERM_COLS - label_col]))
+    bars = m["bars"][:4]
+    top = max([v for _, v, _ in bars] or [0.0]) or 1.0
+    for i, (label, value, text) in enumerate(bars):
+        row = 5 + i
+        filled = int(round(28 * value / top))
+        ops.append(at(0, row, P["muted"], label.replace("claude-", "")[:11]))
+        if filled:
+            ops.append(at(12, row, P["accent"], _BAR_FULL * filled))
+        if filled < 28:
+            ops.append(at(12 + filled, row, P["rule"], _BAR_EMPTY * (28 - filled)))
+        if len(text) <= 7:
+            ops.append(at(41, row, P["fg"], text))
+        else:   # x2 fits 10 characters in the same 7 cells
+            ops.append(Text(TERM_X + 41 * CELL_W, TERM_Y + row * CELL_H + 16, 2,
+                            P["fg"], text[:10]))
+    spark_row = 6 + max(len(bars), 3)    # one blank row after the bars
+    ops.append(at(0, spark_row, P["muted"], f"{m['days']}d"[:4]))
+    if m["trend"]:
+        ops.append(at(5, spark_row, P["accent"], _blocks(m["series"], m["series_max"], 40)))
+    else:
+        ops.append(at(5, spark_row, P["muted"], "not enough days for a trend"))
+    ops.append(at(TERM_COLS - len(CARD_INSTALL), 11, P["muted"], CARD_INSTALL))
+    return ops
+
+
+def card_paths(out_dir: Path) -> tuple:
+    """The first actualis-card[-N] where neither the .svg nor the .png exists.
+
+    Both files move together: a card whose SVG is -2 and PNG is -1 is two
+    different cards with one name.
+    """
+    n = 1
+    while True:
+        stem = "actualis-card" if n == 1 else f"actualis-card-{n}"
+        svg, png = out_dir / f"{stem}.svg", out_dir / f"{stem}.png"
+        if not svg.exists() and not png.exists():
+            return svg, png
+        n += 1
+
+
+def write_card(m: dict, style: str, out_dir: Path) -> tuple:
+    """Write one card. Mode "x" makes never-overwrite hold even under a race."""
+    ops = layout_hero(m) if style == "hero" else layout_terminal(m)
+    svg_data, png_data = svg_text(ops), png_bytes(ops)   # render before opening anything
+    svg, png = card_paths(out_dir)
+    with svg.open("x", encoding="utf-8", newline="\n") as fh:
+        fh.write(svg_data)
+    try:
+        with png.open("xb") as fh:
+            fh.write(png_data)
+    except BaseException:
+        try:
+            svg.unlink()
+        except OSError:
+            pass
+        raise
+    return svg, png
 
 
 # --------------------------------------------------------------------------
@@ -4425,6 +5374,7 @@ JSON_SCHEMA: dict[str, str] = {
     "messages": "int",
     "cost_usd": "float",
     "cost_usd_from_unpriced_models": "float",
+    "copilot_unpriced_sessions": "int",
     "pricing.verified": "str",
     "pricing.age_days": "int",
     "pricing.stale": "bool",
@@ -4516,6 +5466,7 @@ JSON_SCHEMA: dict[str, str] = {
     "vendors.capabilities[].capability": "str",
     "vendors.capabilities[].claude": "str",
     "vendors.capabilities[].codex": "str",
+    "vendors.capabilities[].copilot": "str",
     "vendors.capabilities[].depends_on": "str",
     "vendors.note": "str",
     "unreadable_commands.count": "int",
@@ -4649,6 +5600,7 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
         "messages": fleet.messages,
         "cost_usd": float(round(fleet.total_cost, 4)),
         "cost_usd_from_unpriced_models": float(round(fleet.cost_unknown, 4)),
+        "copilot_unpriced_sessions": int(fleet.copilot_unpriced),
         "pricing": {
             "verified": PRICING_VERIFIED,
             "age_days": pricing_age_days(),
@@ -4753,8 +5705,8 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
         "suppressed_flags": fleet.suppressed_flags,
         "vendors": {
             "capabilities": [
-                {"capability": cap, "claude": c, "codex": x, "depends_on": why}
-                for cap, c, x, why in VENDOR_CAPABILITIES
+                {"capability": cap, "claude": c, "codex": x, "copilot": p, "depends_on": why}
+                for cap, c, x, p, why in VENDOR_CAPABILITIES
             ],
             "note": "a section fed by a field one vendor does not write is "
                     "single-vendor. Comparing two projects on different agents "
@@ -5107,7 +6059,10 @@ def self_check(c: C, days: int | None = 7, root: str | None = None) -> int:
             print(f"          {c.dim}{line}{c.off}")
 
     roots = ([Path(root).expanduser()] if root
-             else transcript_roots() + codex_roots())
+             else transcript_roots() + codex_roots() + copilot_roots())
+    if roots:
+        result(True, "the only directories this run reads",
+               "; ".join(str(r) for r in roots))
 
     # 1. What this build imports at all. Read from the source, so it describes
     #    the shipped file rather than whatever is loaded right now.
@@ -5148,9 +6103,12 @@ def self_check(c: C, days: int | None = 7, root: str | None = None) -> int:
 
     # 3. Where this build is allowed to write, named explicitly.
     writable = [str(p) for p in suppression_paths()]
-    result(True, "the only write path in this build",
+    result(True, "the only write paths in this build",
            "Suppressions, and only when you pass --suppress: "
-           + "; ".join(writable))
+           + "; ".join(writable)
+           + ". A card, and only when you pass --card: actualis-card[-N].svg and "
+           "actualis-card[-N].png in the current directory, or in --out. Neither "
+           "is ever overwritten.")
 
     # 4. What the binary itself is, so it can be compared with what was published.
     try:
@@ -5202,6 +6160,9 @@ def _self_check_corpus(roots: list[Path], sample: list[Path], result, c: C,
     fleet = Fleet()
     since = window_start(days, datetime.now(timezone.utc)) if days else None
     fleet.scan(roots, since, None, progress=False)
+    copilot = [r for r in roots if r in copilot_roots()]
+    if copilot:
+        fleet.scan_copilot(copilot, since, None)
 
     changed = [str(f) for f in sample if _digest_file(f) != before[f]]
     result(not changed,
@@ -5287,6 +6248,16 @@ def _aisvs_9_5_4(fleet: "Fleet") -> tuple[str, str]:
                      f"parameter is exactly what this control forbids.")
 
 
+def is_ungated_mode(key: str) -> bool:
+    """One permission-mode key that does not stop for approval.
+
+    The single definition. ungated_modes, --share and --card all read it, so
+    the three cannot disagree about what "unsupervised" means again.
+    """
+    k = key.lower()
+    return "auto" in k or "bypass" in k or key == "codex:never"
+
+
 def ungated_modes(modes: "Counter") -> int:
     """Turns recorded in a mode that does not stop for approval.
 
@@ -5298,9 +6269,7 @@ def ungated_modes(modes: "Counter") -> int:
     as *consistent* with a control it plainly failed. Understating a failing
     control is the worse direction of error for this tool.
     """
-    return sum(v for k, v in modes.items()
-               if "auto" in k.lower() or "bypass" in k.lower()
-               or k == "codex:never")
+    return sum(v for k, v in modes.items() if is_ungated_mode(k))
 
 
 def _aisvs_9_2_1(fleet: "Fleet") -> tuple[str, str]:
@@ -5569,15 +6538,55 @@ def _codex_events(roots: list[Path], since: datetime | None) -> list[ReplayEvent
     return out
 
 
+def _copilot_events(roots: list[Path], since: datetime | None) -> list[ReplayEvent]:
+    """Copilot records the branch, so unlike Codex it is carried through."""
+    out: list[ReplayEvent] = []
+    for root in roots:
+        for f in sorted(root.glob("*/events.jsonl")):
+            cwd = branch = ""
+            try:
+                fh = f.open(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            with fh:
+                for line in fh:
+                    if "tool.execution_start" not in line and "session.start" not in line \
+                            and "session.context_changed" not in line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if not isinstance(rec, dict) or not isinstance(rec.get("data"), dict):
+                        continue
+                    kind = rec.get("type")
+                    if kind in ("session.start", "session.context_changed"):
+                        ctx = rec["data"].get("context") if kind == "session.start" else rec["data"]
+                        if isinstance(ctx, dict):
+                            cwd, branch = _copilot_context(ctx, cwd, branch)
+                        continue
+                    ts = parse_ts(rec.get("timestamp"))
+                    if ts is None or (since and ts < since):
+                        continue
+                    for cmd in _commands_in(rec):
+                        out.append(ReplayEvent(
+                            ts, cmd, f.parent.name,
+                            pretty_project(Path(cwd).name if cwd else "copilot"),
+                            str(branch), "copilot", str(root)))
+    return out
+
+
 def replay_events(since: datetime | None = None,
                   root: str | None = None) -> list[ReplayEvent]:
-    """Every recorded command across both vendors, oldest first."""
+    """Every recorded command across every vendor, oldest first."""
     if root:
         base = [Path(root).expanduser()]
-        events = _claude_events(base, since) + _codex_events(base, since)
+        events = _claude_events(base, since) + _codex_events(base, since) \
+            + _copilot_events(base, since)
     else:
         events = _claude_events(transcript_roots(), since)
         events += _codex_events(codex_roots(), since)
+        events += _copilot_events(copilot_roots(), since)
     events.sort(key=lambda e: e.ts)
     return events
 
@@ -5598,6 +6607,7 @@ _VALUE_HINT = {          # option -> how the shell should complete its argument
     "--root": "dir",
     "--ci-log": "file",
     "--diff": "file",
+    "--out": "dir",
 }
 
 
@@ -5738,6 +6748,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="run as an MCP server over stdio so an agent can query itself")
     ap.add_argument("--share", action="store_true",
                     help="postable summary with nothing identifying in it")
+    ap.add_argument("--card", nargs="?", const="supervision", choices=CARD_MODES,
+                    metavar="MODE",
+                    help="write a shareable SVG and PNG card: supervision (default), "
+                         "cost or volume. Nothing identifying is on it")
+    ap.add_argument("--style", choices=CARD_STYLES, default="hero",
+                    help="--card layout: hero (default) or terminal")
+    ap.add_argument("--out", metavar="DIR",
+                    help="--card: directory to write into (default: current directory)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--watch", action="store_true",
                     help="live monitor: alert on new secrets and risky commands")
@@ -5745,7 +6763,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="--watch poll interval (default 4)")
     ap.add_argument("--quiet", action="store_true",
                     help="--watch: notify on secrets only, not every flagged command")
-    ap.add_argument("--agent", choices=["all", "claude", "codex"], default="all",
+    ap.add_argument("--agent", choices=["all", "claude", "codex", "copilot"], default="all",
                     help="which agents to include (default: all)")
     ap.add_argument("--no-redact", action="store_true",
                     help="do NOT redact credentials from output (unsafe to share)")
@@ -5782,6 +6800,27 @@ def main(argv: list[str] | None = None) -> int:
     # cannot carry the report's glyphs, printing raises rather than degrades.
     make_output_printable(args.json)
 
+    if args.card and args.json:
+        ap.error("--card writes files; it cannot also emit --json.")
+    if args.card:
+        for flag, on in (("--fail-on", args.fail_on), ("--diff", args.diff),
+                         ("--why", args.why), ("--share", args.share),
+                         ("--watch", args.watch), ("--mcp", args.mcp),
+                         ("--replay", args.replay),
+                         ("--self-check", args.self_check),
+                         ("--suppress", args.suppress),
+                         ("--suppressions", args.suppressions),
+                         ("--explain", args.explain is not None),
+                         ("--agents", args.agents),
+                         ("--completions", args.completions),
+                         ("--service", args.service)):
+            if on:
+                ap.error(f"--card writes files; it cannot be combined with {flag}.")
+        card_dir = Path(args.out).expanduser() if args.out else Path.cwd()
+        if not card_dir.is_dir():
+            print(f"actualis: {card_dir} is not a directory.\n"
+                  "  --out takes the directory the card is written into.", file=sys.stderr)
+            return EXIT_CANNOT_RUN
     if args.service:
         # Unit to stdout, instructions to stderr: `> file` must yield a file
         # that works, and still tell the user what to do with it.
@@ -5804,6 +6843,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.diff and args.json:
         ap.error("--diff renders a comparison; it cannot also emit --json. "
                  "Save this run with --json, then diff the two files.")
+    if not args.card and (args.style != "hero" or args.out):
+        ap.error("--style and --out apply only to --card.")
 
 
     since = None
@@ -5859,12 +6900,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.watch:
         if args.root:
             root = Path(args.root).expanduser()
-            w_roots, w_codex = ([], [root]) if args.agent == "codex" else ([root], [])
+            w_roots, w_codex, w_copilot = (
+                ([], [root], []) if args.agent == "codex"
+                else ([], [], [root]) if args.agent == "copilot"
+                else ([root], [], []))
         else:
             w_roots = transcript_roots() if args.agent in ("all", "claude") else []
             w_codex = codex_roots() if args.agent in ("all", "codex") else []
+            w_copilot = copilot_roots() if args.agent in ("all", "copilot") else []
         return watch(w_roots, w_codex, max(args.interval, 0.5),
-                     C(use_color()), args.quiet, args.no_redact)
+                     C(use_color()), args.quiet, args.no_redact, w_copilot)
 
     if args.replay:
         since_r = window_start(args.days, datetime.now(timezone.utc)) if args.days else None
@@ -5918,6 +6963,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.agent == "codex":
             fleet.roots.append(root)
             fleet.scan_codex([root], since, args.project)
+        elif args.agent == "copilot":
+            fleet.roots.append(root)
+            fleet.scan_copilot([root], since, args.project)
         else:
             fleet.scan([root], since, args.project, progress=progress)
     else:
@@ -5933,6 +6981,13 @@ def main(argv: list[str] | None = None) -> int:
                 fleet.roots.extend(croots)
                 fleet.scan_codex(croots, since, args.project)
             elif args.agent == "codex":
+                sys.exit(no_transcripts_message())
+        if args.agent in ("all", "copilot"):
+            proots = copilot_roots()
+            if proots:
+                fleet.roots.extend(proots)
+                fleet.scan_copilot(proots, since, args.project)
+            elif args.agent == "copilot":
                 sys.exit(no_transcripts_message())
 
     if fleet.messages == 0 and fleet.bash_total == 0:
@@ -5951,6 +7006,22 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.why:
         return render_why(args.why, fleet, C(use_color()))
+
+    if args.card:
+        out_dir = card_dir
+        try:
+            model = card_model(fleet, args.card, args.days)
+        except CardError as exc:
+            print(f"actualis: {exc}", file=sys.stderr)
+            return EXIT_CANNOT_RUN
+        try:
+            svg, png = write_card(model, args.style, out_dir)
+        except OSError as exc:
+            print(f"actualis: cannot write the card to {out_dir}: {exc.strerror or exc}",
+                  file=sys.stderr)
+            return EXIT_CANNOT_RUN
+        print(f"  {svg}\n  {png}\n\n  {model['share']}")
+        return EXIT_OK
 
     if args.json:
         json.dump(to_json(fleet, raw=args.no_redact), sys.stdout, indent=2)

@@ -585,7 +585,7 @@ class TestShareLeakage(unittest.TestCase):
 
     SECRETS = ["ACME-CLASSIFIED-MERGER", "feat/9999-project-tigerclaw",
                "/Users/someone/private/repo", "sk_live_leakcanary1234567",
-               "internal-db.corp.example.com", "#9999"]
+               "internal-db.corp.example.com", "#9999", "ft:leaktest-model"]
 
     def _share_output(self):
         import io, contextlib
@@ -602,6 +602,9 @@ class TestShareLeakage(unittest.TestCase):
                    {"command": "psql postgresql://u:hunter2pass@internal-db.corp.example.com/x "
                                "&& export K=sk_live_leakcanary1234567 "
                                "&& cat /Users/someone/private/repo/.env"}, ts)
+        for _ in range(5):
+            f.add_usage("ACME-CLASSIFIED-MERGER", "ft:leaktest-model",
+                        {"output_tokens": 10}, ts, "main")
         f.add_subagent({"resolvedModel": "claude-sonnet-5", "status": "completed",
                         "totalDurationMs": 1000, "totalTokens": 10,
                         "toolStats": {"bashCount": 40}, "usage": {"output_tokens": 1}}, ts)
@@ -618,6 +621,12 @@ class TestShareLeakage(unittest.TestCase):
         for needle in self.SECRETS:
             with self.subTest(needle=needle):
                 self.assertNotIn(needle, out)
+
+    def test_model_line_shows_custom_for_unlisted_models(self):
+        out = self._share_output()
+        line = next(l for l in out.splitlines() if "models" in l and "%" in l)
+        self.assertIn("custom", line)
+        self.assertIn("claude-opus-5", line)
 
     def test_no_secret_fingerprints_leak(self):
         """Even a hash is an identifier that could be correlated."""
@@ -826,7 +835,7 @@ class TestExplainability(unittest.TestCase):
             with self.subTest(topic=topic):
                 v = str(e["verify"])
                 self.assertTrue(any(v.startswith(p) for p in
-                                    ("actualis", "codesign", "ls ", "grep ")),
+                                    ("actualis", "codesign", "ls ", "grep ", "jq ")),
                                 f"{topic} verify is not a command: {v}")
 
 
@@ -2341,10 +2350,11 @@ class TestVendorCapabilities(unittest.TestCase):
 
     def test_every_capability_names_the_field_it_rests_on(self):
         """A matrix nobody can check against the parser is just a claim."""
-        for cap, c, x, why in af.VENDOR_CAPABILITIES:
+        for cap, c, x, p, why in af.VENDOR_CAPABILITIES:
             with self.subTest(capability=cap):
                 self.assertIn(c, (af.YES, af.PARTIAL, af.NO))
                 self.assertIn(x, (af.YES, af.PARTIAL, af.NO))
+                self.assertIn(p, (af.YES, af.PARTIAL, af.NO))
                 self.assertTrue(why.strip(), "must name the field or the reason")
 
     def test_the_refusal_gap_is_recorded(self):
@@ -2360,11 +2370,11 @@ class TestVendorCapabilities(unittest.TestCase):
         self.assertIn("vendors", af.EXPLAIN)
 
     def test_no_capability_claims_both_vendors_lack_it_without_saying_why(self):
-        for cap, c, x, why in af.VENDOR_CAPABILITIES:
-            if c == af.NO and x == af.NO:
+        for cap, c, x, p, why in af.VENDOR_CAPABILITIES:
+            if c == af.NO and x == af.NO and p == af.NO:
                 with self.subTest(capability=cap):
                     self.assertGreater(len(why), 30,
-                                       "a gap in both needs a real explanation")
+                                       "a gap in all three needs a real explanation")
 
 
 class TestFailOn(unittest.TestCase):

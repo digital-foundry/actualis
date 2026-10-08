@@ -6,7 +6,7 @@ and credential shapes are all fabricated, so an image rendered from this can
 never leak anything from the machine that built it. That is the entire point:
 the alternative is scrubbing real output by hand, which goes wrong once.
 
-    python3 tools/make-demo-fleet.py /tmp/actualis-demo-fleet
+    python3 tools/make-demo-fleet.py /tmp/actualis-demo-fleet [/tmp/actualis-demo-copilot]
 """
 import json, pathlib, random, sys
 from datetime import datetime, timedelta, timezone
@@ -28,6 +28,46 @@ LEAKY = ["export STRIPE_KEY=sk_live_00fictionalvalue0000",
          "echo 'sk-ant-api03-0000fictionalkey0000' >> .env"]
 RISKY = ["rm -rf ./build", "sudo systemctl restart orbital", "chmod 777 /tmp/cache"]
 
+COPILOT_MODELS = ("claude-sonnet-4.5", "gpt-5-mini")
+
+
+def copilot_sessions(dest: str) -> None:
+    """Two invented Copilot CLI sessions, in its events.jsonl shape.
+
+    Written after the Claude fleet, so the random stream that fleet consumes is
+    unchanged and its images stay byte-identical.
+    """
+    state = pathlib.Path(dest) / "session-state"
+    for s in range(2):
+        sid = f"00000000-0000-4000-8000-00000000000{s + 1}"
+        day = BASE + timedelta(days=8 + s * 12)
+        events = [("session.start", {"sessionId": sid, "copilotVersion": "1.0.70",
+                   "context": {"cwd": "/home/dev/orbital-ledger",
+                               "gitRoot": "/home/dev/orbital-ledger",
+                               "branch": f"feature/ORB-{700 + s}"}}, day)]
+        for i in range(20):
+            ts, call = day + timedelta(minutes=3 * i), f"call-{s}-{i}"
+            if random.random() < .1:
+                events.append(("permission.requested", {"requestId": call,
+                               "permissionRequest": {"kind": "shell", "toolCallId": call}}, ts))
+                events.append(("permission.completed", {"requestId": call, "toolCallId": call,
+                               "result": {"kind": "approved"}}, ts))
+            events.append(("tool.execution_start", {"toolCallId": call, "toolName": "bash",
+                           "arguments": {"command": random.choice(SAFE)}}, ts))
+        events.append(("session.shutdown", {
+            "shutdownType": "routine", "totalPremiumRequests": 1.65,
+            "modelMetrics": {m: {"usage": {
+                "inputTokens": 900_000, "cacheReadTokens": 780_000,
+                "cacheWriteTokens": 60_000 if m.startswith("claude") else 0,
+                "outputTokens": 14_000, "reasoningTokens": 3_000}} for m in COPILOT_MODELS}},
+            day + timedelta(hours=2)))
+        d = state / sid
+        d.mkdir(parents=True, exist_ok=True)
+        with (d / "events.jsonl").open("w") as fh:
+            for n, (kind, data, ts) in enumerate(events):
+                fh.write(json.dumps({"type": kind, "data": data, "id": f"e{n}",
+                                     "parentId": None, "timestamp": ts.isoformat()}) + "\n")
+
 
 def pick(weighted):
     r, c = random.random(), 0.0
@@ -38,7 +78,7 @@ def pick(weighted):
     return weighted[-1][0]
 
 
-def main(dest: str) -> None:
+def main(dest: str, copilot_dest=None) -> None:
     root = pathlib.Path(dest)
     random.seed(7)  # fixed: the same fleet every time, so images are reproducible
     for pdir, (tag, share) in PROJECTS.items():
@@ -70,7 +110,9 @@ def main(dest: str) -> None:
                                                  "input": {"command": cmd}}]}}) + "\n")
     print(f"  synthetic fleet: {len(list(root.rglob('*.jsonl')))} files, "
           f"{len(PROJECTS)} projects, at {root}")
+    if copilot_dest:
+        copilot_sessions(copilot_dest)
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
