@@ -189,5 +189,36 @@ class TestPackages(unittest.TestCase):
             self.assertEqual(set(one(cmd)), keys, cmd)
 
 
+class TestReviewFixes(unittest.TestCase):
+    def test_nested_substitution_keeps_outer_curl(self):
+        for cmd in ("echo $(curl https://o.io/$(date))", "x=$(curl -s https://o.io/$(cat v))"):
+            it = one(cmd)
+            self.assertEqual((it["program"], it["host"]), ("curl", "o.io"), cmd)
+
+    def test_three_level_nesting(self):
+        found = items("echo $(echo $(echo $(curl https://deep.io/x)))")
+        self.assertEqual([i["host"] for i in found], ["deep.io"])
+
+    def test_escaped_quotes(self):
+        found, unparsed = af.network_items_from_command(r'sh -c "bash -c \"curl https://a.io\""')
+        self.assertEqual(([i["host"] for i in found], unparsed), (["a.io"], 0))
+        found, unparsed = af.network_items_from_command(r'echo \"; curl https://a.io')
+        self.assertEqual(([i["host"] for i in found], unparsed), (["a.io"], 0))
+
+    def test_ipv6_hosts(self):
+        self.assertEqual(af.url_host("http://[::1]:8080/"), "[::1]")
+        self.assertEqual(af.url_host("https://[2001:DB8::1]/x"), "[2001:db8::1]")
+
+    def test_brew_tap_clones_from_github(self):
+        it = one("brew tap foo/bar")
+        self.assertEqual((it["kind"], it["host"], it["url"], it["host_inferred"]),
+                         ("clone", "github.com", "https://github.com/foo/homebrew-bar", True))
+        self.assertEqual(one("brew install jq")["host"], "formulae.brew.sh")
+
+    def test_file_url_is_a_fetch_without_host(self):
+        it = one("curl file:///etc/passwd")
+        self.assertEqual((it["kind"], it["host"], it["dynamic"]), ("fetch", None, False))
+
+
 if __name__ == "__main__":
     unittest.main()

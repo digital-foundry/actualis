@@ -1141,7 +1141,7 @@ _NET_EXACT_VERSION = re.compile(r"^v?\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?$")
 _NET_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _NET_PREFIX_VALUE_FLAGS = {"sudo": {"-u", "-g", "-C", "-h", "-p"}, "nice": {"-n"}, "env": {"-u", "-C"}}
 _NET_SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
-_NET_SUBST = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
+_NET_BACKTICK = re.compile(r"`([^`]*)`")
 
 
 def url_host(url: str) -> str | None:
@@ -1154,8 +1154,10 @@ def url_host(url: str) -> str | None:
         return None
     if _NET_URL.match(url):
         rest = re.split(r"[/?#]", url.split("://", 1)[1], maxsplit=1)[0]
-        host = rest.rsplit("@", 1)[-1].split(":", 1)[0]
-        return host.lower() or None
+        host = rest.rsplit("@", 1)[-1]
+        if host.startswith("["):             # IPv6 literal: keep the brackets, drop the port
+            return host[:host.find("]") + 1].lower() if "]" in host else None
+        return host.split(":", 1)[0].lower() or None
     m = _NET_SCP.match(url)
     return m.group(1).lower() if m else None
 
@@ -1230,6 +1232,10 @@ def _net_split(text: str) -> tuple[list[str], bool]:
     parts, buf, quote, i = [], [], "", 0
     while i < len(text):
         ch = text[i]
+        if ch == "\\" and quote != "'" and i + 1 < len(text):
+            buf.append(text[i:i + 2])        # an escaped character opens and closes nothing
+            i += 2
+            continue
         if quote:
             buf.append(ch)
             if ch == quote:
@@ -1269,6 +1275,65 @@ def _net_strip_prefixes(tokens: list[str]) -> list[str]:
     return tokens[i:]
 
 
+def _net_substitutions(text: str) -> tuple[list[str], str]:
+    """The bodies of every $( ... ) and `...` in `text`, outermost first (an
+    inner one is found again when its body is read), and `text` with them
+    blanked. Parentheses are matched by depth, so `$(a $(b))` is one body."""
+    bodies: list[str] = []
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        if text.startswith("$(", i):
+            depth, j = 1, i + 2
+            while j < len(text) and depth:
+                depth += (text[j] == "(") - (text[j] == ")")
+                j += 1
+            if depth == 0:
+                bodies.append(text[i + 2:j - 1])
+                out.append(" ")
+                i = j
+                continue
+        out.append(text[i])
+        i += 1
+    rest = "".join(out)
+    bodies += [m.group(1) for m in _NET_BACKTICK.finditer(rest)]
+    return bodies, _NET_BACKTICK.sub(" ", rest)
+
+
+def _net_tokens(segment: str) -> list[str]:
+    """Like _shell_tokens, but a backslash escapes: `\\"` is a quote character,
+    not a quote. Kept here so command_head() keeps its behaviour."""
+    out, buf, quote, started, i = [], [], "", False, 0
+    while i < len(segment):
+        ch = segment[i]
+        if ch == "\\" and quote != "'" and i + 1 < len(segment):
+            nxt = segment[i + 1]
+            if quote == '"' and nxt not in '"\\$`':
+                buf.append(ch)
+            buf.append(nxt)
+            started = True
+            i += 2
+            continue
+        if quote:
+            if ch == quote:
+                quote = ""
+            else:
+                buf.append(ch)
+        elif ch in "\"'":
+            quote, started = ch, True
+        elif ch.isspace():
+            if buf or started:
+                out.append("".join(buf))
+                buf, started = [], False
+        else:
+            buf.append(ch)
+            started = True
+        i += 1
+    if buf or started:
+        out.append("".join(buf))
+    return out
+
+
 def _net_segments(cmd: str, depth: int = 0) -> tuple[list[list[str]], int]:
     """Token lists for every simple command in `cmd`, nested ones included
     ($(...), backticks, bash -c "..."), and how many segments could not be
@@ -1276,17 +1341,18 @@ def _net_segments(cmd: str, depth: int = 0) -> tuple[list[list[str]], int]:
     out: list[list[str]] = []
     unparsed = 0
     text = _without_heredocs(cmd)
+    bodies, text = _net_substitutions(text)
     if depth < 3:
-        for m in _NET_SUBST.finditer(text):
-            inner, bad = _net_segments(m.group(1) or m.group(2) or "", depth + 1)
+        for body in bodies:
+            inner, bad = _net_segments(body, depth + 1)
             out += inner
             unparsed += bad
-    parts, open_quote = _net_split(_NET_SUBST.sub(" ", text))
+    parts, open_quote = _net_split(text)
     if open_quote:
         parts = parts[:-1]
         unparsed += 1
     for segment in parts:
-        tokens = _net_strip_prefixes(_shell_tokens(segment))
+        tokens = _net_strip_prefixes(_net_tokens(segment))
         if not tokens:
             continue
         if (depth < 3 and Path(tokens[0]).name in _NET_SHELLS
@@ -1490,6 +1556,10 @@ def _net_brew(args: list[str]) -> list[dict]:
     pos, _ = _net_positionals(args)
     if not pos or pos[0] not in ("install", "reinstall", "tap"):
         return []
+    if pos[0] == "tap":                      # clones github.com/<owner>/homebrew-<repo>
+        return [_net_item("clone", "brew", host="github.com", host_inferred=True,
+                          url=f"https://github.com/{owner}/homebrew-{repo}")
+                for owner, _, repo in (t.partition("/") for t in pos[1:]) if repo]
     return [_net_registry_item("brew", "brew", f, None, None) for f in pos[1:]]
 
 
