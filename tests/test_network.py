@@ -691,5 +691,28 @@ class TestNetworkJson(unittest.TestCase):
         self.assertEqual(af.network_json(af.Fleet())["trust_sources"], [])
 
 
+class TestUserinfoRedaction(unittest.TestCase):
+    CMDS = ("git clone https://ZqTOKEN@github.com/o/r.git",
+            "npm i git+https://ZqTOKEN@github.com/o/r.git",
+            "git clone user:ZqTOKEN@github.com:o/r.git")
+
+    def test_token_userinfo_is_masked_everywhere(self):
+        for cmd in self.CMDS:
+            with self.subTest(cmd=cmd):
+                f = af.Fleet()
+                f.add_tool("p", "Bash", {"command": cmd}, TS, "auto")
+                self.assertTrue(f.network_items)
+                self.assertNotIn("ZqTOKEN", json.dumps(af.network_json(f)))
+                self.assertNotIn("ZqTOKEN", af.redact(cmd))
+
+    def test_plain_remotes_stay_readable(self):
+        for cmd in ("git clone git@github.com:o/r.git", "git clone https://github.com/o/r"):
+            self.assertEqual(af.redact(cmd), cmd)
+
+    def test_redact_is_idempotent_on_userinfo(self):
+        once = af.redact(self.CMDS[2])
+        self.assertEqual(af.redact(once), once)
+
+
 if __name__ == "__main__":
     unittest.main()

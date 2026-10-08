@@ -531,6 +531,20 @@ def _mask(s: str) -> str:
     return f"{s[:4]}…<redacted:{_length_bucket(len(s))}>"
 
 
+# Userinfo in a URL, with or without a password: `https://TOKEN@host/`.
+_URL_USERINFO = re.compile(r"(\b[A-Za-z][A-Za-z0-9+.-]*://)([^/\s@'\"]+)@")
+# scp-style remote `[user[:secret]@]host:path`. Plain `git@host:` is not a secret,
+# so only a `:` in the userinfo or a long userinfo is masked.
+_SCP_USERINFO = re.compile(r"(?<![^\s'\"=])([^\s@:/'\"]+(?::[^\s@/'\"]*)?)@([A-Za-z0-9.-]+):")
+
+
+def _scp_mask(m: "re.Match") -> str:
+    u = m.group(1)
+    if ":" in u or len(u) > 20:
+        return f"{_mask(u)}@{m.group(2)}:"
+    return m.group(0)
+
+
 def redact(text: str) -> str:
     """Remove credential material from a command string. Idempotent."""
     if not text:
@@ -542,6 +556,8 @@ def redact(text: str) -> str:
     out = _SECRET_PATTERNS[3].sub(lambda m: f"{m.group(1)}{_mask(m.group(2))}{m.group(3)}", out)
     out = _SECRET_PATTERNS[0].sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{_mask(m.group(4))}", out)
     out = _SECRET_PATTERNS[1].sub(lambda m: f"{m.group(1)}{_mask(m.group(2))}", out)
+    out = _URL_USERINFO.sub(lambda m: f"{m.group(1)}{_mask(m.group(2))}@", out)
+    out = _SCP_USERINFO.sub(_scp_mask, out)
     return out
 
 
@@ -6460,6 +6476,7 @@ JSON_SCHEMA: dict[str, str] = {
     "network.packages[].ecosystem": "str",
     "network.packages[].name": "str",
     "network.packages[].versions": "array",
+    "network.packages[].versions[]": "str",
     "network.packages[].pinned": "bool",
     "network.packages[].exec": "bool",
     "network.packages[].count": "int",
@@ -6487,9 +6504,11 @@ JSON_SCHEMA: dict[str, str] = {
     "network.items_truncated": "bool",
     "network.strict": "bool",
     "network.trust": "array",
+    "network.trust[]": "str",
     "network.trust_sources": "array",
     "network.trust_sources[].source": "str",
     "network.trust_sources[].entries": "array",
+    "network.trust_sources[].entries[]": "str",
     "network.trust_sources[].path": "str|null",
     "network.trust_sources[].sha256": "str|null",
     "unknown_models.*": "int",

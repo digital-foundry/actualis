@@ -176,7 +176,7 @@ shell commands and web tools.
 | `items_truncated` | `true` when `items` was cut at the cap |
 | `strict` | whether `--network-strict` was on |
 | `trust` | the trusted host or host-and-path entries in force |
-| `trust_sources[]` | where the trust entries came from: `source` (`flag` or `file`), `path` and `sha256` (both `null` for a flag), and `entries`. It shows whether an agent-editable file supplied the trust, so a reader can tell |
+| `trust_sources[]` | where the trust entries came from: `source` (`flag` or `file`), `path` and `sha256` (both `null` for a flag), and `entries`. It shows whether an agent-editable file supplied the trust, so a reader can tell. `path` is absolute and not redacted, like `scanned.roots` |
 
 **Approval values.** `asked`: the user was prompted and approved. `unasked`:
 the agent ran it without asking, in a mode that does not prompt. `unknown`:

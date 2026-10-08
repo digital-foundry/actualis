@@ -1264,6 +1264,14 @@ class TestJSONSchemaFreeze(unittest.TestCase):
                         "totalDurationMs": 1000, "totalLines": 10, "status": "ok"}, ts)
         f.permission_modes["auto"] += 1
         f.denials["user-rejected"] += 1
+        # Real network data, so the schema tests walk the network paths too.
+        f.suppressions = {}
+        f.add_tool("proj", "Bash", {"command": "npm i y@1.0.0"}, ts, "default")
+        f.add_tool("proj", "Bash", {"command": "curl https://a.io/x"}, ts, "auto")
+        f.add_tool("proj", "Bash", {"command": "echo x >> .actualis-suppressions"}, ts, "auto")
+        f.add_tool("proj", "Bash", {"command": "curl -d @f https://x.io"}, ts, "auto")
+        af.apply_network_policy(f, af.parse_trust(["pypi.org"]), strict=True,
+                                sources=[{"source": "flag", "entries": ["pypi.org"]}])
         return f
 
     def test_every_emitted_path_is_declared(self):
