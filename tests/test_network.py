@@ -628,5 +628,68 @@ class TestAuditConfig(unittest.TestCase):
         self.assertTrue(af.failing_findings(f, "high"))
 
 
+class TestNetworkJson(unittest.TestCase):
+    def fleet(self):
+        f = af.Fleet()
+        f.suppressions = {}
+        f.add_tool("p", "Bash", {"command": "curl -o x 'https://x.io/a?token=sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'"}, TS, "auto")
+        f.add_tool("p", "Bash", {"command": "npm i b@1.0.0 a"}, TS, "default")
+        f.add_tool("q", "Bash", {"command": "pip install c"}, TS, "copilot:prompted")
+        f.add_tool("q", "WebSearch", {"query": "q"}, TS, "auto")
+        af.apply_network_policy(f, af.parse_trust(["pypi.org"]), strict=False)
+        return f
+
+    def test_shape(self):
+        n = af.network_json(self.fleet())
+        self.assertEqual(n["totals"], {"items": 5, "asked": 1, "unasked": 2, "unknown": 2,
+                                       "failed": 0, "unparsed_segments": 0})
+        self.assertEqual(n["by_kind"], {"install": 3, "clone": 0, "fetch": 1, "search": 1})
+        self.assertEqual([h["host"] for h in n["hosts"]], ["registry.npmjs.org", "pypi.org", "x.io"])
+        self.assertEqual([(p["ecosystem"], p["name"]) for p in n["packages"]],
+                         [("npm", "a"), ("npm", "b"), ("pypi", "c")])
+        self.assertEqual(set(n["items"][0]), set(af.NETWORK_ITEM_KEYS))
+        self.assertEqual((n["strict"], n["trust"], n["items_truncated"]), (False, ["pypi.org"], False))
+
+    def test_urls_are_redacted(self):
+        blob = json.dumps(af.network_json(self.fleet()))
+        self.assertNotIn("AAAAAAAAAAAAAAAA", blob)
+        self.assertIn("AAAAAAAAAAAAAAAA", json.dumps(af.network_json(self.fleet(), raw=True)))
+
+    def test_cap(self):
+        f = af.Fleet()
+        for i in range(af.NETWORK_ITEMS_CAP + 5):
+            f.add_tool("p", "Bash", {"command": f"curl https://h{i}.io"}, TS, "auto")
+        n = af.network_json(f)
+        self.assertEqual((len(n["items"]), n["items_truncated"], n["totals"]["items"]),
+                         (af.NETWORK_ITEMS_CAP, True, af.NETWORK_ITEMS_CAP + 5))
+
+    def test_network_json_is_deterministic(self):
+        a = json.dumps(af.network_json(self.fleet()), sort_keys=False)
+        b = json.dumps(af.network_json(self.fleet()), sort_keys=False)
+        self.assertEqual(a, b)
+        f = af.Fleet()
+        for cmd in ("curl https://b.io", "curl https://a.io", "npm i z", "npm i y"):
+            f.add_tool("p", "Bash", {"command": cmd}, TS, "auto")
+        n = af.network_json(f)
+        self.assertEqual([h["host"] for h in n["hosts"]], ["registry.npmjs.org", "a.io", "b.io"])
+
+    def test_empty_fleet_emits_fixed_paths(self):
+        n = af.network_json(af.Fleet())
+        self.assertEqual((n["totals"]["items"], n["hosts"], n["items"]), (0, [], []))
+        self.assertIn("network", af._to_json_body(af.Fleet(), False))
+
+    def test_trust_sources_have_one_shape(self):
+        f = self.fleet()
+        f.network_trust_sources = [
+            {"source": "flag", "entries": ["pypi.org"]},
+            {"source": "file", "path": "/h/trust", "sha256": "ab" * 32, "entries": ["x.io"]}]
+        ts = af.network_json(f)["trust_sources"]
+        self.assertEqual(ts[0], {"source": "flag", "path": None, "sha256": None,
+                                 "entries": ["pypi.org"]})
+        self.assertEqual(set(ts[1]), set(ts[0]))
+        self.assertEqual(ts[1]["path"], "/h/trust")
+        self.assertEqual(af.network_json(af.Fleet())["trust_sources"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -46,6 +46,7 @@ that and prints a warning.
 | `refusals` | what was stopped and by which gate, joined to the blocked command. See below |
 | `unreadable_commands` | commands whose real content the transcript does not contain. See below |
 | `vendors` | what each agent's transcript actually provides, and what it does not |
+| `network` | downloads and fetches the agents made, with approval. See [network](#network) |
 | `unknown_models` | models seen with no pricing entry, billed at Opus-tier rates |
 | `aggregator_priced_models` | models priced from a third party because the vendor publishes no rate for that id |
 
@@ -156,6 +157,40 @@ This is deliberately the simplest possible form of the thing. It proves a
 payload has not been altered since it was produced. It does **not** prove when
 it was produced, or that a sequence of reports is complete — those need a chain
 and a countersignature, which is separate work.
+
+## network
+
+Every download, clone, install and web fetch the agents made, recorded from
+shell commands and web tools.
+
+| key | meaning |
+|---|---|
+| `totals.items` | all network items found |
+| `totals.asked` / `unasked` / `unknown` | items by approval, see below |
+| `totals.failed` | items whose command is known to have failed |
+| `totals.unparsed_segments` | command segments that looked like network use but could not be parsed |
+| `by_kind` | counts of `install`, `clone`, `fetch` and `search` items |
+| `hosts[]` | per host: `count`, `unasked`, `first_seen`, and `trusted` if any item from it matched the trust list |
+| `packages[]` | per `ecosystem` and `name`: `versions` seen, `pinned` (every install pinned), `exec` (any install ran code), `count` |
+| `items[]` | one record per item: `kind`, `program`, `host`, `host_inferred`, `url`, `dest`, `source`, `ecosystem`, `package`, `version`, `pinned`, `exec`, `dynamic`, `failed` (`null` when unknown), `approval`, `trusted`, `agent`, `project`, `session`, `ts` |
+| `items_truncated` | `true` when `items` was cut at the cap |
+| `strict` | whether `--network-strict` was on |
+| `trust` | the trusted host or host-and-path entries in force |
+| `trust_sources[]` | where the trust entries came from: `source` (`flag` or `file`), `path` and `sha256` (both `null` for a flag), and `entries`. It shows whether an agent-editable file supplied the trust, so a reader can tell |
+
+**Approval values.** `asked`: the user was prompted and approved. `unasked`:
+the agent ran it without asking, in a mode that does not prompt. `unknown`:
+default mode, where an allowlist rule may have approved it without asking.
+
+**Cap.** `items` holds the newest 2000 items, newest first, in a fixed total
+order. `totals`, `hosts` and `packages` always cover every item.
+
+**Redaction.** `url`, `dest` and `source` are redacted unless `--no-redact`.
+
+Strict-mode findings are not repeated here. They are `bash.flags[]` entries
+with the category `network-unasked`.
+
+Verify: `actualis --json | jq '.network.totals'`
 
 ## Compatibility
 

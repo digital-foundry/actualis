@@ -1873,6 +1873,74 @@ def apply_network_policy(fleet: "Fleet", trust: list[tuple[str, str]], strict: b
         })
 
 
+NETWORK_ITEM_KEYS = ("kind", "program", "host", "host_inferred", "url", "dest", "source",
+                     "ecosystem", "package", "version", "pinned", "exec", "dynamic", "failed",
+                     "approval", "trusted", "agent", "project", "session", "ts")
+
+
+def network_json(fleet: "Fleet", raw: bool = False) -> dict:
+    """The `network` key of --json. Every list has a total order, so the same
+    input gives the same bytes."""
+    items = fleet.network_items
+    approval = Counter(i["approval"] for i in items)
+    kinds = Counter(i["kind"] for i in items)
+
+    hosts: dict[str, dict] = {}
+    for i in items:
+        if not i["host"]:
+            continue
+        h = hosts.setdefault(i["host"], {"host": i["host"], "count": 0, "unasked": 0,
+                                         "first_seen": None, "trusted": False})
+        h["count"] += 1
+        h["unasked"] += 1 if i["approval"] == "unasked" else 0
+        if i["ts"] and (h["first_seen"] is None or i["ts"] < h["first_seen"]):
+            h["first_seen"] = i["ts"]
+        h["trusted"] = h["trusted"] or i["trusted"]
+
+    packages: dict[tuple[str, str], dict] = {}
+    for i in items:
+        if not i["package"]:
+            continue
+        p = packages.setdefault((i["ecosystem"] or "", i["package"]), {
+            "ecosystem": i["ecosystem"], "name": i["package"], "versions": set(),
+            "pinned": True, "exec": False, "count": 0})
+        p["count"] += 1
+        if i["version"]:
+            p["versions"].add(i["version"])
+        p["pinned"] = p["pinned"] and i["pinned"]
+        p["exec"] = p["exec"] or i["exec"]
+
+    def public(i: dict) -> dict:
+        out = {k: i[k] for k in NETWORK_ITEM_KEYS}
+        if not raw:
+            for k in ("url", "dest", "source"):
+                if out[k]:
+                    out[k] = redact(out[k])
+        return out
+
+    # Every field that can differ is in the key, so no two distinct items tie.
+    order = sorted(items, key=lambda i: tuple(str(i[k] or "") for k in (
+        "ts", "agent", "project", "program", "host", "url", "package", "version", "kind",
+        "dest", "source", "session", "approval")), reverse=True)
+    return {
+        "totals": {"items": len(items), "asked": approval["asked"], "unasked": approval["unasked"],
+                   "unknown": approval["unknown"],
+                   "failed": sum(1 for i in items if i["failed"] is True),
+                   "unparsed_segments": fleet.network_unparsed},
+        "by_kind": {k: kinds.get(k, 0) for k in ("install", "clone", "fetch", "search")},
+        "hosts": sorted(hosts.values(), key=lambda h: (-h["count"], h["host"])),
+        "packages": [{**p, "versions": sorted(p["versions"])}
+                     for _, p in sorted(packages.items(), key=lambda kv: (-kv[1]["count"], kv[0]))],
+        "items": [public(i) for i in order[:NETWORK_ITEMS_CAP]],
+        "items_truncated": len(items) > NETWORK_ITEMS_CAP,
+        "strict": fleet.network_strict,
+        "trust": list(fleet.network_trust),
+        "trust_sources": [{"source": t["source"], "path": t.get("path"),
+                           "sha256": t.get("sha256"), "entries": list(t["entries"])}
+                          for t in fleet.network_trust_sources],
+    }
+
+
 # --------------------------------------------------------------------------
 # Suppressions
 #
@@ -6325,6 +6393,7 @@ JSON_SCHEMA: dict[str, str] = {
     "bash.flags[].project": "str",
     "bash.flags[].when": "str|null",
     "bash.flags[].evidence": "str",
+    "bash.flags[].had_secret": "bool",
     "coach": "array",
     "coach[].id": "str",
     "coach[].severity": "str",
@@ -6371,6 +6440,58 @@ JSON_SCHEMA: dict[str, str] = {
     "refusals.by_program.*.*": "int",
     "refusals.by_project.*.*": "int",
     "refusals.by_week.*.*": "int",
+    "network.totals.items": "int",
+    "network.totals.asked": "int",
+    "network.totals.unasked": "int",
+    "network.totals.unknown": "int",
+    "network.totals.failed": "int",
+    "network.totals.unparsed_segments": "int",
+    "network.by_kind.install": "int",
+    "network.by_kind.clone": "int",
+    "network.by_kind.fetch": "int",
+    "network.by_kind.search": "int",
+    "network.hosts": "array",
+    "network.hosts[].host": "str",
+    "network.hosts[].count": "int",
+    "network.hosts[].unasked": "int",
+    "network.hosts[].first_seen": "str|null",
+    "network.hosts[].trusted": "bool",
+    "network.packages": "array",
+    "network.packages[].ecosystem": "str",
+    "network.packages[].name": "str",
+    "network.packages[].versions": "array",
+    "network.packages[].pinned": "bool",
+    "network.packages[].exec": "bool",
+    "network.packages[].count": "int",
+    "network.items": "array",
+    "network.items[].kind": "str",
+    "network.items[].program": "str",
+    "network.items[].host": "str|null",
+    "network.items[].host_inferred": "bool",
+    "network.items[].url": "str|null",
+    "network.items[].dest": "str|null",
+    "network.items[].source": "str|null",
+    "network.items[].ecosystem": "str|null",
+    "network.items[].package": "str|null",
+    "network.items[].version": "str|null",
+    "network.items[].pinned": "bool",
+    "network.items[].exec": "bool",
+    "network.items[].dynamic": "bool",
+    "network.items[].failed": "bool|null",
+    "network.items[].approval": "str",
+    "network.items[].trusted": "bool",
+    "network.items[].agent": "str",
+    "network.items[].project": "str",
+    "network.items[].session": "str|null",
+    "network.items[].ts": "str|null",
+    "network.items_truncated": "bool",
+    "network.strict": "bool",
+    "network.trust": "array",
+    "network.trust_sources": "array",
+    "network.trust_sources[].source": "str",
+    "network.trust_sources[].entries": "array",
+    "network.trust_sources[].path": "str|null",
+    "network.trust_sources[].sha256": "str|null",
     "unknown_models.*": "int",
     "aggregator_priced_models.*": "int",
 }
@@ -6633,6 +6754,7 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
             "scope_note": "this machine only; refusals are not deduplicated "
                           "across developers and are bounded by transcript retention",
         },
+        "network": network_json(fleet, raw),
         "unknown_models": dict(fleet.unknown_models),
         "aggregator_priced_models": dict(fleet.aggregator_models),
     }
