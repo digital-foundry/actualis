@@ -1226,3 +1226,27 @@ class TestEvasionParity(unittest.TestCase):
             t0 = time.perf_counter()
             af.unreadable_shapes(text)
             self.assertLess(time.perf_counter() - t0, 0.1, text[:12])
+
+
+class TestNetworkFastPath(unittest.TestCase):
+    """I7: a command that cannot name a download is not tokenised at all."""
+
+    def test_plain_command_skips_extraction(self):
+        from unittest import mock
+        with mock.patch.object(af, "_net_segments", side_effect=AssertionError("tokenised")):
+            for cmd in ("ls -la /tmp && make build", "rm -rf dist; mkdir dist", "pytest -q tests/x.py"):
+                self.assertEqual(af.network_items_from_command(cmd), ([], 0))
+
+    def test_fast_path_never_changes_a_result(self):
+        cmds = ("cu''rl https://a.io", "c\\url https://a.io", "x=$(curl https://a.io)", "`wget https://a.io`",
+                "echo 'unterminated", "(curl https://a.io)", "/usr/bin/curl https://a.io",
+                "python3 -m pip install x", "uvx ruff", "bunx tsc", "pnpm add x", "cargo add serde",
+                "make && go get example.com/m@v1", "podman pull x", "ls | xargs wget")
+        for cmd in cmds:
+            with self.subTest(cmd=cmd):
+                found, unparsed = af.network_items_from_command(cmd)
+                self.assertTrue(found or unparsed, cmd)
+
+    def test_basename_helper(self):
+        self.assertEqual(af._net_base("/usr/local/bin/curl"), "curl")
+        self.assertEqual(af._net_base("curl"), "curl")

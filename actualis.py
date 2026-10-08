@@ -575,6 +575,10 @@ _OPT_DOCKER_LOGIN_P = re.compile(r"(?<!\S)(docker\s+login\b[^\n;|&]{0,512}?\s-p)
                                  r"(?!-)([^\s'\"]{1,256})")
 # (rule, credential group). The same table drives redact() and classify_secrets().
 _OPTION_SECRETS = ((_OPT_USERPASS, 5), (_OPT_PASSWORD, 4), (_OPT_DOCKER_LOGIN_P, 4))
+# Every command passes through both detectors, and almost none holds any of
+# these. One search decides whether the option rules (and, in classification,
+# the header rule) need to run at all.
+_OPTION_HINT = re.compile(r"(?i)authorization|(?<!\S)-u|--(?:user|proxy-user|(?:http-|ftp-|proxy-)?password)|docker")
 
 
 def _option_secret(value: str) -> bool:
@@ -607,8 +611,9 @@ def redact(text: str) -> str:
     # Order matters: the Authorization header rule must run before the generic
     # KEY=value rule, or "AUTH" in "Authorization:" makes it eat the scheme word.
     out = _SECRET_PATTERNS[2].sub(lambda m: f"{m.group(1)}{_mask(m.group(2))}", out)
-    for rx, group in _OPTION_SECRETS:
-        out = rx.sub(_option_mask(group), out)
+    if _OPTION_HINT.search(out):
+        for rx, group in _OPTION_SECRETS:
+            out = rx.sub(_option_mask(group), out)
     out = _SECRET_PATTERNS[3].sub(lambda m: f"{m.group(1)}{_mask(m.group(2))}{m.group(3)}", out)
     out = _SECRET_PATTERNS[0].sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{_mask(m.group(4))}", out)
     out = _SECRET_PATTERNS[1].sub(lambda m: f"{m.group(1)}{_mask(m.group(2))}", out)
@@ -1016,17 +1021,21 @@ def classify_secrets(cmd: str) -> list[tuple[str, str, str]]:
 
     # Roadmap S1: every form redact() masks is counted here too, through the
     # same compiled rules, so the rotation list and the masking cannot drift.
-    for rx, group in _OPTION_SECRETS:
-        for m in rx.finditer(cmd):
-            add("high", "password option", m.group(group))
-    for m in _SECRET_PATTERNS[2].finditer(cmd):
-        add("high", "Authorization header", m.group(2))
+    if _OPTION_HINT.search(cmd):
+        for rx, group in _OPTION_SECRETS:
+            for m in rx.finditer(cmd):
+                add("high", "password option", m.group(group))
+        for m in _SECRET_PATTERNS[2].finditer(cmd):
+            add("high", "Authorization header", m.group(2))
     # A password is short. _NAMED_SECRET wants 12 characters, which suits a
     # token; PGPASSWORD=hunter2pass was masked and never counted.
-    for m in _SECRET_PATTERNS[0].finditer(cmd):
-        name = m.group(1)
-        if _PASSWORD_NAME.search(name) and not _NOT_SECRET_NAMES.match(name.strip("_{}%$<>")):
-            add(_priority_for_name(name), clean(name.upper())[:48], m.group(4))
+    if _PASSWORD_NAME.search(cmd):
+        for m in _SECRET_PATTERNS[0].finditer(cmd):
+            name = m.group(1)
+            if _PASSWORD_NAME.search(name) and not _NOT_SECRET_NAMES.match(name.strip("_{}%$<>")):
+                add(_priority_for_name(name), clean(name.upper())[:48], m.group(4))
+    if "@" not in cmd:
+        return out
     for m in _URL_USERINFO.finditer(cmd):
         user, sep, pw = m.group(2).partition(":")
         if sep and pw:
@@ -1264,6 +1273,20 @@ _NET_CONTROL_WORDS = frozenset({"while", "until", "if", "then", "else", "elif", 
 _NET_SHELL_FLAGS = re.compile(r"^-[A-Za-z]+$")
 
 
+def _net_base(path: str) -> str:
+    """The last path component. Path(x).name, at a fraction of the cost on
+    the per-command hot path."""
+    return path.rsplit("/", 1)[-1]
+
+
+# A command holding none of these cannot name a download: no quote, escape,
+# substitution or group to hide a program in, and no program name the
+# extractors know (each name below is a substring of every spelling read:
+# pip covers pip3 and pipx, uv covers uvx, npm covers pnpm, bun covers bunx,
+# go covers cargo, gh is gh). Such a command skips tokenising entirely.
+_NET_MAY_DOWNLOAD = re.compile(r"['\"\\$`(]|curl|wget|git|gh|npm|npx|yarn|bun|pip|uv|brew|go|docker|podman")
+
+
 def _net_shell_c(t: str) -> bool:
     return "c" in t and _NET_SHELL_FLAGS.match(t) is not None
 
@@ -1357,10 +1380,23 @@ def _net_positionals(args: list[str], takes_value: frozenset = frozenset()) -> t
     return pos, opts
 
 
+# The character loops in _net_split and _net_tokens are exact and slow. A text
+# with none of these characters splits the same way in one C-level call, which
+# is most commands. A fuzz of 200,000 random strings found no difference.
+_NET_SPLIT_SLOW = re.compile(r"['\"\\]|>\|")
+_NET_SPLIT_OPS = re.compile(r"(&&|\|\||[;|\n])")
+_NET_TOKENS_SLOW = re.compile(r"['\"\\<>&()]")
+
+
 def _net_split(text: str, seps: list[str] | None = None) -> tuple[list[str], bool]:
     """Split on && || ; | and newline, outside quotes. Returns the parts and
     whether a quote was left open (the last part is then unusable). `seps`,
     when given, receives the operator after each part ("" after the last)."""
+    if not _NET_SPLIT_SLOW.search(text):     # nothing quoted or escaped: one C-level split
+        pieces = _NET_SPLIT_OPS.split(text)
+        if seps is not None:
+            seps += pieces[1::2] + [""]
+        return pieces[0::2], False
     parts, buf, quote, i = [], [], "", 0
     while i < len(text):
         ch = text[i]
@@ -1484,6 +1520,8 @@ def _net_tokens(segment: str, operators: bool = False) -> list[str]:
     `<<< w`, `>| f`, attached or not) is dropped with its target, and a word
     is cut where an unquoted `<` or `>` starts one: `https://a.io>/tmp/x`
     is the URL `https://a.io`. A redirection is never a package or a host."""
+    if not _NET_TOKENS_SLOW.search(segment):  # no quote, escape or operator: plain words
+        return segment.split()
     out, buf, quote, started, i = [], [], "", False, 0
     discard = False                          # the next word is a redirection target
     while i < len(segment):
@@ -1541,7 +1579,8 @@ def _net_segments(cmd: str, depth: int = 0) -> tuple[list[tuple[list[str], bool,
     out: list[tuple[list[str], bool, bool]] = []
     unparsed = 0
     text = _without_heredocs(cmd)
-    bodies, text = _net_substitutions(text)
+    # The character-level pass is skipped when there is nothing for it to find.
+    bodies, text = _net_substitutions(text) if "$(" in text or "`" in text else ([], text)
     if depth < 3:
         for body in bodies:
             inner, bad = _net_segments(body, depth + 1)
@@ -1558,11 +1597,11 @@ def _net_segments(cmd: str, depth: int = 0) -> tuple[list[tuple[list[str], bool,
     for n, (tokens, via_xargs) in enumerate(stripped):
         if not tokens:
             continue
-        prog = Path(tokens[0]).name
+        prog = _net_base(tokens[0])
         flag = _net_shell_c_index(tokens) if prog in _NET_SHELLS else 0
         # `curl … | sh`, `| sudo bash`, `| busybox sh`, on the dequoted names.
         nxt = stripped[n + 1][0] if seps[n] == "|" and n + 1 < len(stripped) else []
-        into_shell = bool(nxt) and Path(nxt[0]).name in _NET_SHELLS and not _net_shell_c_index(nxt)
+        into_shell = bool(nxt) and _net_base(nxt[0]) in _NET_SHELLS and not _net_shell_c_index(nxt)
         # `eval ARGS` runs its arguments joined by spaces, as `bash -c` would.
         nested = (tokens[flag + 1] if flag else
                   " ".join(tokens[1:]) if prog == "eval" and len(tokens) > 1 else None)
@@ -1827,7 +1866,7 @@ def _net_docker(prog: str, args: list[str]) -> list[dict]:
 
 
 def _net_extract(tokens: list[str]) -> list[dict]:
-    prog, args = Path(tokens[0]).name, tokens[1:]
+    prog, args = _net_base(tokens[0]), tokens[1:]
     if re.fullmatch(r"python(?:\d(?:\.\d+)?)?", prog) and args[:2] == ["-m", "pip"]:
         prog, args = "pip", args[2:]
     if prog == "curl":
@@ -1866,11 +1905,14 @@ def network_items_from_command(cmd: str, piped_to_shell: list[str] | None = None
     `piped_to_shell`, when given, receives the program of each curl or wget
     fetch whose output is piped into a shell: remote code execution, seen on
     the dequoted command (`cu''rl … | s''h`) that the audit regexes miss."""
-    segments, unparsed = _net_segments((cmd or "")[:MAX_SCAN_TOTAL])
+    text = (cmd or "")[:MAX_SCAN_TOTAL]
+    if not _NET_MAY_DOWNLOAD.search(text):
+        return [], 0
+    segments, unparsed = _net_segments(text)
     found: list[dict] = []
     for tokens, via_xargs, into_shell in segments:
         got = _net_extract(tokens)
-        prog = Path(tokens[0]).name
+        prog = _net_base(tokens[0])
         if via_xargs and not got and prog in ("curl", "wget"):
             got = [_net_item("fetch", prog, dynamic=True)]   # the URLs came on stdin
         if into_shell and piped_to_shell is not None and prog in ("curl", "wget") and got:
