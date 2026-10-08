@@ -87,8 +87,9 @@ runs:
         if [ -z "${EXECUTION_FILE}" ] || [ ! -f "${EXECUTION_FILE}" ]; then
           echo "::error::execution-file not found: '${EXECUTION_FILE}'"
           echo "Pass the upstream step's execution_file output, e.g."
-          # The token is split deliberately. GitHub interpolates ${{ }} inside
-          # a run: block BEFORE bash sees it, and a backslash does not escape
+          # The token is split deliberately. GitHub interpolates expressions
+          # (dollar, double brace) anywhere in a run: block -- comments too --
+          # BEFORE bash sees it, and a backslash does not escape
           # it -- so writing this expression literally expanded to nothing and
           # left a dangling quote, which killed the whole script with a syntax
           # error in 17ms. Splitting it is the only thing that survives.
