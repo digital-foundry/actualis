@@ -717,10 +717,17 @@ class TestUserinfoRedaction(unittest.TestCase):
 class TestRedactLinearAndMultiAt(unittest.TestCase):
     def test_pathological_inputs_are_fast(self):
         import time
-        for text in ("a@" + "b." * 15000, "b." * 16000, "x://" * 8000, "a@" * 16000):
+        for text in ("a@" + "b." * 15000, "b." * 16000, "x://" * 8000, "a@" * 16000,
+                     "=" * 32000, "a=" * 16000, "x:" * 16000, "k=v&" * 8190,
+                     "a=b:" * 8000, "=a:" * 10000):
             t0 = time.perf_counter()
             af.redact(text)
             self.assertLess(time.perf_counter() - t0, 0.1, text[:12])
+
+    def test_assignment_name_survives_scp_masking(self):
+        out = af.redact("X=user:ZqPW@h:/p")
+        self.assertTrue(out.startswith("X="), out)
+        self.assertNotIn("ZqPW", out)
 
     def test_every_at_in_the_authority_is_userinfo(self):
         out = af.redact("curl https://user:p@ssZqTOKEN@host/x")

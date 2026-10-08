@@ -537,7 +537,11 @@ def _mask(s: str) -> str:
 _URL_USERINFO = re.compile(r"(?<![A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]{0,31}://)([^/?#\s'\"]+)@")
 # scp-style remote `[user[:secret]@]host:path`. Plain `git@host:` is not a secret,
 # so only a `:` in the userinfo or a long userinfo is masked.
-_SCP_USERINFO = re.compile(r"(?<![^\s'\"=])([^\s@:/'\"]+(?::[^\s@/'\"]*)?)@([A-Za-z0-9.-]+):")
+# Linear by construction: a match may start after `=`, so the user class must
+# not contain `=` (or one `=`-dense token is scanned once per `=`, which took
+# 5.6 s on 32 KB), and the password class is bounded for the same reason. The
+# `=` exclusion also keeps `X=` in `X=user:pw@h:/p` visible.
+_SCP_USERINFO = re.compile(r"(?<![^\s'\"=])([^\s@:/'\"=]+(?::[^\s@/'\"]{0,256})?)@([A-Za-z0-9.-]+):")
 
 
 def _scp_mask(m: "re.Match") -> str:
