@@ -1360,3 +1360,83 @@ class TestLocationIdSuppression(unittest.TestCase):
                 for k in (8, 16, 64):
                     self.assertNotIn(d[:k], text)
         self.assertIn("distinct_values", json.dumps(af.JSON_SCHEMA))
+
+
+class TestNoNewValueFingerprints(unittest.TestCase):
+    """Wave A fix round 2, item 1: a person-chosen credential that c596778 did
+    not count must not be published as sha256(value)[:8] now that it is."""
+    # (command, the credential value in it)
+    FORMS = (
+        ("wget --password=Hunter2x https://a.io", "Hunter2x"),
+        ("wget --http-password=Hunter2x https://a.io", "Hunter2x"),
+        ("wget --ftp-password=Hunter2x ftp://a.io", "Hunter2x"),
+        ("wget --proxy-password=Hunter2x https://a.io", "Hunter2x"),
+        ("docker login --password=Hunter2x reg.io", "Hunter2x"),
+        ("docker login -u bob -p Hunter2x reg.io", "Hunter2x"),
+        ("curl -u alice:Hunter2x https://a.io", "Hunter2x"),
+        ("curl -U proxy:Hunter2x https://a.io", "Hunter2x"),
+        ("wget --password Hunter2x https://a.io", "Hunter2x"),
+        ("PGPASSWORD=hunter2 psql -h db", "hunter2"),
+        ("export DB_PASSWORD=hunter2x", "hunter2x"),
+        ("curl https://bob:pw12@a.io/x", "pw12"),
+        ("psql postgresql://u:abc@127.0.0.1/db", "abc"),
+        ("git clone bob:pw12@github.com:o/r.git", "pw12"),
+        ("curl -H 'Authorization: Bearer Zq9plainlongvalue' https://a.io", "Zq9plainlongvalue"),
+        ("curl -H 'Authorization: token Zq9plainlongvalue' https://a.io", "Zq9plainlongvalue"),
+        ("git clone https://abcdefghijklmnopqrstuvwxyz0123@github.com/o/r", "abcdefghijklmnopqrstuvwxyz0123"),
+        # Counted at c596778: these keep their value ids.
+        ("export K=sk_live_abcdefghijklmnopqrst", "sk_live_abcdefghijklmnopqrst"),
+        ("psql postgresql://u:realpassword@db.prod.example.com/x", "realpassword"),
+        ("STRIPE_SECRET_KEY=abcdefghijklmnop", "abcdefghijklmnop"),
+        ("wget --password=LongerPassword123 https://a.io", "LongerPassword123"),
+        ("curl -u alice:ghp_abcdefghijklmnopqrst https://a.io", "ghp_abcdefghijklmnopqrst"),
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        import subprocess
+        cls.tmp = tempfile.TemporaryDirectory()
+        path = Path(cls.tmp.name) / "actualis_c596778.py"
+        try:
+            src = subprocess.run(["git", "-C", str(ROOT), "show", "c596778:actualis.py"],
+                                 capture_output=True, check=True).stdout
+        except (OSError, subprocess.CalledProcessError):
+            raise unittest.SkipTest("c596778 is not in this checkout's history")
+        path.write_bytes(src)
+        spec_old = importlib.util.spec_from_file_location("actualis_c596778", path)
+        cls.old = importlib.util.module_from_spec(spec_old)
+        spec_old.loader.exec_module(cls.old)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_newly_counted_credentials_have_no_value_id(self):
+        import hashlib
+        newly = 0
+        for cmd, value in self.FORMS:
+            with self.subTest(cmd=cmd):
+                vid = hashlib.sha256(value.encode()).hexdigest()[:8]
+                old_ids = [fp for _p, _k, fp in self.old.classify_secrets(cmd)]
+                new_ids = [fp for _p, _k, fp in af.classify_secrets(cmd)]
+                self.assertTrue(new_ids, "counted now")
+                if vid in old_ids:
+                    self.assertIn(vid, new_ids, "an id c596778 emitted must not move")
+                else:
+                    newly += 1
+                    self.assertNotIn(vid, new_ids)
+        self.assertGreaterEqual(newly, 15)
+
+    def test_one_entry_per_credential(self):
+        # A prefixed token passed as an option keeps its value id and is not
+        # counted a second time under a location id.
+        self.assertEqual(len(af.classify_secrets("curl -u alice:ghp_abcdefghijklmnopqrst x")), 1)
+        self.assertEqual(len(af.classify_secrets("wget --password=LongerPassword123 x")), 1)
+
+    def test_location_ids_follow_the_location(self):
+        ids = lambda c: [fp for _p, _k, fp in af.classify_secrets(c)]
+        self.assertEqual(ids("PGPASSWORD=hunter2 psql"), ids("PGPASSWORD=other99 psql"))
+        self.assertNotEqual(ids("PGPASSWORD=hunter2 psql"), ids("PGPASSWORD=hunter2 pg_dump"))
+        self.assertEqual(ids("curl https://bob:pw12@a.io/x"), ids("curl https://bob:zz99@a.io/y"))
+        self.assertNotEqual(ids("curl https://bob:pw12@a.io/x"), ids("curl https://eve:pw12@a.io/x"))
+        self.assertEqual(ids("git clone bob:pw12@h.io:o/r"), ids("git clone bob:qq77@h.io:x/y"))

@@ -56,12 +56,32 @@ These ids are **not** `sha256(value)[:8]`. A person chose the password, so a
 hash of it published in a report, a CI log or a committed
 `.actualis-suppressions` would let anyone confirm a guess offline. The id is
 derived from where the password appears instead: `sha256("opt:" + program +
-":" + option + ":" + user)[:8]`, with the program and option lowercased and
-the user taken from `user:PASS`, `-u`, `--username` or `--user` in the same
-command. The trade-off is accepted: two different passwords for the same user,
-program and option share one id, so rotating one and reusing the line still
-shows as the same entry. Vendor-prefixed tokens, URL passwords and named
-variables keep their value-based ids for now.
+":" + option + ":" + user)[:8]`. The program is lowercased. The option keeps
+its case (`-U`, curl's proxy password, is not `-u`), and two spellings of one
+option are one location (`--user` is `-u`, `--proxy-user` is `-U`, docker
+login's `-p` is `--password`). The user is taken from `user:PASS`, `-u`,
+`--username` or `--user` in the same command. `--password=PASS` and the other
+`=` forms are read the same way as the space forms.
+
+The same applies to every credential that actualis began counting in the same
+release, since any of them may be a short, person-chosen password:
+
+| credential | id from |
+|---|---|
+| a `PASSWORD`, `PASSWD` or `PASSPHRASE` variable whose value is 6 to 11 characters | the variable name and the command's program (`PGPASSWORD=… psql`) |
+| a URL password shorter than 6 characters | `user@host` |
+| an scp-style `user:password@host:` password | `user@host` |
+| a password-less URL or scp userinfo longer than 20 characters | the host |
+| an `Authorization:` header value with no recognised prefix | the program and the scheme word (`Bearer`, `Basic`, `token`) |
+
+Credentials counted before that release keep their value-based ids: tokens
+recognised by prefix, URL passwords of 6 characters or more, and named secrets
+of 12 characters or more. A prefixed token passed as an option (`curl -u
+alice:ghp_…`) is one entry with its value id, not two. Moving those to
+location ids is a later change.
+
+The trade-off is accepted: two different passwords at one location share one
+id, so rotating one and reusing the line still shows as the same entry.
 
 Because one such id can stand for several passwords, a suppression of it must
 not silence a password it was never about. During a run, actualis keeps the

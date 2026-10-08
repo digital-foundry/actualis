@@ -566,8 +566,8 @@ _SCP_USERINFO = re.compile(r"(?<![^\s'\"=])([^\s@:/'\"=]+(?::[^\s@/'\"]{0,256})?
 _OPT_USERPASS = re.compile(r"(?<!\S)(-u|-U|--user|--proxy-user)(=|\s+)?(['\"]?)"
                            r"([^\s:'\"]{1,128}:)(?!//)([^\s'\"]{1,256})")
 #   wget --password / --http-password / --ftp-password / --proxy-password PASS,
-#   and docker login --password PASS. The `=` form is the KEY=value rule's.
-_OPT_PASSWORD = re.compile(r"(?<!\S)(--(?:http-|ftp-|proxy-)?password)(\s+)(['\"]?)(?!-)([^\s'\"]{1,256})")
+#   and docker login --password PASS, with a space or `=`.
+_OPT_PASSWORD = re.compile(r"(?<!\S)(--(?:http-|ftp-|proxy-)?password)(\s+|=)(['\"]?)(?!-)([^\s'\"]{1,256})")
 #   docker login -p PASS. Only for `docker login`: -p is a port, a parent flag
 #   or a profile everywhere else (mkdir -p, ssh -p 22), and mysql -pPASS and
 #   sshpass -p are deliberately left for a program-aware follow-up.
@@ -589,16 +589,25 @@ _OPT_USER_NAME = re.compile(r"(?<!\S)(?:-u|--username|--user)(?:=|\s+)['\"]?([^\
 _SEGMENT_SEP = re.compile(r"[;|&\n]")
 
 
-class _OptionSecretIds:
-    """Ids for option passwords from WHERE they appear, never from their value.
+# One option spelled two ways is one location: curl's -u is --user, -U is
+# --proxy-user, and docker login's -p is --password. Case is kept otherwise:
+# -U is not -u.
+_OPT_SYNONYMS = {"--user": "-u", "--proxy-user": "-U", "-p": "--password"}
+
+
+class _SecretLocations:
+    """Ids for person-chosen credentials from WHERE they appear, never from
+    their value.
 
     A person chose the password, so sha256(value)[:8] published in a report,
     a CI log or a committed suppressions file would confirm a guess offline.
-    The id hashes program, option and user instead. Two passwords for the
-    same user, program and option share one id; docs/secrets.md says so.
+    The id hashes the location instead: program, option and user for an
+    option password; the variable name and program for a PASSWORD variable;
+    user@host for a URL or scp password. Two passwords at one location share
+    one id; docs/secrets.md says so, and the run counts distinct values.
 
     Segment bounds are found once per command and each segment's user is
-    looked up once, so many options in one long command stay linear.
+    looked up once, so many credentials in one long command stay linear.
     """
 
     def __init__(self, cmd: str):
@@ -606,25 +615,37 @@ class _OptionSecretIds:
         self.seps = [m.start() for m in _SEGMENT_SEP.finditer(cmd)]
         self.users: dict[int, str] = {}
 
-    def __call__(self, m: "re.Match", rx: "re.Pattern") -> str:
-        lo, hi, pos = 0, len(self.seps), m.start()   # first separator at or after pos
+    @staticmethod
+    def make(basis: str) -> str:
+        return hashlib.sha256(basis.encode("utf-8", "replace")).hexdigest()[:8]
+
+    def segment(self, pos: int) -> tuple[int, int]:
+        lo, hi = 0, len(self.seps)           # first separator at or after pos
         while lo < hi:
             mid = (lo + hi) // 2
             if self.seps[mid] < pos:
                 lo = mid + 1
             else:
                 hi = mid
-        k = lo
-        start = self.seps[k - 1] + 1 if k else 0
-        end = self.seps[k] if k < len(self.seps) else len(self.cmd)
+        start = self.seps[lo - 1] + 1 if lo else 0
+        end = self.seps[lo] if lo < len(self.seps) else len(self.cmd)
+        return start, end
+
+    def program(self, pos: int) -> str:
+        """The program of the segment holding `pos`: its first word past
+        assignments and prefixes, or "". A bounded look."""
+        start, end = self.segment(pos)
+        head = self.cmd[start:min(end, start + 512)].split()
+        words = _net_strip_prefixes(head)[0]
+        return _net_base(words[0]).lower() if words else ""
+
+    def option(self, m: "re.Match", rx: "re.Pattern") -> str:
+        start, end = self.segment(m.start())
         if rx is _OPT_DOCKER_LOGIN_P:
             program, option = "docker", "-p"
         else:
-            # The program is the segment's first word past any prefix; a
-            # bounded look is enough to find it.
-            head = self.cmd[start:min(m.start(), start + 512)].split()
-            words = _net_strip_prefixes(head)[0]
-            program, option = (_net_base(words[0]) if words else ""), m.group(1)
+            program, option = self.program(m.start()), m.group(1)
+        option = _OPT_SYNONYMS.get(option, option)
         if rx is _OPT_USERPASS:
             user = m.group(4)[:-1]
         else:
@@ -632,8 +653,7 @@ class _OptionSecretIds:
                 u = _OPT_USER_NAME.search(self.cmd, start, end)
                 self.users[start] = u.group(1) if u else ""
             user = self.users[start]
-        basis = f"opt:{program.lower()}:{option.lower()}:{user}"
-        return hashlib.sha256(basis.encode("utf-8", "replace")).hexdigest()[:8]
+        return self.make(f"opt:{program}:{option}:{user}")
 
 
 def _option_secret(value: str) -> bool:
@@ -1050,10 +1070,20 @@ def classify_secrets(cmd: str, value_digests: dict[str, set[str]] | None = None
     cmd = cmd[:MAX_SCAN_TOTAL]
     out: list[tuple[str, str, str]] = []
     seen: set[str] = set()
+    # Characters of the values the c596778 detectors (prefixes, URL passwords
+    # of 6+, named secrets of 12+) count. Those keep their value ids, and a
+    # later detector does not count the same value again under a location id.
+    legacy = bytearray(len(cmd))
 
-    def add(priority: str, kind: str, value: str, fp: str | None = None) -> None:
+    def add(priority: str, kind: str, value: str, fp: str | None = None,
+            span: tuple[int, int] | None = None) -> None:
         if _looks_like_placeholder(value) or is_vendor_example(value):
             return
+        if span is not None:
+            if fp and any(legacy[span[0]:span[1]]):
+                return                           # already counted, by value
+            if not fp:
+                legacy[span[0]:span[1]] = b"\x01" * (span[1] - span[0])
         if fp and value_digests is not None:     # a location id: remember which values
             value_digests.setdefault(fp, set()).add(
                 hashlib.sha256(value.encode("utf-8", "replace")).hexdigest())
@@ -1065,13 +1095,14 @@ def classify_secrets(cmd: str, value_digests: dict[str, set[str]] | None = None
 
     for priority, kind, rx in SECRET_TYPES:
         for m in rx.finditer(cmd):
-            add(priority, kind, m.group(0))
+            add(priority, kind, m.group(0), span=m.span(0))
 
     for m in _URL_CRED.finditer(cmd):
         scheme, _user, pw, host = m.groups()
         local = _LOCAL_HOST.match(host) is not None
         add("low" if local else "critical",
-            clean(f"{scheme} password ({'local' if local else 'remote'})")[:48], pw)
+            clean(f"{scheme} password ({'local' if local else 'remote'})")[:48], pw,
+            span=m.span(3))
 
     for m in _NAMED_SECRET.finditer(cmd):
         name, value = m.group(1), m.group(2)
@@ -1080,42 +1111,53 @@ def classify_secrets(cmd: str, value_digests: dict[str, set[str]] | None = None
         # covers every spelling instead of one per template syntax.
         if _NOT_SECRET_NAMES.match(name.strip("_{}%$<>")):
             continue
-        add(_priority_for_name(name), clean(name.upper())[:48], value)
+        add(_priority_for_name(name), clean(name.upper())[:48], value, span=m.span(2))
+
+    # Everything below was first counted in this wave. A person may have chosen
+    # any of it, so each gets an id from where it appears (_SecretLocations),
+    # never sha256(value)[:8].
+    where = _SecretLocations(cmd)
 
     # Roadmap S1: every form redact() masks is counted here too, through the
     # same compiled rules, so the rotation list and the masking cannot drift.
     if _OPTION_HINT.search(cmd):
-        where = _OptionSecretIds(cmd)
         for rx, group in _OPTION_SECRETS:
             for m in rx.finditer(cmd):
-                add("high", "password option", m.group(group), where(m, rx))
+                add("high", "password option", m.group(group), where.option(m, rx), m.span(group))
         for m in _SECRET_PATTERNS[2].finditer(cmd):
-            add("high", "Authorization header", m.group(2))
+            scheme = m.group(1).split(":", 1)[1].split()[0].lower()
+            add("high", "Authorization header", m.group(2),
+                where.make(f"hdr:{where.program(m.start())}:{scheme}"), m.span(2))
     # A password is short. _NAMED_SECRET wants 12 characters, which suits a
     # token; PGPASSWORD=hunter2pass was masked and never counted.
     if _PASSWORD_NAME.search(cmd):
         for m in _SECRET_PATTERNS[0].finditer(cmd):
             name = m.group(1)
             if _PASSWORD_NAME.search(name) and not _NOT_SECRET_NAMES.match(name.strip("_{}%$<>")):
-                add(_priority_for_name(name), clean(name.upper())[:48], m.group(4))
+                add(_priority_for_name(name), clean(name.upper())[:48], m.group(4),
+                    where.make(f"name:{name.upper()}:{where.program(m.start())}"), m.span(4))
     if "@" not in cmd:
         return out
     for m in _URL_USERINFO.finditer(cmd):
         user, sep, pw = m.group(2).partition(":")
+        host = re.split(r"[\s/:?#'\"]", cmd[m.end():m.end() + 256], maxsplit=1)[0].lower()
         if sep and pw:
-            host = re.split(r"[\s/:?#'\"]", cmd[m.end():m.end() + 256], maxsplit=1)[0]
             local = _LOCAL_HOST.match(host) is not None
             scheme = m.group(1)[:-3]
             add("low" if local else "critical",
-                clean(f"{scheme} password ({'local' if local else 'remote'})")[:48], pw)
+                clean(f"{scheme} password ({'local' if local else 'remote'})")[:48], pw,
+                where.make(f"url:{user}@{host}"), (m.end() - len(pw) - 1, m.end() - 1))
         elif len(user) > 20:
-            add("high", "URL userinfo token", user)
+            add("high", "URL userinfo token", user, where.make(f"urltoken:{host}"),
+                (m.start(2), m.end(2)))
     for m in _SCP_USERINFO.finditer(cmd):
         user, sep, pw = m.group(1).partition(":")
+        host = m.group(2).lower()
         if sep and pw:
-            add("critical", "scp password", pw)
+            add("critical", "scp password", pw, where.make(f"scp:{user}@{host}"),
+                (m.end(1) - len(pw), m.end(1)))
         elif len(user) > 20:
-            add("high", "scp userinfo token", user)
+            add("high", "scp userinfo token", user, where.make(f"scptoken:{host}"), m.span(1))
 
     return out
 
