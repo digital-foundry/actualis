@@ -3962,6 +3962,10 @@ class _MCPCache:
             if croots:
                 f.roots.extend(croots)
                 f.scan_codex(croots, since, project)
+            proots = copilot_roots()
+            if proots:
+                f.roots.extend(proots)
+                f.scan_copilot(proots, since, project)
             self._store[key] = f
             while len(self._store) > MCP_CACHE_MAX:
                 self._store.popitem(last=False)

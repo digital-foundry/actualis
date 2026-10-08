@@ -182,3 +182,10 @@ class TestCopilotWiring(unittest.TestCase):
         self.assertEqual(rc, af.EXIT_OK)
         self.assertIn(str(state), buf.getvalue())
         self.assertEqual(before, after)
+
+    def test_mcp_fleet_summary_sees_copilot(self):
+        with fx.isolated_home() as home:
+            fx.write_sessions(home / ".copilot" / "session-state")
+            out = af._mcp_call("fleet_summary", {}, af._MCPCache())
+        self.assertGreater(out["cost_usd_list_price"], 0)
+        self.assertIn("copilot", out["by_agent"])
