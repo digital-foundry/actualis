@@ -5181,6 +5181,109 @@ def svg_text(ops) -> str:
     return "\n".join(parts) + "\n"
 
 
+HERO_RULE_X = 856
+_HERO_LEFT, _HERO_WIDTH = 64, 768
+_SPARK_BOX = (64, 416, 768, 120)          # x, y, w, h
+TERM_X, TERM_Y, CELL_W, CELL_H, TERM_COLS = 24, 24, 24, 48, 48
+# Card glyphs are written as escapes: they only ever reach the card font, never
+# a terminal, so they have no _GLYPH_FALLBACK entry, and the source-glyph test
+# requires every literal non-ASCII character in this file to have one.
+_BLOCKS = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
+_BAR_FULL, _BAR_EMPTY = "\u2588", "\u2591"
+
+
+def _spark_points(series: list, vmax: float) -> tuple:
+    x, y, w, h = _SPARK_BOX
+    n = len(series)
+    pts = []
+    for i, v in enumerate(series):
+        if v is None:
+            continue
+        px = x + (i * w // (n - 1) if n > 1 else 0)
+        frac = min(max(v / vmax, 0.0), 1.0) if vmax else 0.0
+        pts.append((px, y + h - int(round(frac * h))))
+    return tuple(pts)
+
+
+def _blocks(series: list, vmax: float, width: int) -> str:
+    """One block per day, or per bucket of days when the window is wider."""
+    step = max(1, -(-len(series) // width))
+    cells = []
+    for i in range(0, len(series), step):
+        vals = [v for v in series[i:i + step] if v is not None]
+        if not vals:
+            cells.append(" ")
+            continue
+        level = min(7, int(max(vals) / vmax * 8)) if vmax else 0
+        cells.append(_BLOCKS[level])
+    return "".join(cells)
+
+
+def layout_hero(m: dict) -> list:
+    """Layout A: one big number, a caption, three or four stats, a trend."""
+    P = CARD_PALETTE
+    ops: list = [Text(64, 48, 2, P["muted"], m["label"])]
+    hero = m["hero"]
+    scale = next((s for s in (10, 8, 6) if len(hero) * 8 * s <= _HERO_WIDTH), 4)
+    ops.append(Text(_HERO_LEFT, 112, scale, P["accent"], hero))
+    for i, line in enumerate(_wrap(m["caption"], 32)[:2]):
+        ops.append(Text(_HERO_LEFT, 296 + i * 52, 3, P["fg"], line))
+    ops.append(Rect(HERO_RULE_X, 112, 2, 400, P["rule"]))
+    for i, (value, label) in enumerate(m["stats"][:4]):
+        y = 112 + i * 104
+        # x4 holds 9 characters before the canvas edge; a longer value drops
+        # to x3 (12) rather than being truncated into a different number.
+        ops.append(Text(888, y, 4 if len(value) <= 9 else 3, P["fg"], value[:12]))
+        ops.append(Text(888, y + 68, 2, P["muted"], label[:16]))
+    if m["trend"]:
+        ops.append(Polyline(_spark_points(m["series"], m["series_max"]), P["accent"], 4))
+    else:
+        ops.append(Text(_HERO_LEFT, 456, 2, P["muted"], "not enough days for a trend"))
+    ops.append(Text(_HERO_LEFT, 574, 2, P["muted"], CARD_INSTALL))
+    return ops
+
+
+def layout_terminal(m: dict) -> list:
+    """Layout C: the card as a terminal session, on a 24x48 character grid."""
+    P = CARD_PALETTE
+
+    def at(col: int, row: int, colour: str, s: str, scale: int = 3) -> Text:
+        return Text(TERM_X + col * CELL_W, TERM_Y + row * CELL_H, scale, colour, s)
+
+    header = m["header"]
+    ops: list = [at(0, 0, P["accent"], "$"),
+                 at(2, 0, P["muted"], f"actualis --card {m['mode']}"),
+                 at(0, 1, P["fg"], "ACTUALIS · what actually ran"),
+                 at(0, 2, P["muted"], header + " " + "─" * (TERM_COLS - len(header) - 1))]
+    hero_x, hero_y = TERM_X, TERM_Y + 3 * CELL_H
+    ops.append(Text(hero_x, hero_y, 6, P["accent"], m["hero"]))
+    label_col = len(m["hero"]) * 2 + 1          # a x6 glyph spans two x3 cells
+    ops.append(at(label_col, 4, P["fg"], m["hero_label"][:TERM_COLS - label_col]))
+    bars = m["bars"][:4]
+    top = max([v for _, v, _ in bars] or [0.0]) or 1.0
+    for i, (label, value, text) in enumerate(bars):
+        row = 5 + i
+        filled = int(round(28 * value / top))
+        ops.append(at(0, row, P["muted"], label.replace("claude-", "")[:11]))
+        if filled:
+            ops.append(at(12, row, P["accent"], _BAR_FULL * filled))
+        if filled < 28:
+            ops.append(at(12 + filled, row, P["rule"], _BAR_EMPTY * (28 - filled)))
+        if len(text) <= 7:
+            ops.append(at(41, row, P["fg"], text))
+        else:   # x2 fits 10 characters in the same 7 cells; never cut a number
+            ops.append(Text(TERM_X + 41 * CELL_W, TERM_Y + row * CELL_H + 16, 2,
+                            P["fg"], text[:10]))
+    spark_row = 5 + max(len(bars), 3)
+    ops.append(at(0, spark_row, P["muted"], f"{m['days']}d"[:4]))
+    if m["trend"]:
+        ops.append(at(5, spark_row, P["accent"], _blocks(m["series"], m["series_max"], 40)))
+    else:
+        ops.append(at(5, spark_row, P["muted"], "not enough days for a trend"))
+    ops.append(at(TERM_COLS - len(CARD_INSTALL), 11, P["muted"], CARD_INSTALL))
+    return ops
+
+
 # --------------------------------------------------------------------------
 # The --json contract
 #

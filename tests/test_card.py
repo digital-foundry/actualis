@@ -346,5 +346,90 @@ class TestCardWriters(unittest.TestCase):
         self.assertEqual(xs, list(range(41)))
 
 
+def _extent(op):
+    """Bounding box of an op's pixels, or None when it draws nothing."""
+    rects = af.op_rects(op)
+    if not rects:
+        return None
+    return (min(r[0] for r in rects), min(r[1] for r in rects),
+            max(r[0] + r[2] for r in rects), max(r[1] + r[3] for r in rects))
+
+
+def _extreme_model():
+    return {"mode": "cost", "days": 365, "label": "ACTUALIS · LAST 365 DAYS",
+            "header": "COST", "hero": "$12,345,678", "hero_label": "at list price",
+            "caption": "at API list price, last 365 days",
+            "stats": [("$123,456", "per active day"), ("$9,999,999", "cache saved"),
+                      ("3", "agents"), ("12,345.67", "premium requests")],
+            "bars": [("claude-sonnet-4-5", 9e6, "$9,000,000"), ("custom", 1.0, "$1"),
+                     ("gpt-5.2", 0.0, "$0")],
+            "series": [float(i % 17) for i in range(365)], "series_max": 16.0,
+            "trend": True, "share": "x"}
+
+
+class TestCardLayouts(unittest.TestCase):
+
+    def _all(self):
+        models = [af.card_model(_busy_fleet(), mode) for mode in af.CARD_MODES]
+        models.append(_extreme_model())
+        for m in models:
+            for name, layout in (("hero", af.layout_hero), ("terminal", af.layout_terminal)):
+                yield name, m, layout(m)
+
+    def test_every_op_is_inside_the_canvas(self):
+        for name, m, ops in self._all():
+            for op in ops:
+                box = _extent(op)
+                if box is None:
+                    continue
+                with self.subTest(style=name, mode=m["mode"], op=op):
+                    x0, y0, x1, y1 = box
+                    self.assertGreaterEqual(min(x0, y0), 0)
+                    self.assertLessEqual(x1, 1200)
+                    self.assertLessEqual(y1, 630)
+
+    def test_extreme_values_stay_inside_their_columns(self):
+        ops = af.layout_hero(_extreme_model())
+        left = [op for op in ops if isinstance(op, af.Text) and op.x < af.HERO_RULE_X]
+        for op in left:
+            with self.subTest(op=op):
+                self.assertLessEqual(op.x + len(op.text) * 8 * op.scale, af.HERO_RULE_X - 16)
+        hero = next(op for op in ops if isinstance(op, af.Text) and op.text == "$12,345,678")
+        self.assertLess(hero.scale, 10)
+
+    def test_long_windows_are_bucketed(self):
+        ops = af.layout_terminal(_extreme_model())
+        spark = [op for op in ops if isinstance(op, af.Text)
+                 and op.x == af.TERM_X + 5 * af.CELL_W and op.y > af.TERM_Y + 4 * af.CELL_H]
+        self.assertEqual(len(spark), 1)
+        self.assertLessEqual(len(spark[0].text), 40)
+        line = next(op for op in af.layout_hero(_extreme_model()) if isinstance(op, af.Polyline))
+        for x, y in line.points:
+            self.assertTrue(64 <= x <= 832 and 416 <= y <= 536, (x, y))
+
+    def test_no_trend_says_so(self):
+        m = dict(_extreme_model(), trend=False)
+        for layout in (af.layout_hero, af.layout_terminal):
+            with self.subTest(layout=layout.__name__):
+                texts = [op.text for op in layout(m) if isinstance(op, af.Text)]
+                self.assertIn("not enough days for a trend", texts)
+
+    def test_terminal_bars_are_28_cells(self):
+        ops = af.layout_terminal(af.card_model(_busy_fleet(), "volume"))
+        bar_rows = {}
+        for op in ops:
+            # The sparkline row below the bars can also be all full blocks.
+            if (isinstance(op, af.Text) and set(op.text) <= {"█", "░"}
+                    and op.y < af.TERM_Y + 9 * af.CELL_H):
+                bar_rows[op.y] = bar_rows.get(op.y, 0) + len(op.text)
+        self.assertEqual(sorted(bar_rows.values()), [28, 28, 28, 28])
+
+    def test_footer_on_both(self):
+        for name, m, ops in self._all():
+            with self.subTest(style=name):
+                self.assertIn("uv tool install actualis",
+                              [op.text for op in ops if isinstance(op, af.Text)])
+
+
 if __name__ == "__main__":
     unittest.main()
