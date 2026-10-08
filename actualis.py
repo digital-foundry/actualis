@@ -623,7 +623,8 @@ class _SecretLocations:
         self.cmd = cmd
         self.seps = [m.start() for m in _SEGMENT_SEP.finditer(cmd)]
         self.users: dict[int, str] = {}
-        self.heads: dict[int, tuple] = {}
+        self.prefixes: dict[int, list] = {}      # segment start -> [pos, tokens, clean]
+        self.passes = 0
 
     @staticmethod
     def make(basis: str) -> str:
@@ -649,6 +650,26 @@ class _SecretLocations:
         words = _net_strip_prefixes(head)[0]
         return _net_base(words[0]).lower() if words else ""
 
+    def prefix_tokens(self, pos: int) -> "list[str] | None":
+        """Dequoted tokens of the segment holding `pos`, up to `pos`. Grown from
+        the last call while no quote is open, so many options in one long
+        segment stay linear; None when the pass budget is spent (the caller then
+        masks)."""
+        start, _end = self.segment(pos)
+        cached = self.prefixes.get(start)
+        if cached is not None and cached[2] and cached[0] <= pos:
+            between = self.cmd[cached[0]:pos]
+            cached[1].extend(_net_tokens(between))
+            cached[2] = not _net_split(between)[1]
+            cached[0] = pos
+            return cached[1]
+        if self.passes >= _USERPASS_PASSES:
+            return None
+        self.passes += 1
+        text = self.cmd[start:pos]
+        entry = self.prefixes[start] = [pos, _net_tokens(text), not _net_split(text)[1]]
+        return entry[1]
+
     def option(self, m: "re.Match", rx: "re.Pattern") -> str:
         start, end = self.segment(m.start())
         if rx is _OPT_DOCKER_LOGIN_P:
@@ -666,19 +687,62 @@ class _SecretLocations:
         return self.make(f"opt:{program}:{option}:{user}")
 
 
-# `-u user:pw` fails CLOSED: it is masked and counted for every program except
-# these, where `-u`/`--user` means a user or uid:gid. Naming the credential-taking
-# programs instead would stop masking at any quoted name (cu''rl), wrapper
-# (timeout 5 curl, xargs curl, bash -lc "curl …") or tool left off the list.
-# The head is the first word, and the first word past prefixes and wrappers, in
-# the dequoted tokens the network extractor reads. A credential-taking tool named
-# anywhere in the segment (`docker exec c curl -u a:b`, `sudo curl -u a:b`) keeps
-# masking. A purely numeric pair (`1000:1000`) is never a credential.
+# `-u user:pw` fails CLOSED: it is masked and counted unless the program that
+# RECEIVES the option is one where `-u`/`--user` means a user or uid:gid.
+# That program is found on the dequoted tokens before the match, over the
+# whole segment, past the wrappers the network extractor skips (sudo env
+# timeout nice nohup xargs), a shell's -c string, eval, `su -c`, `ssh HOST …`
+# and `docker exec|run CTR …`. In `docker exec -u root:wheel ctr cmd` docker
+# receives the first -u; in `sudo curl -u a:b` curl does. Anything not
+# recognised, and a budget of tokenising passes spent, masks. A purely numeric
+# pair (`1000:1000`) is never a credential.
 _USERPASS_NOT_CREDENTIAL = frozenset({
     "docker", "podman", "sudo", "su", "ssh", "chown", "chgrp", "id", "useradd", "usermod",
-    "install", "ps", "kill", "pkill", "lsof", "crontab", "systemctl", "git"})
+    "install", "ps", "kill", "pkill", "lsof", "crontab", "systemctl", "git",
+    "env", "doas", "nice", "timeout"})
 _USERPASS_CONTAINER_SUBS = frozenset({"exec", "run", "create"})
-_USERPASS_CREDENTIAL_TOOLS = re.compile(r"(?<![A-Za-z0-9_-])(?:curl|wget|https?|httpie|aria2c|xargs|eval)(?![A-Za-z0-9_-])", re.I)
+_USERPASS_SSH_VALUE = frozenset("-p -i -l -o -F -J -L -R -D -b -c -e -m -O -S -w -W -E -B -I -Q".split())
+_USERPASS_PASSES = 32                        # full tokenising passes per command
+
+
+def _userpass_receiver(toks: list[str], depth: int = 0) -> tuple[str, str]:
+    """(program, docker subcommand) that the option following `toks` belongs to;
+    ("", "") when it cannot be told."""
+    head_toks = toks[:256]                   # the wrapper structure is at the front
+    rest = _net_strip_prefixes(head_toks)[0]
+    if not rest:
+        for t in reversed(head_toks):
+            if _net_base(t).lower() in _NET_PREFIXES:
+                return _net_base(t).lower(), ""
+        return "", ""
+    head = _net_base(rest[0]).lower()
+    if depth >= 4:
+        return head, ""
+    inner: list[str] | None = None
+    sub = ""
+    if head in _NET_SHELLS:
+        k = _net_shell_c_index(rest[:64])
+        inner = _net_tokens(rest[k + 1]) if k else None
+    elif head == "eval" and len(rest) > 1:
+        inner = _net_tokens(" ".join(rest[1:]))
+    elif head == "su":
+        k = next((n for n, t in enumerate(rest[:64]) if t in ("-c", "--command")), 0)
+        inner = _net_tokens(rest[k + 1]) if k and k + 1 < len(rest) else None
+    elif head == "ssh":
+        n = 1
+        while n < len(rest) and rest[n].startswith("-") and len(rest[n]) > 1:
+            n += 2 if rest[n] in _USERPASS_SSH_VALUE else 1
+        inner = _net_tokens(" ".join(rest[n + 1:])) if len(rest) > n + 1 else None
+    elif head in ("docker", "podman") and len(rest) > 1:
+        sub = next((t for t in rest[1:8] if not t.startswith("-")), "")
+        if sub in _USERPASS_CONTAINER_SUBS:
+            n = rest.index(sub) + 1
+            while n < len(rest) and rest[n].startswith("-") and len(rest[n]) > 1:
+                n += 2 if rest[n] in _DOCKER_VALUE else 1
+            inner = rest[n + 1:] if len(rest) > n + 1 else None   # past the container or image
+    if inner:
+        return _userpass_receiver(inner, depth + 1)
+    return head, sub
 
 
 def _userpass_exempt(where: "_SecretLocations", m: "re.Match") -> bool:
@@ -687,23 +751,13 @@ def _userpass_exempt(where: "_SecretLocations", m: "re.Match") -> bool:
     user, pw = m.group(4)[:-1], m.group(5)
     if user.isdigit() and pw.isdigit():
         return True
-    start, end = where.segment(m.start())
-    cached = where.heads.get(start)
-    if cached is None:
-        toks = _net_tokens(where.cmd[start:min(end, start + 512)])
-        stripped = _net_strip_prefixes(toks)[0]
-        raw = [t for t in toks if not _NET_ASSIGN.match(t)]
-        heads = {_net_base(x[0]).lower() for x in (raw, stripped) if x}
-        bases = bool(_USERPASS_CREDENTIAL_TOOLS.search(where.cmd[start:min(end, start + 512)]))
-        subs = {t.lower() for t in toks[:6]}
-        cached = where.heads[start] = (heads, bases, subs)
-    heads, bases, subs = cached
-    if bases:
+    toks = where.prefix_tokens(m.start())
+    if toks is None:
         return False
-    hit = heads & _USERPASS_NOT_CREDENTIAL
-    if not hit:
+    prog, sub = _userpass_receiver(toks)
+    if prog not in _USERPASS_NOT_CREDENTIAL:
         return False
-    return hit - {"docker", "podman"} != set() or bool(subs & _USERPASS_CONTAINER_SUBS)
+    return sub in _USERPASS_CONTAINER_SUBS if prog in ("docker", "podman") else True
 
 
 def _option_secret(value: str) -> bool:

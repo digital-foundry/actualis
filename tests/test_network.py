@@ -1892,3 +1892,73 @@ class TestTripwireRound2(TestAuditConfigTripwire):
             t = time.perf_counter()
             af.writes_audit_config(cmd)
             self.assertLess(time.perf_counter() - t, 0.1, cmd[:20])
+
+
+class TestUserPassReceiver(unittest.TestCase):
+    """Fix round 2, item 2: the program that RECEIVES -u decides, after wrappers,
+    over the whole segment (no 512-character window)."""
+    PW = "Zq9PwSekr3tAB"
+    BLOB = "x" * 600
+
+    def test_masked_and_counted(self):
+        for cmd in (
+            "sudo env X={b} curl -u alice:{pw} https://a.io",
+            "docker exec -e X={b} ctr curl -u alice:{pw} https://a.io",
+            "sudo cu''rl -u alice:{pw} a.io", "sudo c\\url -u alice:{pw} a.io/x",
+            'ssh host "cu\'\'rl -u alice:{pw} a.io"', "su -c 'cu\"\"rl -u alice:{pw} a.io'",
+            "docker exec ctr cu''rl -u alice:{pw} a.io", "docker run -e X={b} img curl -u alice:{pw} a.io",
+            "timeout 5 nice -n 5 curl -u alice:{pw} a.io", "nohup xargs curl -u alice:{pw} a.io",
+            'bash -lc "curl -u alice:{pw} a.io"', "sudo bash -c 'cu\"\"rl -u alice:{pw} a.io'",
+            "docker exec -u root:wheel ctr curl -u alice:{pw} a.io",
+            "ssh -p 22 host curl --user alice:{pw} a.io", "docker login -u alice:{pw} reg.io",
+            "env A=1 B=2 C=3 someunknowntool -u alice:{pw}", 'eval "curl -u alice:{pw} a.io"',
+        ):
+            cmd = cmd.format(pw=self.PW, b=self.BLOB)
+            with self.subTest(cmd=cmd[:60]):
+                self.assertNotIn(self.PW, af.redact(cmd))
+                self.assertTrue(af.contains_secret(cmd))
+                self.assertTrue(af.classify_secrets(cmd))
+
+    def test_not_masked(self):
+        for cmd in ("docker exec -u root:wheel ctr ls", "sudo -u root:wheel ls", "docker run -u 1000:1000 img",
+                    "sudo -E -u root:wheel ls", "docker exec -e X={b} -u root:wheel ctr ls",
+                    "timeout 5 docker run --user app:staff img sh", "ssh -u a:wheel host",
+                    "env A=1 sudo -u root:wheel ls", "docker exec -u root:wheel ctr sh -c 'id'"):
+            cmd = cmd.format(b=self.BLOB)
+            with self.subTest(cmd=cmd[:60]):
+                self.assertEqual(af.redact(cmd), cmd)
+                self.assertEqual(af.classify_secrets(cmd), [])
+
+    def test_fail_closed_set(self):
+        forms = (
+            "cu''rl -u alice:{p} https://a.io/x", "timeout 5 curl -u alice:{p} https://a.io/x",
+            'bash -lc "curl -u alice:{p} https://a.io/x"', "echo https://a.io | xargs curl -u alice:{p}",
+            "frobnicate -u alice:{p} --go", "sudo curl -u alice:{p} https://a.io",
+            "docker exec c curl -u alice:{p} https://a.io", "sudo bash -c 'curl -u alice:{p} https://a.io'",
+            "\\curl -u alice:{p} https://a.io", "/usr/bin/curl -u alice:{p} https://a.io",
+            "env X=1 curl -u alice:{p} https://a.io", "kubectl exec pod -u alice:{p}",
+            "http -u alice:{p} a.io", "c\\url -u alice:{p} https://a.io",
+            "cmd=curl; $cmd -u alice:{p} https://a.io", "ssh h true; curl -u alice:{p} https://a.io",
+            "sudo -u root curl -u alice:{p} https://a.io",
+            "git push -u origin main && curl -u alice:{p} https://a.io",
+            "docker run img sh -c 'curl -u alice:{p} https://a.io'", "ssh host curl -u alice:{p} https://a.io",
+            "ssh host \"cu''rl -u alice:{p} https://a.io\"", "sudo /opt/c''url -u alice:{p} https://a.io",
+            "docker exec c sh -c \"$(printf cu)rl -u alice:{p} https://a.io\"",
+        )
+        self.assertEqual(len(forms), 23)
+        for n, form in enumerate(forms):
+            pw = f"Zq9{n:02d}{chr(65 + n)}kPw{n:02d}xy"
+            cmd = form.format(p=pw)
+            with self.subTest(cmd=cmd):
+                self.assertNotIn(pw, af.redact(cmd))
+                self.assertTrue(af.classify_secrets(cmd))
+
+    def test_long_segments_stay_linear(self):
+        import time
+        for cmd in ("curl " + "-u a:b " * 6000, "docker exec " + "-u a:b " * 4000,
+                    'bash -c "' + "curl -u a:b " * 5000 + '"', "sudo " + "-u a:b " * 6000,
+                    "ssh " + "h " * 15000 + "-u a:b"):
+            t = time.perf_counter()
+            af.redact(cmd)
+            af.classify_secrets(cmd)
+            self.assertLess(time.perf_counter() - t, 0.5, cmd[:20])
