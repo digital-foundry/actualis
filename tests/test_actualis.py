@@ -622,6 +622,20 @@ class TestShareLeakage(unittest.TestCase):
             with self.subTest(needle=needle):
                 self.assertNotIn(needle, out)
 
+    def test_network_data_never_reaches_share(self):
+        import io, contextlib
+        f = af.Fleet()
+        ts = datetime(2026, 10, 1, tzinfo=timezone.utc)
+        f.add_tool("leaky-project", "Bash", {"command": "curl https://leaky-host.example/secret-path"},
+                   ts, "auto")
+        f.add_tool("leaky-project", "WebFetch", {"url": "https://other-leak.example/x"}, ts, "auto")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            af.render_share(f, af.C(False))
+        out = buf.getvalue()
+        for needle in ("leaky-host", "secret-path", "other-leak", "leaky-project"):
+            self.assertNotIn(needle, out)
+
     def test_model_line_shows_custom_for_unlisted_models(self):
         out = self._share_output()
         line = next(l for l in out.splitlines() if "models" in l and "%" in l)
@@ -820,7 +834,7 @@ class TestExplainability(unittest.TestCase):
                    "BY MODEL": "cost", "CACHE EFFICIENCY": "cache",
                    "BY TICKET": "tickets", "TOOL CALLS": "shell",
                    "SUBAGENTS": "subagents", "SHELL AUDIT": "shell",
-                   "REFUSALS": "refusals", "SUPPRESSIONS": "suppressions",
+                   "REFUSALS": "refusals", "NETWORK": "network", "SUPPRESSIONS": "suppressions",
                    "COACH": "coach", "AGENT PLATFORMS": "agents",
                    "EXPLAIN": "sources", "DIFF": "diff",
                    "SELF CHECK": "verify", "INCIDENT": "replay",

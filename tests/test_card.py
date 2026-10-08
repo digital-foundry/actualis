@@ -670,6 +670,17 @@ class TestCardLeaksNothing(unittest.TestCase):
                 with self.subTest(mode=mode, surface=surface, needle=needle):
                     self.assertNotIn(needle, text)
 
+    def test_network_data_never_reaches_the_card(self):
+        f = self._fleet()
+        ts = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        f.add_tool("leaky-project", "Bash", {"command": "curl https://leaky-host.example/secret-path"},
+                   ts, "auto")
+        f.add_tool("leaky-project", "WebFetch", {"url": "https://other-leak.example/x"}, ts, "auto")
+        for mode, surface, text in self._surfaces(f):
+            for needle in ("leaky-host", "secret-path", "other-leak", "leaky-project"):
+                with self.subTest(mode=mode, surface=surface, needle=needle):
+                    self.assertNotIn(needle, text)
+
     def test_private_model_is_shown_as_custom(self):
         m = af.card_model(self._fleet(), "cost")
         self.assertEqual([b[0] for b in m["bars"]], ["custom"])

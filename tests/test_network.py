@@ -735,3 +735,77 @@ class TestRedactLinearAndMultiAt(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReport(unittest.TestCase):
+    def out(self, f, raw=False):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            af.render_network(f, af.C(False), top=12, raw=raw)
+        return buf.getvalue()
+
+    def test_empty(self):
+        self.assertIn("no downloads seen", self.out(af.Fleet()))
+
+    def test_sections_and_unknown_note(self):
+        f = af.Fleet()
+        f.add_tool("proj-a", "Bash", {"command": "curl -o ~/bin/x https://raw.githubusercontent.com/a"}, TS, "auto")
+        f.add_tool("proj-b", "Bash", {"command": "npm i lodash"}, TS, "default")
+        f.add_tool("proj-b", "Bash", {"command": "git clone https://github.com/o/r"}, TS, "copilot:prompted")
+        text = self.out(f)
+        for needle in ("NETWORK", "3 downloads", "1 unasked", "1 unknown", "INSTALLED", "CLONED",
+                       "FETCHED", "UNASKED", "raw.githubusercontent.com", "allowlist rule"):
+            self.assertIn(needle, text, needle)
+
+    def test_report_redacts_urls(self):
+        f = af.Fleet()
+        f.add_tool("p", "Bash", {"command": "curl 'https://x.io/?token=sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'"}, TS, "auto")
+        self.assertNotIn("AAAAAAAAAAAAAAAA", self.out(f))
+
+    def test_trust_sources_printed(self):
+        f = af.Fleet()
+        f.add_tool("p", "Bash", {"command": "curl https://x.io/a"}, TS, "auto")
+        f.network_trust_sources = [
+            {"source": "flag", "entries": ["a.io", "b.io/x"]},
+            {"source": "file", "path": "/w/.actualis-network-trust",
+             "sha256": "0123456789abcdef" * 4, "entries": ["c.io", "d.io", "e.io"]}]
+        text = self.out(f)
+        self.assertIn("trust: --network-trust (2 entries)", text)
+        self.assertIn(".actualis-network-trust /w/.actualis-network-trust sha256 0123456789ab (3 entries)", text)
+        self.assertNotIn("0123456789abc", text)
+
+    def test_no_trust_line_without_sources(self):
+        f = af.Fleet()
+        f.add_tool("p", "Bash", {"command": "curl https://x.io/a"}, TS, "auto")
+        self.assertNotIn("trust:", self.out(f))
+
+    def test_bracketed_ipv6_host_survives(self):
+        f = af.Fleet()
+        f.add_tool("p", "Bash", {"command": "git clone http://[::1]:8080/o/r.git"}, TS, "auto")
+        self.assertIn("NETWORK", self.out(f))
+
+    def test_explain_topic(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = af.render_explain("network", af.C(False))
+        self.assertEqual(rc, 0)
+        self.assertIn("unknown", buf.getvalue())
+
+    def test_explain_covers_limits_and_audit_config(self):
+        entry = af.EXPLAIN["network"]
+        text = " ".join(entry["formula"] + entry["assumes"])
+        for needle in ("tripwire", "not a guarantee", "python -c", "node -e", "postinstall",
+                       "Makefiles", "eval", "$CMD", "xargs", "busybox", "3 levels",
+                       "unparsed_segments", ".actualis-network-trust", ".actualis-suppressions",
+                       "cannot be suppressed", "tee", "sed -i", "Write/Edit", "dd of=", "cp x ."):
+            self.assertIn(needle, text, needle)
+        for line in entry["formula"] + entry["assumes"]:
+            self.assertLessEqual(len(line), 78, line)
+
+    def test_render_includes_section(self):
+        f = af.Fleet()
+        f.add_tool("p", "Bash", {"command": "curl https://x.io/a"}, TS, "auto")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            af.render(f, af.C(False), False, 12)
+        self.assertIn("NETWORK", buf.getvalue())

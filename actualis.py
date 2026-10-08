@@ -4545,6 +4545,47 @@ EXPLAIN: dict[str, dict[str, object]] = {
         ],
         "verify": "actualis --json | jq '.refusals.total, .refusals.by_program'",
     },
+    "network": {
+        "measures": "Downloads and fetches the agents made, and whether a person approved each.",
+        "formula": [
+            "The inventory is a tripwire, not a guarantee. It reads only what the",
+            "transcript shows. Shell commands are split on && || ; | and newlines",
+            "(outside quotes), with $(...), backticks and bash -c \"...\" read as commands",
+            "of their own. Prefixes (sudo, env, time, nice, nohup, VAR=value) are",
+            "skipped. Recognised programs: curl wget git gh npm pnpm yarn bun npx bunx",
+            "pip pip3 uv uvx pipx brew cargo go docker podman. Tool calls: WebFetch,",
+            "WebSearch, web_fetch, web_search, and any tool named like",
+            "fetch/browse/download/http.",
+            "",
+            "approval  asked    Copilot asked the person before the call",
+            "          unasked  the call ran in auto or bypass mode, Codex 'never', or a",
+            "                   Copilot standing rule",
+            "          unknown  default mode: an allowlist rule may have approved it",
+            "                   without asking; the transcript does not say",
+            "",
+            "--network-strict makes each untrusted, unasked or unknown, not-failed",
+            "(program, host) group a medium finding. --network-trust HOST[/PATH] and",
+            "./.actualis-network-trust list trusted sources: host suffix on a label",
+            "boundary, path prefix on a segment boundary. The report prints where trust",
+            "came from, with the file's path and hash.",
+            "",
+            "audit-config: when an agent writes .actualis-network-trust or",
+            ".actualis-suppressions (a redirect target, tee, mv/cp/rm/ln/sed -i, or a",
+            "Write/Edit tool), that is a high finding that cannot be suppressed.",
+        ],
+        "assumes": [
+            "Out of sight, and not guessed at: downloads inside scripts, Makefiles, npm",
+            "scripts, postinstall hooks and interpreters (python -c, node -e), and",
+            "anything run through eval, $CMD, xargs or busybox.",
+            "Command substitution deeper than 3 levels is counted under",
+            "unparsed_segments, not read.",
+            "Not detected as audit-config writes: writes through arbitrary code",
+            "(python -c \"open(...)\"), cp x . and dd of=.",
+            "A registry install with no URL is attributed to the ecosystem's default",
+            "registry (host_inferred: true). Failed is known for Claude Code only.",
+        ],
+        "verify": "actualis --json | jq '.network.totals, .network.hosts[:5]'",
+    },
     "cache": {
         "measures": "Share of input context served from cache, and what that saved.",
         "formula": [
@@ -5321,6 +5362,61 @@ def rule(c: C, title: str = "", width: int = 74) -> None:
         print(f"{c.dim}{'─' * width}{c.off}")
 
 
+def render_network(fleet: Fleet, c: C, top: int, raw: bool = False) -> None:
+    """NETWORK: what came in, and from where; unasked first. Rows come from
+    network_json, which is redacted unless raw; fleet.network_items is only
+    counted here, never printed."""
+    n = network_json(fleet, raw)
+    t = n["totals"]
+    rule(c, "NETWORK")
+    if not t["items"]:
+        print(f"  {c.dim}no downloads seen{c.off}")
+        return
+    print(f"  {num(t['items'])} downloads · {c.yellow}{num(t['unasked'])} unasked{c.off}"
+          f" · {num(t['unknown'])} unknown"
+          + (f" · {num(t['failed'])} failed" if t["failed"] else ""))
+    if t["unknown"]:
+        print(f"  {c.dim}unknown = default mode, where an allowlist rule may have approved it "
+              f"without asking{c.off}")
+    if fleet.network_trust_sources:
+        parts = []
+        for src in fleet.network_trust_sources:
+            k = len(src["entries"])
+            count = f"({k} {'entry' if k == 1 else 'entries'})"
+            if src["source"] == "file":
+                parts.append(f".actualis-network-trust {src.get('path')} "
+                             f"sha256 {(src.get('sha256') or '')[:12]} {count}")
+            else:
+                parts.append(f"--network-trust {count}")
+        print(f"  {c.dim}trust: {' · '.join(parts)}{c.off}")
+    items = fleet.network_items
+
+    eco = Counter(i["ecosystem"] for i in items if i["kind"] == "install" and i["ecosystem"])
+    unpinned = sum(1 for p in n["packages"] if not p["pinned"])
+    if eco:
+        parts = " · ".join(f"{k} {num(v)}" for k, v in sorted(eco.items(), key=lambda kv: (-kv[1], kv[0])))
+        print(f"  {'INSTALLED':<11} {parts}"
+              + (f"   {c.dim}{num(unpinned)} unpinned package(s){c.off}" if unpinned else ""))
+
+    clones = Counter(i["host"] or "(remote name)" for i in items if i["kind"] == "clone")
+    if clones:
+        parts = " · ".join(f"{h} {num(v)}" for h, v in sorted(clones.items(), key=lambda kv: (-kv[1], kv[0]))[:top])
+        print(f"  {'CLONED':<11} {num(sum(clones.values()))}   {parts}")
+
+    fetches = [i for i in items if i["kind"] in ("fetch", "search")]
+    if fetches:
+        fhosts = {i["host"] for i in fetches if i["host"]}
+        print(f"  {'FETCHED':<11} {num(len(fetches))}   {num(len(fhosts))} host(s)")
+
+    rows = [i for i in n["items"] if i["approval"] in ("unasked", "unknown")]
+    rows.sort(key=lambda i: i["approval"] != "unasked")   # stable: newest-first within each
+    for k, i in enumerate(rows[:top]):
+        label = "UNASKED" if k == 0 else ""
+        what = i["url"] or i["package"] or i["program"]
+        print(f"  {label:<11} {clip(i['host'] or '?', 28):<28} {clip(i['program'] + ' ' + (what or ''), 40):<40}"
+              f" {c.dim}{clip(i['project'], 16)}  {(i['ts'] or '')[:10]}  {i['approval']}{c.off}")
+
+
 def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> None:
     span = fleet.span_days
     active = fleet.active_days
@@ -5654,6 +5750,8 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
             print(f"\n    {c.dim}{when}{c.off} {c.red}{cats}{c.off}{mark}")
             print(f"    {line[:150]}")
             print(f"      {c.dim}{f['project'][:66]}{c.off}")
+
+    render_network(fleet, c, top, raw)
 
     if not bash_only:
         render_coach(coach(fleet), c)
