@@ -1705,3 +1705,37 @@ class TestAuditConfigTripwire(unittest.TestCase):
                 self.assertEqual(cm.exception.code, 2)
                 self.assertIn("audit-config", err.getvalue())
                 self.assertFalse((Path(d) / "actualis" / "suppressions").exists())
+
+
+class TestUserPassScopedToCredentialPrograms(unittest.TestCase):
+    """-u means user:password for curl; for docker it is uid:gid, for sudo and ssh a user."""
+    PW = "Zq9secretPW"
+
+    def test_docker_user_group_is_not_a_secret(self):
+        for cmd in ("docker exec -u root:wheel c ls", "docker run --user app:staff img",
+                    "podman exec -u root:wheel c ls", "sudo -u deploy:wheel ls",
+                    "sudo env -u X -u root:wheel ls", "kubectl exec -u root:wheel p",
+                    "ssh -l root:wheel host"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(af.redact(cmd), cmd)
+                self.assertFalse(af.contains_secret(cmd))
+                self.assertEqual(af.classify_secrets(cmd), [])
+
+    def test_credential_programs_stay_masked(self):
+        for cmd in ("curl -u alice:{pw} https://a.io", "sudo curl --user alice:{pw} https://a.io",
+                    "cd /tmp && curl -U p:{pw} https://a.io", "bash -c 'curl -u alice:{pw} https://a.io'",
+                    "eval curl -u alice:{pw} https://a.io", "wget --user alice:{pw} https://a.io",
+                    "aria2c --user alice:{pw} https://a.io", "http --user alice:{pw} https://a.io",
+                    "FOO=1 curl --proxy-user=p:{pw} https://a.io"):
+            cmd = cmd.format(pw=self.PW)
+            with self.subTest(cmd=cmd):
+                self.assertNotIn(self.PW, af.redact(cmd))
+                self.assertTrue(af.classify_secrets(cmd))
+
+    def test_scoped_rule_is_still_linear(self):
+        import time
+        for cmd in ("curl " + "-u a:" * 6000, "docker " + "-u a:b " * 4000):
+            t = time.perf_counter()
+            af.redact(cmd)
+            af.classify_secrets(cmd)
+            self.assertLess(time.perf_counter() - t, 0.5)

@@ -665,16 +665,33 @@ class _SecretLocations:
         return self.make(f"opt:{program}:{option}:{user}")
 
 
+# Where `-u user:pw` is a credential. curl reads it from -u, --user, -U and
+# --proxy-user; the others only from --user. For docker and podman it is uid:gid, for
+# sudo, su and ssh a user name: masking `docker exec -u root:wheel` hid `wheel`.
+# A shell or eval wrapper hides the real program, and a program the segment does
+# not show leaves nothing to rule it out, so those keep masking.
+_USERPASS_ANY = frozenset({"curl"})
+_USERPASS_LONG = frozenset({"wget", "http", "https", "httpie", "aria2c"})
+_USERPASS_WRAPPERS = frozenset({"", "bash", "sh", "zsh", "dash", "ksh", "eval", "watch"})
+
+
+def _userpass_program_ok(where: "_SecretLocations", m: "re.Match") -> bool:
+    program = where.program(m.start())
+    if program in _USERPASS_ANY or program in _USERPASS_WRAPPERS:
+        return True
+    return program in _USERPASS_LONG and m.group(1) in ("--user", "--proxy-user")
+
+
 def _option_secret(value: str) -> bool:
     """An option value worth masking and counting. A uid:gid pair, a shell
     reference and a placeholder are none of them, and both detectors agree."""
     return not (_looks_like_placeholder(value) or is_vendor_example(value))
 
 
-def _option_mask(group: int):
+def _option_mask(group: int, where: "_SecretLocations | None" = None):
     def sub(m: "re.Match") -> str:
         v = m.group(group)
-        if not _option_secret(v):
+        if not _option_secret(v) or (where is not None and not _userpass_program_ok(where, m)):
             return m.group(0)
         return m.group(0)[:m.start(group) - m.start(0)] + _mask(v) + m.group(0)[m.end(group) - m.start(0):]
     return sub
@@ -697,7 +714,8 @@ def redact(text: str) -> str:
     out = _SECRET_PATTERNS[2].sub(lambda m: f"{m.group(1)}{_mask(m.group(2))}", out)
     if _OPTION_HINT.search(out):
         for rx, group in _OPTION_SECRETS:
-            out = rx.sub(_option_mask(group), out)
+            where = _SecretLocations(out) if rx is _OPT_USERPASS and rx.search(out) else None
+            out = rx.sub(_option_mask(group, where), out)
     out = _SECRET_PATTERNS[3].sub(lambda m: f"{m.group(1)}{_mask(m.group(2))}{m.group(3)}", out)
     out = _SECRET_PATTERNS[0].sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{_mask(m.group(4))}", out)
     out = _SECRET_PATTERNS[1].sub(lambda m: f"{m.group(1)}{_mask(m.group(2))}", out)
@@ -1132,6 +1150,8 @@ def classify_secrets(cmd: str, value_digests: dict[str, set[str]] | None = None
     if _OPTION_HINT.search(cmd):
         for rx, group in _OPTION_SECRETS:
             for m in rx.finditer(cmd):
+                if rx is _OPT_USERPASS and not _userpass_program_ok(where, m):
+                    continue
                 add("high", "password option", m.group(group), where.option(m, rx), m.span(group))
         for m in _SECRET_PATTERNS[2].finditer(cmd):
             scheme = m.group(1).split(":", 1)[1].split()[0].lower()
