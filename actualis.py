@@ -1231,7 +1231,28 @@ _NET_URL = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
 _NET_SCP = re.compile(r"^(?:[^@/\s]+@)?([A-Za-z0-9.-]+\.[A-Za-z]{2,}):(?!//)(\S+)$")
 _NET_EXACT_VERSION = re.compile(r"^v?\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?$")
 _NET_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_NET_PREFIX_VALUE_FLAGS = {"sudo": {"-u", "-g", "-C", "-h", "-p"}, "nice": {"-n"}, "env": {"-u", "-C"}}
+_NET_PREFIX_VALUE_FLAGS = {"sudo": {"-u", "-g", "-C", "-h", "-p"}, "nice": {"-n"}, "env": {"-u", "-C"},
+                           "timeout": {"-s", "--signal", "-k", "--kill-after"},
+                           "stdbuf": {"-i", "-o", "-e"}, "doas": {"-u", "-C"},
+                           "xargs": {"-I", "-n", "-P", "-L", "-d", "-E", "-s", "-a",
+                                     "--max-args", "--max-procs", "--max-lines", "--delimiter",
+                                     "--eof", "--max-chars", "--arg-file", "--replace"}}
+# Words that run the command after them: skipped, with their own flags.
+_NET_PREFIXES = frozenset({"sudo", "env", "time", "nice", "nohup", "command", "exec",
+                           "timeout", "stdbuf", "doas", "busybox", "xargs"})
+# Shell grammar that can stand before a command in a segment: `do curl …`,
+# `if curl …`, `! curl …`, `{ curl …`. A `for x in …` header is not here: it is
+# followed by a word list, not a command, and reads as no download.
+_NET_CONTROL_WORDS = frozenset({"while", "until", "if", "then", "else", "elif", "do",
+                                "!", "{", "}", "(", ")"})
+# `-c`, and any single-dash cluster holding c: bash -lc, sh -xc, zsh -ec.
+# A letters-only check plus `"c" in t`: `-[A-Za-z]*c[A-Za-z]*` backtracks once
+# per `c` and took 3 s on a 32 KB token.
+_NET_SHELL_FLAGS = re.compile(r"^-[A-Za-z]+$")
+
+
+def _net_shell_c(t: str) -> bool:
+    return "c" in t and _NET_SHELL_FLAGS.match(t) is not None
 _NET_SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
 _NET_BACKTICK = re.compile(r"`([^`]*)`")
 
@@ -1352,21 +1373,27 @@ def _net_split(text: str) -> tuple[list[str], bool]:
     return parts, bool(quote)
 
 
-def _net_strip_prefixes(tokens: list[str]) -> list[str]:
-    i = 0
+def _net_strip_prefixes(tokens: list[str]) -> tuple[list[str], bool]:
+    """The command a segment runs, past assignments, control-flow words and
+    wrappers, and whether it came through `xargs` (its arguments may then
+    arrive on stdin, out of sight)."""
+    i, via_xargs = 0, False
     while i < len(tokens):
         t = tokens[i]
-        if _NET_ASSIGN.match(t):
+        if _NET_ASSIGN.match(t) or t in _NET_CONTROL_WORDS:
             i += 1
             continue
-        if t in ("sudo", "env", "time", "nice", "nohup", "command", "exec"):
+        if t in _NET_PREFIXES:
             takes = _NET_PREFIX_VALUE_FLAGS.get(t, set())
+            via_xargs = via_xargs or t == "xargs"
             i += 1
-            while i < len(tokens) and tokens[i].startswith("-"):
+            while i < len(tokens) and tokens[i].startswith("-") and len(tokens[i]) > 1:
                 i += 2 if tokens[i] in takes else 1
+            if t == "timeout" and i < len(tokens):
+                i += 1                       # the DURATION
             continue
         break
-    return tokens[i:]
+    return tokens[i:], via_xargs
 
 
 def _net_close_paren(text: str, start: int) -> int:
@@ -1424,11 +1451,11 @@ def _net_substitutions(text: str) -> tuple[list[str], str]:
 _NET_REDIRECT_OPS = ("&>>", "&>", "<<<", "<<", "<>", "<&", "<", ">>", ">&", ">|", ">")
 
 
-def _net_tokens(segment: str, drop_redirects: bool = False) -> list[str]:
+def _net_tokens(segment: str, operators: bool = False) -> list[str]:
     """Like _shell_tokens, but a backslash escapes: `\\"` is a quote character,
     not a quote. Kept here so command_head() keeps its behaviour.
 
-    With `drop_redirects`, an unquoted redirection (`>`, `2>&1`, `&>f`, `< f`,
+    With `operators`, an unquoted `(` or `)` separates words, and an unquoted redirection (`>`, `2>&1`, `&>f`, `< f`,
     `<<< w`, `>| f`, attached or not) is dropped with its target, and a word
     is cut where an unquoted `<` or `>` starts one: `https://a.io>/tmp/x`
     is the URL `https://a.io`. A redirection is never a package or a host."""
@@ -1457,7 +1484,13 @@ def _net_tokens(segment: str, drop_redirects: bool = False) -> list[str]:
                     out.append("".join(buf))
                 discard = False
                 buf, started = [], False
-        elif drop_redirects and (ch in "<>" or segment.startswith("&>", i)):
+        elif operators and ch in "()":
+            if (buf or started) and not discard:
+                out.append("".join(buf))
+            if buf or started:
+                discard = False
+            buf, started = [], False
+        elif operators and (ch in "<>" or segment.startswith("&>", i)):
             op = next(o for o in _NET_REDIRECT_OPS if segment.startswith(o, i))
             word = "".join(buf)
             if (buf or started) and not word.isdigit() and not discard:
@@ -1474,11 +1507,12 @@ def _net_tokens(segment: str, drop_redirects: bool = False) -> list[str]:
     return out
 
 
-def _net_segments(cmd: str, depth: int = 0) -> tuple[list[list[str]], int]:
+def _net_segments(cmd: str, depth: int = 0) -> tuple[list[tuple[list[str], bool]], int]:
     """Token lists for every simple command in `cmd`, nested ones included
-    ($(...), backticks, bash -c "..."), and how many segments could not be
-    tokenised because a quote was left open."""
-    out: list[list[str]] = []
+    ($(...), backticks, bash -lc "...", eval "..."), each with whether it ran
+    under xargs, and how many segments could not be tokenised because a quote
+    was left open or nesting went deeper than is read."""
+    out: list[tuple[list[str], bool]] = []
     unparsed = 0
     text = _without_heredocs(cmd)
     bodies, text = _net_substitutions(text)
@@ -1494,18 +1528,24 @@ def _net_segments(cmd: str, depth: int = 0) -> tuple[list[list[str]], int]:
         parts = parts[:-1]
         unparsed += 1
     for segment in parts:
-        tokens = _net_strip_prefixes(_net_tokens(segment, drop_redirects=True))
+        tokens, via_xargs = _net_strip_prefixes(_net_tokens(segment, operators=True))
         if not tokens:
             continue
-        if Path(tokens[0]).name in _NET_SHELLS and "-c" in tokens[1:-1] and depth >= 3:
-            unparsed += 1                    # bash -c nested deeper than we read
-        if (depth < 3 and Path(tokens[0]).name in _NET_SHELLS
-                and "-c" in tokens[1:-1]):
-            inner, bad = _net_segments(tokens[tokens.index("-c", 1) + 1], depth + 1)
-            out += inner
-            unparsed += bad
-            continue
-        out.append(tokens)
+        prog = Path(tokens[0]).name
+        flag = next((k for k in range(1, len(tokens) - 1) if _net_shell_c(tokens[k])), 0) \
+            if prog in _NET_SHELLS else 0
+        # `eval ARGS` runs its arguments joined by spaces, as `bash -c` would.
+        nested = (tokens[flag + 1] if flag else
+                  " ".join(tokens[1:]) if prog == "eval" and len(tokens) > 1 else None)
+        if nested is not None:
+            if depth >= 3:
+                unparsed += 1                # nested deeper than we read
+            else:
+                inner, bad = _net_segments(nested, depth + 1)
+                out += inner
+                unparsed += bad
+                continue
+        out.append((tokens, via_xargs))
     return out, unparsed
 
 
@@ -1794,8 +1834,12 @@ def network_items_from_command(cmd: str) -> tuple[list[dict], int]:
     """Every download the command shows, and how many segments could not be read."""
     segments, unparsed = _net_segments((cmd or "")[:MAX_SCAN_TOTAL])
     found: list[dict] = []
-    for tokens in segments:
-        found += _net_extract(tokens)
+    for tokens, via_xargs in segments:
+        got = _net_extract(tokens)
+        prog = Path(tokens[0]).name
+        if via_xargs and not got and prog in ("curl", "wget"):
+            got = [_net_item("fetch", prog, dynamic=True)]   # the URLs came on stdin
+        found += got
     return found, unparsed
 
 

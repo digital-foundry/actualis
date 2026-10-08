@@ -1107,3 +1107,70 @@ class TestRedirections(unittest.TestCase):
         self.assertTrue(af.writes_audit_config("echo x>.actualis-suppressions"))
         self.assertTrue(af.writes_audit_config("echo x >| .actualis-suppressions"))
         self.assertFalse(af.writes_audit_config("cat .actualis-suppressions 2>&1"))
+
+
+class TestEverydayShapes(unittest.TestCase):
+    """I3: control flow, wrappers and nested commands that hid downloads."""
+
+    def test_control_flow_and_wrappers(self):
+        cases = {
+            "for p in a b; do npm i lodash; done": ("npm", "lodash"),
+            "if curl -fsS https://a.io/x; then echo ok; fi": ("curl", "a.io"),
+            "while true; do curl https://a.io/x; sleep 1; done": ("curl", "a.io"),
+            "until curl https://a.io/x; do sleep 1; done": ("curl", "a.io"),
+            "if true; then echo; else curl https://a.io/x; fi": ("curl", "a.io"),
+            "if a; then b; elif curl https://a.io/x; then c; fi": ("curl", "a.io"),
+            "{ curl https://a.io/x; }": ("curl", "a.io"),
+            "(curl https://a.io/x)": ("curl", "a.io"),
+            "( cd /tmp && curl https://a.io/x )": ("curl", "a.io"),
+            "! curl https://a.io/x": ("curl", "a.io"),
+            "timeout 60 pip install requests": ("pip", "requests"),
+            "timeout -s KILL -k 5 60s pip install requests": ("pip", "requests"),
+            "timeout --preserve-status 1m curl https://a.io/x": ("curl", "a.io"),
+            "stdbuf -o0 curl https://a.io/x": ("curl", "a.io"),
+            "stdbuf -o L -e 0 curl https://a.io/x": ("curl", "a.io"),
+            "doas curl https://a.io/x": ("curl", "a.io"),
+            "doas -u root npm i lodash": ("npm", "lodash"),
+            "busybox wget https://a.io/x": ("wget", "a.io"),
+            "nice -n 10 curl https://a.io/x": ("curl", "a.io"),
+            "xargs -I{} curl https://a.io/{}": ("curl", "a.io"),
+            "cat list | xargs -n 1 -P 4 npm i lodash": ("npm", "lodash"),
+            "eval 'curl https://a.io/x'": ("curl", "a.io"),
+            'eval "npm i lodash"': ("npm", "lodash"),
+            "bash -lc 'curl https://a.io/x'": ("curl", "a.io"),
+            "sh -xc 'pip install requests'": ("pip", "requests"),
+            "zsh -ec 'curl https://a.io/x'": ("curl", "a.io"),
+        }
+        for cmd, (prog, what) in cases.items():
+            with self.subTest(cmd=cmd):
+                it = one(cmd)
+                self.assertEqual(it["program"].split()[0], prog)
+                self.assertIn(what, (it["host"], it["package"]))
+
+    def test_xargs_reading_urls_from_stdin_is_unknown(self):
+        it = one("cat urls.txt | xargs curl -sS")
+        self.assertEqual((it["program"], it["host"], it["dynamic"]), ("curl", None, True))
+
+    def test_shell_c_clusters_keep_the_depth_cap(self):
+        for flag in ("-lc", "-xc", "-ec"):
+            cmd = "curl https://a.io"
+            for _ in range(2):
+                cmd = f"bash {flag} " + json.dumps(cmd)
+            self.assertEqual(af.network_items_from_command(cmd)[1], 0)
+            self.assertEqual(one(cmd)["host"], "a.io")
+            for _ in range(3):
+                cmd = f"bash {flag} " + json.dumps(cmd)
+            self.assertGreaterEqual(af.network_items_from_command(cmd)[1], 1)
+
+    def test_ordinary_uses_are_not_downloads(self):
+        for cmd in ("timeout 5 ls", "stdbuf -o0 make", "eval \"$CMD\"", "xargs rm -f",
+                    "if [ -f x ]; then cat x; fi", "for f in *.txt; do wc -l $f; done"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(items(cmd), [])
+
+    def test_shell_flag_cluster_check_is_linear(self):
+        import time
+        for tok in ("-" + "c" * 32000 + "!", "-" + "x" * 32000, "-" + "c" * 32000):
+            t0 = time.perf_counter()
+            af.network_items_from_command(f"bash {tok} 'curl https://a.io'")
+            self.assertLess(time.perf_counter() - t0, 0.1, tok[:8])
