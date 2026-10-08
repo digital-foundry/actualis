@@ -170,7 +170,7 @@ python3 actualis.py --agent codex    # one agent only (claude | codex | all)
 | `--days N` | only the last N days |
 | `--project SUBSTR` | only projects whose name contains SUBSTR |
 | `--top N` | how many projects and tickets to list (default 12) |
-| `--agent {all,claude,codex}` | which agents to include (default all) |
+| `--agent {all,claude,codex,copilot}` | which agents to include (default all) |
 | `--root DIR` | read one specific transcript directory instead of discovering them |
 | `--ci-log FILE` | audit a Claude Code Action execution log on a CI runner, instead of discovering transcript directories |
 | `--bash` | shell audit only |
@@ -656,6 +656,7 @@ sitting in plaintext in your transcripts. Rotate anything live.
 |---|---|---|
 | **Claude Code** | yes | `~/.claude/projects/**/*.jsonl` |
 | **Codex** | yes | `$CODEX_HOME/sessions/**/rollout-*.jsonl` |
+| **GitHub Copilot CLI** | yes | `$COPILOT_HOME/session-state/*/events.jsonl` (default `~/.copilot`). Refusal kinds are mapped from the schema until a real denial is observed. |
 | Cursor | **no** | Nothing to read. All `composerData` records are empty shells: `conversationMap {}`, `usageData {}`. The `ai_code_hashes` and `conversation_summaries` tables have zero rows. Content is server-side. |
 | Windsurf | **no** | `globalStorage` holds config and auth only. No conversation or usage store. Server-side. |
 | Cline, Aider | not yet | Both write local files. Untested, likely feasible. |
@@ -676,6 +677,7 @@ if handled like the other:
   `reasoning_output_tokens` as a subset of `output_tokens`. Neither is an addition.
 - Codex's `total_token_usage` is **cumulative** across a session and its
   `token_count` events repeat, so the session total is the final value, never a sum.
+- **Copilot CLI** reports `inputTokens` *including* both cache reads and cache writes, for every provider, and writes one final per-model total at `session.shutdown`.
 
 ## Limitations
 - **Reporting only.** It observes; it does not enforce. Claude Code's own

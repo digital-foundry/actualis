@@ -231,3 +231,34 @@ class TestCopilotMalformedContext(unittest.TestCase):
             self.assertEqual(f.permission_modes["copilot:auto"], 1)
             events = af.replay_events(None, str(state))
         self.assertEqual([e.cmd for e in events], ["echo hi"])
+
+
+class TestCopilotCapabilities(unittest.TestCase):
+
+    def test_copilot_column(self):
+        gaps = dict(af.vendor_gaps("copilot"))
+        self.assertNotIn("Git branch", gaps, "Copilot records the branch; Codex does not")
+        self.assertIn("Sandbox policy", gaps)
+        self.assertIn("Git branch", dict(af.vendor_gaps("codex")))
+
+    def test_it_reaches_json(self):
+        caps = af.to_json(af.Fleet())["vendors"]["capabilities"]
+        self.assertTrue(all("copilot" in row for row in caps))
+
+    def test_explain_copilot_states_the_unverified_mapping(self):
+        e = af.EXPLAIN["copilot"]
+        text = " ".join(e["formula"] + e["assumes"])
+        self.assertIn("approved-for-location", text)
+        self.assertIn("not been observed", text)
+        self.assertIn("unpriced", text)
+
+    def test_refusals_section_warns_about_copilot_kinds(self):
+        f = af.Fleet()
+        f.add_usage("p", "claude-opus-5", {"output_tokens": 1},
+                    datetime(2026, 9, 1, tzinfo=timezone.utc))
+        f.denials["copilot:denied-by-user"] += 1
+        f._record_refusal("copilot:denied-by-user", "p", None, ("Bash", "rm -rf x"))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            af.render(f, af.C(False), bash_only=False, top=5)
+        self.assertIn("--explain copilot", buf.getvalue())

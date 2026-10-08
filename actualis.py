@@ -3242,7 +3242,7 @@ def _commands_in(rec: dict) -> list[str]:
 # --------------------------------------------------------------------------
 # What each vendor's transcript actually gives you
 #
-# Two agents are supported, unevenly, and until now nothing said how. Someone
+# Three agents are supported, unevenly, and until now nothing said how. Someone
 # comparing a Claude Code project against a Codex one was comparing different
 # measurements without being told which.
 #
@@ -3254,33 +3254,52 @@ def _commands_in(rec: dict) -> list[str]:
 YES, PARTIAL, NO = "yes", "partial", "no"
 
 VENDOR_CAPABILITIES = (
-    # capability,            claude,   codex,   the field it rests on
-    ("Cost and token usage", YES,      YES,     "message.usage / token_count"),
-    ("Per-message dedup",    YES,      PARTIAL, "message.id; Codex reports a cumulative "
-                                                "session total instead, so the max is taken"),
-    ("Shell command text",   YES,      YES,     "tool_use Bash / function_call shell_command"),
-    ("Project attribution",  YES,      YES,     "cwd"),
-    ("Git branch",           YES,      NO,      "gitBranch; Codex rollouts carry no branch, "
-                                                "so cost per ticket is Claude Code only"),
-    ("Tool refusals",        YES,      NO,      "toolDenialKind joined by tool_use_id; Codex "
-                                                "writes no per-refusal record at all"),
-    ("Permission mode",      YES,      YES,     "permissionMode / approval_policy"),
-    ("Sandbox policy",       NO,       YES,     "sandbox_policy; Claude Code has no equivalent"),
-    ("Subagent activity",    PARTIAL,  NO,      "toolUseResult.toolStats; command text is never "
-                                                "written to the parent transcript"),
-    ("Subagent cost",        NO,       NO,      "only each run's final message survives, so a "
-                                                "floor is reported and excluded from the total"),
-    ("Cache TTL split",      PARTIAL,  NO,      "cache_creation ephemeral_1h/5m; older records "
-                                                "carry a flat total and OpenAI has no equivalent"),
-    ("Reasoning effort",     YES,      NO,      "effort"),
+    # capability,            claude,  codex,   copilot, the field it rests on
+    ("Cost and token usage", YES,     YES,     YES,     "message.usage / token_count / "
+                                                        "session.shutdown modelMetrics; a Copilot "
+                                                        "session with no shutdown record is "
+                                                        "counted unpriced, never estimated"),
+    ("Per-message dedup",    YES,     PARTIAL, PARTIAL, "message.id; Codex reports a cumulative "
+                                                        "session total, so the max is taken; "
+                                                        "Copilot writes one final total per "
+                                                        "model at shutdown"),
+    ("Shell command text",   YES,     YES,     YES,     "tool_use Bash / function_call "
+                                                        "shell_command / tool.execution_start bash"),
+    ("Project attribution",  YES,     YES,     YES,     "cwd / session context gitRoot"),
+    ("Git branch",           YES,     NO,      YES,     "gitBranch / session context branch; "
+                                                        "Codex rollouts carry no branch, so cost "
+                                                        "per ticket excludes Codex"),
+    ("Tool refusals",        YES,     NO,      YES,     "toolDenialKind joined by tool_use_id; "
+                                                        "Codex writes no per-refusal record at "
+                                                        "all; Copilot's permission.completed "
+                                                        "result.kind is mapped from the schema, "
+                                                        "not yet from an observed denial"),
+    ("Permission mode",      YES,     YES,     YES,     "permissionMode / approval_policy / "
+                                                        "permission.requested per toolCallId; a "
+                                                        "Copilot command allow-listed in config "
+                                                        "is never prompted and counts as auto"),
+    ("Sandbox policy",       NO,      YES,     NO,      "sandbox_policy; Claude Code and Copilot "
+                                                        "CLI have no equivalent"),
+    ("Subagent activity",    PARTIAL, NO,      PARTIAL, "toolUseResult.toolStats / "
+                                                        "subagent.completed totals; command text "
+                                                        "is never written to the parent transcript"),
+    ("Subagent cost",        NO,      NO,      NO,      "only each run's final message survives, "
+                                                        "so a floor is reported and excluded from "
+                                                        "the total; Copilot gives a token total "
+                                                        "with no input/output split"),
+    ("Cache TTL split",      PARTIAL, NO,      NO,      "cache_creation ephemeral_1h/5m; older "
+                                                        "records carry a flat total, and OpenAI "
+                                                        "and Copilot have no equivalent"),
+    ("Reasoning effort",     YES,     NO,      NO,      "effort"),
 )
+
+_VENDOR_COLUMN = {"claude": 1, "codex": 2, "copilot": 3}
 
 
 def vendor_gaps(vendor: str) -> list[tuple[str, str]]:
     """Capabilities this vendor does not fully provide, with the reason."""
-    idx = 1 if vendor == "claude" else 2
-    return [(cap, why) for cap, c, x, why in VENDOR_CAPABILITIES
-            if (c if idx == 1 else x) != YES]
+    idx = _VENDOR_COLUMN.get(vendor, 2)
+    return [(row[0], row[4]) for row in VENDOR_CAPABILITIES if row[idx] != YES]
 
 
 EXPLAIN: dict[str, dict[str, object]] = {
@@ -3335,8 +3354,8 @@ EXPLAIN: dict[str, dict[str, object]] = {
     "vendors": {
         "measures": "What each agent's transcript actually contains, and what it does not.",
         "formula": [
-            "capability                claude   codex",
-        ] + [f"  {cap:<24}{c:<9}{x}" for cap, c, x, _why in VENDOR_CAPABILITIES] + [
+            "capability                claude   codex    copilot",
+        ] + [f"  {cap:<24}{c:<9}{x:<9}{p}" for cap, c, x, p, _why in VENDOR_CAPABILITIES] + [
             "",
             "Every row names the transcript field it rests on; see",
             "VENDOR_CAPABILITIES in the source.",
@@ -3348,6 +3367,33 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "measurements.",
         ],
         "verify": "actualis --json | jq '.vendors'",
+    },
+    "copilot": {
+        "measures": "How a GitHub Copilot CLI session is read, and what it cannot show.",
+        "formula": [
+            "Source    $COPILOT_HOME/session-state/<session>/events.jsonl (~/.copilot)",
+            "Commands  tool.execution_start where toolName is bash",
+            "Project   session context gitRoot, else cwd; the latest value wins",
+            "Cost      session.shutdown modelMetrics, once per model per session.",
+            "          inputTokens already includes cache reads and writes, so",
+            "          fresh input = inputTokens - cacheReadTokens - cacheWriteTokens",
+            "Prompted  a bash call with a shell permission.requested for its toolCallId",
+            "Auto      every other bash call",
+            "Refusal   permission.completed whose result.kind is not approved or",
+            "          approved-for-location",
+            "Premium   session.shutdown totalPremiumRequests, never converted to dollars",
+        ],
+        "assumes": [
+            "Refusal kinds are mapped from the event schema. A denial has not been",
+            "observed in a real session yet, so one recorded some other way is missed.",
+            "A command allow-listed in Copilot's config is never prompted, so it",
+            "counts as auto -- unsupervised -- even though a person approved the rule.",
+            "A session with no session.shutdown record is counted unpriced. No cost",
+            "is estimated for it.",
+            "session.db is not read; events.jsonl carries everything used here.",
+        ],
+        "verify": ("jq -c 'select(.type==\"session.shutdown\") | .data.modelMetrics' "
+                   "~/.copilot/session-state/*/events.jsonl"),
     },
     "diff": {
         "measures": "What changed between a saved report and this one.",
@@ -4505,8 +4551,11 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
               f"sent,{c.off}")
         print(f"  {c.dim}so this exists only in your local transcripts.{c.off}")
         if "codex" in fleet.cost_by_agent:
-            print(f"  {c.yellow}▲{c.off} {c.dim}Claude Code only. Codex writes no "
-                  f"per-refusal record, so its sessions are absent here.{c.off}")
+            print(f"  {c.yellow}▲{c.off} {c.dim}Codex writes no per-refusal record, so "
+                  f"its sessions are absent here.{c.off}")
+        if any(k.startswith("copilot:") for k in fleet.denials):
+            print(f"  {c.yellow}▲{c.off} {c.dim}Copilot refusal kinds are mapped from its "
+                  f"event schema, not observed data. See --explain copilot.{c.off}")
         print()
         gates = sorted(fleet.refusal_tool,
                        key=lambda k: -sum(fleet.refusal_tool[k].values()))
@@ -4861,6 +4910,7 @@ JSON_SCHEMA: dict[str, str] = {
     "vendors.capabilities[].capability": "str",
     "vendors.capabilities[].claude": "str",
     "vendors.capabilities[].codex": "str",
+    "vendors.capabilities[].copilot": "str",
     "vendors.capabilities[].depends_on": "str",
     "vendors.note": "str",
     "unreadable_commands.count": "int",
@@ -5098,8 +5148,8 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
         "suppressed_flags": fleet.suppressed_flags,
         "vendors": {
             "capabilities": [
-                {"capability": cap, "claude": c, "codex": x, "depends_on": why}
-                for cap, c, x, why in VENDOR_CAPABILITIES
+                {"capability": cap, "claude": c, "codex": x, "copilot": p, "depends_on": why}
+                for cap, c, x, p, why in VENDOR_CAPABILITIES
             ],
             "note": "a section fed by a field one vendor does not write is "
                     "single-vendor. Comparing two projects on different agents "
