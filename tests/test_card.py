@@ -603,5 +603,93 @@ class TestCardGoldens(unittest.TestCase):
         self.assertEqual(path.read_text(encoding="utf-8").strip(), digest)
 
 
+class TestCardLeaksNothing(unittest.TestCase):
+    """The card is made to be posted. The only thing that matters about it is
+    that nothing identifying can reach it -- in the model, the SVG, the PNG or
+    the caption line printed beside them."""
+
+    NEEDLES = ["ACME-CLASSIFIED-MERGER", "feat/9999-project-tigerclaw", "9999",
+               "/Users/someone/private/repo", "internal-db.corp.example.com",
+               "hunter2pass", "sk_live_leakcanary1234567", "ft:leaktest-model",
+               "acme-deploy"]
+
+    def _fleet(self):
+        f = af.Fleet()
+        ts = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        for d in range(1, 6):
+            t = ts.replace(day=d)
+            f.add_usage("ACME-CLASSIFIED-MERGER", "ft:leaktest-model",
+                        {"output_tokens": 1_000_000}, t, "feat/9999-project-tigerclaw")
+            f.add_tool("ACME-CLASSIFIED-MERGER", "Bash",
+                       {"command": "psql postgresql://u:hunter2pass@internal-db.corp.example.com/x "
+                                   "&& export K=sk_live_leakcanary1234567 "
+                                   "&& cat /Users/someone/private/repo/.env"}, t, "auto")
+            f.add_tool("ACME-CLASSIFIED-MERGER", "Bash", {"command": "./acme-deploy --prod"},
+                       t, "default")
+        return f
+
+    def _surfaces(self, f):
+        for mode in af.CARD_MODES:
+            m = af.card_model(f, mode)
+            yield mode, "model", json.dumps(m, ensure_ascii=False)
+            yield mode, "share", m["share"]
+            for style, layout in (("hero", af.layout_hero), ("terminal", af.layout_terminal)):
+                ops = layout(m)
+                yield mode, f"{style}.ops", repr(ops)
+                yield mode, f"{style}.svg", af.svg_text(ops)
+                yield mode, f"{style}.png", bytes(_png_pixels(af.png_bytes(ops))).decode("latin-1")
+
+    def test_no_identifying_string_reaches_any_surface(self):
+        f = self._fleet()
+        fps = list(f.secrets)
+        self.assertTrue(fps, "the canary must have been detected for this test to mean anything")
+        for mode, surface, text in self._surfaces(f):
+            for needle in self.NEEDLES + fps:
+                with self.subTest(mode=mode, surface=surface, needle=needle):
+                    self.assertNotIn(needle, text)
+
+    def test_private_model_is_shown_as_custom(self):
+        m = af.card_model(self._fleet(), "cost")
+        self.assertEqual([b[0] for b in m["bars"]], ["custom"])
+
+    def test_end_to_end_through_main(self):
+        with fx.isolated_home() as home, tempfile.TemporaryDirectory() as out:
+            p = home / ".claude" / "projects" / "-Users-someone-private-ACME-CLASSIFIED-MERGER"
+            p.mkdir(parents=True)
+            recs = [{"timestamp": f"2026-09-0{d}T10:00:00Z", "permissionMode": "auto",
+                     "gitBranch": "feat/9999-project-tigerclaw",
+                     "message": {"id": f"m{d}", "model": "ft:leaktest-model",
+                                 "usage": {"output_tokens": 1000},
+                                 "content": [{"type": "tool_use", "id": f"t{d}", "name": "Bash",
+                                              "input": {"command":
+                                                        "export K=sk_live_leakcanary1234567"}}]}}
+                    for d in range(1, 6)]
+            (p / "s.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+            for mode in af.CARD_MODES:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    self.assertEqual(af.main(["--card", mode, "--out", out]), af.EXIT_OK)
+                for needle in self.NEEDLES:
+                    with self.subTest(mode=mode, needle=needle):
+                        self.assertNotIn(needle, buf.getvalue().replace(out, ""))
+            for written in Path(out).iterdir():
+                body = written.read_bytes().decode("latin-1")
+                for needle in self.NEEDLES:
+                    with self.subTest(file=written.name, needle=needle):
+                        self.assertNotIn(needle, body)
+
+    def test_share_leak_test_still_holds_with_copilot_in_the_fleet(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = fx.write_sessions(Path(td) / "session-state")
+            f = af.Fleet()
+            f.scan_copilot([state], None, None)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            af.render_share(f, af.C(False))
+        for needle in ("orbital-ledger", "ORB-412", fx.CANARY, fx.A, "quarry-cli"):
+            with self.subTest(needle=needle):
+                self.assertNotIn(needle, buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
