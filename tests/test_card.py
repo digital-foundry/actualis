@@ -158,5 +158,109 @@ class TestCommandCategory(unittest.TestCase):
         self.assertEqual(f.bash_categories, {"git": 1, "test": 1, "other": 1})
 
 
+D1 = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+
+
+def _day(n):
+    return D1.replace(day=n)
+
+
+def _busy_fleet():
+    """Five days of Claude activity: 4 commands a day, 3 of them in auto."""
+    f = af.Fleet()
+    for d in range(1, 6):
+        f.add_usage("p", "claude-opus-5", {"output_tokens": 100_000,
+                                           "cache_read_input_tokens": 1_000_000}, _day(d))
+        for i in range(4):
+            f.add_tool("p", "Bash", {"command": ["git status", "pytest", "npm i x", "ls"][i]},
+                       _day(d), "auto" if i < 3 else "default")
+    return f
+
+
+class TestCardModel(unittest.TestCase):
+
+    def test_supervision(self):
+        m = af.card_model(_busy_fleet(), "supervision")
+        self.assertEqual(m["hero"], "75%")
+        self.assertEqual(m["days"], 5)
+        self.assertEqual(m["label"], "ACTUALIS · LAST 5 DAYS")
+        self.assertEqual([s[1] for s in m["stats"]], ["commands", "refused", "agents"])
+        self.assertEqual(m["stats"][0][0], "20")
+        self.assertEqual([b[0] for b in m["bars"]], ["auto", "you", "refused"])
+        self.assertEqual(m["series"], [75.0] * 5)
+        self.assertTrue(m["trend"])
+        self.assertTrue(m["share"].startswith("75% of my coding agents' shell commands"))
+        self.assertTrue(m["share"].endswith("uv tool install actualis"))
+
+    def test_volume(self):
+        m = af.card_model(_busy_fleet(), "volume")
+        self.assertEqual(m["hero"], "20")
+        self.assertEqual(dict((b[0], b[1]) for b in m["bars"]),
+                         {"git": 5, "test": 5, "install": 5, "other": 5})
+        self.assertEqual(m["stats"][0][1], "of tool calls")
+
+    def test_cost(self):
+        f = _busy_fleet()
+        m = af.card_model(f, "cost")
+        self.assertEqual(m["hero"], f"${f.total_cost:,.0f}")
+        self.assertEqual(m["caption"], "at API list price, last 5 days")
+        self.assertEqual([b[0] for b in m["bars"]], ["claude-opus-5"])
+        self.assertEqual(len(m["stats"]), 3, "no premium row without Copilot")
+
+    def test_no_shell_commands_refuses_supervision_and_volume(self):
+        f = af.Fleet()
+        f.add_usage("p", "claude-opus-5", {"output_tokens": 1}, D1)
+        for mode in ("supervision", "volume"):
+            with self.subTest(mode=mode):
+                with self.assertRaises(af.CardError) as cm:
+                    af.card_model(f, mode)
+                self.assertEqual(str(cm.exception),
+                                 "no shell commands in window — try --days or --card cost")
+        af.card_model(f, "cost")   # still drawable
+
+    def test_no_priced_usage_is_a_dash_never_zero(self):
+        f = af.Fleet()
+        f.add_tool("p", "Bash", {"command": "ls"}, D1, "auto")
+        m = af.card_model(f, "cost")
+        self.assertEqual(m["hero"], "—")
+        self.assertEqual(m["caption"], "no priced usage in window")
+
+    def test_premium_row_only_with_copilot(self):
+        f = _busy_fleet()
+        f.premium_requests_by_agent["copilot"] += 3.96
+        m = af.card_model(f, "cost")
+        self.assertEqual(m["stats"][3], ("3.96", "premium requests"))
+        self.assertNotIn("$", m["stats"][3][0])
+
+    def test_fewer_than_three_active_days_has_no_trend(self):
+        f = af.Fleet()
+        f.add_tool("p", "Bash", {"command": "ls"}, _day(1), "auto")
+        f.add_tool("p", "Bash", {"command": "ls"}, _day(2), "auto")
+        self.assertFalse(af.card_model(f, "volume")["trend"])
+
+    def test_unknown_mode_everywhere_is_a_dash(self):
+        f = af.Fleet()
+        f.add_tool("p", "Bash", {"command": "ls"}, D1)
+        m = af.card_model(f, "supervision")
+        self.assertEqual(m["hero"], "—")
+
+    def test_model_names_are_catalog_names_or_custom(self):
+        self.assertEqual(af.card_model_name("claude-opus-5"), "claude-opus-5")
+        for private in ("ft:leaktest-model", "ft:gpt-5.2-acme-internal", "gpt-5-mini"):
+            with self.subTest(private=private):
+                self.assertEqual(af.card_model_name(private), "custom")
+
+    def test_custom_models_are_merged(self):
+        f = af.Fleet()
+        f.add_usage("p", "ft:one", {"output_tokens": 1_000_000}, D1)
+        f.add_usage("p", "ft:two", {"output_tokens": 1_000_000}, D1)
+        bars = af.card_model(f, "cost")["bars"]
+        self.assertEqual([b[0] for b in bars], ["custom"])
+
+    def test_window_with_days_ends_today(self):
+        w = af.card_window(af.Fleet(), 3, date(2026, 9, 10))
+        self.assertEqual(w, ["2026-09-08", "2026-09-09", "2026-09-10"])
+
+
 if __name__ == "__main__":
     unittest.main()

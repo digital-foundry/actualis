@@ -4780,6 +4780,133 @@ def render_share(fleet: "Fleet", c: C) -> None:
 
 
 # --------------------------------------------------------------------------
+# Card
+#
+# --share for people who scroll rather than read: one image, one number. The
+# pipeline is Fleet -> card_model -> layout -> draw ops -> SVG and PNG, and
+# only card_model reads Fleet. Everything it returns is a count, a fixed word,
+# or a public model name, which is what the leak test checks -- so the layouts
+# and writers below it cannot leak by construction.
+# --------------------------------------------------------------------------
+
+CARD_MODES = ("supervision", "cost", "volume")
+CARD_STYLES = ("hero", "terminal")
+CARD_INSTALL = "uv tool install actualis"
+CARD_MIN_TREND_DAYS = 3
+_CARD_CATEGORIES = ("git", "test", "install", "other")
+
+
+class CardError(Exception):
+    """This window cannot be drawn honestly in this mode. The message says why."""
+
+
+def card_model_name(model: str) -> str:
+    """A model id only when it is a public catalog name in the price table.
+
+    Everything else -- a fine-tune, a private deployment, a family guess -- is
+    `custom`. A family match would let `ft:gpt-5-acme-internal` through.
+    """
+    return model if model in PRICING else "custom"
+
+
+def _whole_money(x: float) -> str:
+    return f"${x:,.0f}"
+
+
+def _fraction(x: float) -> str:
+    return f"{x:,.2f}".rstrip("0").rstrip(".")
+
+
+def card_window(fleet: "Fleet", days: int | None, today: date | None = None) -> list[str]:
+    """ISO dates the card covers, oldest first. With --days, the last N dates
+    including today, matching window_start; otherwise first to last record."""
+    if days:
+        end = today or datetime.now(timezone.utc).date()
+        return [(end - timedelta(days=i)).isoformat() for i in range(days - 1, -1, -1)]
+    dates = sorted(set(fleet.cost_by_day) | set(fleet.bash_by_day))
+    if not dates:
+        return []
+    start = date.fromisoformat(dates[0])
+    span = (date.fromisoformat(dates[-1]) - start).days + 1
+    return [(start + timedelta(days=i)).isoformat() for i in range(span)]
+
+
+def card_model(fleet: "Fleet", mode: str, days: int | None = None,
+               today: date | None = None) -> dict:
+    """Every number and word a card shows, and nothing else."""
+    window = card_window(fleet, days, today)
+    n = len(window)
+    commands = fleet.bash_total
+    if mode in ("supervision", "volume") and commands == 0:
+        raise CardError("no shell commands in window — try --days or --card cost")
+    agents = str(len(fleet.agents_seen))
+    refused = num(fleet.refusals)
+    m: dict = {"mode": mode, "days": n, "label": f"ACTUALIS · LAST {n} DAYS"}
+
+    if mode == "supervision":
+        moded = sum(fleet.bash_moded_by_day.values())
+        unsup = sum(fleet.unsupervised_by_day.values())
+        if moded:
+            m["hero"] = f"{unsup / moded * 100:.0f}%"
+            m["caption"] = "of my agents' shell commands ran with nobody approving them"
+            m["share"] = (f"{m['hero']} of my coding agents' shell commands ran "
+                          f"unsupervised in the last {n} days. {CARD_INSTALL}")
+        else:
+            m["hero"] = "—"
+            m["caption"] = "no permission mode was recorded for these commands"
+            m["share"] = (f"My coding agents ran {num(commands)} shell commands in "
+                          f"the last {n} days. {CARD_INSTALL}")
+        m.update(header="SUPERVISION", hero_label="unsupervised",
+                 stats=[(num(commands), "commands"), (refused, "refused"), (agents, "agents")],
+                 bars=[("auto", float(unsup), num(unsup)),
+                       ("you", float(moded - unsup), num(moded - unsup)),
+                       ("refused", float(fleet.refusals), refused)],
+                 series=[(fleet.unsupervised_by_day[d] / fleet.bash_moded_by_day[d] * 100)
+                         if fleet.bash_moded_by_day[d] else None for d in window],
+                 series_max=100.0)
+    elif mode == "cost":
+        total = fleet.total_cost
+        saved = max(sum(fleet.cache_uncached.values()) - sum(fleet.cache_actual.values()), 0.0)
+        priced = total > 0
+        m["hero"] = _whole_money(total) if priced else "—"
+        m["caption"] = f"at API list price, last {n} days" if priced else "no priced usage in window"
+        m["share"] = (f"My coding agents used {m['hero']} of compute at API list price "
+                      f"in the last {n} days. {CARD_INSTALL}" if priced else
+                      f"What my coding agents actually ran, last {n} days. {CARD_INSTALL}")
+        stats = [(_whole_money(total / fleet.active_days), "per active day"),
+                 (_whole_money(saved), "cache saved"), (agents, "agents")]
+        premium = fleet.premium_requests_by_agent.get("copilot", 0.0)
+        if premium:
+            stats.append((_fraction(premium), "premium requests"))
+        by_name: Counter = Counter()
+        for model, cost in fleet.cost_by_model.items():
+            by_name[card_model_name(model)] += cost
+        m.update(header="COST", hero_label="at list price", stats=stats,
+                 bars=[(name, cost, _whole_money(cost)) for name, cost in by_name.most_common(3)],
+                 series=[fleet.cost_by_day.get(d, 0.0) for d in window])
+    elif mode == "volume":
+        tools = sum(fleet.tools.values())
+        m.update(header="SHELL", hero=num(commands), hero_label="commands",
+                 caption="shell commands my agents ran",
+                 share=(f"My coding agents ran {num(commands)} shell commands in the "
+                        f"last {n} days. {CARD_INSTALL}"),
+                 stats=[(f"{commands / tools * 100:.0f}%" if tools else "—", "of tool calls"),
+                        (refused, "refused"), (agents, "agents")],
+                 bars=[(cat, float(fleet.bash_categories[cat]), num(fleet.bash_categories[cat]))
+                       for cat in _CARD_CATEGORIES],
+                 series=[float(fleet.bash_by_day.get(d, 0)) for d in window])
+    else:
+        raise ValueError(f"unknown card mode {mode!r}")
+
+    if mode != "supervision":
+        m["series_max"] = max([v for v in m["series"] if v] or [1.0])
+    active = sum(1 for v in m["series"]
+                 if v is not None and (mode == "supervision" or v > 0))
+    m["trend"] = active >= CARD_MIN_TREND_DAYS
+    return m
+
+
+# --------------------------------------------------------------------------
 # The --json contract
 #
 # Everything downstream agrees with this: the tray, the MCP server, and anything
