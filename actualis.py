@@ -493,8 +493,8 @@ _SECRET_PATTERNS = [
     ),
     # bare tokens by known prefix
     re.compile(r"\b(" + "|".join(re.escape(p) for p in _TOKEN_PREFIXES) + r")([A-Za-z0-9_\-]{8,})"),
-    # Authorization headers
-    re.compile(r"(?i)(authorization:\s*(?:bearer|basic)\s+)([^\s'\"]{8,})"),
+    # Authorization headers. `token` is GitHub's scheme word for a PAT.
+    re.compile(r"(?i)(authorization:\s*(?:bearer|basic|token)\s+)([^\s'\"]{8,})"),
     # postgres://user:pass@host and friends
     re.compile(r"([a-z][a-z0-9+.\-]{0,20}://[^\s:/@]{1,128}:)([^\s@/]{3,256})(@)"),
 ]
@@ -544,6 +544,41 @@ _URL_USERINFO = re.compile(r"(?<![A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]{0,31}://
 _SCP_USERINFO = re.compile(r"(?<![^\s'\"=])([^\s@:/'\"=]+(?::[^\s@/'\"]{0,256})?)@([A-Za-z0-9.-]+):")
 
 
+# Credentials passed as option values. Each rule starts on a literal option
+# token behind (?<!\S), so there is one start per option, and every class is
+# bounded and cannot run into the next start: linear on any input. Only the
+# credential is masked; the user part of user:password stays readable.
+#   curl -u/--user/-U/--proxy-user user:PASS, with a space, `=` or nothing.
+#   `//` after the colon is a URL (`pip install -U git+https://…`), not a password.
+_OPT_USERPASS = re.compile(r"(?<!\S)(-u|-U|--user|--proxy-user)(=|\s+)?(['\"]?)"
+                           r"([^\s:'\"]{1,128}:)(?!//)([^\s'\"]{1,256})")
+#   wget --password / --http-password / --ftp-password / --proxy-password PASS,
+#   and docker login --password PASS. The `=` form is the KEY=value rule's.
+_OPT_PASSWORD = re.compile(r"(?<!\S)(--(?:http-|ftp-|proxy-)?password)(\s+)(['\"]?)(?!-)([^\s'\"]{1,256})")
+#   docker login -p PASS. Only for `docker login`: -p is a port, a parent flag
+#   or a profile everywhere else (mkdir -p, ssh -p 22), and mysql -pPASS and
+#   sshpass -p are deliberately left for a program-aware follow-up.
+_OPT_DOCKER_LOGIN_P = re.compile(r"(?<!\S)(docker\s+login\b[^\n;|&]{0,512}?\s-p)(\s+|=)?(['\"]?)"
+                                 r"(?!-)([^\s'\"]{1,256})")
+# (rule, credential group). The same table drives redact() and classify_secrets().
+_OPTION_SECRETS = ((_OPT_USERPASS, 5), (_OPT_PASSWORD, 4), (_OPT_DOCKER_LOGIN_P, 4))
+
+
+def _option_secret(value: str) -> bool:
+    """An option value worth masking and counting. A uid:gid pair, a shell
+    reference and a placeholder are none of them, and both detectors agree."""
+    return not (_looks_like_placeholder(value) or is_vendor_example(value))
+
+
+def _option_mask(group: int):
+    def sub(m: "re.Match") -> str:
+        v = m.group(group)
+        if not _option_secret(v):
+            return m.group(0)
+        return m.group(0)[:m.start(group) - m.start(0)] + _mask(v) + m.group(0)[m.end(group) - m.start(0):]
+    return sub
+
+
 def _scp_mask(m: "re.Match") -> str:
     u = m.group(1)
     if ":" in u or len(u) > 20:
@@ -559,6 +594,8 @@ def redact(text: str) -> str:
     # Order matters: the Authorization header rule must run before the generic
     # KEY=value rule, or "AUTH" in "Authorization:" makes it eat the scheme word.
     out = _SECRET_PATTERNS[2].sub(lambda m: f"{m.group(1)}{_mask(m.group(2))}", out)
+    for rx, group in _OPTION_SECRETS:
+        out = rx.sub(_option_mask(group), out)
     out = _SECRET_PATTERNS[3].sub(lambda m: f"{m.group(1)}{_mask(m.group(2))}{m.group(3)}", out)
     out = _SECRET_PATTERNS[0].sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{_mask(m.group(4))}", out)
     out = _SECRET_PATTERNS[1].sub(lambda m: f"{m.group(1)}{_mask(m.group(2))}", out)
@@ -914,6 +951,9 @@ def _looks_like_placeholder(v: str) -> bool:
                                "insert_", "replace_", "todo")))
 
 
+_PASSWORD_NAME = re.compile(r"(?i)PASS(?:WORD|WD|PHRASE)")
+
+
 # A variable named STRIPE_SECRET_KEY is critical whether or not its value
 # happens to carry a recognisable live-key prefix.
 _CRITICAL_NAMES = re.compile(
@@ -960,6 +1000,36 @@ def classify_secrets(cmd: str) -> list[tuple[str, str, str]]:
         if _NOT_SECRET_NAMES.match(name.strip("_{}%$<>")):
             continue
         add(_priority_for_name(name), clean(name.upper())[:48], value)
+
+    # Roadmap S1: every form redact() masks is counted here too, through the
+    # same compiled rules, so the rotation list and the masking cannot drift.
+    for rx, group in _OPTION_SECRETS:
+        for m in rx.finditer(cmd):
+            add("high", "password option", m.group(group))
+    for m in _SECRET_PATTERNS[2].finditer(cmd):
+        add("high", "Authorization header", m.group(2))
+    # A password is short. _NAMED_SECRET wants 12 characters, which suits a
+    # token; PGPASSWORD=hunter2pass was masked and never counted.
+    for m in _SECRET_PATTERNS[0].finditer(cmd):
+        name = m.group(1)
+        if _PASSWORD_NAME.search(name) and not _NOT_SECRET_NAMES.match(name.strip("_{}%$<>")):
+            add(_priority_for_name(name), clean(name.upper())[:48], m.group(4))
+    for m in _URL_USERINFO.finditer(cmd):
+        user, sep, pw = m.group(2).partition(":")
+        if sep and pw:
+            host = re.split(r"[\s/:?#'\"]", cmd[m.end():m.end() + 256], maxsplit=1)[0]
+            local = _LOCAL_HOST.match(host) is not None
+            scheme = m.group(1)[:-3]
+            add("low" if local else "critical",
+                clean(f"{scheme} password ({'local' if local else 'remote'})")[:48], pw)
+        elif len(user) > 20:
+            add("high", "URL userinfo token", user)
+    for m in _SCP_USERINFO.finditer(cmd):
+        user, sep, pw = m.group(1).partition(":")
+        if sep and pw:
+            add("critical", "scp password", pw)
+        elif len(user) > 20:
+            add("high", "scp userinfo token", user)
 
     return out
 

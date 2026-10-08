@@ -955,3 +955,107 @@ class TestHarnessFieldEscapes(unittest.TestCase):
             for lo, hi, why in af._STRIPPED_RANGES:
                 for ch in text:
                     self.assertFalse(lo <= ord(ch) <= hi, f"{name}: U+{ord(ch):04X} ({why})")
+
+
+class TestOptionValueRedaction(unittest.TestCase):
+    """I6: a credential passed as an option value is masked, and counted."""
+    PW = "Zq9secretPW"
+    MASKED = (
+        "curl -u alice:{pw} https://a.io", "curl -ualice:{pw} https://a.io",
+        "curl --user alice:{pw} https://a.io", "curl --user=alice:{pw} https://a.io",
+        "curl -U proxy:{pw} https://a.io", "curl --proxy-user proxy:{pw} https://a.io",
+        "curl --proxy-user=proxy:{pw} https://a.io", "curl -u 'alice:{pw}' https://a.io",
+        "wget --password {pw} https://a.io", "wget --http-password {pw} https://a.io",
+        "wget --ftp-password {pw} ftp://a.io", "wget --proxy-password '{pw}' https://a.io",
+        "curl -H 'Authorization: token {pw}long' https://api.github.com",
+        "git -c http.extraheader='Authorization: token {pw}long' clone https://x",
+        "docker login --password {pw} reg.io", "docker login -u bob -p {pw} reg.io",
+        "docker login -p{pw} reg.io", "PGPASSWORD={pw} psql -h db",
+    )
+    UNTOUCHED = (
+        "docker run -u 1000:1000 img", "sudo -u root ls", "git push -u origin main:main",
+        "pip install -U git+https://github.com/o/r", "pip install --user git+https://github.com/o/r",
+        "mkdir -p /tmp/x", "ssh -p 22 host", "docker run -p 8080:80 img",
+        "docker login --password-stdin reg.io", "curl -u alice:$PW https://a.io",
+        "mysql --password --host db", "sort -u file.txt",
+    )
+
+    def test_credential_is_masked_and_user_kept(self):
+        for form in self.MASKED:
+            cmd = form.format(pw=self.PW)
+            with self.subTest(cmd=cmd):
+                out = af.redact(cmd)
+                self.assertNotIn(self.PW, out)
+                self.assertTrue(af.contains_secret(cmd))
+                self.assertTrue(af.classify_secrets(cmd))
+                self.assertEqual(af.redact(out), out)
+        self.assertIn("alice:", af.redact(f"curl -u alice:{self.PW} https://a.io"))
+        self.assertIn("token ", af.redact(f"curl -H 'Authorization: token {self.PW}long' x"))
+
+    def test_other_option_shapes_are_untouched(self):
+        for cmd in self.UNTOUCHED:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(af.redact(cmd), cmd)
+                self.assertFalse(af.classify_secrets(cmd))
+
+    def test_generic_dash_p_is_not_a_password(self):
+        # -p means other things in other programs; only `docker login -p` is read.
+        for cmd in ("mysql -pZq9secretPW db", "sshpass -p Zq9secretPW ssh h"):
+            self.assertIn("Zq9secretPW", af.redact(cmd))
+
+    def test_option_rules_are_linear(self):
+        import time
+        for text in ("-u " * 10900, "--user " * 4600, "--password " * 2900, "-u a:" * 6500,
+                     "a:" * 16000, "a=" * 16000, "docker login " * 2500, "docker login -p" * 2000,
+                     "-ua:" * 8000, "--user=" * 4600, "Authorization: token " * 1500):
+            t0 = time.perf_counter()
+            af.redact(text)
+            af.classify_secrets(text)
+            self.assertLess(time.perf_counter() - t0, 0.1, text[:16])
+
+
+class TestDetectorAgreement(unittest.TestCase):
+    """Roadmap S1: what redact() masks, classify_secrets() counts. The
+    exceptions are masked for display and deliberately not counted."""
+    EXCEPTIONS = {
+        "export X=AKIAIOSFODNN7EXAMPLE": "AWS's documented example key: masked, never counted (#51)",
+        "output_tokens=1234567890123": "a metric name in _NOT_SECRET_NAMES",
+        "token_hash=abcdef1234567890": "a hash column in _NOT_SECRET_NAMES",
+        "encrypted_password=abcdef1234567890": "an encrypted column in _NOT_SECRET_NAMES",
+        "TOKENS=abcdefghijklmnop": "a bare plural names a collection",
+        "SECRET=your_secret_here": "a placeholder value",
+        "API_KEY=placeholder1234": "a placeholder value",
+        "postgres://admin@db.internal": "a short password-less userinfo is a username (M6)",
+        "git clone https://ZqTOKEN@github.com/o/r.git": "a short password-less userinfo is a username (M6)",
+    }
+    CORPUS = (
+        TestOptionValueRedaction.UNTOUCHED
+        + tuple(f.format(pw=TestOptionValueRedaction.PW) for f in TestOptionValueRedaction.MASKED)
+        + ("export X=ghp_abcdefghijklmnopqrst", "export X=sk-ant-api03-abcdefghijklmnop",
+           "export X=vcp_notarealtokenjustafixture01", "export X=glpat-abcdefghijklmnop",
+           "MY_API_KEY=supersecretvalue123", "psql postgresql://admin:hunter2pass@db:5432/prod",
+           "curl -H 'Authorization: Bearer sk-ant-fixtureonlyvalue1' https://x",
+           'curl -H "Authorization: Bearer $VERCEL_TOKEN" https://api.vercel.com/x',
+           "TOKEN=ghp_abcdefghijklmnopqrs", "psql postgresql://u:passwordvalue@h/db",
+           "npm run build && git push origin main", "git clone https://github.com/foo/bar.git",
+           "gh pr create --title 'Add token refresh' --body 'fixes auth'",
+           "grep -rn 'password' src/ | head -20", "export K=sk_live_abcdefghijklmnopqrst",
+           "gh auth --with-token ghp_abcdefghijklmnopqrst", "STRIPE_SECRET_KEY=abcdefghijklmnop",
+           "psql postgresql://u:devpassword@127.0.0.1:5432/db", "TOKEN=abcdefghijklmnop",
+           "PGPASSWORD=s3cr3t psql", "wget --password=Zq9secretPW https://a.io",
+           "git -c http.extraheader='Authorization: Basic Zq9secretPWlong' clone https://x",
+           "git clone user:ZqTOKENvalue@github.com:o/r.git", "ci:tok@h:/srv",
+           "git clone https://ghp_abcdefghijklmnopqrstuvwx@github.com/o/r.git",
+           "git clone git@github.com:o/r.git", "curl -u alice:changeme https://a.io",
+           "export X_TOKEN=Zq9secretPWlong")
+        + tuple(EXCEPTIONS)
+    )
+
+    def test_contains_secret_agrees_with_classify(self):
+        for x in self.CORPUS:
+            with self.subTest(cmd=x):
+                if x in self.EXCEPTIONS:
+                    self.assertTrue(af.contains_secret(x))
+                    self.assertFalse(af.classify_secrets(x))
+                else:
+                    self.assertEqual(af.contains_secret(x), bool(af.classify_secrets(x)))
