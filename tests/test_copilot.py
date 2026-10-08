@@ -189,3 +189,24 @@ class TestCopilotWiring(unittest.TestCase):
             out = af._mcp_call("fleet_summary", {}, af._MCPCache())
         self.assertGreater(out["cost_usd_list_price"], 0)
         self.assertIn("copilot", out["by_agent"])
+
+
+class TestCopilotReplay(unittest.TestCase):
+
+    def test_replay_finds_the_in_session_commands(self):
+        with fx.isolated_home() as home:
+            state = fx.write_sessions(home / ".copilot" / "session-state")
+            fleet = _fleet(state, project="quarry")
+            fp = next(iter(fleet.secrets))
+            inc = af.replay(fp, af.replay_events(None, None))
+        self.assertTrue(inc)
+        self.assertEqual(inc["exposure"]["vendors"], ["copilot"])
+        self.assertEqual(inc["exposure"]["sessions"], [fx.D])
+        self.assertIn("fix/QRY-9", inc["exposure"]["branches"])
+        self.assertGreaterEqual(inc["blast_radius"]["same_session"]["commands"], 1)
+
+    def test_replay_with_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = fx.write_sessions(Path(td) / "session-state")
+            events = af.replay_events(None, str(state))
+        self.assertEqual({e.vendor for e in events}, {"copilot"})

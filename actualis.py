@@ -5916,15 +5916,56 @@ def _codex_events(roots: list[Path], since: datetime | None) -> list[ReplayEvent
     return out
 
 
+def _copilot_events(roots: list[Path], since: datetime | None) -> list[ReplayEvent]:
+    """Copilot records the branch, so unlike Codex it is carried through."""
+    out: list[ReplayEvent] = []
+    for root in roots:
+        for f in sorted(root.glob("*/events.jsonl")):
+            cwd = branch = ""
+            try:
+                fh = f.open(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            with fh:
+                for line in fh:
+                    if "tool.execution_start" not in line and "session.start" not in line \
+                            and "session.context_changed" not in line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if not isinstance(rec, dict) or not isinstance(rec.get("data"), dict):
+                        continue
+                    kind = rec.get("type")
+                    if kind in ("session.start", "session.context_changed"):
+                        ctx = rec["data"].get("context") if kind == "session.start" else rec["data"]
+                        if isinstance(ctx, dict):
+                            cwd = ctx.get("gitRoot") or ctx.get("cwd") or cwd
+                            branch = ctx.get("branch") or branch
+                        continue
+                    ts = parse_ts(rec.get("timestamp"))
+                    if ts is None or (since and ts < since):
+                        continue
+                    for cmd in _commands_in(rec):
+                        out.append(ReplayEvent(
+                            ts, cmd, f.parent.name,
+                            pretty_project(Path(cwd).name if cwd else "copilot"),
+                            str(branch), "copilot", str(root)))
+    return out
+
+
 def replay_events(since: datetime | None = None,
                   root: str | None = None) -> list[ReplayEvent]:
-    """Every recorded command across both vendors, oldest first."""
+    """Every recorded command across every vendor, oldest first."""
     if root:
         base = [Path(root).expanduser()]
-        events = _claude_events(base, since) + _codex_events(base, since)
+        events = _claude_events(base, since) + _codex_events(base, since) \
+            + _copilot_events(base, since)
     else:
         events = _claude_events(transcript_roots(), since)
         events += _codex_events(codex_roots(), since)
+        events += _copilot_events(copilot_roots(), since)
     events.sort(key=lambda e: e.ts)
     return events
 
