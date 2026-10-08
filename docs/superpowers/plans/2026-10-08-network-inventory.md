@@ -115,7 +115,7 @@ import json
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -951,7 +951,6 @@ class TestOtherAgents(unittest.TestCase):
                          ("codex", "unasked", "cx-1", None, "requests"))
 
     def test_copilot_web_fetch_keeps_arguments(self):
-        import _fixtures as fx   # tests/ is on sys.path under unittest discover
         with tempfile.TemporaryDirectory() as tmp:
             sid = "ffffffff-0000-0000-0000-000000000001"
             d = Path(tmp) / "session-state" / sid
@@ -970,8 +969,10 @@ class TestOtherAgents(unittest.TestCase):
                          ("copilot", "a.io", "unasked", sid))
 ```
 
-The Copilot test imports `_fixtures` only to fail loudly if the fixture
-module moves. If `scan_copilot` needs a different root layout, the
+If `scan_codex` only finds files under a dated
+`sessions/YYYY/MM/DD/rollout-*.jsonl` layout, copy the layout the existing
+Codex tests in `tests/test_actualis.py` use, and keep the assertions. If
+`scan_copilot` needs a different root layout, the
 signature is `scan_copilot(roots, since, project_filter)`. Match it to
 `tests/test_copilot.py`'s usage, and keep the test's assertions unchanged.
 
@@ -1311,10 +1312,8 @@ class TestStrict(unittest.TestCase):
         self.assertEqual((g.suppressed_flags, af.failing_findings(g, "any")), (3, []))
 
     def test_cli_rejects_bad_trust(self):
-        with self.assertRaises(SystemExit) as cm, redirect_stdout(io.StringIO()):
-            import contextlib
-            with contextlib.redirect_stderr(io.StringIO()):
-                af.main(["--network-trust", "https://x.io", "--json"])
+        with self.assertRaises(SystemExit) as cm, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            af.main(["--network-trust", "https://x.io", "--json"])
         self.assertEqual(cm.exception.code, 2)
 ```
 
@@ -1843,7 +1842,7 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False) -> None:
         print(f"  {'FETCHED':<11} {num(len(fetches))}   {num(len(fhosts))} host(s)")
 
     rows = [i for i in n["items"] if i["approval"] in ("unasked", "unknown")]
-    rows.sort(key=lambda i: (i["approval"] != "unasked", ), )   # stable: keeps newest-first within each
+    rows.sort(key=lambda i: i["approval"] != "unasked")   # stable: newest-first within each
     for k, i in enumerate(rows[:top]):
         label = "UNASKED" if k == 0 else ""
         what = i["url"] or i["package"] or i["program"]
