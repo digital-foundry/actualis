@@ -53,9 +53,11 @@ jobs:
           import ast, sys
           # Standard library only. 'typing' is stdlib and carries no runtime
           # cost worth avoiding; it is here because Rate is a NamedTuple.
+          # struct and zlib write the --card PNG without an imaging library.
           allowed = {'__future__','argparse','collections','contextlib','datetime',
                      'hashlib','importlib','io','json','os','pathlib','re',
-                     'shutil','subprocess','sys','time','typing','unittest'}
+                     'shutil','struct','subprocess','sys','time','typing',
+                     'unittest','zlib'}
           tree = ast.parse(open('actualis.py').read())
           found = set()
           for n in ast.walk(tree):
