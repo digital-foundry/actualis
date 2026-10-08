@@ -1157,9 +1157,9 @@ def url_host(url: str) -> str | None:
         host = rest.rsplit("@", 1)[-1]
         if host.startswith("["):             # IPv6 literal: keep the brackets, drop the port
             return host[:host.find("]") + 1].lower() if "]" in host else None
-        return host.split(":", 1)[0].lower() or None
+        return host.split(":", 1)[0].lower().removesuffix(".") or None
     m = _NET_SCP.match(url)
-    return m.group(1).lower() if m else None
+    return m.group(1).lower().removesuffix(".") if m else None
 
 
 def url_path(url: str) -> str:
@@ -1700,6 +1700,13 @@ def network_items_from_tool(name: str, tool_input: dict) -> list[dict]:
     return []
 
 
+AUDIT_CONFIG_FILES = (".actualis-network-trust", ".actualis-suppressions")
+_FILE_WRITE_TOOLS = frozenset({"write", "edit", "multiedit", "notebookedit", "create",
+                               "edit_file", "str_replace_editor", "str_replace_based_edit_tool"})
+_AUDIT_CONFIG_WRITE = re.compile(
+    r">|\btee\b|\bsed\s+-i|\b(?:mv|cp|rm|ln|truncate|install)\b|\bperl\s+-[a-z]*i")
+
+
 def network_approval(mode: str | None) -> str:
     """asked / unasked / unknown, from the mode key the call ran under.
 
@@ -1718,7 +1725,7 @@ _TRUST_ENTRY = re.compile(r"^([a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-
                           r"(/[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)*)?/?$")
 
 
-def parse_trust(entries: list[str]) -> list[tuple[str, str]]:
+def parse_trust(entries: list[str], source: str = "--network-trust") -> list[tuple[str, str]]:
     """Trust entries as (host, "/path" or ""). A bad entry is an error, never
     a silent skip: a typo in a trust list would otherwise trust nothing, or
     worse, be read as something broader than meant."""
@@ -1728,58 +1735,85 @@ def parse_trust(entries: list[str]) -> list[tuple[str, str]]:
         if not e:
             continue
         host, _, path = e.partition("/")
-        m = _TRUST_ENTRY.match(host.lower() + ("/" + path if path else ""))
+        m = _TRUST_ENTRY.match(host.lower().removesuffix(".") + ("/" + path.lower() if path else ""))
         if "://" in e or "*" in e or not m:
-            raise ValueError(f"network trust entry {raw.strip()!r} is not a host or host/path "
-                             "(no scheme, port or wildcard)")
+            raise ValueError(f"{source}: network trust entry {raw.strip()!r} is not a host or "
+                             "host/path (no scheme, port or wildcard)")
         out.append((m.group(1), (m.group(2) or "").rstrip("/")))
     return out
 
 
-def load_network_trust(cli: list[str] | None, cwd: Path | None = None) -> list[tuple[str, str]]:
-    """--network-trust values (comma-separated, repeatable), then ./.actualis-network-trust."""
-    entries: list[str] = []
+def load_network_trust_sources(cli: list[str] | None, cwd: Path | None = None
+                               ) -> tuple[list[tuple[str, str]], list[dict]]:
+    """Trust entries from --network-trust (comma-separated, repeatable), then
+    ./.actualis-network-trust, plus where each came from. The file's hash is
+    recorded because the audited agent can write it."""
+    trust: list[tuple[str, str]] = []
+    sources: list[dict] = []
+    flag_entries: list[str] = []
     for value in cli or []:
-        entries += value.split(",")
+        flag_entries += [e.strip() for e in value.split(",") if e.strip()]
+    if cli:
+        trust += parse_trust(flag_entries, "--network-trust")
+        sources.append({"source": "flag", "entries": [h + p for h, p in parse_trust(flag_entries)]})
+    path = (cwd or Path.cwd()) / NETWORK_TRUST_FILE
     try:
-        text = ((cwd or Path.cwd()) / NETWORK_TRUST_FILE).read_text(encoding="utf-8")
-    except OSError:
-        text = ""
-    for line in text.splitlines():
-        entries.append(line.split("#", 1)[0])
-    return parse_trust(entries)
+        raw = path.read_bytes()
+        text = raw.decode("utf-8-sig")
+    except (OSError, UnicodeDecodeError):
+        return trust, sources
+    file_trust: list[tuple[str, str]] = []
+    for n, line in enumerate(text.splitlines(), 1):
+        file_trust += parse_trust([line.split("#", 1)[0]], f"{NETWORK_TRUST_FILE} line {n}")
+    trust += file_trust
+    sources.append({"source": "file", "path": str(path.resolve()),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                    "entries": [h + p for h, p in file_trust]})
+    return trust, sources
 
 
-def _net_item_path(item: dict) -> str:
+def load_network_trust(cli: list[str] | None, cwd: Path | None = None) -> list[tuple[str, str]]:
+    return load_network_trust_sources(cli, cwd)[0]
+
+
+def _net_item_path(item: dict) -> str | None:
+    """Lowercased path, "" when there is none, None when it cannot be known
+    (a dot segment or an encoded dot could walk out of a trusted prefix)."""
     if item.get("url"):
-        return url_path(item["url"])
-    pkg = item.get("package") or ""
-    if item.get("ecosystem") == "go" and "/" in pkg:
-        return "/" + pkg.split("/", 1)[1]
-    return ""
+        path = url_path(item["url"])
+    else:
+        pkg = item.get("package") or ""
+        path = "/" + pkg.split("/", 1)[1] if item.get("ecosystem") == "go" and "/" in pkg else ""
+    if any(seg in (".", "..") or "%2e" in seg.lower() for seg in path.split("/")):
+        return None
+    return path.lower()
 
 
 def network_trusted(item: dict, trust: list[tuple[str, str]]) -> bool:
     """Host suffix on a label boundary; path prefix on a segment boundary.
     An item with no known host is never trusted."""
-    host = item.get("host")
+    host = (item.get("host") or "").removesuffix(".")
     if not host:
         return False
     path = _net_item_path(item)
     for h, p in trust:
         if host != h and not host.endswith("." + h):
             continue
-        if not p or path == p or path.startswith(p + "/"):
+        if not p:
+            return True
+        if path is not None and (path == p or path.startswith(p + "/")):
             return True
     return False
 
 
-def apply_network_policy(fleet: "Fleet", trust: list[tuple[str, str]], strict: bool) -> None:
+def apply_network_policy(fleet: "Fleet", trust: list[tuple[str, str]], strict: bool,
+                         sources: list[dict] | None = None) -> None:
     """Mark trusted items, and in strict mode turn each untrusted, unapproved,
     not-failed group (program, host) into one medium shell-audit flag. Run once,
     after the scan."""
     fleet.network_trust = [h + p for h, p in trust]
     fleet.network_strict = strict
+    fleet.network_trust_sources = sources or []
     groups: dict[tuple[str, str], list[dict]] = {}
     for item in fleet.network_items:
         item["trusted"] = network_trusted(item, trust)
@@ -2238,6 +2272,7 @@ class Fleet:
         self.network: list[dict] = []
         self.network_unparsed = 0
         self.network_trust: list[str] = []
+        self.network_trust_sources: list[dict] = []
         self.network_strict = False
         self._net_by_call: dict[str, list[int]] = {}
         self.flag_counts: Counter = Counter()
@@ -2774,6 +2809,7 @@ class Fleet:
         name = clean(name)[:48] or "?"
         self.tools[name] += 1
         self._add_network(project, name, tool_input or {}, ts, mode, session, call_id, agent)
+        self._audit_config_write(project, name, tool_input or {}, ts)
         if name != "Bash":
             return
         cmd = (tool_input or {}).get("command") or ""
@@ -2924,6 +2960,45 @@ class Fleet:
                             self._network_results(rec)
         except OSError:
             return
+
+    def _audit_config_write(self, project: str, name: str, tool_input: dict,
+                            ts: datetime | None) -> None:
+        """The audited agent writing the files that decide what is reported.
+
+        Never suppressible: an agent able to edit .actualis-suppressions could
+        otherwise silence this finding with the same edit. Codex apply_patch
+        edits are not read, so they are not seen here.
+        """
+        evidence = None
+        program = name
+        if name == "Bash":
+            cmd = tool_input.get("command")
+            if isinstance(cmd, str) and any(f in cmd for f in AUDIT_CONFIG_FILES) \
+               and _AUDIT_CONFIG_WRITE.search(cmd):
+                evidence = redact(cmd)
+                program = clean(command_head(cmd) or "Bash")[:40]
+        elif name.lower() in _FILE_WRITE_TOOLS:
+            for key in ("file_path", "path", "notebook_path"):
+                target = tool_input.get(key)
+                if isinstance(target, str):
+                    base = target.replace("\\", "/").rsplit("/", 1)[-1]
+                    if base in AUDIT_CONFIG_FILES:
+                        evidence = f"{name} wrote {base}"
+                        break
+        if evidence is None:
+            return
+        self.flags.append({
+            "id": flag_id("high", ["audit-config"], program),
+            "severity": "high",
+            "categories": ["audit-config"],
+            "program": program,
+            "project": project,
+            "when": ts.isoformat() if ts else None,
+            "evidence": evidence[:240],
+            "had_secret": False,
+            "suppressed": False,
+            "suppressed_reason": "",
+        })
 
     def _ingest_claude(self, rec: dict, project: str, since: "datetime | None",
                        calls: dict) -> None:
@@ -6351,8 +6426,12 @@ def failing_findings(fleet: Fleet, level: str) -> list[str]:
             out.append(f"{len(fl)} high-severity shell command(s) flagged")
     if want_any:
         fl = [f for f in fleet.actionable_flags if f["severity"] == "med"]
+        net = [f for f in fl if f["categories"] == ["network-unasked"]]
+        fl = [f for f in fl if f["categories"] != ["network-unasked"]]
         if fl:
             out.append(f"{len(fl)} medium-severity shell command(s) flagged")
+        if net:
+            out.append(f"{len(net)} unasked download group(s) from untrusted sources")
     return out
 
 
@@ -7628,12 +7707,6 @@ def main(argv: list[str] | None = None) -> int:
     if not args.card and (args.style != "hero" or args.out):
         ap.error("--style and --out apply only to --card.")
 
-    try:
-        network_trust = load_network_trust(args.network_trust)
-    except ValueError as exc:
-        ap.error(str(exc))
-
-
     since = None
     if args.days:
         since = window_start(args.days)
@@ -7718,6 +7791,13 @@ def main(argv: list[str] | None = None) -> int:
             render_replay(inc, C(use_color()))
         return EXIT_OK
 
+    # Loaded here, after every mode that never scans: a malformed trust file
+    # must not break --explain, --agents, --suppressions and the rest.
+    try:
+        network_trust, trust_sources = load_network_trust_sources(args.network_trust)
+    except ValueError as exc:
+        ap.error(str(exc))
+
     fleet = Fleet()
     progress = not args.json and sys.stderr.isatty()
 
@@ -7781,7 +7861,7 @@ def main(argv: list[str] | None = None) -> int:
         print(dead_end_message(fleet, args), file=sys.stderr)
         return EXIT_CANNOT_RUN
 
-    apply_network_policy(fleet, network_trust, args.network_strict)
+    apply_network_policy(fleet, network_trust, args.network_strict, trust_sources)
 
     if args.diff:
         try:

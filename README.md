@@ -548,6 +548,13 @@ scoring that drifts between runs. A command either matches a rule or it doesn't,
 and you can read every rule in the source. Categories: `destructive`, `privilege`,
 `remote-exec`, `credentials`, `egress`, `git`, `publish`, `database`, `audit`.
 
+One more category, `audit-config`, is always `high` and can never be suppressed. It
+fires when the agent writes `.actualis-network-trust` or `.actualis-suppressions`
+(through a file-write tool, or a shell command that mentions the file and redirects,
+`tee`s, `sed -i`s, moves, copies or deletes it). Those files decide what is reported,
+so an agent that could edit them could hide its own work; a suppression of this finding
+would be the same edit. Known limit: Codex `apply_patch` edits are not read.
+
 **A flag means "worth looking at", not "wrong".** Most `rm -rf` calls are a build
 directory. The point is that you can see them at all.
 
