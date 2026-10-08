@@ -420,6 +420,10 @@ UNREADABLE_SHAPES = (
 )
 
 
+class AuditConfigId(ValueError):
+    """--suppress was given the id of the audit-config finding."""
+
+
 def flag_id(severity: str, categories: list[str], program: str) -> str:
     """A stable id for a class of shell-audit finding.
 
@@ -430,6 +434,11 @@ def flag_id(severity: str, categories: list[str], program: str) -> str:
     """
     basis = f"{severity}:{','.join(sorted(categories))}:{program}"
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:8]
+
+
+# One id for every audit-config finding, whatever program wrote the file: it can
+# never be suppressed, so --suppress can refuse it by name.
+AUDIT_CONFIG_ID = flag_id("high", ["audit-config"], "audit-config")
 
 
 def unreadable_shapes(cmd: str) -> list[str]:
@@ -2128,12 +2137,35 @@ _WRITE_REDIRECT = re.compile(r">>?(.*)$", re.S)
 _FILE_MUTATORS = frozenset({"mv", "cp", "rm", "ln", "truncate", "install"})
 
 
+# The user-level file (suppression_paths()[0]) is `.../actualis/suppressions`.
+_AUDIT_CONFIG_TEXT = re.compile(r"\.actualis-|actualis/suppressions", re.I)
+# Programs that only read: a segment naming a config file is not a write when its
+# program is one of these. Anything else that names the file trips the wire.
+_READ_ONLY_PROGRAMS = frozenset({"cat", "less", "more", "head", "tail", "grep", "rg", "wc", "diff",
+                                 "ls", "stat", "file", "sha256sum", "shasum", "md5"})
+_READ_ONLY_GIT = frozenset({"diff", "log", "show", "status"})
+_ACTUALIS_PROGRAMS = frozenset({"actualis", "actualis.py"})
+
+
 def _is_audit_config(path: str, glob: bool = False) -> bool:
-    base = path.replace("\\", "/").rsplit("/", 1)[-1]
+    """APFS and NTFS are case-insensitive, so `.ACTUALIS-SUPPRESSIONS` is the same file."""
+    parts = path.replace("\\", "/").lower().rstrip("/").rsplit("/", 2)
+    base = parts[-1]
     if base in AUDIT_CONFIG_FILES:
+        return True
+    if base == SUPPRESSION_FILENAME and len(parts) > 1 and parts[-2] == "actualis":
         return True
     # A glob target (`> .actualis-s*`) may name either file; prefix check, no fnmatch.
     return glob and base.startswith(".actualis-") and any(c in base for c in "*?[")
+
+
+def _runs_actualis_suppress(words: list[str]) -> bool:
+    """`actualis --suppress`, `python3 actualis.py --suppress`, `uvx actualis
+    --suppressions`, `pipx run actualis --suppress=ID`: the CLI writes the user file."""
+    for i, w in enumerate(words[:6]):
+        if _net_base(w).lower() in _ACTUALIS_PROGRAMS:
+            return any(a.lower().startswith("--suppress") for a in words[i + 1:])
+    return False
 
 
 def writes_audit_config(cmd: str) -> bool:
@@ -2156,13 +2188,15 @@ def writes_audit_config(cmd: str) -> bool:
         if not words:
             continue
         prog = words[0].rsplit("/", 1)[-1]
-        args = [w for w in words[1:] if _is_audit_config(w) and ">" not in w]
-        if not args:
-            continue
-        if prog == "tee" or prog in _FILE_MUTATORS:
+        if _runs_actualis_suppress(toks):
             return True
-        if prog in ("sed", "perl") and any(re.match(r"^-[a-z]*i", w) for w in words[1:]):
-            return True
+        # Conservative: a segment that names a config file and is not a known
+        # reader is a write until shown otherwise (python -c open(...), cp x .,
+        # dd of=, rsync, curl -o, git checkout).
+        if _AUDIT_CONFIG_TEXT.search(" ".join(toks)):
+            sub = next((w for w in words[1:] if not w.startswith("-")), "")
+            if not (prog in _READ_ONLY_PROGRAMS or (prog == "git" and sub in _READ_ONLY_GIT)):
+                return True
     return False
 
 
@@ -2430,6 +2464,11 @@ def add_suppression(fingerprint: str, reason: str) -> Path:
     # Every id this tool emits is sha256[:8]. Accepting anything else writes a
     # suppression that can never match, and the user walks away believing they
     # silenced something. Caught in testing when a shell passed seven ids as one.
+    if fingerprint.lower() == AUDIT_CONFIG_ID:
+        raise AuditConfigId(
+            f"{fingerprint} is the audit-config finding. It cannot be suppressed: the files it "
+            "names decide what is reported, so a suppression of it would be the same edit it "
+            "reports. Review the write instead.")
     if not _FINGERPRINT.fullmatch(fingerprint):
         raise ValueError(
             f"{fingerprint!r} is not an id from this tool. Ids are eight hex "
@@ -3528,23 +3567,21 @@ class Fleet:
         program = name
         if name == "Bash":
             cmd = tool_input.get("command")
-            if isinstance(cmd, str) and ".actualis-" in cmd \
+            if isinstance(cmd, str) and "actualis" in cmd.lower() \
                and writes_audit_config(cmd):
                 # Model-written text: escapes and newlines out, as everywhere else.
                 evidence = clean(redact(cmd)).replace("\n", " ")
                 program = clean(command_head(cmd) or "Bash")[:40]
-        elif name.lower() in _FILE_WRITE_TOOLS:
+        elif name.lower() in _FILE_WRITE_TOOLS and tool_input.get("command") != "view":
             for key in ("file_path", "path", "notebook_path"):
                 target = tool_input.get(key)
-                if isinstance(target, str):
-                    base = target.replace("\\", "/").rsplit("/", 1)[-1]
-                    if base in AUDIT_CONFIG_FILES:
-                        evidence = f"{name} wrote {base}"
-                        break
+                if isinstance(target, str) and _is_audit_config(target):
+                    evidence = clean(f"{name} wrote {target.replace(chr(92), '/').rsplit('/', 1)[-1]}")
+                    break
         if evidence is None:
             return
         self.flags.append({
-            "id": flag_id("high", ["audit-config"], program),
+            "id": AUDIT_CONFIG_ID,
             "severity": "high",
             "categories": ["audit-config"],
             "program": program,
@@ -8470,6 +8507,8 @@ def main(argv: list[str] | None = None) -> int:
         c = C(use_color())
         try:
             path = add_suppression(args.suppress, args.reason or "")
+        except AuditConfigId as exc:
+            ap.error(str(exc))
         except ValueError as exc:
             sys.exit(f"actualis: {exc}")
         print(f"  suppressed {args.suppress} in {path}")

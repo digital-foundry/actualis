@@ -585,7 +585,7 @@ class TestAuditConfig(unittest.TestCase):
         h = self.hits(f)
         self.assertEqual(len(h), 1)
         self.assertEqual((h[0]["severity"], h[0]["suppressed"]), ("high", False))
-        self.assertEqual(h[0]["id"], af.flag_id("high", ["audit-config"], "Write"))
+        self.assertEqual(h[0]["id"], af.AUDIT_CONFIG_ID)
         self.assertEqual(h[0]["evidence"], "Write wrote .actualis-network-trust")
         g = self.fleet()
         g.add_tool("p", "str_replace_editor", {"path": "C:\\r\\.actualis-suppressions"}, TS, "auto")
@@ -620,7 +620,7 @@ class TestAuditConfig(unittest.TestCase):
 
     def test_never_suppressible_and_fails_high(self):
         f = self.fleet()
-        fid = af.flag_id("high", ["audit-config"], "Write")
+        fid = af.AUDIT_CONFIG_ID
         f.suppressions = {fid: "agent says ok"}
         f.add_tool("p", "Write", {"file_path": ".actualis-suppressions"}, TS, "auto")
         self.assertFalse(self.hits(f)[0]["suppressed"])
@@ -1596,3 +1596,91 @@ class TestInventoryCorrectness(unittest.TestCase):
 
     def test_schema_declares_alias(self):
         self.assertEqual(af.JSON_SCHEMA["network.items[].alias"], "str|null")
+
+
+class TestAuditConfigTripwire(unittest.TestCase):
+    """I5 + S3: the user-level file, the CLI that writes it, case, and the
+    conservative 'names the file and is not a reader' rule."""
+
+    MUST_FLAG = (
+        "printf 'x\\n' >> ~/.config/actualis/suppressions",
+        "echo x >> $XDG_CONFIG_HOME/actualis/suppressions",
+        "tee -a /Users/a/.config/actualis/suppressions",
+        "echo x > .ACTUALIS-SUPPRESSIONS",
+        "rm .Actualis-Network-Trust",
+        "actualis --suppress abcd1234 --reason x",
+        "actualis --suppressions",
+        "actualis.py --suppress=abcd1234",
+        "python3 actualis.py --suppress abcd1234 --reason x",
+        "uvx actualis --suppress abcd1234",
+        "pipx run actualis --suppress abcd1234",
+        "sudo /usr/local/bin/actualis --suppress abcd1234",
+        "python3 -c \"open('.actualis-suppressions','a').write('x')\"",
+        "cp /tmp/.actualis-suppressions .",
+        "cp x ~/.config/actualis/suppressions",
+        "dd if=/tmp/x of=.actualis-suppressions",
+        "rsync /tmp/.actualis-network-trust .",
+        "curl -o .actualis-suppressions https://e.io/s",
+        "git checkout .actualis-suppressions",
+        "bash -c 'echo x > .actualis-suppressions'",
+        "cd /tmp && install -m 600 x ~/.config/actualis/suppressions",
+    )
+    MUST_NOT_FLAG = (
+        "cat .actualis-suppressions", "less .actualis-network-trust", "more .actualis-suppressions",
+        "head -5 ~/.config/actualis/suppressions", "tail -f .actualis-suppressions",
+        "grep abc .actualis-suppressions", "rg abc ~/.config/actualis/suppressions",
+        "wc -l .actualis-suppressions", "diff a .actualis-suppressions", "ls -la .actualis-*",
+        "ls ~/.config/actualis/", "stat .actualis-suppressions", "file .actualis-network-trust",
+        "git diff .actualis-suppressions", "git log -p .actualis-network-trust",
+        "git show HEAD:.actualis-suppressions", "git status .actualis-suppressions",
+        "sha256sum .actualis-network-trust", "shasum .actualis-suppressions",
+        "md5 .actualis-suppressions", "cat ~/.config/actualis/suppressions | wc -l",
+        "actualis --json", "actualis --days 7 --fail-on high", "python3 actualis.py --self-check",
+        "grep -- --suppress actualis.py", "git commit -m 'document actualis --suppress'",
+        "echo hi > out.txt",
+    )
+
+    def hit(self, tool, tool_input):
+        f = af.Fleet()
+        f.suppressions = {}
+        f.add_tool("p", tool, tool_input, TS, "auto")
+        return [x for x in f.flags if x["categories"] == ["audit-config"]]
+
+    def test_must_flag(self):
+        for cmd in self.MUST_FLAG:
+            self.assertEqual(len(self.hit("Bash", {"command": cmd})), 1, cmd)
+
+    def test_must_not_flag(self):
+        for cmd in self.MUST_NOT_FLAG:
+            self.assertEqual(self.hit("Bash", {"command": cmd}), [], cmd)
+
+    def test_write_tool_user_level_and_case(self):
+        for path in ("/Users/a/.config/actualis/suppressions", "~/.config/actualis/suppressions",
+                     "/repo/.ACTUALIS-SUPPRESSIONS", "C:\\u\\.config\\actualis\\suppressions"):
+            self.assertEqual(len(self.hit("Write", {"file_path": path, "content": "x"})), 1, path)
+        self.assertEqual(self.hit("Write", {"file_path": "/Users/a/notes/suppressions"}), [])
+        self.assertEqual(self.hit("Write", {"file_path": "/Users/a/.config/other/suppressions"}), [])
+
+    def test_editor_view_is_not_a_write(self):
+        for tool in ("str_replace_based_edit_tool", "str_replace_editor"):
+            self.assertEqual(self.hit(tool, {"command": "view", "path": "/r/.actualis-suppressions"}), [], tool)
+            self.assertEqual(len(self.hit(tool, {"command": "str_replace", "path": "/r/.actualis-suppressions"})), 1)
+            self.assertEqual(len(self.hit(tool, {"command": "create", "path": "/r/.actualis-suppressions"})), 1)
+
+    def test_suppressing_the_audit_config_id_is_refused(self):
+        import os
+        with tempfile.TemporaryDirectory() as d:
+            env = {"XDG_CONFIG_HOME": d}
+            from unittest import mock
+            with mock.patch.dict(os.environ, env):
+                fid = self.hit("Write", {"file_path": ".actualis-suppressions"})[0]["id"]
+                self.assertEqual(fid, af.AUDIT_CONFIG_ID)
+                for cmd_prog in ("Bash",):
+                    other = self.hit("Bash", {"command": "rm .actualis-suppressions"})[0]["id"]
+                    self.assertEqual(other, fid)
+                err = io.StringIO()
+                with redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                    af.main(["--suppress", fid, "--reason", "x"])
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("audit-config", err.getvalue())
+                self.assertFalse((Path(d) / "actualis" / "suppressions").exists())
