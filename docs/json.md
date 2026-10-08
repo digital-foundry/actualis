@@ -249,6 +249,14 @@ actionable list in the report, not hidden. A scan with many suppressions must
 not be indistinguishable from a clean one, and `suppressed_secrets` is the
 number that makes the difference visible.
 
+`distinct_values` is how many different values were seen under the id in this
+run. It is always 1 for an id taken from the value. For a password passed as an
+option, the id comes from where the password appears (see
+[secrets.md](secrets.md)), so it can be more than 1. When a suppressed id of that
+kind has more than one value, it is reported as `suppressed: false` with
+`suppressed_reason` "suppression covers one value; N seen", and it counts
+toward `--fail-on`.
+
 ## `by_ticket[]`
 
 ```json

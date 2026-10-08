@@ -1303,3 +1303,60 @@ class TestOptionSecretIds(unittest.TestCase):
             t0 = time.perf_counter()
             af.classify_secrets(text)
             self.assertLess(time.perf_counter() - t0, 0.1, text[:12])
+
+
+class TestLocationIdSuppression(unittest.TestCase):
+    """F1a addendum: a location-based id suppressed for one password must not
+    silence a different password at the same location."""
+
+    def fleet(self, *cmds, suppress=True):
+        f = af.Fleet()
+        fp = af.classify_secrets(cmds[0])[0][2]
+        f.suppressions = {fp: "test fixture"} if suppress else {}
+        for cmd in cmds:
+            f.add_tool("p", "Bash", {"command": cmd}, TS, "auto")
+        return f, fp
+
+    def test_two_values_unsuppress_with_reason(self):
+        f, fp = self.fleet("curl -u alice:Hunter2 https://a.io", "curl -u alice:Other9x https://b.io")
+        e = f.secrets[fp]
+        self.assertEqual(e["distinct_values"], 2)
+        self.assertFalse(e["suppressed"])
+        self.assertEqual(e["suppressed_reason"], "suppression covers one value; 2 seen")
+        self.assertIn(fp, f.actionable_secrets)
+        self.assertTrue(af.failing_findings(f, "high"))
+        [row] = [s for s in af.to_json(f)["secrets"] if s["id"] == fp]
+        self.assertEqual((row["distinct_values"], row["suppressed"]), (2, False))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            af.render(f, af.C(False), True, 12)
+        self.assertIn("2 distinct values", buf.getvalue())
+
+    def test_one_value_stays_suppressed(self):
+        f, fp = self.fleet("curl -u alice:Hunter2 https://a.io", "curl -u alice:Hunter2 https://b.io")
+        e = f.secrets[fp]
+        self.assertEqual((e["distinct_values"], e["suppressed"]), (1, True))
+        self.assertEqual(e["suppressed_reason"], "test fixture")
+        self.assertNotIn(fp, f.actionable_secrets)
+        [row] = [s for s in af.to_json(f)["secrets"] if s["id"] == fp]
+        self.assertEqual(row["distinct_values"], 1)
+
+    def test_value_based_ids_are_untouched(self):
+        f, fp = self.fleet("TOKEN=ghp_abcdefghijklmnopqrst", "TOKEN=ghp_abcdefghijklmnopqrst")
+        self.assertEqual((f.secrets[fp]["distinct_values"], f.secrets[fp]["suppressed"]), (1, True))
+
+    def test_no_digest_in_any_output(self):
+        import hashlib
+        f, fp = self.fleet("curl -u alice:Hunter2 https://a.io", "curl -u alice:Other9x https://b.io")
+        digests = [hashlib.sha256(v.encode()).hexdigest() for v in ("Hunter2", "Other9x")]
+        outs = [json.dumps(af.to_json(f)), json.dumps(af.to_json(f, True))]
+        for fn in (lambda: af.render(f, af.C(False), False, 12), lambda: af.render_share(f, af.C(False))):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                fn()
+            outs.append(buf.getvalue())
+        for text in outs:
+            for d in digests:
+                for k in (8, 16, 64):
+                    self.assertNotIn(d[:k], text)
+        self.assertIn("distinct_values", json.dumps(af.JSON_SCHEMA))

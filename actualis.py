@@ -1037,10 +1037,15 @@ def _priority_for_name(name: str) -> str:
     return "critical" if _CRITICAL_NAMES.search(name) else "high"
 
 
-def classify_secrets(cmd: str) -> list[tuple[str, str, str]]:
+def classify_secrets(cmd: str, value_digests: dict[str, set[str]] | None = None
+                     ) -> list[tuple[str, str, str]]:
     """Return [(priority, type, sha256[:8])] for each distinct secret in a command.
 
-    The secret value is hashed immediately and never retained.
+    The secret value is hashed immediately and never retained. For an id taken
+    from where a password appears rather than from its value, `value_digests`,
+    when given, receives id -> {sha256(value)}, so the caller can tell how many
+    different passwords one id stands for. The caller keeps those digests in
+    memory only and never emits them.
     """
     cmd = cmd[:MAX_SCAN_TOTAL]
     out: list[tuple[str, str, str]] = []
@@ -1049,6 +1054,9 @@ def classify_secrets(cmd: str) -> list[tuple[str, str, str]]:
     def add(priority: str, kind: str, value: str, fp: str | None = None) -> None:
         if _looks_like_placeholder(value) or is_vendor_example(value):
             return
+        if fp and value_digests is not None:     # a location id: remember which values
+            value_digests.setdefault(fp, set()).add(
+                hashlib.sha256(value.encode("utf-8", "replace")).hexdigest())
         fp = fp or hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:8]
         if fp in seen:
             return
@@ -2676,6 +2684,9 @@ class Fleet:
         self.network_trust_sources: list[dict] = []
         self.network_strict = False
         self._net_by_call: dict[str, list[int]] = {}
+        # Location-based secret id -> sha256 of every value seen under it, for
+        # this run only. Never written to JSON, a report or a log.
+        self._location_values: dict[str, set[str]] = {}
         # Set by _add_network for the command add_tool is reading: a curl or
         # wget piped into a shell, on the dequoted tokens.
         self._net_remote_exec = False
@@ -3247,12 +3258,22 @@ class Fleet:
             self.secret_projects[project] += 1
 
         _rank = {"critical": 0, "high": 1, "low": 2}
-        for priority, kind, fp in classify_secrets(cmd):
+        for priority, kind, fp in classify_secrets(cmd, self._location_values):
             e = self.secrets.setdefault(fp, {
                 "priority": priority, "kinds": set(), "uses": 0,
                 "first": None, "last": None, "projects": set(),
                 "suppressed": fp in self.suppressions,
-                "suppressed_reason": self.suppressions.get(fp, "")})
+                "suppressed_reason": self.suppressions.get(fp, ""),
+                "distinct_values": 1})
+            # A location id is one user's password at one option, not one value.
+            # A suppression recorded for one password must not silence another:
+            # once a second value is seen under it in this run, it is unsuppressed.
+            n = len(self._location_values.get(fp, ()))
+            if n > 1:
+                e["distinct_values"] = n
+                if fp in self.suppressions:
+                    e["suppressed"] = False
+                    e["suppressed_reason"] = f"suppression covers one value; {n} seen"
             # the same value may appear under several names; keep the worst
             if _rank[priority] < _rank[e["priority"]]:
                 e["priority"] = priority
@@ -6010,6 +6031,10 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
             kind = ", ".join(sorted(e["kinds"]))
             print(f"    {col}{mark:<7}{c.off} {kind[:26]:<26} {num(e['uses']):>6}  "
                   f"{(e['first'] or '?'):<11} {(e['last'] or '?'):<11} {c.dim}{fp}{c.off}")
+            if e.get("distinct_values", 1) > 1:
+                print(f"            {c.dim}{e['distinct_values']} distinct values"
+                      + (f"; {e['suppressed_reason']}" if e.get("suppressed_reason", "").startswith(
+                          "suppression covers") else "") + f"{c.off}")
         if len(rows) > 24:
             print(f"    {c.dim}… {len(rows) - 24} more{c.off}")
         print(f"\n    {c.dim}id is sha256[:8] of the secret; the value is never stored or")
@@ -6834,6 +6859,7 @@ JSON_SCHEMA: dict[str, str] = {
     "secrets[].projects[]": "str",
     "secrets[].first_seen": "str",
     "secrets[].last_seen": "str",
+    "secrets[].distinct_values": "int",
     "secret_projects.*": "int",
     "redacted": "bool",
     "permission_modes.*": "int",
@@ -7128,7 +7154,8 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
              "uses": e["uses"], "first_seen": e["first"], "last_seen": e["last"],
              "projects": sorted(e["projects"]),
              "suppressed": bool(e.get("suppressed")),
-             "suppressed_reason": e.get("suppressed_reason", "")}
+             "suppressed_reason": e.get("suppressed_reason", ""),
+             "distinct_values": e.get("distinct_values", 1)}
             for fp, e in sorted(
                 fleet.secrets.items(),
                 key=lambda kv: ({"critical": 0, "high": 1, "low": 2}.get(kv[1]["priority"], 9),

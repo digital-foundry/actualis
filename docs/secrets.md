@@ -63,6 +63,20 @@ program and option share one id, so rotating one and reusing the line still
 shows as the same entry. Vendor-prefixed tokens, URL passwords and named
 variables keep their value-based ids for now.
 
+Because one such id can stand for several passwords, a suppression of it must
+not silence a password it was never about. During a run, actualis keeps the
+full `sha256` of each value seen under a location id, in memory only. They are
+never written to JSON, a report or a log, and they are discarded when the run
+ends. `--json` reports `distinct_values` for each secret, and the text report
+says "N distinct values" when N is more than 1. If a suppressed location id has
+more than one value in the run, it is treated as unsuppressed, for display and
+for `--fail-on`, with the reason "suppression covers one value; N seen".
+
+**The limit is per run.** Nothing about a value survives the run, so a new
+password that appears in a later run, alone under its id in that run, cannot be
+told apart from the one the suppression was recorded for. The suppression then
+still applies.
+
 ## Deliberately not flagged
 
 Both classes below were found firing on real data and removed. A scanner that
