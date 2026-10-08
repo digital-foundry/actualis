@@ -1340,6 +1340,8 @@ def _net_split(text: str) -> tuple[list[str], bool]:
             buf = []
             i += 2
             continue
+        elif ch == "|" and buf and buf[-1] == ">":
+            buf.append(ch)                   # `>|` is a clobber redirection, not a pipe
         elif ch in ";|\n":
             parts.append("".join(buf))
             buf = []
@@ -1417,10 +1419,21 @@ def _net_substitutions(text: str) -> tuple[list[str], str]:
     return bodies, _NET_BACKTICK.sub(" ", rest)
 
 
-def _net_tokens(segment: str) -> list[str]:
+# Redirection operators, longest first. `>|` reaches here only from _net_split,
+# which keeps the `|` of a clobber with its `>`.
+_NET_REDIRECT_OPS = ("&>>", "&>", "<<<", "<<", "<>", "<&", "<", ">>", ">&", ">|", ">")
+
+
+def _net_tokens(segment: str, drop_redirects: bool = False) -> list[str]:
     """Like _shell_tokens, but a backslash escapes: `\\"` is a quote character,
-    not a quote. Kept here so command_head() keeps its behaviour."""
+    not a quote. Kept here so command_head() keeps its behaviour.
+
+    With `drop_redirects`, an unquoted redirection (`>`, `2>&1`, `&>f`, `< f`,
+    `<<< w`, `>| f`, attached or not) is dropped with its target, and a word
+    is cut where an unquoted `<` or `>` starts one: `https://a.io>/tmp/x`
+    is the URL `https://a.io`. A redirection is never a package or a host."""
     out, buf, quote, started, i = [], [], "", False, 0
+    discard = False                          # the next word is a redirection target
     while i < len(segment):
         ch = segment[i]
         if ch == "\\" and quote != "'" and i + 1 < len(segment):
@@ -1440,13 +1453,23 @@ def _net_tokens(segment: str) -> list[str]:
             quote, started = ch, True
         elif ch.isspace():
             if buf or started:
-                out.append("".join(buf))
+                if not discard:
+                    out.append("".join(buf))
+                discard = False
                 buf, started = [], False
+        elif drop_redirects and (ch in "<>" or segment.startswith("&>", i)):
+            op = next(o for o in _NET_REDIRECT_OPS if segment.startswith(o, i))
+            word = "".join(buf)
+            if (buf or started) and not word.isdigit() and not discard:
+                out.append(word)                 # `a.io>f`: the word ends here; `2>f`: 2 is the fd
+            buf, started, discard = [], False, True
+            i += len(op)
+            continue
         else:
             buf.append(ch)
             started = True
         i += 1
-    if buf or started:
+    if (buf or started) and not discard:
         out.append("".join(buf))
     return out
 
@@ -1471,7 +1494,7 @@ def _net_segments(cmd: str, depth: int = 0) -> tuple[list[list[str]], int]:
         parts = parts[:-1]
         unparsed += 1
     for segment in parts:
-        tokens = _net_strip_prefixes(_net_tokens(segment))
+        tokens = _net_strip_prefixes(_net_tokens(segment, drop_redirects=True))
         if not tokens:
             continue
         if Path(tokens[0]).name in _NET_SHELLS and "-c" in tokens[1:-1] and depth >= 3:

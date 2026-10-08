@@ -1059,3 +1059,51 @@ class TestDetectorAgreement(unittest.TestCase):
                     self.assertFalse(af.classify_secrets(x))
                 else:
                     self.assertEqual(af.contains_secret(x), bool(af.classify_secrets(x)))
+
+
+class TestRedirections(unittest.TestCase):
+    """I2: a redirection is never a package, a host or a destination."""
+
+    def test_review_examples(self):
+        cases = {
+            "npm install foo > /dev/null 2>&1": ["foo"],
+            "pip install requests 2>/dev/null": ["requests"],
+            "cargo install rg 2> err.log": ["rg"],
+            "brew install jq 2>&1": ["jq"],
+            "npm i a >> log.txt b": ["a", "b"],
+            "npm i a &> /dev/null": ["a"],
+            "npm i a &>/dev/null": ["a"],
+            "npm i a < input.txt": ["a"],
+            "npm i a <<< 'word'": ["a"],
+            "npm i a >| out.txt": ["a"],
+            "npm i a >|out.txt": ["a"],
+            "npm i a 1>out.txt": ["a"],
+            "npm i a >& out.txt": ["a"],
+            "pip install 'requests>=2'": ["requests"],
+        }
+        for cmd, want in cases.items():
+            with self.subTest(cmd=cmd):
+                self.assertEqual([i["package"] for i in items(cmd)], want)
+
+    def test_git_dest_and_curl_host(self):
+        it = one("git clone https://github.com/o/r 2>&1")
+        self.assertEqual((it["host"], it["dest"]), ("github.com", None))
+        it = one("git clone https://github.com/o/r dir > log 2>&1")
+        self.assertEqual(it["dest"], "dir")
+        it = one("curl https://a.io>/tmp/x")
+        self.assertEqual((it["host"], it["url"]), ("a.io", "https://a.io"))
+        it = one("curl https://a.io</dev/null")
+        self.assertEqual(it["host"], "a.io")
+        it = one("curl 'https://a.io/?q=>x'")
+        self.assertEqual(it["url"], "https://a.io/?q=>x")
+
+    def test_no_redirect_shaped_items(self):
+        cmd = "npm i x > /dev/null 2>&1; pip install y 2>/dev/null; brew install z 2>&1"
+        for it in items(cmd):
+            for v in (it["package"], it["dest"], it["host"]):
+                self.assertNotIn(v, (">", "2", "2>", "2>&1", "/dev/null", "&1"))
+
+    def test_audit_config_redirects_still_seen(self):
+        self.assertTrue(af.writes_audit_config("echo x>.actualis-suppressions"))
+        self.assertTrue(af.writes_audit_config("echo x >| .actualis-suppressions"))
+        self.assertFalse(af.writes_audit_config("cat .actualis-suppressions 2>&1"))
