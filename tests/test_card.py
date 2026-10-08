@@ -262,5 +262,89 @@ class TestCardModel(unittest.TestCase):
         self.assertEqual(w, ["2026-09-08", "2026-09-09", "2026-09-10"])
 
 
+W, H = 1200, 630
+
+
+def _paint(rects_by_colour, bg="0d1117"):
+    """An independent painter, for checking the writers against each other."""
+    buf = bytearray(bytes.fromhex(bg) * (W * H))
+    for colour, rects in rects_by_colour:
+        px = bytes.fromhex(colour.lstrip("#"))
+        for x, y, w, h in rects:
+            x0, y0, x1, y1 = max(x, 0), max(y, 0), min(x + w, W), min(y + h, H)
+            for yy in range(y0, y1):
+                o = (yy * W + x0) * 3
+                buf[o:o + (x1 - x0) * 3] = px * max(x1 - x0, 0)
+    return buf
+
+
+def _png_pixels(data):
+    """Check every chunk's CRC and the IHDR, and return the unfiltered pixels."""
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    pos, idat, ihdr = 8, b"", None
+    while pos < len(data):
+        (length,) = struct.unpack(">I", data[pos:pos + 4])
+        tag, body = data[pos + 4:pos + 8], data[pos + 8:pos + 8 + length]
+        (crc,) = struct.unpack(">I", data[pos + 8 + length:pos + 12 + length])
+        assert crc == zlib.crc32(tag + body) & 0xFFFFFFFF, f"bad CRC on {tag!r}"
+        if tag == b"IHDR":
+            ihdr = struct.unpack(">IIBBBBB", body)
+        elif tag == b"IDAT":
+            idat += body
+        pos += 12 + length
+    assert ihdr == (W, H, 8, 2, 0, 0, 0), ihdr
+    raw, stride, out = zlib.decompress(idat), W * 3, bytearray()
+    for y in range(H):
+        row = raw[y * (stride + 1):(y + 1) * (stride + 1)]
+        assert row[0] == 0, "filter type 0 on every scanline"
+        out += row[1:]
+    return out
+
+
+def _ops():
+    return [af.Rect(0, 0, 10, 10, "#f0883e"),
+            af.Text(20, 20, 2, "#e6edf3", "A%·█"),
+            af.Polyline(((100, 100), (200, 150), (300, 120)), "#f0883e", 4),
+            af.Rect(1190, 620, 50, 50, "#8b949e")]        # clipped at the corner
+
+
+class TestCardWriters(unittest.TestCase):
+
+    def test_font_covers_every_glyph_a_card_draws(self):
+        for ch in [chr(c) for c in range(32, 127)] + list("·▁▂▃▄▅▆▇█░─—"):
+            with self.subTest(ch=ch):
+                self.assertRegex(af.CARD_FONT[ch], r"^[0-9a-f]{32}$")
+        self.assertEqual(af.CARD_FONT["A"][4:6], "7c", "Spleen 'A', row 2")
+
+    def test_unknown_glyph_falls_back(self):
+        q = af.op_rects(af.Text(0, 0, 1, "#ffffff", "?"))
+        self.assertEqual(af.op_rects(af.Text(0, 0, 1, "#ffffff", "漢")), q)
+
+    def test_text_scales_by_integer_cells(self):
+        one = af.op_rects(af.Text(0, 0, 1, "#ffffff", "A"))
+        three = af.op_rects(af.Text(0, 0, 3, "#ffffff", "A"))
+        self.assertEqual(three, [(x * 3, y * 3, w * 3, h * 3) for x, y, w, h in one])
+
+    def test_png_is_valid_and_matches_the_rasterizer(self):
+        ops = _ops()
+        self.assertEqual(_png_pixels(af.png_bytes(ops)), af.rasterize(ops))
+
+    def test_svg_and_png_agree_pixel_for_pixel(self):
+        ops = _ops()
+        svg = af.svg_text(ops)
+        self.assertNotIn("<text", svg)
+        painted = []
+        for colour, d in re.findall(r'<path fill="(#[0-9a-f]{6})" d="([^"]*)"/>', svg):
+            rects = [tuple(int(v) for v in r) for r in
+                     re.findall(r"M(-?\d+) (-?\d+)h(\d+)v(\d+)h-\d+z", d)]
+            painted.append((colour, rects))
+        self.assertEqual(_paint(painted), af.rasterize(ops))
+
+    def test_polyline_is_contiguous(self):
+        rects = af.op_rects(af.Polyline(((0, 0), (40, 7)), "#ffffff", 1))
+        xs = sorted({x + dx for x, y, w, h in rects for dx in range(w)})
+        self.assertEqual(xs, list(range(41)))
+
+
 if __name__ == "__main__":
     unittest.main()

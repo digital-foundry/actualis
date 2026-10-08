@@ -4906,6 +4906,281 @@ def card_model(fleet: "Fleet", mode: str, days: int | None = None,
     return m
 
 
+# CARD_FONT glyphs are from Spleen 2.2.0 (8x16), redistributed under its license:
+# Copyright (c) 2018-2026, Frederic Cambus
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+#   * Redistributions of source code must retain the above copyright
+#     notice, this list of conditions and the following disclaimer.
+#
+#   * Redistributions in binary form must reproduce the above copyright
+#     notice, this list of conditions and the following disclaimer in the
+#     documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS
+# BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+CARD_FONT: dict[str, str] = {
+    ' ': '00000000000000000000000000000000',
+    '!': '00001818181818181800181800000000',
+    '"': '00666666660000000000000000000000',
+    '#': '00006c6cfe6c6c6c6cfe6c6c00000000',
+    '$': '00107ed0d0d07c16161616fc10000000',
+    '%': '000006666c0c18183036666000000000',
+    '&': '0000386c6c6c3870dacccc7a00000000',
+    "'": '00181818180000000000000000000000',
+    '(': '000e183030606060603030180e000000',
+    ')': '0070180c0c060606060c0c1870000000',
+    '*': '00000000663c18ff183c660000000000',
+    '+': '000000000018187e1818000000000000',
+    ',': '00000000000000000000181830000000',
+    '-': '000000000000007e0000000000000000',
+    '.': '00000000000000000000181800000000',
+    '/': '0006060c0c181830306060c0c0000000',
+    '0': '00007cc6c6cedef6e6c6c67c00000000',
+    '1': '00001838785818181818187e00000000',
+    '2': '00007cc606060c183060c6fe00000000',
+    '3': '00007cc606063c060606c67c00000000',
+    '4': '0000c0c0ccccccccfe0c0c0c00000000',
+    '5': '0000fec6c0c0fc060606c67c00000000',
+    '6': '00007cc6c0c0fcc6c6c6c67c00000000',
+    '7': '0000fec606060c183030303000000000',
+    '8': '00007cc6c6c67cc6c6c6c67c00000000',
+    '9': '00007cc6c6c6c67e0606c67c00000000',
+    ':': '00000000001818000000181800000000',
+    ';': '00000000001818000000181830000000',
+    '<': '0000060c1830606030180c0600000000',
+    '=': '00000000007e00007e00000000000000',
+    '>': '00006030180c06060c18306000000000',
+    '?': '00007cc6060c18303000303000000000',
+    '@': '0000007cc2dadadadadec07c00000000',
+    'A': '00007cc6c6c6fec6c6c6c6c600000000',
+    'B': '0000fcc6c6c6fcc6c6c6c6fc00000000',
+    'C': '00007ec0c0c0c0c0c0c0c07e00000000',
+    'D': '0000fcc6c6c6c6c6c6c6c6fc00000000',
+    'E': '00007ec0c0c0f8c0c0c0c07e00000000',
+    'F': '00007ec0c0c0f8c0c0c0c0c000000000',
+    'G': '00007ec0c0c0dec6c6c6c67e00000000',
+    'H': '0000c6c6c6c6fec6c6c6c6c600000000',
+    'I': '00007e18181818181818187e00000000',
+    'J': '00007e1818181818181818f000000000',
+    'K': '0000c6c6c6ccf8ccc6c6c6c600000000',
+    'L': '0000c0c0c0c0c0c0c0c0c07e00000000',
+    'M': '0000c6eefed6c6c6c6c6c6c600000000',
+    'N': '0000c6c6e6e6d6d6cecec6c600000000',
+    'O': '00007cc6c6c6c6c6c6c6c67c00000000',
+    'P': '0000fcc6c6c6fcc0c0c0c0c000000000',
+    'Q': '00007cc6c6c6c6c6c6d6d67c180c0000',
+    'R': '0000fcc6c6c6fcc6c6c6c6c600000000',
+    'S': '00007ec0c0c07c06060606fc00000000',
+    'T': '0000ff18181818181818181800000000',
+    'U': '0000c6c6c6c6c6c6c6c6c67e00000000',
+    'V': '0000c6c6c6c6c6c6c66c381000000000',
+    'W': '0000c6c6c6c6c6c6d6feeec600000000',
+    'X': '0000c6c6c66c386cc6c6c6c600000000',
+    'Y': '0000c6c6c6c67e06060606fc00000000',
+    'Z': '0000fe06060c183060c0c0fe00000000',
+    '[': '003e303030303030303030303e000000',
+    '\\': '00c0c06060303018180c0c0606000000',
+    ']': '007c0c0c0c0c0c0c0c0c0c0c7c000000',
+    '^': '0010386cc60000000000000000000000',
+    '_': '0000000000000000000000000000fe00',
+    '`': '0030180c000000000000000000000000',
+    'a': '00000000007c067ec6c6c67e00000000',
+    'b': '0000c0c0c0fcc6c6c6c6c6fc00000000',
+    'c': '00000000007ec0c0c0c0c07e00000000',
+    'd': '00000606067ec6c6c6c6c67e00000000',
+    'e': '00000000007ec6c6fec0c07e00000000',
+    'f': '00001e3030307c303030303000000000',
+    'g': '00000000007ec6c6c6c6c67c0606fc00',
+    'h': '0000c0c0c0fcc6c6c6c6c6c600000000',
+    'i': '00001818003818181818181c00000000',
+    'j': '00001818001818181818181818187000',
+    'k': '0000c0c0c0ccd8f0f0d8ccc600000000',
+    'l': '00003030303030303030301c00000000',
+    'm': '0000000000ecd6d6d6d6c6c600000000',
+    'n': '0000000000fcc6c6c6c6c6c600000000',
+    'o': '00000000007cc6c6c6c6c67c00000000',
+    'p': '0000000000fcc6c6c6c6c6fcc0c0c000',
+    'q': '00000000007ec6c6c6c6c67e06060600',
+    'r': '00000000007ec6c0c0c0c0c000000000',
+    's': '00000000007ec0c07c0606fc00000000',
+    't': '00003030307c30303030301e00000000',
+    'u': '0000000000c6c6c6c6c6c67e00000000',
+    'v': '0000000000c6c6c6c66c381000000000',
+    'w': '0000000000c6c6d6d6d6d66e00000000',
+    'x': '0000000000c66c38386cc6c600000000',
+    'y': '0000000000c6c6c6c6c6c67e0606fc00',
+    'z': '0000000000fe060c183060fe00000000',
+    '{': '000e181818187070181818180e000000',
+    '|': '00181818181818181818181818000000',
+    '}': '0070181818180e0e1818181870000000',
+    '~': '000000000000327e4c00000000000000',
+    '\xb7': '00000000000000181800000000000000',
+    '\u2581': '0000000000000000000000000000ffff',
+    '\u2582': '000000000000000000000000ffffffff',
+    '\u2583': '00000000000000000000ffffffffffff',
+    '\u2584': '0000000000000000ffffffffffffffff',
+    '\u2585': '000000000000ffffffffffffffffffff',
+    '\u2586': '00000000ffffffffffffffffffffffff',
+    '\u2587': '0000ffffffffffffffffffffffffffff',
+    '\u2588': 'ffffffffffffffffffffffffffffffff',
+    '\u2591': '11441144114411441144114411441144',
+    '\u2500': '00000000000000ff0000000000000000',
+    '\u2014': '000000000000007e0000000000000000',
+}
+
+
+CARD_W, CARD_H = 1200, 630
+CARD_PALETTE = {"bg": "#0d1117", "fg": "#e6edf3", "muted": "#8b949e",
+                "rule": "#30363d", "accent": "#f0883e"}
+
+
+class Text(NamedTuple):
+    x: int
+    y: int
+    scale: int
+    colour: str
+    text: str
+
+
+class Rect(NamedTuple):
+    x: int
+    y: int
+    w: int
+    h: int
+    colour: str
+
+
+class Polyline(NamedTuple):
+    points: tuple
+    colour: str
+    width: int
+
+
+def _bresenham(x0: int, y0: int, x1: int, y1: int):
+    dx, dy = abs(x1 - x0), -abs(y1 - y0)
+    sx, sy = (1 if x0 < x1 else -1), (1 if y0 < y1 else -1)
+    err = dx + dy
+    while True:
+        yield x0, y0
+        if x0 == x1 and y0 == y1:
+            return
+        e2 = 2 * err
+        if e2 >= dy:
+            err += dy
+            x0 += sx
+        if e2 <= dx:
+            err += dx
+            y0 += sy
+
+
+def _runs(pixels: set) -> list[tuple[int, int, int, int]]:
+    out: list[tuple[int, int, int, int]] = []
+    for x, y in sorted(pixels, key=lambda p: (p[1], p[0])):
+        if out and out[-1][1] == y and out[-1][0] + out[-1][2] == x:
+            px, py, pw, ph = out[-1]
+            out[-1] = (px, py, pw + 1, ph)
+        else:
+            out.append((x, y, 1, 1))
+    return out
+
+
+def op_rects(op) -> list[tuple[int, int, int, int]]:
+    """The exact pixels one draw op covers, as (x, y, w, h) runs.
+
+    Both writers consume this and nothing else, so the SVG and the PNG cannot
+    disagree about a single pixel.
+    """
+    if isinstance(op, Rect):
+        return [(op.x, op.y, op.w, op.h)]
+    if isinstance(op, Text):
+        s, out = op.scale, []
+        for i, ch in enumerate(op.text):
+            bits = CARD_FONT.get(ch) or CARD_FONT["?"]
+            gx = op.x + i * 8 * s
+            for row in range(16):
+                byte, col = int(bits[row * 2:row * 2 + 2], 16), 0
+                while col < 8:
+                    if byte & (0x80 >> col):
+                        start = col
+                        while col < 8 and byte & (0x80 >> col):
+                            col += 1
+                        out.append((gx + start * s, op.y + row * s, (col - start) * s, s))
+                    else:
+                        col += 1
+        return out
+    # Polyline: integer Bresenham, every point stamped as a width x width square.
+    pixels: set = set()
+    half = op.width // 2
+    for (x0, y0), (x1, y1) in zip(op.points, op.points[1:]):
+        for x, y in _bresenham(x0, y0, x1, y1):
+            for dy in range(op.width):
+                for dx in range(op.width):
+                    pixels.add((x - half + dx, y - half + dy))
+    return _runs(pixels)
+
+
+def rasterize(ops) -> bytearray:
+    """RGB pixels, row-major from the top left. Ops paint in order, clipped."""
+    buf = bytearray(bytes.fromhex(CARD_PALETTE["bg"][1:]) * (CARD_W * CARD_H))
+    for op in ops:
+        px = bytes.fromhex(op.colour[1:])
+        for x, y, w, h in op_rects(op):
+            x0, y0 = max(x, 0), max(y, 0)
+            x1, y1 = min(x + w, CARD_W), min(y + h, CARD_H)
+            if x0 >= x1 or y0 >= y1:
+                continue
+            run = px * (x1 - x0)
+            for yy in range(y0, y1):
+                o = (yy * CARD_W + x0) * 3
+                buf[o:o + len(run)] = run
+    return buf
+
+
+def _png_chunk(tag: bytes, body: bytes) -> bytes:
+    return (struct.pack(">I", len(body)) + tag + body
+            + struct.pack(">I", zlib.crc32(tag + body) & 0xFFFFFFFF))
+
+
+def png_bytes(ops) -> bytes:
+    """An 8-bit RGB PNG of the ops, from the standard library alone."""
+    buf, stride = rasterize(ops), CARD_W * 3
+    raw = b"".join(b"\x00" + bytes(buf[y * stride:(y + 1) * stride]) for y in range(CARD_H))
+    ihdr = struct.pack(">IIBBBBB", CARD_W, CARD_H, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", ihdr)
+            + _png_chunk(b"IDAT", zlib.compress(raw, 9)) + _png_chunk(b"IEND", b""))
+
+
+def svg_text(ops) -> str:
+    """The same pixels as png_bytes, as integer-aligned paths in paint order.
+
+    No <text> elements: a glyph is pixels, so nothing on a card can be copied,
+    searched or indexed as text.
+    """
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{CARD_W}" height="{CARD_H}" '
+             f'viewBox="0 0 {CARD_W} {CARD_H}" shape-rendering="crispEdges">',
+             f'<rect width="{CARD_W}" height="{CARD_H}" fill="{CARD_PALETTE["bg"]}"/>']
+    for op in ops:
+        d = "".join(f"M{x} {y}h{w}v{h}h{-w}z" for x, y, w, h in op_rects(op))
+        if d:
+            parts.append(f'<path fill="{op.colour}" d="{d}"/>')
+    parts.append("</svg>")
+    return "\n".join(parts) + "\n"
+
+
 # --------------------------------------------------------------------------
 # The --json contract
 #
