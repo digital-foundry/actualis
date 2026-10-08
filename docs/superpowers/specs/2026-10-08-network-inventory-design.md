@@ -109,14 +109,40 @@ counted and shown, marked failed.
 A refused call never ran. It gives no item and stays in the existing
 refusals section.
 
-### 1.4 Out of sight (stated in `--explain network`)
+### 1.4 What is read, what is counted unreadable, what stays out of sight (stated in `--explain network`)
 
-What happens inside the following is not visible in the transcript and is
-not inferred:
+The tokenizer reads the dequoted text, so `cu''rl` is `curl`. It reads, as
+commands of their own:
 
-- `bash script.sh`, `make`, `npm run`, `just`;
-- postinstall hooks;
-- language-level fetches (`requests.get` in a `python -c`).
+- command substitution (`$(...)`, backticks) and process substitution
+  (`<(...)`), to three levels;
+- the string after a shell's `-c`, including combined flags (`bash -lc`,
+  `sh -xc`), and the arguments of `eval`;
+- loop and group bodies (`if`/`while`/`until`/`do`/`then`, `{ }`, `( )`, a
+  leading `!`);
+- through the wrappers `sudo env time nice nohup command exec timeout stdbuf
+  doas busybox xargs`, and `VAR=value`. Under `xargs` the arguments may be on
+  stdin, so a bare `xargs curl` is a fetch with a variable host.
+
+Counted, not skipped silently, in `totals.unparsed_segments`: a segment with a
+quote left open, and substitution nested deeper than three levels.
+
+A git remote name resolves to the URL it was added (`git remote add|set-url`)
+or cloned with earlier in the same agent and session. A name that resolves to
+nothing has no host: it stays in the inventory and is never a strict finding.
+
+Out of sight, and not inferred. The residue falls in these categories:
+
+- scripts and build tools: `bash script.sh`, `make`, `npm run`, `just`,
+  postinstall hooks;
+- code that fetches: `python -c`, `node -e`, `perl`, `ruby`, `php`, `nc`,
+  `/dev/tcp`, `openssl s_client`;
+- names built at run time: `$CMD`, aliases, brace expansion, ANSI-C quoting,
+  `env -S`, a command piped or here-stringed into a shell;
+- a command after a single `&`;
+- programs not recognised (`aria2c`, `httpie`, `scp`, `rsync`, `npm exec`,
+  `yarn dlx`, `pip download`, `gem`, `apt-get`, `cargo binstall`);
+- a URL with no scheme.
 
 ## 2. Approval
 

@@ -866,7 +866,7 @@ class TestReport(unittest.TestCase):
         for needle in ("tripwire", "not a guarantee", "python -c", "node -e", "postinstall",
                        "Makefiles", "eval", "$CMD", "xargs", "busybox", "3 levels",
                        "unparsed_segments", ".actualis-network-trust", ".actualis-suppressions",
-                       "cannot be suppressed", "tee", "sed -i", "Write/Edit", "dd of=", "cp x ."):
+                       "cannot be suppressed", "tee", "Write/Edit", "known reader"):
             self.assertIn(needle, text, needle)
         for line in entry["formula"] + entry["assumes"]:
             self.assertLessEqual(len(line), 78, line)
@@ -953,7 +953,7 @@ class TestReportFixes(unittest.TestCase):
 
     def test_explain_prefix_list(self):
         text = " ".join(af.EXPLAIN["network"]["formula"])
-        self.assertIn("command, exec", text)
+        self.assertIn("command exec", text)
 
 
 if __name__ == "__main__":
@@ -1827,3 +1827,24 @@ class TestUserPassFailsClosed(unittest.TestCase):
             af.redact(cmd)
             af.classify_secrets(cmd)
             self.assertLess(time.perf_counter() - t, 0.5)
+
+
+class TestExplainNetwork(unittest.TestCase):
+    def text(self):
+        e = af.EXPLAIN["network"]
+        return "\n".join(e["formula"] + e["assumes"])
+
+    def test_covers_what_is_read_and_the_residue(self):
+        t = self.text()
+        for needle in ("-lc", "eval", "xargs", "<(...)", "timeout", "unparsed_segments",
+                       "same session", "ANSI-C", "aria2c",
+                       "~/.config/actualis/suppressions", "tripwire"):
+            self.assertIn(needle, t)
+
+    def test_the_old_claims_are_gone(self):
+        t = self.text()
+        self.assertNotIn("bash -c \"...\" read as commands", t)
+        self.assertNotIn("anything run through eval, $CMD, xargs or busybox", t)
+        self.assertNotIn("(python -c \"open(...)\"), cp x . and dd of=", t)
+        for line in af.EXPLAIN["network"]["formula"] + af.EXPLAIN["network"]["assumes"]:
+            self.assertLessEqual(len(line), 78, line)

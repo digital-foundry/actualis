@@ -168,7 +168,7 @@ shell commands and web tools.
 | `totals.items` | all network items found |
 | `totals.asked` / `unasked` / `unknown` | items by approval, see below |
 | `totals.failed` | items whose command is known to have failed |
-| `totals.unparsed_segments` | command segments that looked like network use but could not be parsed |
+| `totals.unparsed_segments` | command segments that could not be read: a segment with a quote left open, or substitution nested deeper than three levels |
 | `by_kind` | counts of `install`, `clone`, `fetch` and `search` items |
 | `hosts[]` | per host: `count`, `unasked`, `first_seen`, and `trusted` if any item from it matched the trust list |
 | `packages[]` | per `ecosystem` and `name`: `versions` seen, `pinned` (every install named an exact version: a full `MAJOR.MINOR.PATCH` for npm, crates and go, `==` for pypi, an `@sha256:` digest for images; ranges, tags and prefixes are not pinned), `exec` (any install ran code), `count` |
