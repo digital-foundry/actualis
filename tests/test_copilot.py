@@ -210,3 +210,24 @@ class TestCopilotReplay(unittest.TestCase):
             state = fx.write_sessions(Path(td) / "session-state")
             events = af.replay_events(None, str(state))
         self.assertEqual({e.vendor for e in events}, {"copilot"})
+
+
+class TestCopilotMalformedContext(unittest.TestCase):
+
+    def test_non_string_context_values_cannot_abort_a_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td) / "session-state"
+            d = state / "cccccccc-0000-4000-8000-000000000001"
+            d.mkdir(parents=True)
+            with (d / "events.jsonl").open("w", encoding="utf-8", newline="\n") as fh:
+                fh.write(json.dumps({"type": "session.start", "timestamp": "2026-09-06T10:00:00Z",
+                                     "data": {"context": {"gitRoot": {"x": 1}, "cwd": 7,
+                                                          "branch": ["a"]}}}) + "\n")
+                fh.write(json.dumps({"type": "tool.execution_start",
+                                     "timestamp": "2026-09-06T10:00:01Z",
+                                     "data": {"toolName": "bash",
+                                              "arguments": {"command": "echo hi"}}}) + "\n")
+            f = _fleet(state)
+            self.assertEqual(f.permission_modes["copilot:auto"], 1)
+            events = af.replay_events(None, str(state))
+        self.assertEqual([e.cmd for e in events], ["echo hi"])

@@ -1437,6 +1437,19 @@ def copilot_roots() -> list[Path]:
     return [sess] if sess.is_dir() else []
 
 
+def _copilot_context(ctx: dict, cwd: str, branch: str) -> tuple[str, str]:
+    """Take cwd and branch from a Copilot context, only where they are non-empty strings."""
+    for key in ("gitRoot", "cwd"):
+        v = ctx.get(key)
+        if isinstance(v, str) and v:
+            cwd = v
+            break
+    b = ctx.get("branch")
+    if isinstance(b, str) and b:
+        branch = b
+    return cwd, branch
+
+
 # permission.completed result kinds that let the command run. Every other kind
 # is a refusal -- a mapping taken from the schema, because no denial has been
 # observed in a real session yet. --explain copilot says so.
@@ -1887,8 +1900,7 @@ class Fleet:
                     if kind in ("session.start", "session.context_changed"):
                         ctx = data.get("context") if kind == "session.start" else data
                         if isinstance(ctx, dict):
-                            cwd = ctx.get("gitRoot") or ctx.get("cwd") or cwd
-                            branch = ctx.get("branch") or branch
+                            cwd, branch = _copilot_context(ctx, cwd, branch)
                     elif kind == "tool.execution_start":
                         name = str(data.get("toolName") or "?")
                         args = data.get("arguments")
@@ -5941,8 +5953,7 @@ def _copilot_events(roots: list[Path], since: datetime | None) -> list[ReplayEve
                     if kind in ("session.start", "session.context_changed"):
                         ctx = rec["data"].get("context") if kind == "session.start" else rec["data"]
                         if isinstance(ctx, dict):
-                            cwd = ctx.get("gitRoot") or ctx.get("cwd") or cwd
-                            branch = ctx.get("branch") or branch
+                            cwd, branch = _copilot_context(ctx, cwd, branch)
                         continue
                     ts = parse_ts(rec.get("timestamp"))
                     if ts is None or (since and ts < since):
