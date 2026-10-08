@@ -637,9 +637,14 @@ class TestCardLeaksNothing(unittest.TestCase):
                 ops = layout(m)
                 yield mode, f"{style}.ops", repr(ops)
                 yield mode, f"{style}.svg", af.svg_text(ops)
+                yield mode, f"{style}.png-raw", af.png_bytes(ops).decode("latin-1")
                 yield mode, f"{style}.png", bytes(_png_pixels(af.png_bytes(ops))).decode("latin-1")
 
     def test_no_identifying_string_reaches_any_surface(self):
+        canary = af.Fleet()
+        canary.add_tool("p", "Bash", {"command": "export K=sk_live_leakcanary1234567"},
+                        datetime(2026, 8, 1, tzinfo=timezone.utc), "auto")
+        self.assertTrue(canary.secrets, "the sk_live canary itself must be recognised as a secret")
         f = self._fleet()
         fps = list(f.secrets)
         self.assertTrue(fps, "the canary must have been detected for this test to mean anything")
@@ -656,25 +661,35 @@ class TestCardLeaksNothing(unittest.TestCase):
         with fx.isolated_home() as home, tempfile.TemporaryDirectory() as out:
             p = home / ".claude" / "projects" / "-Users-someone-private-ACME-CLASSIFIED-MERGER"
             p.mkdir(parents=True)
+            cmds = ["psql postgresql://u:hunter2pass@internal-db.corp.example.com/x",
+                    "cat /Users/someone/private/repo/.env",
+                    "export K=sk_live_leakcanary1234567",
+                    "./acme-deploy --prod",
+                    "export K=sk_live_leakcanary1234567 && ./acme-deploy --prod"]
+            fps = sorted({fp for c in cmds for _p, _k, fp in af.classify_secrets(c)})
+            self.assertTrue(fps, "the seeded commands must contain a detectable secret")
+            needles = self.NEEDLES + fps
             recs = [{"timestamp": f"2026-09-0{d}T10:00:00Z", "permissionMode": "auto",
                      "gitBranch": "feat/9999-project-tigerclaw",
                      "message": {"id": f"m{d}", "model": "ft:leaktest-model",
-                                 "usage": {"output_tokens": 1000},
+                                 "usage": {"output_tokens": 1_000_000},
                                  "content": [{"type": "tool_use", "id": f"t{d}", "name": "Bash",
-                                              "input": {"command":
-                                                        "export K=sk_live_leakcanary1234567"}}]}}
+                                              "input": {"command": cmds[d - 1]}}]}}
                     for d in range(1, 6)]
             (p / "s.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
             for mode in af.CARD_MODES:
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
                     self.assertEqual(af.main(["--card", mode, "--out", out]), af.EXIT_OK)
-                for needle in self.NEEDLES:
+                self.assertIn("uv tool install actualis", buf.getvalue())
+                for needle in needles:
                     with self.subTest(mode=mode, needle=needle):
                         self.assertNotIn(needle, buf.getvalue().replace(out, ""))
-            for written in Path(out).iterdir():
+            files = list(Path(out).iterdir())
+            self.assertEqual(len(files), 6)
+            for written in files:
                 body = written.read_bytes().decode("latin-1")
-                for needle in self.NEEDLES:
+                for needle in needles:
                     with self.subTest(file=written.name, needle=needle):
                         self.assertNotIn(needle, body)
 
