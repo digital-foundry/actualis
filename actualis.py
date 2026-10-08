@@ -3390,6 +3390,10 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "counts as auto -- unsupervised -- even though a person approved the rule.",
             "A session with no session.shutdown record is counted unpriced. No cost",
             "is estimated for it.",
+            "Cache writes carry no TTL, so they are priced at the 1h rate, the same",
+            "assumption as a Claude record with no TTL split. If Copilot uses",
+            "5-minute caching, this overstates its cost (by about 12% on observed",
+            "sessions).",
             "session.db is not read; events.jsonl carries everything used here.",
         ],
         "verify": ("jq -c 'select(.type==\"session.shutdown\") | .data.modelMetrics' "
@@ -4381,6 +4385,10 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
         print(f"  tokens        {num(tok)}")
         print(f"  {c.bold}cost{c.off}          {c.bold}{money(fleet.total_cost)}{c.off} "
               f"{c.dim}notional, at API list price{c.off}")
+        if fleet.copilot_unpriced:
+            n_u = fleet.copilot_unpriced
+            print(f"  {c.dim}{n_u} Copilot session{'s' if n_u != 1 else ''} "
+                  f"unpriced (no shutdown record){c.off}")
         if active >= 2:
             per_day = fleet.total_cost / active
             print(f"  {c.dim}per active day {money(per_day)}"
@@ -4763,9 +4771,14 @@ def render_share(fleet: "Fleet", c: C) -> None:
               f"history   {d}{num(crit)} critical, {num(rotate)} worth rotating{o}")
 
     if fleet.msgs_by_model:
+        # Through the same gate as the card: a fine-tune id is identifying.
+        shown: Counter = Counter()
+        for m, n in fleet.msgs_by_model.items():
+            if m != "<synthetic>":
+                shown[card_model_name(m)] += n
         print(f"\n  {d}models{o}  " + "   ".join(
             f"{m} {n / sum(fleet.msgs_by_model.values()) * 100:.0f}%"
-            for m, n in fleet.msgs_by_model.most_common(4) if m != "<synthetic>"))
+            for m, n in shown.most_common(4)))
 
     findings = coach(fleet)
     if findings:
@@ -4873,8 +4886,8 @@ def card_model(fleet: "Fleet", mode: str, days: int | None = None,
         m["share"] = (f"My coding agents used {m['hero']} of compute at API list price "
                       f"in the last {n} days. {CARD_INSTALL}" if priced else
                       f"What my coding agents actually ran, last {n} days. {CARD_INSTALL}")
-        stats = [(_whole_money(total / fleet.active_days), "per active day"),
-                 (_whole_money(saved), "cache saved"), (agents, "agents")]
+        stats = [(_whole_money(total / fleet.active_days) if priced else "—", "per active day"),
+                 (_whole_money(saved) if priced else "—", "cache saved"), (agents, "agents")]
         premium = fleet.premium_requests_by_agent.get("copilot", 0.0)
         if premium:
             stats.append((_fraction(premium), "premium requests"))
@@ -5358,6 +5371,7 @@ JSON_SCHEMA: dict[str, str] = {
     "messages": "int",
     "cost_usd": "float",
     "cost_usd_from_unpriced_models": "float",
+    "copilot_unpriced_sessions": "int",
     "pricing.verified": "str",
     "pricing.age_days": "int",
     "pricing.stale": "bool",
@@ -5583,6 +5597,7 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
         "messages": fleet.messages,
         "cost_usd": float(round(fleet.total_cost, 4)),
         "cost_usd_from_unpriced_models": float(round(fleet.cost_unknown, 4)),
+        "copilot_unpriced_sessions": int(fleet.copilot_unpriced),
         "pricing": {
             "verified": PRICING_VERIFIED,
             "age_days": pricing_age_days(),
@@ -6782,6 +6797,27 @@ def main(argv: list[str] | None = None) -> int:
     # cannot carry the report's glyphs, printing raises rather than degrades.
     make_output_printable(args.json)
 
+    if args.card and args.json:
+        ap.error("--card writes files; it cannot also emit --json.")
+    if args.card:
+        for flag, on in (("--fail-on", args.fail_on), ("--diff", args.diff),
+                         ("--why", args.why), ("--share", args.share),
+                         ("--watch", args.watch), ("--mcp", args.mcp),
+                         ("--replay", args.replay),
+                         ("--self-check", args.self_check),
+                         ("--suppress", args.suppress),
+                         ("--suppressions", args.suppressions),
+                         ("--explain", args.explain is not None),
+                         ("--agents", args.agents),
+                         ("--completions", args.completions),
+                         ("--service", args.service)):
+            if on:
+                ap.error(f"--card writes files; it cannot be combined with {flag}.")
+        card_dir = Path(args.out).expanduser() if args.out else Path.cwd()
+        if not card_dir.is_dir():
+            print(f"actualis: {card_dir} is not a directory.\n"
+                  "  --out takes the directory the card is written into.", file=sys.stderr)
+            return EXIT_CANNOT_RUN
     if args.service:
         # Unit to stdout, instructions to stderr: `> file` must yield a file
         # that works, and still tell the user what to do with it.
@@ -6804,20 +6840,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.diff and args.json:
         ap.error("--diff renders a comparison; it cannot also emit --json. "
                  "Save this run with --json, then diff the two files.")
-    if args.card and args.json:
-        ap.error("--card writes files; it cannot also emit --json.")
-    if args.card:
-        for flag, on in (("--fail-on", args.fail_on), ("--diff", args.diff),
-                         ("--why", args.why), ("--share", args.share),
-                         ("--watch", args.watch), ("--mcp", args.mcp),
-                         ("--replay", args.replay)):
-            if on:
-                ap.error(f"--card writes files; it cannot be combined with {flag}.")
-        card_dir = Path(args.out).expanduser() if args.out else Path.cwd()
-        if not card_dir.is_dir():
-            print(f"actualis: {card_dir} is not a directory.\n"
-                  "  --out takes the directory the card is written into.", file=sys.stderr)
-            return EXIT_CANNOT_RUN
     if not args.card and (args.style != "hero" or args.out):
         ap.error("--style and --out apply only to --card.")
 

@@ -16,6 +16,7 @@ that and prints a warning.
 | `messages` | count of assistant messages with usage |
 | `cost_usd` | total, at provider list prices |
 | `cost_usd_from_unpriced_models` | how much of `cost_usd` came from models with no published rate |
+| `copilot_unpriced_sessions` | Copilot sessions with no shutdown record, counted but not priced (not $0) |
 | `cost_note` | how unpriced models are rated, and in which direction that errs |
 | `pricing` | where each rate came from, how old the table is, and how much of the total rests on a published price. See [Rate provenance](#rate-provenance) |
 | `duplicate_usage_records_skipped` | repeated records for the same message, counted once |

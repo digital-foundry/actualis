@@ -224,6 +224,8 @@ class TestCardModel(unittest.TestCase):
         m = af.card_model(f, "cost")
         self.assertEqual(m["hero"], "—")
         self.assertEqual(m["caption"], "no priced usage in window")
+        for value, _label in m["stats"]:
+            self.assertNotIn("$", value)
 
     def test_premium_row_only_with_copilot(self):
         f = _busy_fleet()
@@ -549,6 +551,21 @@ class TestCardCli(unittest.TestCase):
             with self.subTest(flag=flag):
                 err = io.StringIO()
                 with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+                    af.main(argv)
+                self.assertIn("cannot be combined with " + flag, err.getvalue())
+
+    def test_card_with_an_early_exit_flag_is_an_error(self):
+        for argv, flag in ((["--card", "--self-check"], "--self-check"),
+                           (["--card", "--explain"], "--explain"),
+                           (["--card", "--agents"], "--agents"),
+                           (["--card", "--suppressions"], "--suppressions"),
+                           (["--card", "--suppress", "abcd1234"], "--suppress"),
+                           (["--card", "--completions", "bash"], "--completions"),
+                           (["--card", "--service", "systemd"], "--service")):
+            with self.subTest(flag=flag):
+                err = io.StringIO()
+                with self.assertRaises(SystemExit), contextlib.redirect_stderr(err), \
+                        contextlib.redirect_stdout(io.StringIO()):
                     af.main(argv)
                 self.assertIn("cannot be combined with " + flag, err.getvalue())
 

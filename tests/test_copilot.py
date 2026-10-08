@@ -252,6 +252,24 @@ class TestCopilotCapabilities(unittest.TestCase):
         self.assertIn("not been observed", text)
         self.assertIn("unpriced", text)
 
+    def test_explain_copilot_states_the_cache_ttl_assumption(self):
+        self.assertIn("1h", " ".join(af.EXPLAIN["copilot"]["assumes"]))
+
+    def test_unpriced_sessions_are_shown_and_in_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = fx.write_sessions(Path(td) / "session-state")
+            f = _fleet(state, project="atlas")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            af.render(f, af.C(False), bash_only=False, top=10)
+        self.assertIn("1 Copilot session unpriced (no shutdown record)", buf.getvalue())
+        self.assertEqual(af.to_json(f)["copilot_unpriced_sessions"], 1)
+        f.copilot_unpriced = 2
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            af.render(f, af.C(False), bash_only=False, top=10)
+        self.assertIn("2 Copilot sessions unpriced (no shutdown record)", buf.getvalue())
+
     def test_refusals_section_warns_about_copilot_kinds(self):
         f = af.Fleet()
         f.add_usage("p", "claude-opus-5", {"output_tokens": 1},

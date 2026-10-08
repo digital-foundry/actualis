@@ -585,7 +585,7 @@ class TestShareLeakage(unittest.TestCase):
 
     SECRETS = ["ACME-CLASSIFIED-MERGER", "feat/9999-project-tigerclaw",
                "/Users/someone/private/repo", "sk_live_leakcanary1234567",
-               "internal-db.corp.example.com", "#9999"]
+               "internal-db.corp.example.com", "#9999", "ft:leaktest-model"]
 
     def _share_output(self):
         import io, contextlib
@@ -602,6 +602,9 @@ class TestShareLeakage(unittest.TestCase):
                    {"command": "psql postgresql://u:hunter2pass@internal-db.corp.example.com/x "
                                "&& export K=sk_live_leakcanary1234567 "
                                "&& cat /Users/someone/private/repo/.env"}, ts)
+        for _ in range(5):
+            f.add_usage("ACME-CLASSIFIED-MERGER", "ft:leaktest-model",
+                        {"output_tokens": 10}, ts, "main")
         f.add_subagent({"resolvedModel": "claude-sonnet-5", "status": "completed",
                         "totalDurationMs": 1000, "totalTokens": 10,
                         "toolStats": {"bashCount": 40}, "usage": {"output_tokens": 1}}, ts)
@@ -618,6 +621,12 @@ class TestShareLeakage(unittest.TestCase):
         for needle in self.SECRETS:
             with self.subTest(needle=needle):
                 self.assertNotIn(needle, out)
+
+    def test_model_line_shows_custom_for_unlisted_models(self):
+        out = self._share_output()
+        line = next(l for l in out.splitlines() if "models" in l and "%" in l)
+        self.assertIn("custom", line)
+        self.assertIn("claude-opus-5", line)
 
     def test_no_secret_fingerprints_leak(self):
         """Even a hash is an identifier that could be correlated."""
