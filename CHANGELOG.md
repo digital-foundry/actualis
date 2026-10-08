@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.2.0 — unreleased
+
+Actualis now reads Copilot CLI. Post your card.
+
+### Added
+
+- **GitHub Copilot CLI sessions are read**, from
+  `$COPILOT_HOME/session-state/*/events.jsonl` (default `~/.copilot`): shell
+  commands into the same audit, cost per model per session, supervision per
+  command, refusals, subagents and premium requests. `--agent copilot` reads it
+  alone. Copilot reports `inputTokens` *including* cache reads and writes for
+  every provider, and Claude model ids with dots; both are handled, and
+  `--explain copilot` says how. Refusal kinds are mapped from the event schema
+  because no real denial has been observed yet, and the report says so where a
+  Copilot refusal appears.
+- **`--card`** writes a 1200×630 SVG and PNG to post: `supervision`, `cost` or
+  `volume`, in a `hero` or `terminal` style. Standard library only. The SVG and
+  PNG are drawn from one list of pixel runs, so they cannot disagree. Nothing
+  identifying can reach either, and the leak test now checks both, plus the
+  printed caption.
+- **`--card` refuses to combine** with `--json`, `--fail-on`, `--diff`, `--why`,
+  `--share`, `--watch`, `--mcp` and `--replay`, so a card run can never
+  silently skip a CI gate.
+- **The MCP server (`--mcp`) now sees Copilot sessions** too.
+
+### Changed
+
+- **The card counts supervision per shell command**, using the permission mode
+  in force when each command ran, rather than per turn. `--share` still counts
+  per turn, but `--share` and the card now share the one definition of
+  "unsupervised" the AISVS mapping already used, so `codex:never` counts there
+  too.
+- **MCP `fleet_summary` uses the same single "unsupervised" definition**, so
+  `codex:never` counts as unsupervised there as well.
+- The vendor matrix (`--explain vendors`, `--json`) has a `copilot` column.
+
 ## 0.1.14 — 2026-09-05
 
 ### Fixed

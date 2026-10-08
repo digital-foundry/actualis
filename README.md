@@ -160,7 +160,7 @@ python3 actualis.py --watch          # live alerting on new secrets
 python3 actualis.py --project svc    # filter to matching projects
 python3 actualis.py --json           # machine-readable
 python3 actualis.py --top 25         # show more projects
-python3 actualis.py --agent codex    # one agent only (claude | codex | all)
+python3 actualis.py --agent codex    # one agent only (claude | codex | copilot | all)
 ```
 
 ### All options
@@ -365,6 +365,29 @@ The test suite plants identifying strings — a project name, a branch, a path, 
 live-shaped key, an internal hostname — and asserts that none of them can reach
 this output. Secret fingerprints are excluded too, since a hash is still an
 identifier that could be correlated.
+
+## Post your card
+
+`--share` prints a summary for people who read. `--card` draws one for people who scroll:
+
+    actualis --card                    # supervision: what % of shell commands nobody approved
+    actualis --card cost               # spend at API list price
+    actualis --card volume --style terminal
+
+<p align="center"><img src="docs/img/card-hero-supervision.png" width="600" alt="A hero card"> <img src="docs/img/card-terminal-cost.png" width="600" alt="A terminal card"></p>
+
+Each run writes `actualis-card.svg` and `actualis-card.png` (1200×630, the size social
+sites preview) to the current directory or `--out DIR`, and prints a caption you can
+paste beside it. It never overwrites; a second card is `actualis-card-2.*`.
+
+What is on it is counts, four command categories (`git`, `test`, `install`, `other`)
+and model names from the public price table. Everything else is `custom`. No project,
+branch, ticket, path, command, credential or fingerprint can reach it, and the test
+suite checks the SVG, the PNG pixels and the caption for each of them. The SVG has
+no text in it at all: every glyph is pixels.
+
+<sub>Images above are from the invented demo fleet. Regenerate with
+<code>tools/make-card-images.py</code>.</sub>
 
 ## Nothing is a black box
 
