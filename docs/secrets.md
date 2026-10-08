@@ -43,6 +43,26 @@ names is one secret carrying both names.
 master, root, prod, payment, or billing — a variable called
 `STRIPE_SECRET_KEY` is critical whatever its value looks like.
 
+**Passwords passed as options** — `curl -u user:PASS` (also `-uuser:PASS`,
+`--user`, `--user=`, `-U`, `--proxy-user`), `wget --password PASS` (also
+`--http-password`, `--ftp-password`, `--proxy-password`), and
+`docker login --password PASS` or `docker login -p PASS`. `high`. The user
+part of `user:PASS` stays readable; only the password is masked. A `uid:gid`
+pair, a shell reference and a placeholder are left alone, and the generic
+`-p` (`mysql -pPASS`, `sshpass -p`) is not read: `-p` means other things in
+other programs.
+
+These ids are **not** `sha256(value)[:8]`. A person chose the password, so a
+hash of it published in a report, a CI log or a committed
+`.actualis-suppressions` would let anyone confirm a guess offline. The id is
+derived from where the password appears instead: `sha256("opt:" + program +
+":" + option + ":" + user)[:8]`, with the program and option lowercased and
+the user taken from `user:PASS`, `-u`, `--username` or `--user` in the same
+command. The trade-off is accepted: two different passwords for the same user,
+program and option share one id, so rotating one and reusing the line still
+shows as the same entry. Vendor-prefixed tokens, URL passwords and named
+variables keep their value-based ids for now.
+
 ## Deliberately not flagged
 
 Both classes below were found firing on real data and removed. A scanner that

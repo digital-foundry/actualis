@@ -1250,3 +1250,56 @@ class TestNetworkFastPath(unittest.TestCase):
     def test_basename_helper(self):
         self.assertEqual(af._net_base("/usr/local/bin/curl"), "curl")
         self.assertEqual(af._net_base("curl"), "curl")
+
+
+class TestOptionSecretIds(unittest.TestCase):
+    """F1a: a guessable password passed as an option gets an id from where it
+    appears, never from its value, so a published id confirms no guess."""
+
+    def ids(self, cmd):
+        return [fp for _p, _k, fp in af.classify_secrets(cmd)]
+
+    def test_same_location_same_id(self):
+        self.assertEqual(self.ids("curl -u alice:Hunter2 x"), self.ids("curl -u alice:Other9 y"))
+        self.assertEqual(len(self.ids("curl -u alice:Hunter2 x")), 1)
+
+    def test_id_is_never_the_value_hash(self):
+        import hashlib
+        for cmd, value in (("curl -u alice:Hunter2 x", "Hunter2"), ("curl --user=alice:Hunter2 x", "Hunter2"),
+                           ("wget --password Hunter2 x", "Hunter2"), ("wget --http-password Hunter2 x", "Hunter2"),
+                           ("wget --ftp-password Hunter2 x", "Hunter2"),
+                           ("docker login -u bob --password Hunter2 r", "Hunter2"),
+                           ("docker login -u bob -p Hunter2 r", "Hunter2")):
+            with self.subTest(cmd=cmd):
+                ids = self.ids(cmd)
+                self.assertTrue(ids)
+                self.assertNotIn(hashlib.sha256(value.encode()).hexdigest()[:8], ids)
+                for fp in ids:
+                    self.assertRegex(fp, r"^[0-9a-f]{8}$")
+
+    def test_user_program_and_option_separate_ids(self):
+        alice = self.ids("curl -u alice:Hunter2 x")
+        self.assertNotEqual(alice, self.ids("curl -u bob:Hunter2 x"))
+        self.assertNotEqual(alice, self.ids("curl --proxy-user alice:Hunter2 x"))
+        self.assertNotEqual(self.ids("docker login -u bob -p Hunter2 r"),
+                            self.ids("docker login -u eve -p Hunter2 r"))
+
+    def test_existing_ids_do_not_move(self):
+        # Fixture: ids as shipped at c596778, before this wave.
+        fixture = {
+            "export K=sk_live_abcdefghijklmnopqrst": "5e346453",
+            "TOKEN=ghp_abcdefghijklmnopqrst": "45df8dac",
+            "psql postgresql://u:realpassword@db.prod.example.com/x": "71c5d021",
+            "STRIPE_SECRET_KEY=abcdefghijklmnop": "f39dac6c",
+        }
+        for cmd, fp in fixture.items():
+            with self.subTest(cmd=cmd):
+                self.assertIn(fp, self.ids(cmd))
+
+    def test_location_ids_are_linear(self):
+        import time
+        for text in ("-u a:b " * 4600, "--password x " * 2700, "docker login -p x " * 1800,
+                     "wget --password x; " * 1700):
+            t0 = time.perf_counter()
+            af.classify_secrets(text)
+            self.assertLess(time.perf_counter() - t0, 0.1, text[:12])

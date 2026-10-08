@@ -581,6 +581,61 @@ _OPTION_SECRETS = ((_OPT_USERPASS, 5), (_OPT_PASSWORD, 4), (_OPT_DOCKER_LOGIN_P,
 _OPTION_HINT = re.compile(r"(?i)authorization|(?<!\S)-u|--(?:user|proxy-user|(?:http-|ftp-|proxy-)?password)|docker")
 
 
+# The user an option password belongs to, when the segment names one apart
+# from user:password: `docker login -u bob -p …`, `wget --user=bob --password …`.
+_OPT_USER_NAME = re.compile(r"(?<!\S)(?:-u|--username|--user)(?:=|\s+)['\"]?([^\s'\"=:]{1,128})")
+
+
+_SEGMENT_SEP = re.compile(r"[;|&\n]")
+
+
+class _OptionSecretIds:
+    """Ids for option passwords from WHERE they appear, never from their value.
+
+    A person chose the password, so sha256(value)[:8] published in a report,
+    a CI log or a committed suppressions file would confirm a guess offline.
+    The id hashes program, option and user instead. Two passwords for the
+    same user, program and option share one id; docs/secrets.md says so.
+
+    Segment bounds are found once per command and each segment's user is
+    looked up once, so many options in one long command stay linear.
+    """
+
+    def __init__(self, cmd: str):
+        self.cmd = cmd
+        self.seps = [m.start() for m in _SEGMENT_SEP.finditer(cmd)]
+        self.users: dict[int, str] = {}
+
+    def __call__(self, m: "re.Match", rx: "re.Pattern") -> str:
+        lo, hi, pos = 0, len(self.seps), m.start()   # first separator at or after pos
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self.seps[mid] < pos:
+                lo = mid + 1
+            else:
+                hi = mid
+        k = lo
+        start = self.seps[k - 1] + 1 if k else 0
+        end = self.seps[k] if k < len(self.seps) else len(self.cmd)
+        if rx is _OPT_DOCKER_LOGIN_P:
+            program, option = "docker", "-p"
+        else:
+            # The program is the segment's first word past any prefix; a
+            # bounded look is enough to find it.
+            head = self.cmd[start:min(m.start(), start + 512)].split()
+            words = _net_strip_prefixes(head)[0]
+            program, option = (_net_base(words[0]) if words else ""), m.group(1)
+        if rx is _OPT_USERPASS:
+            user = m.group(4)[:-1]
+        else:
+            if start not in self.users:
+                u = _OPT_USER_NAME.search(self.cmd, start, end)
+                self.users[start] = u.group(1) if u else ""
+            user = self.users[start]
+        basis = f"opt:{program.lower()}:{option.lower()}:{user}"
+        return hashlib.sha256(basis.encode("utf-8", "replace")).hexdigest()[:8]
+
+
 def _option_secret(value: str) -> bool:
     """An option value worth masking and counting. A uid:gid pair, a shell
     reference and a placeholder are none of them, and both detectors agree."""
@@ -991,10 +1046,10 @@ def classify_secrets(cmd: str) -> list[tuple[str, str, str]]:
     out: list[tuple[str, str, str]] = []
     seen: set[str] = set()
 
-    def add(priority: str, kind: str, value: str) -> None:
+    def add(priority: str, kind: str, value: str, fp: str | None = None) -> None:
         if _looks_like_placeholder(value) or is_vendor_example(value):
             return
-        fp = hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:8]
+        fp = fp or hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:8]
         if fp in seen:
             return
         seen.add(fp)
@@ -1022,9 +1077,10 @@ def classify_secrets(cmd: str) -> list[tuple[str, str, str]]:
     # Roadmap S1: every form redact() masks is counted here too, through the
     # same compiled rules, so the rotation list and the masking cannot drift.
     if _OPTION_HINT.search(cmd):
+        where = _OptionSecretIds(cmd)
         for rx, group in _OPTION_SECRETS:
             for m in rx.finditer(cmd):
-                add("high", "password option", m.group(group))
+                add("high", "password option", m.group(group), where(m, rx))
         for m in _SECRET_PATTERNS[2].finditer(cmd):
             add("high", "Authorization header", m.group(2))
     # A password is short. _NAMED_SECRET wants 12 characters, which suits a
