@@ -365,5 +365,35 @@ class TestOtherAgents(unittest.TestCase):
                          ("copilot", "a.io", "unasked", sid))
 
 
+class TestFleetFixRound1(unittest.TestCase):
+    def test_error_only_result_does_not_move_subagent_counters(self):
+        sub = result("t1", True)
+        sub["toolUseResult"] = {"toolStats": {"bashCount": 1}, "status": "completed",
+                                "totalDurationMs": 5, "resolvedModel": "claude-sonnet-4-5"}
+        with tempfile.TemporaryDirectory() as tmp:
+            f = claude_session(tmp, [call("t1", "curl https://a.io/x"), sub])
+            base = claude_session(tmp, [call("t1", "curl https://a.io/x")])
+        self.assertEqual(f.sub_calls, base.sub_calls)
+        self.assertEqual(f.sub_calls, 0)
+        self.assertIs(f.network_items[0]["failed"], True)
+
+    def test_denial_without_is_error_drops_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = claude_session(tmp, [call("t1", "curl https://a.io/x"),
+                                     result("t1", False, "user-rejected")])
+        self.assertEqual(f.network_items, [])
+        self.assertEqual(f.refusals, 1)
+
+    def test_refusal_in_a_later_file_drops_the_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp) / "-Users-x-proj"
+            d.mkdir()
+            (d / "a.jsonl").write_text(json.dumps(call("t1", "curl https://a.io/x")) + "\n")
+            (d / "b.jsonl").write_text(json.dumps(result("t1", True, "user-rejected")) + "\n")
+            f = af.Fleet()
+            f.scan([Path(tmp)], None, None, progress=False)
+        self.assertEqual(f.network_items, [])
+
+
 if __name__ == "__main__":
     unittest.main()

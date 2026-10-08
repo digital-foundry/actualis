@@ -2813,11 +2813,13 @@ class Fleet:
                     # Cheap prefilter: skip lines that cannot contribute to any
                     # counter. Must include the permission fields, which live on
                     # records that carry neither usage nor tool_use.
-                    if ('"usage"' not in line and '"tool_use"' not in line
-                            and '"permissionMode"' not in line
-                            and '"toolDenialKind"' not in line
-                            and '"is_error":true' not in line
-                            and '"is_error": true' not in line):
+                    counts = not ('"usage"' not in line and '"tool_use"' not in line
+                                  and '"permissionMode"' not in line
+                                  and '"toolDenialKind"' not in line)
+                    # A line admitted only for its error result feeds the
+                    # network inventory alone, so no existing counter moves.
+                    if not counts and '"is_error":true' not in line \
+                            and '"is_error": true' not in line:
                         continue
                     try:
                         rec = json.loads(line)
@@ -2826,7 +2828,12 @@ class Fleet:
                     if not isinstance(rec, dict):
                         continue
 
-                    self._ingest_claude(rec, project, since, calls)
+                    if counts:
+                        self._ingest_claude(rec, project, since, calls)
+                    else:
+                        ts = parse_ts(rec.get("timestamp"))
+                        if not (since and ts and ts < since):
+                            self._network_results(rec)
         except OSError:
             return
 
@@ -2935,7 +2942,8 @@ class Fleet:
             return
         refused = bool(rec.get("toolDenialKind"))
         for b in content:
-            if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error"):
+            if isinstance(b, dict) and b.get("type") == "tool_result" \
+                    and (refused or b.get("is_error")):
                 self._network_outcome(f"claude:{b.get('tool_use_id') or ''}", refused)
 
     @property
