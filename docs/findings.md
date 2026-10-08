@@ -24,7 +24,7 @@ user, and it is why the thresholds below are mostly relative rather than absolut
 | [AF009](#af009) | info | one ticket cost >8× your median ticket |
 | [AF010](#af010) | info | >35% of spend cannot be tied to a ticket |
 | [AF011](#af011) | high | ≥10% of shell activity happened inside subagents |
-| [AF012](#af012) | critical | a scan of ≥500 messages collapsed zero repeated records |
+| [AF012](#af012) | critical | a scan of ≥500 Claude Code messages collapsed zero repeated records |
 | [AF013](#af013) | high / info | the rate table has not been checked in over 90 days |
 
 ---
@@ -134,6 +134,9 @@ re-emits an assistant record while a response streams — same `message.id`, sam
 usage block, a fresh record uuid — so a scan of any size normally collapses
 thousands of repeats. On a real corpus of 145,116 usage records, 50.9% were
 repeats.
+
+Only Claude Code messages count toward the 500: Codex and Copilot are
+recorded as whole sessions, which are never re-emitted.
 
 Zero repeats on a scan of 500 messages or more has not been observed in real
 transcripts. The likely cause is that the transcript format stopped carrying a

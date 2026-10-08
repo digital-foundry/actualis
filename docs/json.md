@@ -15,7 +15,7 @@ that and prints a warning.
 | `scanned` | `files`, `bytes`, `roots[]` |
 | `messages` | count of assistant messages with usage |
 | `cost_usd` | total, at provider list prices |
-| `cost_usd_from_unpriced_models` | how much of `cost_usd` came from models with no published rate |
+| `cost_usd_from_unpriced_models` | how much of `cost_usd` was estimated: models priced by family inference or the default ceiling, not from a price list, vendor docs or an aggregator |
 | `copilot_unpriced_sessions` | Copilot sessions with no shutdown record, counted but not priced (not $0) |
 | `cost_note` | how unpriced models are rated, and in which direction that errs |
 | `pricing` | where each rate came from, how old the table is, and how much of the total rests on a published price. See [Rate provenance](#rate-provenance) |
@@ -373,7 +373,9 @@ a differing usage payload, so the choice of which copy to keep does not matter.
 A non-zero value here is normal and healthy. Zero on a large scan is suspicious.
 
 `cost_usd_from_unpriced_models` is the share of `cost_usd` attributable to
-models absent from the rate table. Those are priced at the top of the known
+models absent from the rate table (priced by family inference or the default
+ceiling). Models priced from an aggregator are known, not unpriced; they are
+listed in `aggregator_priced_models`. Those are priced at the top of the known
 range for their provider, so that share is an upper bound among current models,
 not a measurement. It is reported separately rather than folded in so you can
 subtract it and see the floor. A model priced above everything in the table
