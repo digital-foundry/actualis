@@ -177,6 +177,9 @@ python3 actualis.py --agent codex    # one agent only (claude | codex | all)
 | `--coach` | findings and actions only |
 | `--aisvs` | which OWASP AISVS controls your transcripts show are **not** holding |
 | `--share` | postable summary with nothing identifying in it |
+| `--card [MODE]` | write a shareable 1200×630 SVG and PNG: `supervision` (default), `cost` or `volume`. Nothing identifying is on it, and it never overwrites |
+| `--style STYLE` | `--card` layout: `hero` (default) or `terminal` |
+| `--out DIR` | `--card`: the directory to write into (default: the current directory) |
 | `--json` | machine-readable ([schema](docs/json.md)) |
 | `--diff OLD.json` | compare against a saved `--json` report: what appeared, what went away, what got worse |
 | `--watch` | live monitor; alert on new secrets and risky commands |

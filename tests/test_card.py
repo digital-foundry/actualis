@@ -436,5 +436,133 @@ class TestCardLayouts(unittest.TestCase):
                               [op.text for op in ops if isinstance(op, af.Text)])
 
 
+GOLDENS = ROOT / "tests" / "goldens"
+UPDATE = os.environ.get("ACTUALIS_UPDATE_GOLDENS") == "1"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _fixtures as fx  # noqa: E402
+
+
+def _tool(name, file):
+    spec = importlib.util.spec_from_file_location(name, ROOT / "tools" / file)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestCardFiles(unittest.TestCase):
+
+    def test_first_card_has_no_suffix(self):
+        with tempfile.TemporaryDirectory() as td:
+            svg, png = af.card_paths(Path(td))
+        self.assertEqual((svg.name, png.name), ("actualis-card.svg", "actualis-card.png"))
+
+    def test_one_existing_file_bumps_both(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "actualis-card.png").write_bytes(b"mine")
+            svg, png = af.card_paths(Path(td))
+            self.assertEqual((svg.name, png.name),
+                             ("actualis-card-2.svg", "actualis-card-2.png"))
+            self.assertEqual((Path(td) / "actualis-card.png").read_bytes(), b"mine")
+
+    def test_write_card_never_overwrites(self):
+        m = af.card_model(_busy_fleet(), "volume")
+        with tempfile.TemporaryDirectory() as td:
+            a = af.write_card(m, "hero", Path(td))
+            b = af.write_card(m, "hero", Path(td))
+            self.assertNotEqual(a, b)
+            self.assertEqual(len(list(Path(td).iterdir())), 4)
+
+
+class TestCardCli(unittest.TestCase):
+
+    def _run(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = af.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_card_writes_two_files_and_a_caption(self):
+        with fx.isolated_home() as home, tempfile.TemporaryDirectory() as out:
+            fx.write_sessions(home / ".copilot" / "session-state")
+            rc, stdout, _ = self._run(["--card", "--out", out])
+            names = sorted(p.name for p in Path(out).iterdir())
+        self.assertEqual(rc, af.EXIT_OK)
+        self.assertEqual(names, ["actualis-card.png", "actualis-card.svg"])
+        self.assertIn("uv tool install actualis", stdout)
+        self.assertIn("actualis-card.svg", stdout)
+
+    def test_terminal_style_and_mode(self):
+        with fx.isolated_home() as home, tempfile.TemporaryDirectory() as out:
+            fx.write_sessions(home / ".copilot" / "session-state")
+            rc, _, _ = self._run(["--card", "cost", "--style", "terminal", "--out", out])
+        self.assertEqual(rc, af.EXIT_OK)
+
+    def test_out_must_be_a_directory(self):
+        with fx.isolated_home() as home, tempfile.TemporaryDirectory() as td:
+            fx.write_sessions(home / ".copilot" / "session-state")
+            target = Path(td) / "file.txt"
+            target.write_text("x")
+            rc, _, err = self._run(["--card", "--out", str(target)])
+            self.assertEqual(sorted(p.name for p in Path(td).iterdir()), ["file.txt"])
+        self.assertEqual(rc, af.EXIT_CANNOT_RUN)
+        self.assertIn("is not a directory", err)
+
+    def test_no_commands_exits_nonzero_and_writes_nothing(self):
+        with fx.isolated_home() as home, tempfile.TemporaryDirectory() as out:
+            p = home / ".claude" / "projects" / "proj"
+            p.mkdir(parents=True)
+            (p / "s.jsonl").write_text(json.dumps(
+                {"timestamp": "2026-09-01T00:00:00Z",
+                 "message": {"id": "m1", "model": "claude-opus-5",
+                             "usage": {"output_tokens": 10}}}) + "\n")
+            rc, _, err = self._run(["--card", "--out", out])
+            self.assertEqual(list(Path(out).iterdir()), [])
+        self.assertEqual(rc, af.EXIT_CANNOT_RUN)
+        self.assertIn("no shell commands in window — try --days or --card cost", err)
+
+    def test_card_and_json_conflict(self):
+        with self.assertRaises(SystemExit):
+            self._run(["--card", "--json"])
+
+    def test_style_without_card_is_an_error(self):
+        with self.assertRaises(SystemExit):
+            self._run(["--style", "terminal"])
+
+    def test_self_check_names_the_card_write_path(self):
+        with fx.isolated_home():
+            _, stdout, _ = self._run(["--self-check"])
+        self.assertIn("actualis-card", stdout)
+        self.assertIn("--card", stdout)
+
+
+class TestCardGoldens(unittest.TestCase):
+    """Cost goldens change when the price table does. Regenerate deliberately:
+    ACTUALIS_UPDATE_GOLDENS=1 python3 -m unittest discover -s tests -p test_card.py"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod, cls.cards = _tool("make_card_images", "make-card-images.py").cards()
+
+    def test_svg_goldens(self):
+        self.assertEqual(len(self.cards), 6)
+        for (style, mode), ops in self.cards.items():
+            with self.subTest(style=style, mode=mode):
+                got = self.mod.svg_text(ops)
+                path = GOLDENS / f"card-{style}-{mode}.svg"
+                if UPDATE:
+                    GOLDENS.mkdir(exist_ok=True)
+                    with path.open("w", encoding="utf-8", newline="\n") as fh:
+                        fh.write(got)
+                self.assertEqual(path.read_text(encoding="utf-8").replace("\r\n", "\n"), got)
+
+    def test_png_pixels_golden(self):
+        digest = hashlib.sha256(bytes(self.mod.rasterize(self.cards[("hero", "supervision")]))).hexdigest()
+        path = GOLDENS / "card-hero-supervision.pixels.sha256"
+        if UPDATE:
+            with path.open("w", encoding="utf-8", newline="\n") as fh:
+                fh.write(digest + "\n")
+        self.assertEqual(path.read_text(encoding="utf-8").strip(), digest)
+
+
 if __name__ == "__main__":
     unittest.main()

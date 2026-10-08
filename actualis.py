@@ -5284,6 +5284,32 @@ def layout_terminal(m: dict) -> list:
     return ops
 
 
+def card_paths(out_dir: Path) -> tuple:
+    """The first actualis-card[-N] where neither the .svg nor the .png exists.
+
+    Both files move together: a card whose SVG is -2 and PNG is -1 is two
+    different cards with one name.
+    """
+    n = 1
+    while True:
+        stem = "actualis-card" if n == 1 else f"actualis-card-{n}"
+        svg, png = out_dir / f"{stem}.svg", out_dir / f"{stem}.png"
+        if not svg.exists() and not png.exists():
+            return svg, png
+        n += 1
+
+
+def write_card(m: dict, style: str, out_dir: Path) -> tuple:
+    """Write one card. Mode "x" makes never-overwrite hold even under a race."""
+    ops = layout_hero(m) if style == "hero" else layout_terminal(m)
+    svg, png = card_paths(out_dir)
+    with svg.open("x", encoding="utf-8", newline="\n") as fh:
+        fh.write(svg_text(ops))
+    with png.open("xb") as fh:
+        fh.write(png_bytes(ops))
+    return svg, png
+
+
 # --------------------------------------------------------------------------
 # The --json contract
 #
@@ -6051,9 +6077,12 @@ def self_check(c: C, days: int | None = 7, root: str | None = None) -> int:
 
     # 3. Where this build is allowed to write, named explicitly.
     writable = [str(p) for p in suppression_paths()]
-    result(True, "the only write path in this build",
+    result(True, "the only write paths in this build",
            "Suppressions, and only when you pass --suppress: "
-           + "; ".join(writable))
+           + "; ".join(writable)
+           + ". A card, and only when you pass --card: actualis-card[-N].svg and "
+           "actualis-card[-N].png in the current directory, or in --out. Neither "
+           "is ever overwritten.")
 
     # 4. What the binary itself is, so it can be compared with what was published.
     try:
@@ -6552,6 +6581,7 @@ _VALUE_HINT = {          # option -> how the shell should complete its argument
     "--root": "dir",
     "--ci-log": "file",
     "--diff": "file",
+    "--out": "dir",
 }
 
 
@@ -6692,6 +6722,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="run as an MCP server over stdio so an agent can query itself")
     ap.add_argument("--share", action="store_true",
                     help="postable summary with nothing identifying in it")
+    ap.add_argument("--card", nargs="?", const="supervision", choices=CARD_MODES,
+                    metavar="MODE",
+                    help="write a shareable SVG and PNG card: supervision (default), "
+                         "cost or volume. Nothing identifying is on it")
+    ap.add_argument("--style", choices=CARD_STYLES, default="hero",
+                    help="--card layout: hero (default) or terminal")
+    ap.add_argument("--out", metavar="DIR",
+                    help="--card: directory to write into (default: current directory)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--watch", action="store_true",
                     help="live monitor: alert on new secrets and risky commands")
@@ -6758,6 +6796,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.diff and args.json:
         ap.error("--diff renders a comparison; it cannot also emit --json. "
                  "Save this run with --json, then diff the two files.")
+    if args.card and args.json:
+        ap.error("--card writes files; it cannot also emit --json.")
+    if not args.card and (args.style != "hero" or args.out):
+        ap.error("--style and --out apply only to --card.")
 
 
     since = None
@@ -6919,6 +6961,21 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.why:
         return render_why(args.why, fleet, C(use_color()))
+
+    if args.card:
+        out_dir = Path(args.out).expanduser() if args.out else Path.cwd()
+        if not out_dir.is_dir():
+            print(f"actualis: {out_dir} is not a directory.\n"
+                  "  --out takes the directory the card is written into.", file=sys.stderr)
+            return EXIT_CANNOT_RUN
+        try:
+            model = card_model(fleet, args.card, args.days)
+        except CardError as exc:
+            print(f"actualis: {exc}", file=sys.stderr)
+            return EXIT_CANNOT_RUN
+        svg, png = write_card(model, args.style, out_dir)
+        print(f"  {svg}\n  {png}\n\n  {model['share']}")
+        return EXIT_OK
 
     if args.json:
         json.dump(to_json(fleet, raw=args.no_redact), sys.stdout, indent=2)
