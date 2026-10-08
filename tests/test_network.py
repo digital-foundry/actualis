@@ -1848,3 +1848,42 @@ class TestExplainNetwork(unittest.TestCase):
         self.assertNotIn("(python -c \"open(...)\"), cp x . and dd of=", t)
         for line in af.EXPLAIN["network"]["formula"] + af.EXPLAIN["network"]["assumes"]:
             self.assertLessEqual(len(line), 78, line)
+
+
+class TestTripwireRound2(TestAuditConfigTripwire):
+    """Fix round 2, item 1: dequoted gate, assignments, paths, globs, wrappers."""
+    MUST_FLAG = (
+        "echo id >> .actu''alis-suppressions", 'echo id >> ".actu"alis-network-trust',
+        "echo id >> .actu\\alis-suppressions", "a''ctualis --suppress X",
+        "cp /tmp/e .act''ualis-network-trust", "echo id >> .ACTU''ALIS-SUPPRESSIONS",
+        "F=.actualis-suppressions; echo id >> $F",
+        "export F=.actualis-network-trust && echo id >> ${F}",
+        "F=.actualis-suppressions\necho id >> \"$F\"", "F=.actualis-suppressions; rm $F",
+        "D=~/.config/actualis; echo id >> $D/suppressions",
+        "echo id >> actualis//suppressions", "echo id >> ~/.config/actualis/./suppressions",
+        "echo id >> ~/.config//actualis/suppressions",
+        "cd ~/.config/actualis && echo id >> suppressions",
+        "cd $HOME/.config/actualis; cp /tmp/x suppressions",
+        'cd "$XDG_CONFIG_HOME/actualis" && tee suppressions',
+        "cd ~/.config && cd actualis && echo id > suppressions",
+        "echo id > .act*-suppressions", "echo id > .actuali?-network-trust",
+        "echo id > .actualis-[st]*", "echo id > ~/.config/actualis/supp*",
+        "rm .act*-suppressions", "echo id > .actu*",
+        "env A=1 B=2 C=3 D=4 E=5 actualis --suppress X",
+        "env A=1 B=2 C=3 D=4 E=5 F=6 G=7 python3 actualis.py --suppress X",
+    )
+    MUST_NOT_FLAG = (
+        "cd /tmp/actualis-notes && echo x >> suppressions", "cd src && echo x > suppressions",
+        "F=notes.txt; echo id >> $F", "echo x > notes*.txt", "rm -rf .*", "echo x > ?",
+        "cd ~/.config/other && echo x > suppressions", "grep x .actu*-suppressions",
+        "env A=1 B=2 C=3 D=4 E=5 actualis --json", "ls .act*", "echo x > .env*",
+    )
+
+    def test_glob_and_path_work_is_fast(self):
+        import time
+        for cmd in ("echo x > " + "*" * 32000, "echo x > " + "a*" * 16000 + "b",
+                    "F=a;" * 5000 + "echo > $F", "cd a;" * 5000 + "echo > suppressions",
+                    "echo x > " + "[a" * 16000, "x=" * 16000):
+            t = time.perf_counter()
+            af.writes_audit_config(cmd)
+            self.assertLess(time.perf_counter() - t, 0.1, cmd[:20])

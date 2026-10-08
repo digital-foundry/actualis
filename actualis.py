@@ -2240,69 +2240,155 @@ _READ_ONLY_GIT = frozenset({"diff", "log", "show", "status"})
 _ACTUALIS_PROGRAMS = frozenset({"actualis", "actualis.py"})
 
 
+_AUDIT_CONFIG_NAMES = (".actualis-network-trust", ".actualis-suppressions")
+_SHELL_VAR = re.compile(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})")
+# What the user-level path variables stand for, unless the command assigns them.
+_PATH_VARS = {"HOME": "~", "XDG_CONFIG_HOME": "~/.config"}
+_GLOB_CHARS = frozenset("*?[")
+# Cheap gate, applied to the command with quotes and backslashes removed: the
+# name can be split (`.actu''alis-…`), so the raw text is not tested.
+_DEQUOTE = str.maketrans("", "", "'\"\\")
+_AUDIT_GATE = re.compile(r"actualis|suppress|network-trust|(?:^|[\s/>=])\.[a-z0-9_-]{3,}[*?\[]")
+
+
+def _glob_match(pattern: str, name: str) -> bool:
+    """Could shell glob `pattern` match `name`? Translated by hand (no fnmatch).
+    A pattern with fewer than three literal characters (`.*`, `?`) or an
+    unreasonable size is not taken for an audit-config name."""
+    if len(pattern) > 128 or pattern.count("*") > 6:
+        return False
+    if not any(c in _GLOB_CHARS for c in pattern):
+        return pattern == name
+    out, literal, i = [], 0, 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "*":
+            if not out or out[-1] != "[^/]*":
+                out.append("[^/]*")
+        elif c == "?":
+            out.append("[^/]")
+        elif c == "[" and pattern.find("]", i + 2) > 0:
+            end = pattern.find("]", i + 2)
+            body = pattern[i + 1:end]
+            neg = body[:1] in ("!", "^")
+            out.append("[" + ("^" if neg else "") + re.sub(r"([\\\]\[^])", r"\\\1", body[1:] if neg else body) + "]")
+            i = end
+            literal += 1
+        else:
+            out.append(re.escape(c))
+            literal += 1
+        i += 1
+    if literal < 3:
+        return False
+    return re.fullmatch("".join(out), name) is not None
+
+
 def _is_audit_config(path: str, glob: bool = False) -> bool:
-    """APFS and NTFS are case-insensitive, so `.ACTUALIS-SUPPRESSIONS` is the same file."""
-    parts = path.replace("\\", "/").lower().rstrip("/").rsplit("/", 2)
-    base = parts[-1]
-    if base in AUDIT_CONFIG_FILES:
+    """Is `path` one of the files that decide what is reported?
+
+    Case-insensitive (APFS and NTFS are), with `//`, `/./` and a trailing `/`
+    collapsed. With `glob`, a pattern that could match either project name, or
+    `suppressions` under `actualis`, counts."""
+    parts = [p for p in path.replace("\\", "/").lower().split("/") if p not in ("", ".")]
+    if not parts:
+        return False
+    base, parent = parts[-1], parts[-2] if len(parts) > 1 else ""
+    if base in _AUDIT_CONFIG_NAMES or (base == SUPPRESSION_FILENAME and parent == "actualis"):
         return True
-    if base == SUPPRESSION_FILENAME and len(parts) > 1 and parts[-2] == "actualis":
-        return True
-    # A glob target (`> .actualis-s*`) may name either file; prefix check, no fnmatch.
-    return glob and base.startswith(".actualis-") and any(c in base for c in "*?[")
+    if not (glob and any(c in _GLOB_CHARS for c in path)):
+        return False
+    return (any(_glob_match(base, n) for n in _AUDIT_CONFIG_NAMES)
+            or (_glob_match(base, SUPPRESSION_FILENAME) and _glob_match(parent, "actualis")))
 
 
 def _runs_actualis_suppress(words: list[str]) -> bool:
     """`actualis --suppress`, `python3 actualis.py --suppress`, `uvx actualis
-    --suppressions`, `pipx run actualis --suppress=ID`: the CLI writes the user file."""
+    --suppressions`, `pipx run actualis --suppress=ID`: the CLI writes the user file.
+    Read past the same prefixes and wrappers the extractor skips (env A=1 …)."""
+    words = _net_strip_prefixes(words)[0]
     for i, w in enumerate(words[:6]):
         if _net_base(w).lower() in _ACTUALIS_PROGRAMS:
             return any(a.lower().startswith("--suppress") for a in words[i + 1:])
     return False
 
 
+def _expand_vars(tok: str, env: dict[str, str]) -> str:
+    """`$NAME` and `${NAME}` replaced by what this command assigned, or by the
+    user-level path variables; anything else is left as written."""
+    if "$" not in tok:
+        return tok
+    def sub(m: "re.Match") -> str:
+        name = m.group(1) or m.group(2)
+        return env.get(name) or _PATH_VARS.get(name) or m.group(0)
+    return _SHELL_VAR.sub(sub, tok)
+
+
 def writes_audit_config(cmd: str) -> bool:
     """A heuristic: does a segment of `cmd` write one of the audit config files?
 
-    A redirection into the file, `tee` of it, or an in-place editor / file
-    mutator that takes it as an argument. Reads, redirections to /dev/null,
-    `&N` duplications and redirections into other files do not count.
+    Read on the dequoted text. `NAME=value` assignments earlier in the command
+    are substituted into `$NAME`, `cd DIR` is remembered for relative targets,
+    and `//`, `/./` are collapsed. A redirect or output-option target that
+    names a config file always counts; so does any argument of a program that
+    is not a known reader. Reads, redirections to /dev/null, `&N` duplications
+    and redirections into other files do not count.
     """
+    env: dict[str, str] = {}
+    cwd = ""
+
+    def names(path: str) -> bool:
+        if _is_audit_config(path, glob=True):
+            return True
+        return bool(cwd) and not path.startswith(("/", "~")) and _is_audit_config(f"{cwd}/{path}", glob=True)
+
     # `>|` (clobber) holds a pipe character that _net_split would cut on.
     for segment in _net_split(cmd.replace(">|", ">"))[0]:
         toks = _net_tokens(segment)
+        k = 0
+        while k < len(toks) and (_NET_ASSIGN.match(toks[k]) or toks[k] in ("export", "declare", "readonly", "local")):
+            if "=" in toks[k] and _NET_ASSIGN.match(toks[k]) and len(env) < 256:
+                name, _, value = toks[k].partition("=")
+                env[name] = _expand_vars(value, env)[:1024]
+            k += 1
+        toks = [_expand_vars(t, env) for t in toks]
         for i, tok in enumerate(toks):
             m = _WRITE_REDIRECT.search(tok)
             if m:
                 target = m.group(1) or (toks[i + 1] if i + 1 < len(toks) else "")
-                if _is_audit_config(target, glob=True):
+                if names(target):
                     return True
         words = [t for t in toks if t not in ("sudo", "env", "command", "nohup") and "=" not in t.split("/")[0]]
         if not words:
             continue
         prog = words[0].rsplit("/", 1)[-1]
+        if prog in ("cd", "pushd") and len(words) > 1:
+            target = words[1]
+            cwd = target if target.startswith(("/", "~")) or not cwd else f"{cwd}/{target}"
+            cwd = cwd[:512]
+            continue
         if _runs_actualis_suppress(toks):
             return True
+        sub = next((w for w in words[1:] if not w.startswith("-")), "")
+        reader = prog in _READ_ONLY_PROGRAMS or (prog == "git" and sub in _READ_ONLY_GIT)
         # Conservative: a segment that names a config file and is not a known
         # reader is a write until shown otherwise (python -c open(...), cp x .,
         # dd of=, rsync, curl -o, git checkout).
-        if _AUDIT_CONFIG_TEXT.search(" ".join(toks)):
-            sub = next((w for w in words[1:] if not w.startswith("-")), "")
-            if not (prog in _READ_ONLY_PROGRAMS or (prog == "git" and sub in _READ_ONLY_GIT)):
+        if not reader and (_AUDIT_CONFIG_TEXT.search(" ".join(toks))
+                           or any(names(w) for w in words[1:])):
+            return True
+        # A reader that is told to write: `git diff --output=F`, `sort -o F`.
+        # (A redirect target was checked above, for every program.)
+        for j, w in enumerate(toks):
+            if w in ("-o", "-O", "--output"):
+                val = toks[j + 1] if j + 1 < len(toks) else ""
+            elif w.startswith("--output="):
+                val = w[len("--output="):]
+            elif w[:2] in ("-o", "-O") and not w.startswith("--"):
+                val = w[2:]
+            else:
+                continue
+            if names(val):
                 return True
-            # A reader that is told to write: `git diff --output=F`, `sort -o F`.
-            # (A redirect target was checked above, for every program.)
-            for j, w in enumerate(toks):
-                if w in ("-o", "-O", "--output"):
-                    val = toks[j + 1] if j + 1 < len(toks) else ""
-                elif w.startswith("--output="):
-                    val = w[len("--output="):]
-                elif w[:2] in ("-o", "-O") and not w.startswith("--"):
-                    val = w[2:]
-                else:
-                    continue
-                if _is_audit_config(val, glob=True):
-                    return True
     return False
 
 
@@ -3678,7 +3764,7 @@ class Fleet:
         program = name
         if name == "Bash":
             cmd = tool_input.get("command")
-            if isinstance(cmd, str) and "actualis" in cmd.lower() \
+            if isinstance(cmd, str) and _AUDIT_GATE.search(cmd.lower().translate(_DEQUOTE)) \
                and writes_audit_config(cmd):
                 # Model-written text: escapes and newlines out, as everywhere else.
                 evidence = clean(redact(cmd)).replace("\n", " ")
