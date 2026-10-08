@@ -601,14 +601,19 @@ class TestAuditConfig(unittest.TestCase):
         for cmd in ("cat .actualis-suppressions", "ls", "echo hi > out.txt",
                     "cat .actualis-suppressions 2>/dev/null",
                     "grep x .actualis-network-trust >/dev/null 2>&1",
-                    "cat .actualis-suppressions > /tmp/copy", "ls -la .actualis-*"):
+                    "cat .actualis-suppressions > /tmp/copy", "ls -la .actualis-*",
+                    "echo x>/tmp/out", "diff a .actualis-suppressions > /tmp/out",
+                    "cat a >| /tmp/out", "echo x 2>&1"):
             g = self.fleet()
             g.add_tool("p", "Bash", {"command": cmd}, TS, "auto")
             self.assertEqual(self.hits(g), [], cmd)
         for cmd in ("sed -i s/a/b/ .actualis-network-trust", "rm .actualis-suppressions",
                     "printf x | tee .actualis-network-trust", "printf 'a\\n' > ./.actualis-network-trust",
                     "tee -a .actualis-suppressions", "mv /tmp/t .actualis-network-trust",
-                    "echo x >>.actualis-suppressions"):
+                    "echo x >>.actualis-suppressions",
+                    "echo x>>.actualis-suppressions", "echo x>.actualis-network-trust",
+                    "cat a >| .actualis-suppressions", "echo x > .actualis-s*",
+                    "echo x > ./.actualis-?uppressions"):
             g = self.fleet()
             g.add_tool("p", "Bash", {"command": cmd}, TS, "auto")
             self.assertEqual(len(self.hits(g)), 1, cmd)

@@ -1703,12 +1703,16 @@ def network_items_from_tool(name: str, tool_input: dict) -> list[dict]:
 AUDIT_CONFIG_FILES = (".actualis-network-trust", ".actualis-suppressions")
 _FILE_WRITE_TOOLS = frozenset({"write", "edit", "multiedit", "notebookedit", "create",
                                "edit_file", "str_replace_editor", "str_replace_based_edit_tool"})
-_REDIRECT = re.compile(r"^(?:\d*|&)>>?(.*)$")
+_WRITE_REDIRECT = re.compile(r">>?(.*)$", re.S)
 _FILE_MUTATORS = frozenset({"mv", "cp", "rm", "ln", "truncate", "install"})
 
 
-def _is_audit_config(path: str) -> bool:
-    return path.replace("\\", "/").rsplit("/", 1)[-1] in AUDIT_CONFIG_FILES
+def _is_audit_config(path: str, glob: bool = False) -> bool:
+    base = path.replace("\\", "/").rsplit("/", 1)[-1]
+    if base in AUDIT_CONFIG_FILES:
+        return True
+    # A glob target (`> .actualis-s*`) may name either file; prefix check, no fnmatch.
+    return glob and base.startswith(".actualis-") and any(c in base for c in "*?[")
 
 
 def writes_audit_config(cmd: str) -> bool:
@@ -1718,19 +1722,20 @@ def writes_audit_config(cmd: str) -> bool:
     mutator that takes it as an argument. Reads, redirections to /dev/null,
     `&N` duplications and redirections into other files do not count.
     """
-    for segment in _net_split(cmd)[0]:
+    # `>|` (clobber) holds a pipe character that _net_split would cut on.
+    for segment in _net_split(cmd.replace(">|", ">"))[0]:
         toks = _net_tokens(segment)
         for i, tok in enumerate(toks):
-            m = _REDIRECT.match(tok)
+            m = _WRITE_REDIRECT.search(tok)
             if m:
                 target = m.group(1) or (toks[i + 1] if i + 1 < len(toks) else "")
-                if _is_audit_config(target):
+                if _is_audit_config(target, glob=True):
                     return True
         words = [t for t in toks if t not in ("sudo", "env", "command", "nohup") and "=" not in t.split("/")[0]]
         if not words:
             continue
         prog = words[0].rsplit("/", 1)[-1]
-        args = [w for w in words[1:] if _is_audit_config(w) and not _REDIRECT.match(w)]
+        args = [w for w in words[1:] if _is_audit_config(w) and ">" not in w]
         if not args:
             continue
         if prog == "tee" or prog in _FILE_MUTATORS:
@@ -3006,7 +3011,7 @@ class Fleet:
         program = name
         if name == "Bash":
             cmd = tool_input.get("command")
-            if isinstance(cmd, str) and any(f in cmd for f in AUDIT_CONFIG_FILES) \
+            if isinstance(cmd, str) and ".actualis-" in cmd \
                and writes_audit_config(cmd):
                 evidence = redact(cmd)
                 program = clean(command_head(cmd) or "Bash")[:40]
