@@ -171,8 +171,8 @@ shell commands and web tools.
 | `totals.unparsed_segments` | command segments that looked like network use but could not be parsed |
 | `by_kind` | counts of `install`, `clone`, `fetch` and `search` items |
 | `hosts[]` | per host: `count`, `unasked`, `first_seen`, and `trusted` if any item from it matched the trust list |
-| `packages[]` | per `ecosystem` and `name`: `versions` seen, `pinned` (every install pinned), `exec` (any install ran code), `count` |
-| `items[]` | one record per item: `kind`, `program`, `host`, `host_inferred`, `url`, `dest`, `source`, `ecosystem`, `package`, `version`, `pinned`, `exec`, `dynamic`, `failed` (`null` when unknown), `approval`, `trusted`, `agent`, `project`, `session`, `ts` |
+| `packages[]` | per `ecosystem` and `name`: `versions` seen, `pinned` (every install named an exact version: a full `MAJOR.MINOR.PATCH` for npm, crates and go, `==` for pypi, an `@sha256:` digest for images; ranges, tags and prefixes are not pinned), `exec` (any install ran code), `count` |
+| `items[]` | one record per item: `kind`, `program`, `host`, `host_inferred`, `url`, `dest`, `source`, `ecosystem`, `package`, `version`, `pinned`, `exec`, `dynamic`, `alias` (the name an npm alias installs under, `x` in `x@npm:evil@1.0.0`, where `package` is `evil`; else `null`), `failed` (`null` when unknown), `approval`, `trusted`, `agent`, `project`, `session`, `ts` |
 | `items_truncated` | `true` when `items` was cut at the cap |
 | `strict` | whether `--network-strict` was on |
 | `trust` | the trusted host or host-and-path entries in force |

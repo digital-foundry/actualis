@@ -184,7 +184,7 @@ class TestPackages(unittest.TestCase):
 
     def test_item_keys_are_fixed(self):
         keys = {"kind", "program", "host", "host_inferred", "url", "dest", "source", "ecosystem",
-                "package", "version", "pinned", "exec", "dynamic"}
+                "package", "version", "pinned", "exec", "dynamic", "alias"}
         for cmd in ("curl https://a.io", "npm ci", "git pull", "docker pull x"):
             self.assertEqual(set(one(cmd)), keys, cmd)
 
@@ -1521,3 +1521,78 @@ class TestRound2Minors(unittest.TestCase):
         self.assertNotIn("id is sha256[:8] of the secret", buf.getvalue())
         self.assertIn("for a password, of where it\n    appeared", buf.getvalue())
         self.assertNotIn("fingerprints are sha256[:8]", af.SRC_TEXT)   # the MCP note
+
+
+class TestInventoryCorrectness(unittest.TestCase):
+    """B1 (actualis-pro #57): pinned means an exact version, OCI names are one
+    package, forge shorthand has a URL, aliases and cargo subcommands are told apart."""
+
+    def test_pinned_table(self):
+        table = {
+            "npm i left-pad@4": False, "npm i x@^4": False, "npm i x@~4.1.0": False,
+            "npm i x@4.x": False, "npm i x@latest": False, "npm i x@next": False,
+            "npm i x@4.1": False, "npm i x@4.17.21": True, "npm i x@1.0.0-rc.1": True,
+            "cargo add serde@1.2": False, "cargo add serde@1.2.3": False,
+            "cargo add serde@=1.2.3": True,
+            "cargo install x --version 1.2.3": True, "cargo install x --version 1.2": False,
+            "cargo install x --version =1.2.3": True, "cargo install x --version ^1.2.3": False,
+            "cargo install x@1.2.3": True,   # UNVERIFIED assumption: the @ form is exact, like --version
+            "go install github.com/Evil/mod@v1.2": False, "go install github.com/Evil/mod@v1.2.3": True,
+            "go install github.com/Evil/mod@latest": False, "go install github.com/Evil/mod@v1": False,
+            "pip install x==1.2.3": True, "pip install x===1.2.3": True, "pip install x>=1": False,
+            "pip install x==1.*": False,
+            "docker pull nginx:1.25": False, "docker pull nginx": False,
+            "docker pull nginx@sha256:abc": True, "docker pull nginx:1.25@sha256:abc": True,
+        }
+        for cmd, pinned in table.items():
+            self.assertEqual(one(cmd)["pinned"], pinned, cmd)
+
+    def test_cargo_version_forms(self):
+        self.assertEqual(one("cargo install foo --version =1.2.3")["version"], "1.2.3")
+        self.assertEqual(one("cargo add serde@=1.2.3")["version"], "1.2.3")
+        self.assertEqual(one("cargo add serde@1.2")["version"], "1.2")
+
+    def test_pip_triple_equals_keeps_operator(self):
+        self.assertEqual(one("pip install x===1.2.3")["version"], "===1.2.3")
+        self.assertEqual(one("pip install x==1.2.3")["version"], "1.2.3")
+
+    def test_cargo_subcommand_is_in_program(self):
+        self.assertEqual(one("cargo add serde")["program"], "cargo add")
+        self.assertEqual(one("cargo install ripgrep")["program"], "cargo install")
+        self.assertEqual(one("cargo install --git https://github.com/o/r")["program"], "cargo install")
+
+    def test_oci_names_are_one_package(self):
+        for ref in ("docker.io/library/nginx:1.25", "library/nginx:1.25", "docker.io/nginx:1.25",
+                    "index.docker.io/library/nginx:1.25", "registry-1.docker.io/nginx:1.25",
+                    "nginx:1.25", "NGINX:1.25"):
+            it = one(f"docker pull {ref}")
+            self.assertEqual((it["package"], it["version"], it["host"]),
+                             ("nginx", "1.25", "registry-1.docker.io"), ref)
+        self.assertEqual(one("docker run nginx")["package"], "nginx")
+        self.assertEqual(one("docker pull docker.io/bitnami/redis")["package"], "bitnami/redis")
+        it = one("docker pull ghcr.io/o/img:1")
+        self.assertEqual((it["package"], it["host"]), ("ghcr.io/o/img", "ghcr.io"))
+        it = one("docker pull localhost:5000/library/x")
+        self.assertEqual((it["package"], it["host"]), ("localhost:5000/library/x", "localhost"))
+
+    def test_npm_forge_shorthand_has_a_url(self):
+        self.assertEqual(one("npm i github:evil-org/x")["url"], "https://github.com/evil-org/x")
+        self.assertEqual(one("npm i gitlab:o/r#v1")["url"], "https://gitlab.com/o/r")
+        self.assertEqual(one("npm i bitbucket:o/r")["url"], "https://bitbucket.org/o/r")
+        it = one("npm i github:evil-org/x")
+        it["trusted"] = False
+        self.assertEqual(af._net_item_path(it), "/evil-org/x")
+        self.assertTrue(af.network_trusted(it, af.parse_trust(["github.com/evil-org"])))
+        self.assertFalse(af.network_trusted(it, af.parse_trust(["github.com/good-org"])))
+
+    def test_npm_alias_records_the_target(self):
+        it = one("npm i x@npm:evil@1.0.0")
+        self.assertEqual((it["package"], it["version"], it["alias"], it["pinned"]),
+                         ("evil", "1.0.0", "x", True))
+        it = one("npm i @s/x@npm:@o/evil@^2")
+        self.assertEqual((it["package"], it["version"], it["alias"], it["pinned"]),
+                         ("@o/evil", "^2", "@s/x", False))
+        self.assertIsNone(one("npm i lodash")["alias"])
+
+    def test_schema_declares_alias(self):
+        self.assertEqual(af.JSON_SCHEMA["network.items[].alias"], "str|null")

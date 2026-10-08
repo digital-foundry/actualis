@@ -1358,6 +1358,11 @@ _NET_URL = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
 # scp-style git remote: [user@]host.tld:owner/repo
 _NET_SCP = re.compile(r"^(?:[^@/\s]+@)?([A-Za-z0-9.-]+\.[A-Za-z]{2,}):(?!//)(\S+)$")
 _NET_EXACT_VERSION = re.compile(r"^v?\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?$")
+# A full MAJOR.MINOR.PATCH: the only npm, crates or go version that names one release.
+# `4`, `4.1`, `^4.1.2`, `4.x`, `latest` and `v1.2` (a go prefix query) are ranges or tags.
+_NET_FULL_VERSION = re.compile(r"^=?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?$")
+_NET_GO_VERSION = re.compile(r"^v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?$")
+_OCI_HUB_HOSTS = frozenset({"docker.io", "index.docker.io", "registry-1.docker.io"})
 _NET_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _NET_PREFIX_VALUE_FLAGS = {"sudo": {"-u", "-g", "-C", "-h", "-p"}, "nice": {"-n"}, "env": {"-u", "-C"},
                            "timeout": {"-s", "--signal", "-k", "--kill-after"},
@@ -1434,7 +1439,7 @@ def url_path(url: str) -> str:
 def _net_item(kind: str, program: str, **kw) -> dict:
     item = {"kind": kind, "program": program, "host": None, "host_inferred": False,
             "url": None, "dest": None, "source": None, "ecosystem": None, "package": None,
-            "version": None, "pinned": False, "exec": False, "dynamic": False}
+            "version": None, "pinned": False, "exec": False, "dynamic": False, "alias": None}
     item.update(kw)
     return item
 
@@ -1446,10 +1451,11 @@ def _net_url_item(kind: str, program: str, url: str, **kw) -> dict:
 
 
 def _net_registry_item(program: str, ecosystem: str, name: str | None, version: str | None,
-                       registry: str | None, exec_: bool = False) -> dict:
+                       registry: str | None, exec_: bool = False,
+                       exact: "re.Pattern" = _NET_FULL_VERSION) -> dict:
     host = url_host(registry) if registry else None
     return _net_item("install", program, ecosystem=ecosystem, package=name, version=version,
-                     pinned=bool(version and _NET_EXACT_VERSION.match(version)), exec=exec_,
+                     pinned=bool(version and exact.match(version)), exec=exec_,
                      host=host or NETWORK_REGISTRY[ecosystem], host_inferred=not host)
 
 
@@ -1845,7 +1851,9 @@ def _net_npm_package(program: str, spec: str, registry: str | None, exec_: bool 
     forge = {"github": "github.com", "gitlab": "gitlab.com", "bitbucket": "bitbucket.org"}
     prefix = spec.split(":", 1)[0]
     if prefix in forge and ":" in spec and "://" not in spec:
-        return _net_item("install", program, ecosystem="npm", host=forge[prefix], package=spec, exec=exec_)
+        repo = spec.split(":", 1)[1].split("#", 1)[0]
+        return _net_item("install", program, ecosystem="npm", host=forge[prefix], package=spec,
+                         url=f"https://{forge[prefix]}/{repo}", exec=exec_)
     if "://" in spec:
         url = spec[4:] if spec.startswith("git+") else spec
         return _net_url_item("install", program, url, ecosystem="npm", exec=exec_)
@@ -1853,7 +1861,14 @@ def _net_npm_package(program: str, spec: str, registry: str | None, exec_: bool 
         return None
     at = spec.find("@", 1)
     name, version = (spec, None) if at < 0 else (spec[:at], spec[at + 1:] or None)
-    return _net_registry_item(program, "npm", name, version, registry, exec_)
+    alias = None
+    if version and version.startswith("npm:"):       # x@npm:evil@1.0.0 installs evil as x
+        alias, target = name, version[4:]
+        at = target.find("@", 1)
+        name, version = (target, None) if at < 0 else (target[:at], target[at + 1:] or None)
+    item = _net_registry_item(program, "npm", name, version, registry, exec_)
+    item["alias"] = alias
+    return item
 
 
 def _net_npm(prog: str, args: list[str]) -> list[dict]:
@@ -1899,7 +1914,9 @@ def _net_pip_package(program: str, spec: str, registry: str | None, exec_: bool 
     if not m:
         return None
     exact = m.group(3) in ("==", "===") and "*" not in m.group(4)
-    return _net_registry_item(program, "pypi", m.group(1), m.group(4) if exact else None, registry, exec_)
+    version = (m.group(3) if m.group(3) == "===" else "") + m.group(4) if exact else None
+    return _net_registry_item(program, "pypi", m.group(1), version, registry, exec_,
+                              exact=re.compile(r"^(?:===)?v?\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?$"))
 
 
 def _net_pip(prog: str, args: list[str]) -> list[dict]:
@@ -1959,14 +1976,21 @@ def _net_cargo(args: list[str]) -> list[dict]:
     pos, opts = _net_positionals(args, _CARGO_VALUE)
     if not pos or pos[0] not in ("install", "add") or opts.get("--path"):
         return []
+    prog = f"cargo {pos[0]}"                 # `cargo add` edits a manifest; `cargo install` builds a binary
     if opts.get("--git"):
-        return [_net_url_item("install", "cargo", opts["--git"], ecosystem="crates",
+        return [_net_url_item("install", prog, opts["--git"], ecosystem="crates",
                               package=pos[1] if len(pos) > 1 else None)]
     version = opts.get("--version") or opts.get("--vers")
     out = []
     for spec in pos[1:]:
         name, _, ver = spec.partition("@")
-        out.append(_net_registry_item("cargo", "crates", name, ver or version, None))
+        ver = ver or version
+        # install: a bare full version is exact. add: only a leading `=` is.
+        # (`cargo install x@1.2.3` is treated like `--version 1.2.3`; not verified against cargo.)
+        exact = bool(ver and _NET_FULL_VERSION.match(ver) and (pos[0] == "install" or ver.startswith("=")))
+        item = _net_registry_item(prog, "crates", name, ver.lstrip("=") if exact else ver, None)
+        item["pinned"] = exact
+        out.append(item)
     return out
 
 
@@ -1981,9 +2005,30 @@ def _net_go(args: list[str]) -> list[dict]:
         if spec.startswith((".", "/")) or "." not in first:
             continue                         # local package or standard library
         out.append(_net_item("install", "go", ecosystem="go", package=mod, version=ver or None,
-                             pinned=bool(ver and ver != "latest" and _NET_EXACT_VERSION.match(ver)),
+                             pinned=bool(ver and _NET_GO_VERSION.match(ver)),
                              host=first.lower()))
     return out
+
+
+def _oci_name(name: str) -> tuple[str, str | None]:
+    """(package, registry host or None) for an image name without tag or digest.
+
+    Lowercased; Docker Hub spelled out (`docker.io/`, `index.docker.io/`,
+    `registry-1.docker.io/`) or implied is one package, with `library/` dropped
+    (`docker.io/library/nginx`, `library/nginx` and `nginx` are all `nginx`).
+    Any other explicit registry stays in the name."""
+    name = name.lower()
+    first = name.split("/", 1)[0]
+    if "/" in name and (first in _OCI_HUB_HOSTS):
+        name, first = name.split("/", 1)[1], ""
+        hub = True
+    elif "/" in name and ("." in first or ":" in first or first == "localhost"):
+        return name, first.split(":", 1)[0]
+    else:
+        hub = False
+    if name.startswith("library/"):
+        name = name[len("library/"):]
+    return name, (NETWORK_REGISTRY["oci"] if hub else None)
 
 
 def _net_docker(prog: str, args: list[str]) -> list[dict]:
@@ -1994,12 +2039,9 @@ def _net_docker(prog: str, args: list[str]) -> list[dict]:
         return []
     ref = pos[0]
     name, _, digest = ref.partition("@")
-    first = name.split("/", 1)[0]
-    explicit = "/" in name and ("." in first or ":" in first or first == "localhost")
     last = name.rsplit("/", 1)[-1]
     tag = last.split(":", 1)[1] if ":" in last else None
-    pkg = name[:len(name) - len(tag) - 1] if tag else name
-    host = first.split(":", 1)[0].lower() if explicit else None
+    pkg, host = _oci_name(name[:len(name) - len(tag) - 1] if tag else name)
     return [_net_item("install", prog, ecosystem="oci", package=pkg, version=digest or tag,
                       pinned=digest.startswith("sha256:"),
                       host=host or NETWORK_REGISTRY["oci"], host_inferred=not host)]
@@ -2253,8 +2295,8 @@ def apply_network_policy(fleet: "Fleet", trust: list[tuple[str, str]], strict: b
 
 
 NETWORK_ITEM_KEYS = ("kind", "program", "host", "host_inferred", "url", "dest", "source",
-                     "ecosystem", "package", "version", "pinned", "exec", "dynamic", "failed",
-                     "approval", "trusted", "agent", "project", "session", "ts")
+                     "ecosystem", "package", "version", "pinned", "exec", "dynamic", "alias",
+                     "failed", "approval", "trusted", "agent", "project", "session", "ts")
 
 
 def network_json(fleet: "Fleet", raw: bool = False) -> dict:
@@ -7009,6 +7051,7 @@ JSON_SCHEMA: dict[str, str] = {
     "network.items[].pinned": "bool",
     "network.items[].exec": "bool",
     "network.items[].dynamic": "bool",
+    "network.items[].alias": "str|null",
     "network.items[].failed": "bool|null",
     "network.items[].approval": "str",
     "network.items[].trusted": "bool",
