@@ -32,7 +32,7 @@ that and prints a warning.
 | `by_project` | cost per project |
 | `by_day` | cost per calendar day, ascending |
 | `tools` | tool-call counts, descending |
-| `bash` | `total`, `commands{}`, `flag_counts{}`, `flags[]` |
+| `bash` | `total`, `commands{}`, `flag_counts{}`, `oversized_commands` (commands over 32 KB, each also a medium `oversized-command` flag), `flags[]` |
 | `coach` | findings: `id`, `severity`, `title`, `evidence`, `action`, `impact` |
 | `secrets` | array; see below |
 | `secret_exposures` | commands containing credential material |

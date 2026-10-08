@@ -50,6 +50,13 @@
 - **Strict mode no longer flags a remote name** (`git pull origin`). A remote
   added or cloned earlier in the same session resolves to its host and is judged
   normally.
+- **A command over 32 KB is a signal, and padding no longer hides what follows
+  it.** Each is counted once in `bash.oversized_commands` (and as unreadable),
+  shown as "N commands over 32 KB were only partly audited", and raises a
+  medium `oversized-command` flag. The audit-config tripwire, the remote-exec
+  shape and credential detection now read the whole command in overlapping
+  32 KB windows, up to 1 MiB; past that the command is counted unreadable.
+  Redacted text cut at the scan cap ends in `…[truncated]`.
 - **`-u user:pw` no longer masks a uid:gid** (`docker exec -u root:wheel`).
 
 ## 0.2.2 — 2026-10-08

@@ -786,7 +786,16 @@ def redact(text: str) -> str:
     """Remove credential material from a command string. Idempotent."""
     if not text:
         return text
-    out = text[:MAX_SCAN_TOTAL]
+    truncated = False
+    if text.endswith(TRUNCATED_MARK):        # idempotent: strip our own marker first
+        text, truncated = text[:-len(TRUNCATED_MARK)], True
+    if len(text) > MAX_SCAN_TOTAL:
+        text, truncated = text[:MAX_SCAN_TOTAL], True
+    out = _redact_scanned(text)
+    return out + TRUNCATED_MARK if truncated else out
+
+
+def _redact_scanned(out: str) -> str:
     # Order matters: the Authorization header rule must run before the generic
     # KEY=value rule, or "AUTH" in "Authorization:" makes it eat the scheme word.
     out = _SECRET_PATTERNS[2].sub(lambda m: f"{m.group(1)}{_mask(m.group(2))}", out)
@@ -899,6 +908,25 @@ MAX_SCAN_LINES = 400
 # Real commands carrying secrets are small; a 40,000-character single line is
 # pathological and cost 4 seconds unbounded.
 MAX_SCAN_TOTAL = 32768
+MAX_SCAN_HARD = 1 << 20          # past this a command is counted unreadable, not scanned
+SCAN_OVERLAP = 1024              # windows of an oversized command overlap by this much
+TRUNCATED_MARK = "…[truncated]"
+
+
+def scan_windows(cmd: str) -> list[str]:
+    """A command as windows of MAX_SCAN_TOTAL overlapping by SCAN_OVERLAP, so a
+    name or token split by a boundary lies whole in one window. Linear in the
+    command, which is first cut to MAX_SCAN_HARD."""
+    cmd = cmd[:MAX_SCAN_HARD]
+    if len(cmd) <= MAX_SCAN_TOTAL:
+        return [cmd]
+    step = MAX_SCAN_TOTAL - SCAN_OVERLAP
+    out, i = [], 0
+    while True:
+        out.append(cmd[i:i + MAX_SCAN_TOTAL])
+        if i + MAX_SCAN_TOTAL >= len(cmd):
+            return out
+        i += step
 
 
 def clean(text: str | None) -> str:
@@ -3150,6 +3178,9 @@ class Fleet:
         # found nothing in. Counted, never flagged.
         self.unreadable = 0
         self.unreadable_shapes: Counter = Counter()
+        # Commands past the 32 KB scan cap: counted once, flagged, and the checks
+        # that must not be evaded by padding run over the rest in windows.
+        self.oversized_commands = 0
         # A shell-audit finding can be wrong too. Secrets got suppression in
         # 0.1.3 and flags did not, which is arbitrary from a user's side: an
         # `rm -rf build` flagged every run forever leaves only the options of
@@ -3696,13 +3727,24 @@ class Fleet:
             self.unreadable += 1
             for name in shapes:
                 self.unreadable_shapes[name] += 1
+        windows = scan_windows(cmd)
+        oversized = len(cmd) > MAX_SCAN_TOTAL
+        if oversized:
+            self._add_oversized(project, head, cmd, ts, counted=bool(shapes))
 
-        if contains_secret(cmd):
+        if any(contains_secret(w) for w in windows):
             self.secret_exposures += 1
             self.secret_projects[project] += 1
 
         _rank = {"critical": 0, "high": 1, "low": 2}
-        for priority, kind, fp in classify_secrets(cmd, self._location_values):
+        found_secrets: list[tuple[str, str, str]] = []
+        seen_fp: set[str] = set()
+        for w in windows:                    # one secret seen in two windows is one
+            for item in classify_secrets(w, self._location_values):
+                if item[2] not in seen_fp:
+                    seen_fp.add(item[2])
+                    found_secrets.append(item)
+        for priority, kind, fp in found_secrets:
             e = self.secrets.setdefault(fp, {
                 "priority": priority, "kinds": set(), "uses": 0,
                 "first": None, "last": None, "projects": set(),
@@ -3730,6 +3772,8 @@ class Fleet:
                 e["last"] = max(e["last"] or day, day)
 
         matches = audit_command(cmd)
+        if oversized and not any(cat == "remote-exec" for _, cat, _ in matches):
+            matches += self._oversized_remote_exec(cmd, windows)
         # Roadmap S2: `cu''rl … | s''h` and `curl … | busybox sh` evade the
         # remote-exec regex on the raw text; the network tokenizer reads them
         # dequoted. One flag per command: added only when the rule did not fire.
@@ -3764,6 +3808,51 @@ class Fleet:
             "suppressed": suppressed,
             "suppressed_reason": self.suppressions.get(fid, ""),
         })
+
+    def _add_oversized(self, project: str, head: str | None, cmd: str,
+                       ts: datetime | None, counted: bool) -> None:
+        self.oversized_commands += 1
+        if not counted:
+            self.unreadable += 1             # not already counted under a shape
+        prog = clean(head or "?")[:40]
+        fid = flag_id("med", ["oversized-command"], prog)
+        suppressed = fid in self.suppressions
+        if suppressed:
+            self.suppressed_flags += 1
+        self.flag_counts["med:oversized-command"] += 1
+        self.flags.append({
+            "id": fid, "severity": "med", "categories": ["oversized-command"],
+            "program": prog, "project": project, "when": ts.isoformat() if ts else None,
+            "evidence": (f"a command of {len(cmd):,} characters; only the first 32 KB were "
+                         "fully audited" + ("; the rest past 1 MiB was not read"
+                                            if len(cmd) > MAX_SCAN_HARD else "")),
+            "had_secret": False, "suppressed": suppressed,
+            "suppressed_reason": self.suppressions.get(fid, ""),
+        })
+
+    @staticmethod
+    def _oversized_remote_exec(cmd: str, windows: list[str]) -> list[tuple[str, str, str]]:
+        """The remote-exec rules over the part of an oversized command past the
+        cut: raw text in 4 KB chunks (the length the rules are bounded for) with
+        1 KB overlap, and the dequoted `cu''rl … | s''h` shape per window."""
+        rules = [(sev, rx) for sev, cat, rx in COMPILED_RULES if cat == "remote-exec"]
+        text = cmd[:MAX_SCAN_HARD]
+        for i in range(MAX_SCAN_TOTAL - SCAN_OVERLAP - MAX_SCAN_LINE, len(text), 3072):
+            chunk = text[max(i, 0):max(i, 0) + MAX_SCAN_LINE]
+            for sev, rx in rules:
+                m = rx.search(chunk)
+                if m:
+                    lo = max(m.start() - 80, 0)
+                    return [(sev, "remote-exec", clean(chunk[lo:lo + 200].strip()))]
+        for w in windows[1:]:
+            piped: list[str] = []
+            try:
+                network_items_from_command(w, piped)
+            except Exception:                # noqa: BLE001 -- counted as oversized already
+                continue
+            if piped:
+                return [("high", "remote-exec", clean(piped[0][:200].strip()))]
+        return []
 
     # -- scan --------------------------------------------------------------
 
@@ -3854,11 +3943,16 @@ class Fleet:
         program = name
         if name == "Bash":
             cmd = tool_input.get("command")
-            if isinstance(cmd, str) and _AUDIT_GATE.search(cmd.lower().translate(_DEQUOTE)) \
-               and writes_audit_config(cmd):
-                # Model-written text: escapes and newlines out, as everywhere else.
-                evidence = clean(redact(cmd)).replace("\n", " ")
-                program = clean(command_head(cmd) or "Bash")[:40]
+            if isinstance(cmd, str):
+                for n, w in enumerate(scan_windows(cmd)):
+                    if _AUDIT_GATE.search(w.lower().translate(_DEQUOTE)) and writes_audit_config(w):
+                        # Model-written text: escapes and newlines out, as everywhere else.
+                        # Past the first window no command text is shown.
+                        evidence = (clean(redact(w)).replace("\n", " ") if n == 0 else
+                                    f"a {len(cmd):,}-character command writes an audit config "
+                                    "file past its first 32 KB")
+                        program = clean(command_head(cmd) or "Bash")[:40]
+                        break
         elif name.lower() in _FILE_WRITE_TOOLS and tool_input.get("command") != "view":
             for key in ("file_path", "path", "notebook_path"):
                 target = tool_input.get(key)
@@ -6444,6 +6538,10 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
         print(f"  {c.dim}Not a finding. A script is normal; this is what the audit "
               f"could not see.{c.off}")
 
+    if fleet.oversized_commands:
+        print(f"\n  {c.yellow}▲{c.off} {num(fleet.oversized_commands)} commands over 32 KB "
+              f"were only partly audited")
+
     if fleet.refusals:
         rule(c, "REFUSALS")
         print(f"  {c.dim}What was stopped, and by whom. A refused command is never "
@@ -7316,6 +7414,7 @@ JSON_SCHEMA: dict[str, str] = {
     "bash.total": "int",
     "bash.commands.*": "int",
     "bash.flag_counts.*": "int",
+    "bash.oversized_commands": "int",
     "bash.flags": "array",
     "bash.flags[].id": "str",
     "bash.flags[].program": "str",
@@ -7628,6 +7727,7 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
             "total": fleet.bash_total,
             "commands": dict(fleet.bash_first_token.most_common(50)),
             "flag_counts": dict(fleet.flag_counts),
+            "oversized_commands": fleet.oversized_commands,
             "flags": fleet.flags if raw else [
                 {**f, "evidence": redact(f["evidence"])} for f in fleet.flags
             ],
