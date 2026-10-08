@@ -1700,13 +1700,13 @@ def _net_tokens(segment: str, operators: bool = False) -> list[str]:
     return out
 
 
-def _net_segments(cmd: str, depth: int = 0) -> tuple[list[tuple[list[str], bool, bool]], int]:
+def _net_segments(cmd: str, depth: int = 0) -> tuple[list[tuple[list[str], bool, bool, str]], int]:
     """Token lists for every simple command in `cmd`, nested ones included
-    ($(...), backticks, bash -lc "...", eval "..."), each with whether it ran
-    under xargs and whether its output is piped into a shell, and how many
-    segments could not be tokenised because a quote was left open or nesting
-    went deeper than is read."""
-    out: list[tuple[list[str], bool, bool]] = []
+    ($(...), <(...), backticks, bash -lc "...", eval "..."), each with whether
+    it ran under xargs, whether its output is run by a shell, and its raw text;
+    and how many segments could not be tokenised because a quote was left
+    open or nesting went deeper than is read."""
+    out: list[tuple[list[str], bool, bool, str]] = []
     unparsed = 0
     text = _without_heredocs(cmd)
     # The character-level pass is skipped when there is nothing for it to find.
@@ -1717,7 +1717,7 @@ def _net_segments(cmd: str, depth: int = 0) -> tuple[list[tuple[list[str], bool,
         for body, feed in zip(bodies, feeds):
             inner, bad = _net_segments(body, depth + 1)
             # `sh -c "$(curl …)"`, `bash <(curl …)`: what the body prints is run.
-            out += [(t, x, True) for t, x, _ in inner] if feed else inner
+            out += [(t, x, True, r) for t, x, _, r in inner] if feed else inner
             unparsed += bad
     elif bodies:
         unparsed += 1                        # nested deeper than we read: say so
@@ -1753,7 +1753,7 @@ def _net_segments(cmd: str, depth: int = 0) -> tuple[list[tuple[list[str], bool,
                 out += inner
                 unparsed += bad
                 continue
-        out.append((tokens, via_xargs, into_shell))
+        out.append((tokens, via_xargs, into_shell, parts[n]))
     return out, unparsed
 
 
@@ -2042,21 +2042,21 @@ def network_items_from_command(cmd: str, piped_to_shell: list[str] | None = None
                                ) -> tuple[list[dict], int]:
     """Every download the command shows, and how many segments could not be read.
 
-    `piped_to_shell`, when given, receives the program of each curl or wget
-    fetch whose output is piped into a shell: remote code execution, seen on
-    the dequoted command (`cu''rl … | s''h`) that the audit regexes miss."""
+    `piped_to_shell`, when given, receives the raw text of each curl or wget
+    segment whose output a shell runs: remote code execution, seen on the
+    dequoted command (`cu''rl … | s''h`) that the audit regexes miss."""
     text = (cmd or "")[:MAX_SCAN_TOTAL]
     if not _NET_MAY_DOWNLOAD.search(text):
         return [], 0
     segments, unparsed = _net_segments(text)
     found: list[dict] = []
-    for tokens, via_xargs, into_shell in segments:
+    for tokens, via_xargs, into_shell, raw in segments:
         got = _net_extract(tokens)
         prog = _net_base(tokens[0])
         if via_xargs and not got and prog in ("curl", "wget"):
             got = [_net_item("fetch", prog, dynamic=True)]   # the URLs came on stdin
         if into_shell and piped_to_shell is not None and prog in ("curl", "wget") and got:
-            piped_to_shell.append(prog)
+            piped_to_shell.append(raw)
         found += got
     return found, unparsed
 
@@ -2763,9 +2763,9 @@ class Fleet:
         # Location-based secret id -> sha256 of every value seen under it, for
         # this run only. Never written to JSON, a report or a log.
         self._location_values: dict[str, set[str]] = {}
-        # Set by _add_network for the command add_tool is reading: a curl or
-        # wget piped into a shell, on the dequoted tokens.
-        self._net_remote_exec = False
+        # Set by _add_network for the command add_tool is reading: the raw
+        # text of a curl or wget segment whose output a shell runs, or "".
+        self._net_remote_exec = ""
         self.flag_counts: Counter = Counter()
         self.permission_modes: Counter = Counter()
         self.denials: Counter = Counter()
@@ -3301,7 +3301,7 @@ class Fleet:
         project = clean(project)[:120] or "unknown"
         name = clean(name)[:48] or "?"
         self.tools[name] += 1
-        self._net_remote_exec = False
+        self._net_remote_exec = ""
         self._add_network(project, name, tool_input or {}, ts, mode, session, call_id, agent)
         self._audit_config_write(project, name, tool_input or {}, ts)
         if name != "Bash":
@@ -3366,7 +3366,10 @@ class Fleet:
         # remote-exec regex on the raw text; the network tokenizer reads them
         # dequoted. One flag per command: added only when the rule did not fire.
         if self._net_remote_exec and not any(cat == "remote-exec" for _, cat, _ in matches):
-            line = next((ln for ln in cmd.splitlines() if "|" in ln), cmd)
+            # The line holding the fetch that the shell runs, not just any pipe.
+            frag = self._net_remote_exec
+            line = next((ln for ln in cmd.splitlines() if frag in ln), None) \
+                or next((ln for ln in cmd.splitlines() if "|" in ln), cmd)
             matches.append(("high", "remote-exec", clean(line[:MAX_SCAN_LINE].strip())))
         if not matches:
             return
@@ -3584,9 +3587,12 @@ class Fleet:
             if not isinstance(cmd, str) or not cmd:
                 return
             piped: list[str] = []
-            found, unparsed = network_items_from_command(cmd, piped)
+            try:
+                found, unparsed = network_items_from_command(cmd, piped)
+            except Exception:                   # noqa: BLE001 -- one bad command must not end the scan
+                found, unparsed, piped = [], 1, []
             self.network_unparsed += unparsed
-            self._net_remote_exec = bool(piped)
+            self._net_remote_exec = piped[0].strip() if piped else ""
         else:
             found = network_items_from_tool(name, tool_input)
         if not found:
@@ -5016,6 +5022,9 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "Command text is matched against known token prefixes, connection-string",
             "shapes, and secret-shaped assignments. Each hit is hashed immediately to",
             "sha256[:8]; the value is never stored, printed, or written to JSON.",
+            "A password a person may have chosen (an option such as curl -u, a short",
+            "PASSWORD variable, a short URL or scp password) is fingerprinted by where",
+            "it appeared instead, so a published id cannot confirm a guess.",
             "",
             "A secret is a VALUE: the same one under two variable names is one row,",
             "and the worst priority wins.",
@@ -5513,7 +5522,8 @@ def _mcp_call(name: str, args: dict, cache: _MCPCache) -> dict:
         return {
             "distinct_secrets": len(rows),
             "worth_rotating": sum(1 for _, e in rows if e["priority"] != "low"),
-            "note": "fingerprints are sha256[:8]; values are never stored or returned",
+            "note": "a fingerprint is sha256[:8] of the value, or for a password, of "
+                    "where it appeared; values are never stored or returned",
             "secrets": [{"priority": e["priority"], "types": sorted(e["kinds"]),
                          "fingerprint": fp, "uses": e["uses"],
                          "first_seen": e["first"], "last_seen": e["last"],
@@ -6113,9 +6123,10 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
                           "suppression covers") else "") + f"{c.off}")
         if len(rows) > 24:
             print(f"    {c.dim}… {len(rows) - 24} more{c.off}")
-        print(f"\n    {c.dim}id is sha256[:8] of the secret; the value is never stored or")
-        print(f"    printed. Same secret reused 200 times counts once. Rotate in the order")
-        print(f"    shown, then purge the transcripts that carry them.{c.off}")
+        print(f"\n    {c.dim}id is a fingerprint of the secret, or for a password, of where it")
+        print(f"    appeared; the value is never stored or printed. Same secret reused 200")
+        print(f"    times counts once. Rotate in the order shown, then purge the")
+        print(f"    transcripts that carry them.{c.off}")
         # In place, where the finding is, rather than in documentation nobody
         # reads at the moment they disagree with it.
         print(f"\n    {c.dim}Not a credential? Say so:{c.off}")
