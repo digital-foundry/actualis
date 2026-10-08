@@ -1645,6 +1645,11 @@ class TestAuditConfigTripwire(unittest.TestCase):
         "git checkout .actualis-suppressions",
         "bash -c 'echo x > .actualis-suppressions'",
         "cd /tmp && install -m 600 x ~/.config/actualis/suppressions",
+        "cat a > .actualis-suppressions", "grep x y >> ~/.config/actualis/suppressions",
+        "tail -n1 z 1> .ACTUALIS-NETWORK-TRUST", "cat x | tee .actualis-suppressions",
+        "git diff --output=.actualis-network-trust", "git show HEAD --output=.actualis-suppressions",
+        "sort -o .actualis-suppressions in.txt", "sort -o.actualis-suppressions in.txt",
+        "diff --output .actualis-suppressions a b",
     )
     MUST_NOT_FLAG = (
         "cat .actualis-suppressions", "less .actualis-network-trust", "more .actualis-suppressions",
@@ -1658,7 +1663,9 @@ class TestAuditConfigTripwire(unittest.TestCase):
         "md5 .actualis-suppressions", "cat ~/.config/actualis/suppressions | wc -l",
         "actualis --json", "actualis --days 7 --fail-on high", "python3 actualis.py --self-check",
         "grep -- --suppress actualis.py", "git commit -m 'document actualis --suppress'",
-        "echo hi > out.txt",
+        "echo hi > out.txt", "cat .actualis-suppressions > /tmp/x",
+        "grep x .actualis-network-trust 2>/dev/null", "sha256sum -c .actualis-suppressions",
+        "git diff --output=/tmp/d .actualis-suppressions",
     )
 
     def hit(self, tool, tool_input):

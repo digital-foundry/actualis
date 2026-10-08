@@ -2217,6 +2217,19 @@ def writes_audit_config(cmd: str) -> bool:
             sub = next((w for w in words[1:] if not w.startswith("-")), "")
             if not (prog in _READ_ONLY_PROGRAMS or (prog == "git" and sub in _READ_ONLY_GIT)):
                 return True
+            # A reader that is told to write: `git diff --output=F`, `sort -o F`.
+            # (A redirect target was checked above, for every program.)
+            for j, w in enumerate(toks):
+                if w in ("-o", "-O", "--output"):
+                    val = toks[j + 1] if j + 1 < len(toks) else ""
+                elif w.startswith("--output="):
+                    val = w[len("--output="):]
+                elif w[:2] in ("-o", "-O") and not w.startswith("--"):
+                    val = w[2:]
+                else:
+                    continue
+                if _is_audit_config(val, glob=True):
+                    return True
     return False
 
 
