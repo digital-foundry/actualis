@@ -733,9 +733,6 @@ class TestRedactLinearAndMultiAt(unittest.TestCase):
         self.assertIn("host/x", out)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestReport(unittest.TestCase):
     def out(self, f, raw=False):
@@ -809,3 +806,83 @@ class TestReport(unittest.TestCase):
         with redirect_stdout(buf):
             af.render(f, af.C(False), False, 12)
         self.assertIn("NETWORK", buf.getvalue())
+
+
+class TestReportFixes(unittest.TestCase):
+    def out(self, f, top=12):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            af.render_network(f, af.C(False), top=top)
+        return buf.getvalue()
+
+    def test_escapes_do_not_reach_output(self):
+        f = af.Fleet()
+        f.add_tool("p", "Bash", {"command": "curl https://evil.io/\x1b[2K\x1b[1Ahidden"}, TS, "auto")
+        f.add_tool("p", "Bash", {"command": "npm i 'pkg\x1b]8;;http://x\x07'"}, TS, "auto")
+        f.add_tool("p", "WebFetch", {"url": "https://h\x1b[31m.io/x"}, TS, "auto")
+        for text in (self.out(f), json.dumps(af.network_json(f)), json.dumps(af.network_json(f, True))):
+            for bad in ("\x1b", "\x07", "\r"):
+                self.assertNotIn(bad, text)
+        self.assertIn("evil.io", self.out(f))
+
+    def test_newline_in_field_becomes_space(self):
+        f = af.Fleet()
+        f.add_tool("p", "WebFetch", {"url": "https://a.io/x\ny"}, TS, "auto")
+        self.assertNotIn("\n", f.network[0]["url"])
+
+    def test_long_urls_show_and_rows_fit(self):
+        f = af.Fleet()
+        for k in range(50):
+            f.add_tool("project-number-one", "Bash",
+                       {"command": f"curl https://example-host-{k}.io/a/very/long/path/segment/{k}/more"},
+                       TS, "auto")
+        rows = [l for l in self.out(f, top=50).splitlines() if "example-host" in l and "auto" not in l
+                and "unasked" in l]
+        self.assertEqual(len(rows), 50)
+        for l in rows:
+            self.assertLessEqual(len(l), 100, l)
+            self.assertRegex(l, r"curl https://\S")
+
+    def test_labels_per_group(self):
+        f = af.Fleet()
+        f.add_tool("p", "Bash", {"command": "curl https://a.io/1"}, TS, "default")
+        f.add_tool("p", "Bash", {"command": "curl https://b.io/1"}, TS, "default")
+        text = self.out(f)
+        self.assertEqual(text.count("UNKNOWN"), 1)
+        self.assertNotIn("UNASKED", text)
+        f.add_tool("p", "Bash", {"command": "curl https://c.io/1"}, TS, "auto")
+        text = self.out(f)
+        self.assertEqual((text.count("UNASKED"), text.count("UNKNOWN")), (1, 1))
+
+    def test_singular(self):
+        f = af.Fleet()
+        f.add_tool("p", "Bash", {"command": "curl https://a.io/1"}, TS, "auto")
+        self.assertIn("1 download ·", self.out(f))
+
+    def test_top_caps_rows(self):
+        f = af.Fleet()
+        for k in range(10):
+            f.add_tool("p", "Bash", {"command": f"curl https://h{k}.io/x"}, TS, "auto")
+        rows = [l for l in self.out(f, top=3).splitlines() if l.rstrip().endswith("unasked")]
+        self.assertEqual(len(rows), 3)
+
+    def test_refused_only_fleet_is_empty(self):
+        f = af.Fleet()
+        f.add_tool("p", "Bash", {"command": "curl https://a.io/x"}, TS, "auto", call_id="c1")
+        f._network_outcome("claude:c1", True)
+        self.assertIn("no downloads seen", self.out(f))
+
+    def test_deep_bash_c_counts_unparsed(self):
+        cmd = "curl https://a.io"
+        for _ in range(5):
+            cmd = "bash -c " + json.dumps(cmd)
+        found, unparsed = af.network_items_from_command(cmd)
+        self.assertGreaterEqual(unparsed, 1)
+
+    def test_explain_prefix_list(self):
+        text = " ".join(af.EXPLAIN["network"]["formula"])
+        self.assertIn("command, exec", text)
+
+
+if __name__ == "__main__":
+    unittest.main()

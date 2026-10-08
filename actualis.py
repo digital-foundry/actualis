@@ -1400,6 +1400,8 @@ def _net_segments(cmd: str, depth: int = 0) -> tuple[list[list[str]], int]:
         tokens = _net_strip_prefixes(_net_tokens(segment))
         if not tokens:
             continue
+        if Path(tokens[0]).name in _NET_SHELLS and "-c" in tokens[1:-1] and depth >= 3:
+            unparsed += 1                    # bash -c nested deeper than we read
         if (depth < 3 and Path(tokens[0]).name in _NET_SHELLS
                 and "-c" in tokens[1:-1]):
             inner, bad = _net_segments(tokens[tokens.index("-c", 1) + 1], depth + 1)
@@ -3206,6 +3208,9 @@ class Fleet:
             agent = ("codex" if (mode or "").startswith("codex:")
                      else "copilot" if (mode or "").startswith("copilot:") else "claude")
         for item in found:
+            for k, v in item.items():           # transcript text must not reach a terminal
+                if isinstance(v, str):
+                    item[k] = clean(v).replace("\n", " ")
             item.update(approval=network_approval(mode), agent=agent, project=project,
                         session=clean(str(session))[:80] if session else None,
                         ts=ts.isoformat() if ts else None,
@@ -4551,9 +4556,10 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "The inventory is a tripwire, not a guarantee. It reads only what the",
             "transcript shows. Shell commands are split on && || ; | and newlines",
             "(outside quotes), with $(...), backticks and bash -c \"...\" read as commands",
-            "of their own. Prefixes (sudo, env, time, nice, nohup, VAR=value) are",
-            "skipped. Recognised programs: curl wget git gh npm pnpm yarn bun npx bunx",
-            "pip pip3 uv uvx pipx brew cargo go docker podman. Tool calls: WebFetch,",
+            "of their own. Prefixes (sudo, env, time, nice, nohup, command, exec,",
+            "VAR=value) are skipped. Recognised programs: curl wget git gh npm pnpm",
+            "yarn bun npx bunx pip pip3 uv uvx pipx brew cargo go docker podman.",
+            "Tool calls: WebFetch,",
             "WebSearch, web_fetch, web_search, and any tool named like",
             "fetch/browse/download/http.",
             "",
@@ -5372,7 +5378,7 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False) -> None:
     if not t["items"]:
         print(f"  {c.dim}no downloads seen{c.off}")
         return
-    print(f"  {num(t['items'])} downloads · {c.yellow}{num(t['unasked'])} unasked{c.off}"
+    print(f"  {num(t['items'])} download{'' if t['items'] == 1 else 's'} · {c.yellow}{num(t['unasked'])} unasked{c.off}"
           f" · {num(t['unknown'])} unknown"
           + (f" · {num(t['failed'])} failed" if t["failed"] else ""))
     if t["unknown"]:
@@ -5410,11 +5416,17 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False) -> None:
 
     rows = [i for i in n["items"] if i["approval"] in ("unasked", "unknown")]
     rows.sort(key=lambda i: i["approval"] != "unasked")   # stable: newest-first within each
-    for k, i in enumerate(rows[:top]):
-        label = "UNASKED" if k == 0 else ""
-        what = i["url"] or i["package"] or i["program"]
-        print(f"  {label:<11} {clip(i['host'] or '?', 28):<28} {clip(i['program'] + ' ' + (what or ''), 40):<40}"
-              f" {c.dim}{clip(i['project'], 16)}  {(i['ts'] or '')[:10]}  {i['approval']}{c.off}")
+    last = None
+    for i in rows[:top]:
+        label = i["approval"].upper() if i["approval"] != last else ""
+        last = i["approval"]
+        what = i["url"] or i["package"] or ""
+        room = 32 - len(i["program"]) - 1
+        if what and len(what) > room:
+            what = what[:max(room - 1, 1)] + "\u2026"
+        target = f"{i['program']} {what}".rstrip()
+        print(f"  {label:<9}{clip(i['host'] or '?', 26):<26} {target[:32]:<32}"
+              f" {c.dim}{clip(i['project'], 10):<10} {(i['ts'] or '')[:10]} {i['approval']}{c.off}")
 
 
 def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> None:
