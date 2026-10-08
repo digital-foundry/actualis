@@ -2280,7 +2280,10 @@ def _glob_match(pattern: str, name: str) -> bool:
         i += 1
     if literal < 3:
         return False
-    return re.fullmatch("".join(out), name) is not None
+    try:
+        return re.fullmatch("".join(out), name) is not None
+    except re.error:                         # a reversed range such as [e-c]
+        return False
 
 
 def _is_audit_config(path: str, glob: bool = False) -> bool:

@@ -1879,6 +1879,11 @@ class TestTripwireRound2(TestAuditConfigTripwire):
         "env A=1 B=2 C=3 D=4 E=5 actualis --json", "ls .act*", "echo x > .env*",
     )
 
+    def test_malformed_glob_never_raises(self):
+        for cmd in ("echo x > .actualis-[e-c]", "echo x > .actualis-[", "echo x > .actualis-[]x]*",
+                    "echo x > [!a-", "rm .act[z-a]*"):
+            af.writes_audit_config(cmd)
+
     def test_glob_and_path_work_is_fast(self):
         import time
         for cmd in ("echo x > " + "*" * 32000, "echo x > " + "a*" * 16000 + "b",
