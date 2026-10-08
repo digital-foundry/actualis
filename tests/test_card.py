@@ -403,6 +403,11 @@ class TestCardLayouts(unittest.TestCase):
                  and op.x == af.TERM_X + 5 * af.CELL_W and op.y > af.TERM_Y + 4 * af.CELL_H]
         self.assertEqual(len(spark), 1)
         self.assertLessEqual(len(spark[0].text), 40)
+        last_bar = max(op.y for op in ops if isinstance(op, af.Text)
+                       and op.x >= af.TERM_X + 12 * af.CELL_W and set(op.text) <= {"█", "░"})
+        self.assertGreaterEqual(spark[0].y, last_bar + 2 * af.CELL_H)
+        footer = next(op for op in ops if isinstance(op, af.Text) and op.text == af.CARD_INSTALL)
+        self.assertGreaterEqual(footer.y, spark[0].y + af.CELL_H)
         line = next(op for op in af.layout_hero(_extreme_model()) if isinstance(op, af.Polyline))
         for x, y in line.points:
             self.assertTrue(64 <= x <= 832 and 416 <= y <= 536, (x, y))
@@ -418,9 +423,9 @@ class TestCardLayouts(unittest.TestCase):
         ops = af.layout_terminal(af.card_model(_busy_fleet(), "volume"))
         bar_rows = {}
         for op in ops:
-            # The sparkline row below the bars can also be all full blocks.
+            # The sparkline starts at column 5, so x excludes it.
             if (isinstance(op, af.Text) and set(op.text) <= {"█", "░"}
-                    and op.y < af.TERM_Y + 9 * af.CELL_H):
+                    and op.x >= af.TERM_X + 12 * af.CELL_W):
                 bar_rows[op.y] = bar_rows.get(op.y, 0) + len(op.text)
         self.assertEqual(sorted(bar_rows.values()), [28, 28, 28, 28])
 

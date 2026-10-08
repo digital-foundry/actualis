@@ -5271,10 +5271,10 @@ def layout_terminal(m: dict) -> list:
             ops.append(at(12 + filled, row, P["rule"], _BAR_EMPTY * (28 - filled)))
         if len(text) <= 7:
             ops.append(at(41, row, P["fg"], text))
-        else:   # x2 fits 10 characters in the same 7 cells; never cut a number
+        else:   # x2 fits 10 characters in the same 7 cells
             ops.append(Text(TERM_X + 41 * CELL_W, TERM_Y + row * CELL_H + 16, 2,
                             P["fg"], text[:10]))
-    spark_row = 5 + max(len(bars), 3)
+    spark_row = 6 + max(len(bars), 3)    # one blank row after the bars
     ops.append(at(0, spark_row, P["muted"], f"{m['days']}d"[:4]))
     if m["trend"]:
         ops.append(at(5, spark_row, P["accent"], _blocks(m["series"], m["series_max"], 40)))
