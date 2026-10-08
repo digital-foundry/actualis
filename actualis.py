@@ -1490,18 +1490,18 @@ def _net_positionals(args: list[str], takes_value: frozenset = frozenset()) -> t
 # with none of these characters splits the same way in one C-level call, which
 # is most commands. A fuzz of 200,000 random strings found no difference.
 _NET_SPLIT_SLOW = re.compile(r"['\"\\]|>\|")
-_NET_SPLIT_OPS = re.compile(r"(&&|\|\||[;|\n])")
+_NET_SPLIT_OPS = re.compile(r"(&&|\|\||\|&|[;|\n])")
 _NET_TOKENS_SLOW = re.compile(r"['\"\\<>&()]")
 
 
 def _net_split(text: str, seps: list[str] | None = None) -> tuple[list[str], bool]:
-    """Split on && || ; | and newline, outside quotes. Returns the parts and
+    """Split on && || |& ; | and newline, outside quotes. Returns the parts and
     whether a quote was left open (the last part is then unusable). `seps`,
     when given, receives the operator after each part ("" after the last)."""
     if not _NET_SPLIT_SLOW.search(text):     # nothing quoted or escaped: one C-level split
         pieces = _NET_SPLIT_OPS.split(text)
         if seps is not None:
-            seps += pieces[1::2] + [""]
+            seps += ["|" if p == "|&" else p for p in pieces[1::2]] + [""]
         return pieces[0::2], False
     parts, buf, quote, i = [], [], "", 0
     while i < len(text):
@@ -1517,10 +1517,10 @@ def _net_split(text: str, seps: list[str] | None = None) -> tuple[list[str], boo
         elif ch in "\"'":
             quote = ch
             buf.append(ch)
-        elif text.startswith(("&&", "||"), i):
+        elif text.startswith(("&&", "||", "|&"), i):
             parts.append("".join(buf))
             if seps is not None:
-                seps.append(text[i:i + 2])
+                seps.append("|" if text.startswith("|&", i) else text[i:i + 2])   # |& pipes stderr too
             buf = []
             i += 2
             continue
@@ -1589,27 +1589,51 @@ def _net_close_paren(text: str, start: int) -> int:
     return -1
 
 
-def _net_substitutions(text: str) -> tuple[list[str], str]:
-    """The bodies of every $( ... ) and `...` in `text`, outermost first (an
-    inner one is found again when its body is read), and `text` with them
-    blanked. Parentheses are matched by depth, so `$(a $(b))` is one body."""
+def _net_feeds_shell(before: str, process: bool) -> bool:
+    """Whether a substitution that starts right after `before` is run by a
+    shell as code. For `$(…)`: `sh -c "$(…)"`, where the output is the
+    script. For a process substitution `<(…)`: `bash <(…)`, `source <(…)`,
+    `. <(…)`. `before` is a bounded window, so this is constant work."""
+    cut = max(before.rfind(c) for c in ";&|\n(") + 1
+    words = [w.strip("\"'") for w in before[cut:].split()]
+    words = _net_strip_prefixes([w for w in words if w])[0]
+    if not words:
+        return False
+    prog = _net_base(words[0])
+    if process:
+        return (prog in _NET_SHELLS or prog in ("source", ".")) \
+            and all(w.startswith("-") for w in words[1:])
+    return prog in _NET_SHELLS and len(words) > 1 and _net_shell_c(words[-1])
+
+
+def _net_substitutions(text: str, feeds: list[bool] | None = None) -> tuple[list[str], str]:
+    """The bodies of every $( ... ), <( ... ) and `...` in `text`, outermost
+    first (an inner one is found again when its body is read), and `text`
+    with them blanked. Parentheses are matched by depth, so `$(a $(b))` is
+    one body. `feeds`, when given, receives for each body whether a shell
+    runs its output as code (_net_feeds_shell)."""
     bodies: list[str] = []
     out: list[str] = []
     i = 0
     while i < len(text):
-        if text.startswith("$(", i):
+        if text.startswith(("$(", "<("), i):
             end = _net_close_paren(text, i + 2)
             if end < 0:
                 out.append(text[i:])         # unbalanced: nothing later can balance either
                 break
             bodies.append(text[i + 2:end])
+            if feeds is not None:
+                feeds.append(_net_feeds_shell(text[max(0, i - 256):i], text[i] == "<"))
             out.append(" ")
             i = end + 1
             continue
         out.append(text[i])
         i += 1
     rest = "".join(out)
-    bodies += [m.group(1) for m in _NET_BACKTICK.finditer(rest)]
+    ticks = [m.group(1) for m in _NET_BACKTICK.finditer(rest)]
+    bodies += ticks
+    if feeds is not None:
+        feeds += [False] * len(ticks)
     return bodies, _NET_BACKTICK.sub(" ", rest)
 
 
@@ -1686,11 +1710,14 @@ def _net_segments(cmd: str, depth: int = 0) -> tuple[list[tuple[list[str], bool,
     unparsed = 0
     text = _without_heredocs(cmd)
     # The character-level pass is skipped when there is nothing for it to find.
-    bodies, text = _net_substitutions(text) if "$(" in text or "`" in text else ([], text)
+    feeds: list[bool] = []
+    bodies, text = (_net_substitutions(text, feeds) if "$(" in text or "`" in text or "<(" in text
+                    else ([], text))
     if depth < 3:
-        for body in bodies:
+        for body, feed in zip(bodies, feeds):
             inner, bad = _net_segments(body, depth + 1)
-            out += inner
+            # `sh -c "$(curl …)"`, `bash <(curl …)`: what the body prints is run.
+            out += [(t, x, True) for t, x, _ in inner] if feed else inner
             unparsed += bad
     elif bodies:
         unparsed += 1                        # nested deeper than we read: say so
@@ -1700,14 +1727,21 @@ def _net_segments(cmd: str, depth: int = 0) -> tuple[list[tuple[list[str], bool,
         parts = parts[:-1]
         unparsed += 1
     stripped = [_net_strip_prefixes(_net_tokens(p, operators=True)) for p in parts]
+    # `curl … | sh`, `| sudo bash`, `| busybox sh`, `| tee f | sh`: a shell at
+    # any later stage of the same pipeline, on the dequoted names. Worked
+    # backwards once, so a long pipeline stays linear.
+    downstream = [False] * (len(stripped) + 1)
+    for n in range(len(stripped) - 2, -1, -1):
+        if seps[n] == "|":
+            nxt = stripped[n + 1][0]
+            downstream[n] = downstream[n + 1] or (
+                bool(nxt) and _net_base(nxt[0]) in _NET_SHELLS and not _net_shell_c_index(nxt))
     for n, (tokens, via_xargs) in enumerate(stripped):
         if not tokens:
             continue
         prog = _net_base(tokens[0])
         flag = _net_shell_c_index(tokens) if prog in _NET_SHELLS else 0
-        # `curl … | sh`, `| sudo bash`, `| busybox sh`, on the dequoted names.
-        nxt = stripped[n + 1][0] if seps[n] == "|" and n + 1 < len(stripped) else []
-        into_shell = bool(nxt) and _net_base(nxt[0]) in _NET_SHELLS and not _net_shell_c_index(nxt)
+        into_shell = downstream[n]
         # `eval ARGS` runs its arguments joined by spaces, as `bash -c` would.
         nested = (tokens[flag + 1] if flag else
                   " ".join(tokens[1:]) if prog == "eval" and len(tokens) > 1 else None)
