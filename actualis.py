@@ -37,7 +37,7 @@ from typing import NamedTuple
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 # --------------------------------------------------------------------------
 # Pricing
@@ -254,7 +254,9 @@ def rates_for(model: str, when: datetime | None) -> tuple[float, float, str, boo
     every caller to be touched again.
     """
     r = rate_for(model)
-    return (r.input, r.output, r.provider, r.tier == VENDOR, r.tier)
+    # Known means the price has a source (price list, vendor docs, aggregator).
+    # Only family inference and the default ceiling are estimates.
+    return (r.input, r.output, r.provider, r.tier in (VENDOR, VENDOR_DOC, AGGREGATOR), r.tier)
 
 
 def window_start(days: int, now: datetime | None = None) -> datetime:
@@ -1705,6 +1707,8 @@ class Fleet:
         if not known:
             self.unknown_models[model] += 1
             self.cost_unknown += cost
+        elif tier == AGGREGATOR:
+            self.aggregator_models[model] += 1
 
         self.messages += 1
         self.agents_seen.add("codex")
@@ -1742,6 +1746,8 @@ class Fleet:
         if not known:
             self.unknown_models[model] += 1
             self.cost_unknown += cost
+        elif tier == AGGREGATOR:
+            self.aggregator_models[model] += 1
 
         self.messages += 1
         self.agents_seen.add("copilot")
@@ -2014,7 +2020,8 @@ class Fleet:
         self.refusals += 1
         self.refusal_project[project][kind] += 1
         if ts:
-            self.refusal_week[ts.strftime("%Y-W%V")][kind] += 1
+            # %G, the ISO year, pairs with %V: 2025-12-29 is 2026-W01.
+            self.refusal_week[ts.strftime("%G-W%V")][kind] += 1
         if not call:
             return
         name, cmd = call
@@ -2159,7 +2166,9 @@ class Fleet:
             if progress:
                 print(f"\r  scanning {i}/{len(dirs)}  {project[:48]:<48}",
                       end="", file=sys.stderr, flush=True)
-            for f in d.glob("*.jsonl"):
+            # Sorted: which copy of a repeated message is kept decides its day,
+            # branch and ticket, so the order must not be the filesystem's.
+            for f in sorted(d.glob("*.jsonl")):
                 self._scan_file(f, project, since)
         if progress:
             print("\r" + " " * 72 + "\r", end="", file=sys.stderr, flush=True)
@@ -2592,10 +2601,13 @@ def coach(fleet: "Fleet") -> list[Finding]:
     # If a transcript format stops emitting message ids, cost silently doubles
     # -- the exact 0.1.0 defect, reintroduced by a vendor change rather than by
     # us, with nothing to say so.
-    if fleet.messages >= 500 and fleet.duplicate_usage_records == 0:
+    # Claude Code messages only: Codex and Copilot units are whole sessions,
+    # which are never re-emitted, so counting them here raised a false critical.
+    claude_messages = fleet.units_by_agent["claude-code"]
+    if claude_messages >= 500 and fleet.duplicate_usage_records == 0:
         out.append(Finding(
             "AF012", "critical", "Deduplication collapsed nothing, which should be impossible",
-            f"{num(fleet.messages)} messages were counted and not one repeated record "
+            f"{num(claude_messages)} Claude Code messages were counted and not one repeated record "
             f"was collapsed. On a scan this size that has not been observed in real "
             f"transcripts: an agent re-emits an assistant record while a response "
             f"streams, so repeats are normal and their absence is not.",
@@ -3080,7 +3092,7 @@ def _jsonl_files(roots: list[Path], codex: list[Path],
     out: list[Path] = []
     for r in roots:
         try:
-            out.extend(f for d in r.iterdir() if d.is_dir() for f in d.glob("*.jsonl"))
+            out.extend(f for d in sorted(r.iterdir()) if d.is_dir() for f in sorted(d.glob("*.jsonl")))
         except OSError:
             continue
     for r in codex:
@@ -4022,7 +4034,8 @@ class _MCPCache:
             self._store.move_to_end(key)
         else:
             f = Fleet()
-            since = (datetime.now(timezone.utc) - timedelta(days=days)) if days else None
+            # The same cutoff as the CLI's --days, so the two never disagree.
+            since = window_start(days) if days else None
             roots = transcript_roots()
             if roots:
                 f.scan(roots, since, project, progress=False)

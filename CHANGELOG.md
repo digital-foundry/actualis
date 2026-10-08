@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.2.2 — 2026-10-08
+
+### Fixed
+
+Found by an audit of every calculation for explainability, traceability and
+determinism.
+
+- **Results no longer depend on the order the filesystem lists transcripts.**
+  When the same message appears in two transcripts it is counted once, and the
+  copy kept decides its day, branch and ticket. Files were read in directory
+  order, which differs between machines, so a Mac and a Linux runner could
+  report different per-day and per-branch figures and a different
+  `report_sha256` for the same files. Files are now read in sorted path order.
+- **AF012 no longer fires a false critical on Codex- or Copilot-only fleets.**
+  It counted their sessions toward its 500-message threshold, but sessions are
+  never re-emitted, so `--fail-on critical` failed on 500 Codex sessions. It
+  now counts Claude Code messages only.
+- **`refusals.by_week` labels weeks with their ISO year.** 2025-12-29 was
+  labelled `2025-W01` instead of `2026-W01`, colliding with January.
+- **The MCP server's `days` window matches `--days`.** It counted back from
+  the current time instead of from midnight UTC, so the same `days` covered an
+  extra partial day and reported a different cost than the CLI.
+- **Models priced from an aggregator or vendor docs are no longer reported as
+  unpriced.** They were added to `unknown_models` and
+  `cost_usd_from_unpriced_models`, and the report said they were billed at
+  Opus-tier rates. `aggregator_priced_models` is now filled for Claude Code,
+  Codex and Copilot.
+
 ## 0.2.1 — 2026-10-07
 
 ### Fixed
