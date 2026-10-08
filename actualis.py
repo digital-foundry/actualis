@@ -1703,8 +1703,41 @@ def network_items_from_tool(name: str, tool_input: dict) -> list[dict]:
 AUDIT_CONFIG_FILES = (".actualis-network-trust", ".actualis-suppressions")
 _FILE_WRITE_TOOLS = frozenset({"write", "edit", "multiedit", "notebookedit", "create",
                                "edit_file", "str_replace_editor", "str_replace_based_edit_tool"})
-_AUDIT_CONFIG_WRITE = re.compile(
-    r">|\btee\b|\bsed\s+-i|\b(?:mv|cp|rm|ln|truncate|install)\b|\bperl\s+-[a-z]*i")
+_REDIRECT = re.compile(r"^(?:\d*|&)>>?(.*)$")
+_FILE_MUTATORS = frozenset({"mv", "cp", "rm", "ln", "truncate", "install"})
+
+
+def _is_audit_config(path: str) -> bool:
+    return path.replace("\\", "/").rsplit("/", 1)[-1] in AUDIT_CONFIG_FILES
+
+
+def writes_audit_config(cmd: str) -> bool:
+    """A heuristic: does a segment of `cmd` write one of the audit config files?
+
+    A redirection into the file, `tee` of it, or an in-place editor / file
+    mutator that takes it as an argument. Reads, redirections to /dev/null,
+    `&N` duplications and redirections into other files do not count.
+    """
+    for segment in _net_split(cmd)[0]:
+        toks = _net_tokens(segment)
+        for i, tok in enumerate(toks):
+            m = _REDIRECT.match(tok)
+            if m:
+                target = m.group(1) or (toks[i + 1] if i + 1 < len(toks) else "")
+                if _is_audit_config(target):
+                    return True
+        words = [t for t in toks if t not in ("sudo", "env", "command", "nohup") and "=" not in t.split("/")[0]]
+        if not words:
+            continue
+        prog = words[0].rsplit("/", 1)[-1]
+        args = [w for w in words[1:] if _is_audit_config(w) and not _REDIRECT.match(w)]
+        if not args:
+            continue
+        if prog == "tee" or prog in _FILE_MUTATORS:
+            return True
+        if prog in ("sed", "perl") and any(re.match(r"^-[a-z]*i", w) for w in words[1:]):
+            return True
+    return False
 
 
 def network_approval(mode: str | None) -> str:
@@ -2974,7 +3007,7 @@ class Fleet:
         if name == "Bash":
             cmd = tool_input.get("command")
             if isinstance(cmd, str) and any(f in cmd for f in AUDIT_CONFIG_FILES) \
-               and _AUDIT_CONFIG_WRITE.search(cmd):
+               and writes_audit_config(cmd):
                 evidence = redact(cmd)
                 program = clean(command_head(cmd) or "Bash")[:40]
         elif name.lower() in _FILE_WRITE_TOOLS:
