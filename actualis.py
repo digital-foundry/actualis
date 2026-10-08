@@ -1266,6 +1266,8 @@ def no_transcripts_message() -> str:
          "Claude Code", "CLAUDE_CONFIG_DIR"),
         (Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser() / "sessions",
          "Codex", "CODEX_HOME"),
+        (Path(os.environ.get("COPILOT_HOME", "~/.copilot")).expanduser() / "session-state",
+         "Copilot CLI", "COPILOT_HOME"),
     ]
     for path, label, env in checked:
         parent_exists = path.parent.is_dir()
@@ -1284,6 +1286,7 @@ def no_transcripts_message() -> str:
         "If your config lives elsewhere, point at it:",
         "  CLAUDE_CONFIG_DIR=/path/to/config actualis",
         "  CODEX_HOME=/path/to/codex actualis",
+        "  COPILOT_HOME=/path/to/copilot actualis",
         "  actualis --root /path/to/a/transcript/directory",
         "",
         "Nothing is wrong with the install. There is simply nothing to read yet:",
@@ -1343,7 +1346,7 @@ def dead_end_message(fleet: "Fleet", args) -> str:
                      "Drop it to see every project.")
     if args.agent != "all":
         lines.append(f"  --agent {args.agent} reads only that vendor. "
-                     "Drop it to read both.")
+                     "Drop it to read every agent.")
     if args.days is None and not args.project and args.agent == "all":
         lines.append("  No filters were applied, so these files carry no usage records --\n"
                      "  they may be from a different tool, or truncated.")
@@ -1427,6 +1430,51 @@ def codex_session_cost(usage: dict, model: str) -> float:
     return total_in / 1e6 * in_rate + out / 1e6 * out_rate
 
 
+def copilot_roots() -> list[Path]:
+    """Copilot CLI writes one directory per session under $COPILOT_HOME/session-state."""
+    base = Path(os.environ.get("COPILOT_HOME", Path.home() / ".copilot")).expanduser()
+    sess = base / "session-state"
+    return [sess] if sess.is_dir() else []
+
+
+# permission.completed result kinds that let the command run. Every other kind
+# is a refusal -- a mapping taken from the schema, because no denial has been
+# observed in a real session yet. --explain copilot says so.
+COPILOT_APPROVED = frozenset({"approved", "approved-for-location"})
+
+
+def copilot_model(raw: str) -> str:
+    """Copilot writes Anthropic ids with dots (`claude-haiku-4.5`); the price
+    table uses dashes (`claude-haiku-4-5`). Without this, every Claude model run
+    through Copilot was priced as a family guess instead of its published rate."""
+    m = clean(raw)[:48] or "unknown"
+    if m.startswith("claude-"):
+        m = re.sub(r"(?<=\d)\.(?=\d)", "-", m)
+    return m
+
+
+def copilot_session_cost(usage: dict, model: str) -> float:
+    """Cost of one model's share of one Copilot session.
+
+    Measured on 17 local sessions: inputTokens INCLUDES cacheReadTokens and
+    cacheWriteTokens, for Anthropic and OpenAI models alike, and
+    reasoningTokens is a subset of outputTokens. Adding either back
+    double-counts. Cache writes carry no TTL, so they are priced at the same
+    assumed rate as a Claude record with no TTL split.
+    """
+    r = rate_for(model)
+    total_in = usage.get("inputTokens", 0) or 0
+    rd = usage.get("cacheReadTokens", 0) or 0
+    wr = usage.get("cacheWriteTokens", 0) or 0
+    out = usage.get("outputTokens", 0) or 0
+    fresh = max(total_in - rd - wr, 0)
+    read_mult = OPENAI_CACHED_MULT if r.provider == "openai" else CACHE_READ_MULT
+    return (fresh / 1e6 * r.input
+            + rd / 1e6 * r.input * read_mult
+            + wr / 1e6 * r.input * CACHE_WRITE_ASSUMED_MULT
+            + out / 1e6 * r.output)
+
+
 class Fleet:
     def __init__(self) -> None:
         self.messages = 0
@@ -1475,6 +1523,13 @@ class Fleet:
         self.unsupervised_by_day: Counter = Counter()
         self.bash_categories: Counter = Counter()
         self.agents_seen: set[str] = set()
+        # Copilot bills in premium requests as well as tokens. Fractional
+        # (0.33 per request on some models), and never converted to dollars:
+        # the conversion depends on a plan this tool cannot see.
+        self.premium_requests_by_agent: dict[str, float] = defaultdict(float)
+        # Copilot sessions with activity but no session.shutdown record. Their
+        # usage is unknowable, so they are counted rather than estimated.
+        self.copilot_unpriced = 0
         # The permission mode in force, carried across records within one file.
         self._mode: str | None = None
         self.flags: list[dict] = []
@@ -1653,6 +1708,54 @@ class Fleet:
             if self.last_ts is None or ts > self.last_ts:
                 self.last_ts = ts
 
+    def add_copilot_session(self, project: str, model: str, usage: dict,
+                            ts: datetime | None, branch: str | None = None) -> None:
+        """One model's usage in one Copilot session, from session.shutdown.
+
+        modelMetrics is the session's final per-model total, written once, so
+        each (session, model) pair is recorded exactly once -- the same guard
+        add_codex_session applies to Codex's cumulative totals.
+        """
+        project = clean(project)[:120] or "unknown"
+        model = copilot_model(model)
+        branch = (clean(branch)[:120] or None) if branch else None
+        cost = copilot_session_cost(usage, model)
+        _, _, _, known, tier = rates_for(model, None)
+        self.cost_by_tier[tier] += cost
+        self.models_by_tier[tier].add(model)
+        if not known:
+            self.unknown_models[model] += 1
+            self.cost_unknown += cost
+
+        self.messages += 1
+        self.agents_seen.add("copilot")
+        self.cost_by_agent["copilot"] += cost
+        self.msgs_by_model[model] += 1
+        self.cost_by_model[model] += cost
+        self.cost_by_project[project] += cost
+        rd = usage.get("cacheReadTokens", 0) or 0
+        wr = usage.get("cacheWriteTokens", 0) or 0
+        self.tokens["input"] += max((usage.get("inputTokens", 0) or 0) - rd - wr, 0)
+        self.tokens["cache_read"] += rd
+        self.tokens["cache_w_assumed"] += wr
+        self.tokens["output"] += usage.get("outputTokens", 0) or 0
+
+        self.cost_by_branch[branch_bucket(branch)] += cost
+        ticket = extract_ticket(branch)
+        if ticket:
+            self.cost_by_ticket[ticket] += cost
+            self.msgs_by_ticket[ticket] += 1
+            self.branches_by_ticket[ticket].add(branch)
+            self.projects_by_ticket[ticket].add(project)
+            if ts:
+                self.dates_by_ticket[ticket].append(ts.date().isoformat())
+        if ts:
+            self.cost_by_day[ts.date().isoformat()] += cost
+            if self.first_ts is None or ts < self.first_ts:
+                self.first_ts = ts
+            if self.last_ts is None or ts > self.last_ts:
+                self.last_ts = ts
+
     def scan_codex(self, roots: list[Path], since: datetime | None,
                    project_filter: str | None) -> None:
         for root in roots:
@@ -1740,6 +1843,137 @@ class Fleet:
         if best:
             self.add_codex_session(project, model or "unknown", best, last_ts)
 
+    def scan_copilot(self, roots: list[Path], since: datetime | None,
+                     project_filter: str | None) -> None:
+        for root in roots:
+            for f in sorted(root.glob("*/events.jsonl")):
+                self._scan_copilot_file(f, since, project_filter)
+
+    def _scan_copilot_file(self, path: Path, since: datetime | None,
+                           project_filter: str | None) -> None:
+        """One Copilot CLI session. Two passes over memory, one over disk:
+        whether a command was prompted is only known once every
+        permission.requested in the session has been seen."""
+        try:
+            st = path.stat()
+        except OSError:
+            return
+        if since is not None and st.st_mtime < (since.timestamp() - 3600):
+            return
+        self.bytes_scanned += st.st_size
+        self.files_scanned += 1
+
+        cwd = branch = None
+        shutdown: dict | None = None
+        shutdown_ts: datetime | None = None
+        calls: list[tuple[str, str, str, datetime | None]] = []   # (id, tool, command, ts)
+        prompted: set[str] = set()
+        refusals: list[tuple[str, str, datetime | None]] = []     # (kind, id, ts)
+        subagents: list[tuple[dict, datetime | None]] = []
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    try:
+                        rec = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if not isinstance(rec, dict):
+                        continue
+                    data = rec.get("data")
+                    if not isinstance(data, dict):
+                        continue
+                    kind = rec.get("type")
+                    ts = parse_ts(rec.get("timestamp"))
+                    if kind in ("session.start", "session.context_changed"):
+                        ctx = data.get("context") if kind == "session.start" else data
+                        if isinstance(ctx, dict):
+                            cwd = ctx.get("gitRoot") or ctx.get("cwd") or cwd
+                            branch = ctx.get("branch") or branch
+                    elif kind == "tool.execution_start":
+                        name = str(data.get("toolName") or "?")
+                        args = data.get("arguments")
+                        cmd = args.get("command") if isinstance(args, dict) else None
+                        cmd = cmd if name == "bash" and isinstance(cmd, str) else ""
+                        calls.append((str(data.get("toolCallId") or ""), name, cmd, ts))
+                    elif kind == "permission.requested":
+                        req = data.get("permissionRequest")
+                        if isinstance(req, dict) and req.get("kind") == "shell" \
+                                and req.get("toolCallId"):
+                            prompted.add(str(req["toolCallId"]))
+                    elif kind == "permission.completed":
+                        result = data.get("result")
+                        rk = result.get("kind") if isinstance(result, dict) else None
+                        if rk and rk not in COPILOT_APPROVED:
+                            refusals.append((f"copilot:{clean(str(rk))[:40]}",
+                                             str(data.get("toolCallId") or ""), ts))
+                    elif kind == "subagent.completed":
+                        subagents.append((data, ts))
+                    elif kind == "session.shutdown":
+                        shutdown, shutdown_ts = data, ts
+        except OSError:
+            return
+
+        project = pretty_project(cwd.lstrip("/").replace("/", "-")) if cwd else "copilot"
+        if project_filter and project_filter.lower() not in project.lower():
+            return
+
+        def in_window(t: datetime | None) -> bool:
+            return not (since and t and t < since)
+
+        active = False
+        joined: dict[str, tuple[str, str]] = {}
+        for call_id, name, cmd, ts in calls:
+            if not in_window(ts):
+                continue
+            active = True
+            if cmd:
+                mode = "copilot:prompted" if call_id in prompted else "copilot:auto"
+                self.permission_modes[mode] += 1
+                # Normalised onto "Bash", as Codex is, so the audit is one view.
+                self.add_tool(project, "Bash", {"command": cmd}, ts, mode)
+                if call_id:
+                    joined[call_id] = ("Bash", cmd[:MAX_SCAN_LINE])
+            else:
+                self.add_tool(project, name, {}, ts)
+                if call_id:
+                    joined[call_id] = (name, "")
+        for kind, call_id, ts in refusals:
+            if in_window(ts):
+                active = True
+                self.denials[kind] += 1
+                self.denials_by_project[project] += 1
+                self._record_refusal(kind, project, ts, joined.get(call_id))
+        for data, ts in subagents:
+            if in_window(ts):
+                # Copilot gives a token total with no input/output split, so no
+                # usage is passed and no cost floor is recorded.
+                self.add_subagent({"resolvedModel": copilot_model(str(data.get("model") or "")),
+                                   "status": "completed",
+                                   "totalDurationMs": data.get("durationMs") or 0,
+                                   "toolStats": {}}, ts)
+        if active:
+            self.agents_seen.add("copilot")
+
+        if shutdown is None:
+            if active:
+                self.copilot_unpriced += 1
+            return
+        if not in_window(shutdown_ts):
+            return
+        metrics = shutdown.get("modelMetrics")
+        priced = False
+        if isinstance(metrics, dict):
+            for model, m in metrics.items():
+                usage = m.get("usage") if isinstance(m, dict) else None
+                if isinstance(usage, dict):
+                    self.add_copilot_session(project, str(model), usage, shutdown_ts, branch)
+                    priced = True
+        if priced:
+            self.units_by_agent["copilot"] += 1
+        pr = shutdown.get("totalPremiumRequests")
+        if isinstance(pr, (int, float)) and not isinstance(pr, bool):
+            self.premium_requests_by_agent["copilot"] += float(pr)
+
     def add_refusal(self, kind: str, rec: dict, project: str,
                     ts: datetime | None, calls: dict[str, tuple[str, str]]) -> None:
         """Attribute one refusal to the tool call it blocked.
@@ -1748,29 +1982,33 @@ class Fleet:
         through `tool_use_id` on its tool_result. Reading only the refusal
         record tells you a refusal happened and nothing about what was refused.
         """
+        hit = None
+        msg = rec.get("message")
+        blocks = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(blocks, list):
+            for b in blocks:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    hit = calls.get(b.get("tool_use_id") or "")
+                    if hit:
+                        break
+        self._record_refusal(kind, project, ts, hit)
+
+    def _record_refusal(self, kind: str, project: str, ts: datetime | None,
+                        call: tuple[str, str] | None) -> None:
+        """Count one refusal, and attribute it when the blocked call is known."""
         self.refusals += 1
         self.refusal_project[project][kind] += 1
         if ts:
             self.refusal_week[ts.strftime("%Y-W%V")][kind] += 1
-
-        msg = rec.get("message")
-        blocks = msg.get("content") if isinstance(msg, dict) else None
-        if not isinstance(blocks, list):
+        if not call:
             return
-        for b in blocks:
-            if not isinstance(b, dict) or b.get("type") != "tool_result":
-                continue
-            hit = calls.get(b.get("tool_use_id") or "")
-            if not hit:
-                continue
-            name, cmd = hit
-            self.refusals_joined += 1
-            self.refusal_tool[kind][clean(name)[:48] or "?"] += 1
-            if name == "Bash" and cmd:
-                head = command_head(cmd)
-                if head:
-                    self.refusal_program[kind][clean(head)[:40]] += 1
-            return
+        name, cmd = call
+        self.refusals_joined += 1
+        self.refusal_tool[kind][clean(name)[:48] or "?"] += 1
+        if name == "Bash" and cmd:
+            head = command_head(cmd)
+            if head:
+                self.refusal_program[kind][clean(head)[:40]] += 1
 
     def add_subagent(self, result: dict, ts: datetime | None) -> None:
         """One completed subagent run.
@@ -2822,7 +3060,8 @@ def notify(title: str, message: str) -> None:
         pass  # a missing notifier must never take the watcher down
 
 
-def _jsonl_files(roots: list[Path], codex: list[Path]) -> list[Path]:
+def _jsonl_files(roots: list[Path], codex: list[Path],
+                 copilot: list[Path] | None = None) -> list[Path]:
     out: list[Path] = []
     for r in roots:
         try:
@@ -2834,11 +3073,16 @@ def _jsonl_files(roots: list[Path], codex: list[Path]) -> list[Path]:
             out.extend(r.rglob("rollout-*.jsonl"))
         except OSError:
             continue
+    for r in copilot or []:
+        try:
+            out.extend(r.glob("*/events.jsonl"))
+        except OSError:
+            continue
     return out
 
 
 def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
-          quiet: bool, raw: bool) -> int:
+          quiet: bool, raw: bool, copilot: list[Path] | None = None) -> int:
     import time
 
     # Python block-buffers stdout when it is not a terminal. For a watcher that
@@ -2850,7 +3094,7 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
         pass
 
     offsets: dict[Path, int] = {}
-    for f in _jsonl_files(roots, codex):
+    for f in _jsonl_files(roots, codex, copilot):
         try:
             offsets[f] = f.stat().st_size      # start at EOF: history is not news
         except OSError:
@@ -2860,7 +3104,7 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
     cmds = flagged = crit = 0
     started = datetime.now(timezone.utc)
 
-    srcs = ", ".join(str(r) for r in (roots + codex))
+    srcs = ", ".join(str(r) for r in (roots + codex + (copilot or [])))
     print(f"{c.bold}actualis watch{c.off} {c.dim}· {len(offsets)} files · every "
           f"{interval:g}s · ctrl-c to stop{c.off}")
     print(f"{c.dim}watching {srcs}{c.off}")
@@ -2868,7 +3112,7 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
 
     try:
         while True:
-            for f in _jsonl_files(roots, codex):
+            for f in _jsonl_files(roots, codex, copilot):
                 try:
                     size = f.stat().st_size
                 except OSError:
@@ -2889,9 +3133,11 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
                 except OSError:
                     continue
 
-                project = pretty_project(f.parent.name)
+                project = ("copilot" if f.name == "events.jsonl"
+                           else pretty_project(f.parent.name))
                 for line in chunk.splitlines():
-                    if '"tool_use"' not in line and '"function_call"' not in line:
+                    if ('"tool_use"' not in line and '"function_call"' not in line
+                            and '"tool.execution_start"' not in line):
                         continue
                     try:
                         rec = json.loads(line)
@@ -2943,7 +3189,7 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
 
 
 def _commands_in(rec: dict) -> list[str]:
-    """Every shell command in one transcript record, across both agent formats."""
+    """Every shell command in one transcript record, across every agent format."""
     out: list[str] = []
     msg = rec.get("message")
     if isinstance(msg, dict) and isinstance(msg.get("content"), list):
@@ -2960,6 +3206,13 @@ def _commands_in(rec: dict) -> list[str]:
             args = {}
         if args.get("command"):
             out.append(args["command"])
+    data = rec.get("data")
+    if rec.get("type") == "tool.execution_start" and isinstance(data, dict) \
+            and data.get("toolName") == "bash":
+        args = data.get("arguments")
+        cmd = args.get("command") if isinstance(args, dict) else None
+        if isinstance(cmd, str) and cmd:
+            out.append(cmd)
     return out
 
 
@@ -3024,6 +3277,7 @@ EXPLAIN: dict[str, dict[str, object]] = {
         "formula": [
             "Claude Code  ~/.claude/projects/**/*.jsonl  (plus $CLAUDE_CONFIG_DIR)",
             "Codex        $CODEX_HOME/sessions/**/rollout-*.jsonl",
+            "Copilot CLI  $COPILOT_HOME/session-state/*/events.jsonl  (default ~/.copilot)",
             "",
             "Files are opened read-only. Nothing is written, cached, or sent.",
             "Every directory actually scanned is printed in the report header.",
@@ -5182,7 +5436,10 @@ def self_check(c: C, days: int | None = 7, root: str | None = None) -> int:
             print(f"          {c.dim}{line}{c.off}")
 
     roots = ([Path(root).expanduser()] if root
-             else transcript_roots() + codex_roots())
+             else transcript_roots() + codex_roots() + copilot_roots())
+    if roots:
+        result(True, "the only directories this run reads",
+               "; ".join(str(r) for r in roots))
 
     # 1. What this build imports at all. Read from the source, so it describes
     #    the shipped file rather than whatever is loaded right now.
@@ -5277,6 +5534,9 @@ def _self_check_corpus(roots: list[Path], sample: list[Path], result, c: C,
     fleet = Fleet()
     since = window_start(days, datetime.now(timezone.utc)) if days else None
     fleet.scan(roots, since, None, progress=False)
+    copilot = [r for r in roots if r in copilot_roots()]
+    if copilot:
+        fleet.scan_copilot(copilot, since, None)
 
     changed = [str(f) for f in sample if _digest_file(f) != before[f]]
     result(not changed,
@@ -5828,7 +6088,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="--watch poll interval (default 4)")
     ap.add_argument("--quiet", action="store_true",
                     help="--watch: notify on secrets only, not every flagged command")
-    ap.add_argument("--agent", choices=["all", "claude", "codex"], default="all",
+    ap.add_argument("--agent", choices=["all", "claude", "codex", "copilot"], default="all",
                     help="which agents to include (default: all)")
     ap.add_argument("--no-redact", action="store_true",
                     help="do NOT redact credentials from output (unsafe to share)")
@@ -5942,12 +6202,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.watch:
         if args.root:
             root = Path(args.root).expanduser()
-            w_roots, w_codex = ([], [root]) if args.agent == "codex" else ([root], [])
+            w_roots, w_codex, w_copilot = (
+                ([], [root], []) if args.agent == "codex"
+                else ([], [], [root]) if args.agent == "copilot"
+                else ([root], [], []))
         else:
             w_roots = transcript_roots() if args.agent in ("all", "claude") else []
             w_codex = codex_roots() if args.agent in ("all", "codex") else []
+            w_copilot = copilot_roots() if args.agent in ("all", "copilot") else []
         return watch(w_roots, w_codex, max(args.interval, 0.5),
-                     C(use_color()), args.quiet, args.no_redact)
+                     C(use_color()), args.quiet, args.no_redact, w_copilot)
 
     if args.replay:
         since_r = window_start(args.days, datetime.now(timezone.utc)) if args.days else None
@@ -6001,6 +6265,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.agent == "codex":
             fleet.roots.append(root)
             fleet.scan_codex([root], since, args.project)
+        elif args.agent == "copilot":
+            fleet.roots.append(root)
+            fleet.scan_copilot([root], since, args.project)
         else:
             fleet.scan([root], since, args.project, progress=progress)
     else:
@@ -6016,6 +6283,13 @@ def main(argv: list[str] | None = None) -> int:
                 fleet.roots.extend(croots)
                 fleet.scan_codex(croots, since, args.project)
             elif args.agent == "codex":
+                sys.exit(no_transcripts_message())
+        if args.agent in ("all", "copilot"):
+            proots = copilot_roots()
+            if proots:
+                fleet.roots.extend(proots)
+                fleet.scan_copilot(proots, since, args.project)
+            elif args.agent == "copilot":
                 sys.exit(no_transcripts_message())
 
     if fleet.messages == 0 and fleet.bash_total == 0:
