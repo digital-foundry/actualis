@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.1 — 2026-10-07
+
+### Fixed
+
+- **The GitHub Action could not load in 0.2.0.** GitHub evaluates `${{ ... }}`
+  expressions anywhere in a `run:` block, shell comments included, and the
+  comment explaining 0.2.0's own fix contained an empty one. Every caller got
+  "An expression was expected". The CLI was not affected. A new test fails the
+  build on any empty or unclosed expression in `action.yml` or a workflow, so
+  this is now caught before a release instead of by the post-release
+  self-test.
+
 ## 0.2.0 — 2026-10-07
 
 Actualis now reads Copilot CLI. Post your card.
