@@ -5302,11 +5302,19 @@ def card_paths(out_dir: Path) -> tuple:
 def write_card(m: dict, style: str, out_dir: Path) -> tuple:
     """Write one card. Mode "x" makes never-overwrite hold even under a race."""
     ops = layout_hero(m) if style == "hero" else layout_terminal(m)
+    svg_data, png_data = svg_text(ops), png_bytes(ops)   # render before opening anything
     svg, png = card_paths(out_dir)
     with svg.open("x", encoding="utf-8", newline="\n") as fh:
-        fh.write(svg_text(ops))
-    with png.open("xb") as fh:
-        fh.write(png_bytes(ops))
+        fh.write(svg_data)
+    try:
+        with png.open("xb") as fh:
+            fh.write(png_data)
+    except BaseException:
+        try:
+            svg.unlink()
+        except OSError:
+            pass
+        raise
     return svg, png
 
 
@@ -6798,6 +6806,18 @@ def main(argv: list[str] | None = None) -> int:
                  "Save this run with --json, then diff the two files.")
     if args.card and args.json:
         ap.error("--card writes files; it cannot also emit --json.")
+    if args.card:
+        for flag, on in (("--fail-on", args.fail_on), ("--diff", args.diff),
+                         ("--why", args.why), ("--share", args.share),
+                         ("--watch", args.watch), ("--mcp", args.mcp),
+                         ("--replay", args.replay)):
+            if on:
+                ap.error(f"--card writes files; it cannot be combined with {flag}.")
+        card_dir = Path(args.out).expanduser() if args.out else Path.cwd()
+        if not card_dir.is_dir():
+            print(f"actualis: {card_dir} is not a directory.\n"
+                  "  --out takes the directory the card is written into.", file=sys.stderr)
+            return EXIT_CANNOT_RUN
     if not args.card and (args.style != "hero" or args.out):
         ap.error("--style and --out apply only to --card.")
 
@@ -6963,17 +6983,18 @@ def main(argv: list[str] | None = None) -> int:
         return render_why(args.why, fleet, C(use_color()))
 
     if args.card:
-        out_dir = Path(args.out).expanduser() if args.out else Path.cwd()
-        if not out_dir.is_dir():
-            print(f"actualis: {out_dir} is not a directory.\n"
-                  "  --out takes the directory the card is written into.", file=sys.stderr)
-            return EXIT_CANNOT_RUN
+        out_dir = card_dir
         try:
             model = card_model(fleet, args.card, args.days)
         except CardError as exc:
             print(f"actualis: {exc}", file=sys.stderr)
             return EXIT_CANNOT_RUN
-        svg, png = write_card(model, args.style, out_dir)
+        try:
+            svg, png = write_card(model, args.style, out_dir)
+        except OSError as exc:
+            print(f"actualis: cannot write the card to {out_dir}: {exc.strerror or exc}",
+                  file=sys.stderr)
+            return EXIT_CANNOT_RUN
         print(f"  {svg}\n  {png}\n\n  {model['share']}")
         return EXIT_OK
 

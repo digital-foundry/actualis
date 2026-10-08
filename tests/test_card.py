@@ -472,6 +472,21 @@ class TestCardFiles(unittest.TestCase):
             self.assertNotEqual(a, b)
             self.assertEqual(len(list(Path(td).iterdir())), 4)
 
+    def test_failed_png_leaves_no_half_card(self):
+        m = af.card_model(_busy_fleet(), "volume")
+        real = af.png_bytes
+
+        def boom(ops):
+            raise RuntimeError("png")
+        af.png_bytes = boom
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                with self.assertRaises(RuntimeError):
+                    af.write_card(m, "hero", Path(td))
+                self.assertEqual(list(Path(td).iterdir()), [])
+        finally:
+            af.png_bytes = real
+
 
 class TestCardCli(unittest.TestCase):
 
@@ -528,6 +543,29 @@ class TestCardCli(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self._run(["--style", "terminal"])
 
+    def test_card_with_another_mode_is_an_error(self):
+        for argv, flag in ((["--card", "--fail-on", "high"], "--fail-on"),
+                           (["--card", "--share"], "--share")):
+            with self.subTest(flag=flag):
+                err = io.StringIO()
+                with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+                    af.main(argv)
+                self.assertIn("cannot be combined with " + flag, err.getvalue())
+
+    @unittest.skipIf(os.name == "nt", "POSIX permissions")
+    def test_unwritable_out_exits_cleanly(self):
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("root ignores directory permissions")
+        with fx.isolated_home() as home, tempfile.TemporaryDirectory() as d:
+            fx.write_sessions(home / ".copilot" / "session-state")
+            os.chmod(d, 0o500)
+            try:
+                rc, _, err = self._run(["--card", "--out", d])
+            finally:
+                os.chmod(d, 0o700)
+        self.assertEqual(rc, af.EXIT_CANNOT_RUN)
+        self.assertIn("cannot write the card", err)
+
     def test_self_check_names_the_card_write_path(self):
         with fx.isolated_home():
             _, stdout, _ = self._run(["--self-check"])
@@ -559,6 +597,7 @@ class TestCardGoldens(unittest.TestCase):
         digest = hashlib.sha256(bytes(self.mod.rasterize(self.cards[("hero", "supervision")]))).hexdigest()
         path = GOLDENS / "card-hero-supervision.pixels.sha256"
         if UPDATE:
+            GOLDENS.mkdir(exist_ok=True)
             with path.open("w", encoding="utf-8", newline="\n") as fh:
                 fh.write(digest + "\n")
         self.assertEqual(path.read_text(encoding="utf-8").strip(), digest)
