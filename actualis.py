@@ -5725,7 +5725,8 @@ def _mcp_call(name: str, args: dict, cache: _MCPCache) -> dict:
             "secrets": [{"priority": e["priority"], "types": sorted(e["kinds"]),
                          "fingerprint": fp, "uses": e["uses"],
                          "first_seen": e["first"], "last_seen": e["last"],
-                         "projects": sorted(e["projects"])} for fp, e in rows[:50]],
+                         "projects": sorted(e["projects"]),
+                         "distinct_values": e.get("distinct_values", 1)} for fp, e in rows[:50]],
         }
 
     if name == "explain":

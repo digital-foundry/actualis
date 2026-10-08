@@ -790,6 +790,19 @@ class TestMCP(unittest.TestCase):
             self.assertEqual(len(s["fingerprint"]), 8)
             self.assertIn("priority", s)
 
+    def test_exposed_secrets_reports_distinct_values_at_one_location(self):
+        f = self._fleet_with_secrets()
+        ts = datetime(2026, 8, 2, tzinfo=timezone.utc)
+        for pw in ("Zq9firstPW1", "Zq9otherPW2"):
+            f.add_tool("proj", "Bash", {"command": f"curl -u alice:{pw} https://a.io"}, ts)
+        cache = af._MCPCache()
+        cache._store[(None, None)] = f
+        out = af._mcp_call("exposed_secrets", {}, cache)
+        loc = [s for s in out["secrets"] if "password option" in s["types"]]
+        self.assertEqual([(s["uses"], s["distinct_values"]) for s in loc], [(2, 2)])
+        self.assertTrue(all(isinstance(s["distinct_values"], int) for s in out["secrets"]))
+        self.assertNotIn("Zq9firstPW1", json.dumps(out))
+
     def test_ticket_lookup_accepts_bare_and_hashed(self):
         for q in ("#412", "412"):
             with self.subTest(q=q):
