@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 — unreleased
+## 0.2.0 — 2026-10-07
 
 Actualis now reads Copilot CLI. Post your card.
 
@@ -20,10 +20,16 @@ Actualis now reads Copilot CLI. Post your card.
   PNG are drawn from one list of pixel runs, so they cannot disagree. Nothing
   identifying can reach either, and the leak test now checks both, plus the
   printed caption.
-- **`--card` refuses to combine** with `--json`, `--fail-on`, `--diff`, `--why`,
-  `--share`, `--watch`, `--mcp` and `--replay`, so a card run can never
-  silently skip a CI gate.
+- **`--card` refuses to combine** with another mode -- `--json`, `--fail-on`,
+  `--diff`, `--why`, `--share`, `--watch`, `--mcp`, `--replay`, `--self-check`,
+  `--explain`, `--agents`, `--suppress`, `--suppressions`, `--completions` or
+  `--service` -- so a card run can never silently skip a CI gate or quietly
+  write nothing.
 - **The MCP server (`--mcp`) now sees Copilot sessions** too.
+- **Copilot sessions with no shutdown record are reported, not dropped.** The
+  report says `N Copilot sessions unpriced (no shutdown record)` under the cost
+  line, and `--json` carries `copilot_unpriced_sessions`. No cost is estimated
+  for them.
 
 ### Changed
 
@@ -35,6 +41,16 @@ Actualis now reads Copilot CLI. Post your card.
 - **MCP `fleet_summary` uses the same single "unsupervised" definition**, so
   `codex:never` counts as unsupervised there as well.
 - The vendor matrix (`--explain vendors`, `--json`) has a `copilot` column.
+
+### Fixed
+
+- **`--share` printed raw model ids.** A fine-tune or private deployment id
+  could reach a summary documented as containing nothing identifying. Model
+  names now appear only when they are exact entries in the public price table;
+  anything else is `custom`. The leak test seeds a private model id.
+- **A GitHub expression inside the Action's `run:` block killed the audit
+  step.** GitHub expands `${{ ... }}` before bash sees the script, so a help
+  message quoting one left a dangling quote and a syntax error on the runner.
 
 ## 0.1.14 — 2026-09-05
 
