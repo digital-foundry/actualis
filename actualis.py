@@ -1839,13 +1839,47 @@ def _net_wget(args: list[str]) -> list[dict]:
     return [_net_url_item("fetch", "wget", u, dest=dest) for u in pos if _net_is_url_arg(u)]
 
 
-def _net_git(args: list[str]) -> list[dict]:
+def _net_git_sub(args: list[str]) -> tuple[str, list[str]]:
+    """The git subcommand and its arguments, past the global options."""
     i = 0
     while i < len(args) and args[i].startswith("-"):
         i += 2 if args[i] in _GIT_GLOBAL_VALUE else 1
-    if i >= len(args):
+    return (args[i], args[i + 1:]) if i < len(args) else ("", [])
+
+
+NET_REMOTES_CAP = 256
+
+
+def _net_git_remotes(args: list[str], remotes: dict[str, str]) -> None:
+    """Track, in order, the URL each remote name stands for in this session:
+    `git remote add|set-url NAME URL`, and the `origin` a `git clone URL` makes."""
+    sub, rest = _net_git_sub(args)
+    if sub == "clone":
+        pos, _ = _net_positionals(rest, _GIT_CLONE_VALUE)
+        if pos and (len(remotes) < NET_REMOTES_CAP or "origin" in remotes):
+            remotes["origin"] = pos[0]
+    elif sub == "remote" and rest[:1] in (["add"], ["set-url"]):
+        pos, _ = _net_positionals(rest[1:])
+        if len(pos) >= 2 and (len(remotes) < NET_REMOTES_CAP or pos[0] in remotes):
+            remotes[pos[0]] = pos[1]
+
+
+def _net_git_remote_name(args: list[str]) -> str | None:
+    """The remote a fetch, pull or dry-run push names (`origin` when none is
+    given), or None for any other command or when a URL is given directly."""
+    sub, rest = _net_git_sub(args)
+    if sub not in ("fetch", "pull", "push"):
+        return None
+    pos, _ = _net_positionals(rest, frozenset({"--depth", "-j", "--jobs"}))
+    if not pos:
+        return "origin"
+    return None if _NET_URL.match(pos[0]) or url_host(pos[0]) else pos[0]
+
+
+def _net_git(args: list[str]) -> list[dict]:
+    sub, rest = _net_git_sub(args)
+    if not sub:
         return []
-    sub, rest = args[i], args[i + 1:]
     if sub == "clone":
         pos, _ = _net_positionals(rest, _GIT_CLONE_VALUE)
         if not pos:
@@ -1857,6 +1891,11 @@ def _net_git(args: list[str]) -> list[dict]:
             return [_net_url_item("clone", "git", pos[0])]
         return [_net_item("clone", "git")]
     if sub == "submodule" and rest[:1] == ["update"]:
+        return [_net_item("clone", "git")]
+    if sub == "push" and ("--dry-run" in rest or "-n" in rest):    # contacts the remote
+        pos, _ = _net_positionals(rest, frozenset({"--repo", "-o", "--push-option"}))
+        if pos and (_NET_URL.match(pos[0]) or url_host(pos[0])):
+            return [_net_url_item("clone", "git", pos[0])]
         return [_net_item("clone", "git")]
     return []
 
@@ -2109,13 +2148,18 @@ def _net_extract(tokens: list[str]) -> list[dict]:
     return []
 
 
-def network_items_from_command(cmd: str, piped_to_shell: list[str] | None = None
-                               ) -> tuple[list[dict], int]:
+def network_items_from_command(cmd: str, piped_to_shell: list[str] | None = None,
+                               remotes: dict[str, str] | None = None) -> tuple[list[dict], int]:
     """Every download the command shows, and how many segments could not be read.
 
     `piped_to_shell`, when given, receives the raw text of each curl or wget
     segment whose output a shell runs: remote code execution, seen on the
-    dequoted command (`cu''rl … | s''h`) that the audit regexes miss."""
+    dequoted command (`cu''rl … | s''h`) that the audit regexes miss.
+
+    `remotes`, when given, is one session's git remote names and the URLs they
+    were added with; it is read to resolve `git pull NAME` and updated by
+    `git remote add` and `git clone`, so a remote added in one command and
+    pulled in the next keeps its host. Pass a fresh dict per session, never shared."""
     text = (cmd or "")[:MAX_SCAN_TOTAL]
     if not _NET_MAY_DOWNLOAD.search(text):
         return [], 0
@@ -2124,6 +2168,11 @@ def network_items_from_command(cmd: str, piped_to_shell: list[str] | None = None
     for tokens, via_xargs, into_shell, raw in segments:
         got = _net_extract(tokens)
         prog = _net_base(tokens[0])
+        if prog == "git" and remotes is not None:
+            name = _net_git_remote_name(tokens[1:])
+            if name in remotes and len(got) == 1 and got[0]["host"] is None and not got[0]["dynamic"]:
+                got = [_net_url_item("clone", "git", remotes[name], host_inferred=True)]
+            _net_git_remotes(tokens[1:], remotes)
         if via_xargs and not got and prog in ("curl", "wget"):
             got = [_net_item("fetch", prog, dynamic=True)]   # the URLs came on stdin
         if into_shell and piped_to_shell is not None and prog in ("curl", "wget") and got:
@@ -2878,6 +2927,7 @@ class Fleet:
         self.network_trust_sources: list[dict] = []
         self.network_strict = False
         self._net_by_call: dict[str, list[int]] = {}
+        self._git_remotes: dict[tuple[str, str], dict[str, str]] = {}   # per (agent, session)
         # Location-based secret id -> sha256 of every value seen under it, for
         # this run only. Never written to JSON, a report or a log.
         self._location_values: dict[str, set[str]] = {}
@@ -3703,8 +3753,16 @@ class Fleet:
             if not isinstance(cmd, str) or not cmd:
                 return
             piped: list[str] = []
+            # Remotes are per (agent, session), never across sessions; a call with
+            # no session id tracks within its own command only.
+            remotes = {}
+            if session:
+                key = (agent or ("codex" if (mode or "").startswith("codex:")
+                                 else "copilot" if (mode or "").startswith("copilot:") else "claude"),
+                       str(session))
+                remotes = self._git_remotes.setdefault(key, {})
             try:
-                found, unparsed = network_items_from_command(cmd, piped)
+                found, unparsed = network_items_from_command(cmd, piped, remotes)
             except Exception:                   # noqa: BLE001 -- one bad command must not end the scan
                 found, unparsed, piped = [], 1, []
             self.network_unparsed += unparsed
