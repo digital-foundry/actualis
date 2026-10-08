@@ -1926,6 +1926,21 @@ def _net_git_sub(args: list[str]) -> tuple[str, list[str]]:
 
 
 NET_REMOTES_CAP = 256
+_GIT_REMOTE_ADD_VALUE = frozenset({"-t", "-m", "--track", "--master"})
+
+
+def _net_git_remote_names(args: list[str]) -> "list[str] | None":
+    """For a command that touches several remotes (`fetch --all`, `pull --all`,
+    `remote update [NAMES]`): the names it names, or None for every remote.
+    Returns [] for any other command."""
+    sub, rest = _net_git_sub(args)
+    if sub in ("fetch", "pull"):
+        _, opts = _net_positionals(rest, frozenset({"--depth", "-j", "--jobs"}))
+        return None if "--all" in opts else []
+    if sub == "remote" and rest[:1] == ["update"]:
+        pos, _ = _net_positionals(rest[1:])
+        return pos or None
+    return []
 
 
 def _net_git_remotes(args: list[str], remotes: dict[str, str]) -> None:
@@ -1933,11 +1948,13 @@ def _net_git_remotes(args: list[str], remotes: dict[str, str]) -> None:
     `git remote add|set-url NAME URL`, and the `origin` a `git clone URL` makes."""
     sub, rest = _net_git_sub(args)
     if sub == "clone":
-        pos, _ = _net_positionals(rest, _GIT_CLONE_VALUE)
-        if pos and (len(remotes) < NET_REMOTES_CAP or "origin" in remotes):
-            remotes["origin"] = pos[0]
+        pos, opts = _net_positionals(rest, _GIT_CLONE_VALUE)
+        name = opts.get("-o") or opts.get("--origin") or "origin"
+        if pos and (len(remotes) < NET_REMOTES_CAP or name in remotes):
+            remotes[name] = pos[0]
     elif sub == "remote" and rest[:1] in (["add"], ["set-url"]):
-        pos, _ = _net_positionals(rest[1:])
+        # -t BRANCH and -m MASTER take a value; -f, --tags, --no-tags, --mirror=… do not.
+        pos, _ = _net_positionals(rest[1:], _GIT_REMOTE_ADD_VALUE)
         if len(pos) >= 2 and (len(remotes) < NET_REMOTES_CAP or pos[0] in remotes):
             remotes[pos[0]] = pos[1]
 
@@ -1970,6 +1987,13 @@ def _net_git(args: list[str]) -> list[dict]:
         return [_net_item("clone", "git")]
     if sub == "submodule" and rest[:1] == ["update"]:
         return [_net_item("clone", "git")]
+    if sub == "remote" and rest[:1] == ["update"]:
+        return [_net_item("clone", "git")]
+    if sub == "remote" and rest[:1] == ["add"]:
+        pos, opts = _net_positionals(rest[1:], _GIT_REMOTE_ADD_VALUE)
+        if len(pos) >= 2 and ("-f" in opts or "--fetch" in opts):    # fetches at once
+            return [_net_url_item("clone", "git", pos[1])]
+        return []
     if sub == "push" and ("--dry-run" in rest or "-n" in rest):    # contacts the remote
         pos, _ = _net_positionals(rest, frozenset({"--repo", "-o", "--push-option"}))
         if pos and (_NET_URL.match(pos[0]) or url_host(pos[0])):
@@ -2247,9 +2271,18 @@ def network_items_from_command(cmd: str, piped_to_shell: list[str] | None = None
         got = _net_extract(tokens)
         prog = _net_base(tokens[0])
         if prog == "git" and remotes is not None:
+            hostless = len(got) == 1 and got[0]["host"] is None and not got[0]["dynamic"]
             name = _net_git_remote_name(tokens[1:])
-            if name in remotes and len(got) == 1 and got[0]["host"] is None and not got[0]["dynamic"]:
+            if hostless and name in remotes:
                 got = [_net_url_item("clone", "git", remotes[name], host_inferred=True)]
+            elif hostless:
+                names = _net_git_remote_names(tokens[1:])
+                urls = list(dict.fromkeys(remotes.values() if names is None
+                                          else [remotes[n] for n in names if n in remotes]))
+                if names is not None and any(n not in remotes for n in names):
+                    urls = list(dict.fromkeys(remotes.values()))    # a group name: every remote
+                if urls and (names is None or names):
+                    got = [_net_url_item("clone", "git", u, host_inferred=True) for u in urls]
             _net_git_remotes(tokens[1:], remotes)
         if via_xargs and not got and prog in ("curl", "wget"):
             got = [_net_item("fetch", prog, dynamic=True)]   # the URLs came on stdin

@@ -1962,3 +1962,48 @@ class TestUserPassReceiver(unittest.TestCase):
             af.redact(cmd)
             af.classify_secrets(cmd)
             self.assertLess(time.perf_counter() - t, 0.5, cmd[:20])
+
+
+class TestRemoteResolutionRound2(TestStrict):
+    """Fix round 2, item 3, each under --network-strict."""
+    ADD = "git remote add x https://evil.example/r"
+
+    def hosts(self, calls):
+        f, net = self.strict(calls)
+        return f, net, sorted(i["host"] for i in f.network_items if i["host"])
+
+    def test_all_remote_commands_resolve_every_known_remote(self):
+        for tail in ("git fetch --all", "git pull --all", "git remote update", "git remote update x",
+                     "git remote update somegroup", "git -C d fetch --all"):
+            f, net, hosts = self.hosts([self.ADD, "git remote add y https://other.example/q", tail])
+            want = ["evil.example"] if tail == "git remote update x" else ["evil.example", "other.example"]
+            self.assertEqual(hosts, want, tail)
+            self.assertEqual(len(net), len(want), tail)       # one (git, host) group each
+            self.assertTrue(all(i["host_inferred"] for i in f.network_items), tail)
+        f, net, hosts = self.hosts([self.ADD, "git fetch --all"])
+        self.assertEqual((hosts, len(net)), (["evil.example"], 1))
+        self.assertIn("evil.example", net[0]["evidence"])
+
+    def test_all_with_no_known_remote_stays_exempt(self):
+        f, net, hosts = self.hosts(["git fetch --all", "git remote update"])
+        self.assertEqual((hosts, net), ([], []))
+        self.assertEqual(len(f.network_items), 2)
+
+    def test_remote_add_options_are_parsed(self):
+        for opts in ("-t main", "-m main", "-t main -m trunk", "--tags", "--no-tags", "--mirror=fetch",
+                     "--track main"):
+            f, net = self.strict([f"git remote add {opts} x https://evil.example/r", "git pull x"])
+            self.assertEqual([i["host"] for i in f.network_items], ["evil.example"], opts)
+            self.assertEqual(len(net), 1, opts)
+
+    def test_remote_add_f_fetches_at_once(self):
+        for flag in ("-f", "--fetch"):
+            f, net = self.strict([f"git remote add {flag} x https://evil.example/r"])
+            self.assertEqual([(i["host"], i["kind"]) for i in f.network_items], [("evil.example", "clone")])
+            self.assertEqual(len(net), 1)
+        f, net = self.strict(["git remote add x https://evil.example/r"])
+        self.assertEqual(f.network_items, [])
+
+    def test_clone_o_names_the_remote(self):
+        f, net = self.strict(["git clone -o up https://github.com/o/r", "git pull up", "git pull origin"])
+        self.assertEqual([i["host"] for i in f.network_items], ["github.com", "github.com", None])
