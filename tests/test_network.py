@@ -2007,3 +2007,31 @@ class TestRemoteResolutionRound2(TestStrict):
     def test_clone_o_names_the_remote(self):
         f, net = self.strict(["git clone -o up https://github.com/o/r", "git pull up", "git pull origin"])
         self.assertEqual([i["host"] for i in f.network_items], ["github.com", "github.com", None])
+
+
+class TestRound2Minor(unittest.TestCase):
+    def test_fail_on_help_says_three_and_two_is_usage(self):
+        help_text = af.build_parser().format_help()
+        self.assertIn("exit 3 if any unsuppressed finding", " ".join(help_text.split()))
+        self.assertIn("2 is a usage error", " ".join(help_text.split()))
+
+    def test_pinned_wording_for_crates(self):
+        text = "\n".join(af.EXPLAIN["network"]["assumes"])
+        self.assertIn("cargo add", text)
+        self.assertIn("=1.2.3", text)
+        self.assertIn("cargo add", (ROOT / "docs" / "json.md").read_text(encoding="utf-8"))
+
+    def test_suppressions_listing_marks_the_audit_config_id(self):
+        import os
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "actualis").mkdir()
+            (Path(d) / "actualis" / "suppressions").write_text(
+                f"{af.AUDIT_CONFIG_ID}  hand edited\ndeadbeef  real one\n", encoding="utf-8")
+            buf = io.StringIO()
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": d}), redirect_stdout(buf):
+                self.assertEqual(af.main(["--suppressions"]), 0)
+        lines = {ln.split()[0]: ln for ln in buf.getvalue().splitlines() if ln.strip()[:8].isalnum()}
+        self.assertIn("ignored", lines[af.AUDIT_CONFIG_ID])
+        self.assertIn("audit-config findings cannot be suppressed", lines[af.AUDIT_CONFIG_ID])
+        self.assertNotIn("ignored", lines["deadbeef"])

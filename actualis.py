@@ -5381,8 +5381,10 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "as audit-config writes.",
             "A registry install with no URL is attributed to the ecosystem's default",
             "registry (host_inferred: true). Failed is known for Claude Code only.",
-            "pinned means an exact version only: a full MAJOR.MINOR.PATCH for npm,",
-            "crates and go, == for pypi, an @sha256: digest for images.",
+            "pinned means an exact version only: a full MAJOR.MINOR.PATCH for npm and",
+            "go (go with a leading v), == for pypi, an @sha256: digest for images. For",
+            "crates, cargo add is pinned only with =1.2.3 (x@1.2.3 is a caret",
+            "requirement) and cargo install --version 1.2.3 is exact.",
         ],
         "verify": "actualis --json | jq '.network.totals, .network.hosts[:5]'",
     },
@@ -8722,9 +8724,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-redact", action="store_true",
                     help="do NOT redact credentials from output (unsafe to share)")
     ap.add_argument("--fail-on", metavar="LEVEL", choices=FAIL_ON_LEVELS,
-                    help="exit 2 if any unsuppressed finding is at or above "
-                         f"LEVEL ({', '.join(FAIL_ON_LEVELS)}). For gating a "
-                         "pipeline. Still changes nothing and blocks nothing.")
+                    help="exit 3 if any unsuppressed finding is at or above "
+                         f"LEVEL ({', '.join(FAIL_ON_LEVELS)}); 2 is a usage error. "
+                         "For gating a pipeline. Still changes nothing and blocks nothing.")
     ap.add_argument("--network-trust", metavar="HOST[/PATH],...", action="append",
                     help="trusted download sources for --network-strict; also read from "
                          "./.actualis-network-trust")
@@ -8821,6 +8823,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {c.dim}Nothing suppressed. Add one with:{c.off}")
             print(f"    actualis --suppress <id> --reason \"why\"")
         for fp, why in sorted(current.items()):
+            if fp == AUDIT_CONFIG_ID:
+                why = f"ignored: audit-config findings cannot be suppressed ({why})"
             print(f"  {fp}  {c.dim}{why}{c.off}")
         print(f"\n  {c.dim}Suppressed findings are still counted and still appear "
               f"in --json.{c.off}")
