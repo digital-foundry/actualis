@@ -97,6 +97,14 @@ password that appears in a later run, alone under its id in that run, cannot be
 told apart from the one the suppression was recorded for. The suppression then
 still applies.
 
+**`--watch` and `--replay` work per id.** `--watch` alerts once per id, so a
+second password at a location that already alerted raises no new alert. The
+first alert stands for every password at that location. `--replay <id>` merges
+every password under a location id into one incident window, so the window
+can span several passwords and several rotations. To tell them apart, look at
+`distinct_values` in `--json` for the same window. Both are known limits of
+location ids; the code is unchanged.
+
 ## Deliberately not flagged
 
 Both classes below were found firing on real data and removed. A scanner that
