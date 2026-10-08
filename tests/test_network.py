@@ -237,5 +237,133 @@ class TestReviewFixes(unittest.TestCase):
         self.assertGreaterEqual(af.network_items_from_command(cmd)[1], 1)
 
 
+class TestToolCalls(unittest.TestCase):
+    def test_webfetch_and_search(self):
+        it = af.network_items_from_tool("WebFetch", {"url": "https://docs.x.io/a", "prompt": "p"})[0]
+        self.assertEqual((it["kind"], it["program"], it["host"]), ("fetch", "WebFetch", "docs.x.io"))
+        it = af.network_items_from_tool("WebSearch", {"query": "secret plans"})[0]
+        self.assertEqual((it["kind"], it["host"]), ("search", None))
+        self.assertNotIn("secret plans", json.dumps(it))
+
+    def test_copilot_and_mcp_names(self):
+        self.assertEqual(af.network_items_from_tool("web_fetch", {"url": "https://a.io"})[0]["host"], "a.io")
+        self.assertEqual(af.network_items_from_tool("mcp__browser__fetch_page", {"uri": "https://b.io/x"})[0]["host"], "b.io")
+        self.assertEqual(af.network_items_from_tool("Read", {"file_path": "/x"}), [])
+        self.assertEqual(af.network_items_from_tool("Bash", {"command": "curl https://a.io"}), [])
+
+
+class TestApproval(unittest.TestCase):
+    def test_mapping(self):
+        cases = {"auto": "unasked", "bypassPermissions": "unasked", "codex:never": "unasked",
+                 "copilot:auto": "unasked", "copilot:prompted": "asked", "default": "unknown",
+                 "acceptEdits": "unknown", "plan": "unknown", "codex:on-request": "unknown", None: "unknown"}
+        for mode, want in cases.items():
+            self.assertEqual(af.network_approval(mode), want, mode)
+
+
+def claude_session(tmp, records):
+    d = Path(tmp) / "-Users-x-proj"
+    d.mkdir(exist_ok=True)
+    (d / "s.jsonl").write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    f = af.Fleet()
+    f.scan([Path(tmp)], None, None, progress=False)
+    return f
+
+
+def call(tid, command=None, name="Bash", inp=None, mode=None, ts="2026-10-01T10:00:00Z"):
+    rec = {"timestamp": ts, "type": "assistant", "uuid": "a" + tid, "sessionId": "sess-1",
+           "message": {"id": "m" + tid, "role": "assistant",
+                       "content": [{"type": "tool_use", "id": tid, "name": name,
+                                    "input": inp if inp is not None else {"command": command}}]}}
+    if mode:
+        rec["permissionMode"] = mode
+    return rec
+
+
+def result(tid, is_error, denial=None):
+    rec = {"timestamp": "2026-10-01T10:00:01Z", "type": "user", "uuid": "r" + tid,
+           "message": {"role": "user", "content": [
+               {"type": "tool_result", "tool_use_id": tid, "is_error": is_error, "content": "x"}]}}
+    if denial:
+        rec["toolDenialKind"] = denial
+    return rec
+
+
+class TestFleetIntegration(unittest.TestCase):
+    def test_claude_items_carry_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = claude_session(tmp, [call("t1", "curl -o x https://a.io/x", mode="bypassPermissions")])
+        [it] = f.network_items
+        self.assertEqual((it["agent"], it["approval"], it["session"], it["failed"], it["trusted"]),
+                         ("claude", "unasked", "sess-1", False, False))
+        self.assertEqual(it["ts"], "2026-10-01T10:00:00+00:00")
+
+    def test_failed_result_marks_item(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = claude_session(tmp, [call("t1", "curl https://a.io/x"), result("t1", True)])
+        self.assertIs(f.network_items[0]["failed"], True)
+
+    def test_refused_call_is_dropped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = claude_session(tmp, [call("t1", "curl https://a.io/x"), result("t1", True, "user-rejected")])
+        self.assertEqual(f.network_items, [])
+        self.assertEqual(f.refusals, 1)
+
+    def test_webfetch_through_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = claude_session(tmp, [call("t1", name="WebFetch", inp={"url": "https://docs.x.io"}, mode="auto")])
+        self.assertEqual([(i["kind"], i["host"]) for i in f.network_items], [("fetch", "docs.x.io")])
+
+    def test_direct_add_tool_infers_agent_from_mode(self):
+        f = af.Fleet()
+        f.add_tool("p", "Bash", {"command": "npm i x"}, TS, "codex:never")
+        f.add_tool("p", "Bash", {"command": "curl 'https://a.io"}, TS, "codex:never")
+        self.assertEqual([(i["agent"], i["approval"], i["failed"]) for i in f.network_items],
+                         [("codex", "unasked", None)])
+        self.assertEqual(f.network_unparsed, 1)
+
+    def test_existing_counters_unchanged(self):
+        f = af.Fleet()
+        f.add_tool("p", "WebFetch", {"url": "https://a.io"}, TS, "auto")
+        self.assertEqual((f.tools["WebFetch"], f.bash_total), (1, 0))
+
+
+class TestOtherAgents(unittest.TestCase):
+    def test_codex_shell_command_item(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "rollout-2026-10-01T10-00-00-cx-1.jsonl"
+            recs = [
+                {"timestamp": "2026-10-01T10:00:00Z", "type": "session_meta", "payload": {"id": "cx-1", "cwd": "/Users/x/proj"}},
+                {"timestamp": "2026-10-01T10:00:00Z", "type": "turn_context", "payload": {"cwd": "/Users/x/proj", "approval_policy": "never"}},
+                {"timestamp": "2026-10-01T10:00:01Z", "type": "response_item", "payload": {
+                    "type": "function_call", "name": "shell_command", "call_id": "c1",
+                    "arguments": json.dumps({"command": "pip install requests", "workdir": "/Users/x/proj"})}},
+            ]
+            p.write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+            f = af.Fleet()
+            f.scan_codex([Path(tmp)], None, None)
+        [it] = f.network_items
+        self.assertEqual((it["agent"], it["approval"], it["session"], it["failed"], it["package"]),
+                         ("codex", "unasked", "cx-1", None, "requests"))
+
+    def test_copilot_web_fetch_keeps_arguments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sid = "ffffffff-0000-0000-0000-000000000001"
+            d = Path(tmp) / "session-state" / sid
+            d.mkdir(parents=True)
+            events = [
+                {"type": "session.start", "timestamp": "2026-10-01T10:00:00Z",
+                 "data": {"sessionId": sid, "context": {"cwd": "/Users/x/proj"}}},
+                {"type": "tool.execution_start", "timestamp": "2026-10-01T10:00:01Z",
+                 "data": {"toolCallId": "k1", "toolName": "web_fetch", "arguments": {"url": "https://a.io/doc"}}},
+            ]
+            (d / "events.jsonl").write_text("\n".join(json.dumps(e) for e in events) + "\n")
+            f = af.Fleet()
+            f.scan_copilot([Path(tmp) / "session-state"], None, None)
+        [it] = f.network_items
+        self.assertEqual((it["agent"], it["host"], it["approval"], it["session"]),
+                         ("copilot", "a.io", "unasked", sid))
+
+
 if __name__ == "__main__":
     unittest.main()

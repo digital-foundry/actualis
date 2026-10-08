@@ -1682,6 +1682,37 @@ def network_items_from_command(cmd: str) -> tuple[list[dict], int]:
     return found, unparsed
 
 
+_NET_TOOL_WORDS = ("fetch", "browse", "download", "http")
+
+
+def network_items_from_tool(name: str, tool_input: dict) -> list[dict]:
+    """A non-shell tool call that reaches the network. A search keeps no query:
+    the query is the user's words, not a destination."""
+    n = (name or "").lower()
+    if n in ("bash", "shell_command"):
+        return []
+    if n in ("websearch", "web_search"):
+        return [_net_item("search", name)]
+    if n in ("webfetch", "web_fetch") or any(w in n for w in _NET_TOOL_WORDS):
+        inp = tool_input if isinstance(tool_input, dict) else {}
+        url = next((inp[k] for k in ("url", "uri", "href") if isinstance(inp.get(k), str)), None)
+        return [_net_url_item("fetch", name, url) if url else _net_item("fetch", name)]
+    return []
+
+
+def network_approval(mode: str | None) -> str:
+    """asked / unasked / unknown, from the mode key the call ran under.
+
+    The same is_ungated_mode() that --share and --card read, so "unasked" here
+    cannot disagree with "unsupervised" there. Claude Code writes no record
+    for a call a person approved, so outside auto or bypass it is unknown:
+    an allowlist rule in settings may have let it through silently.
+    """
+    if mode == "copilot:prompted":
+        return "asked"
+    return "unasked" if mode and is_ungated_mode(mode) else "unknown"
+
+
 # --------------------------------------------------------------------------
 # Suppressions
 #
@@ -2113,6 +2144,14 @@ class Fleet:
         # The permission mode in force, carried across records within one file.
         self._mode: str | None = None
         self.flags: list[dict] = []
+        # Network inventory. `network` keeps refused calls (flagged
+        # `_refused`) so a later refusal record can find them by call id;
+        # everything downstream reads `network_items`, which drops them.
+        self.network: list[dict] = []
+        self.network_unparsed = 0
+        self.network_trust: list[str] = []
+        self.network_strict = False
+        self._net_by_call: dict[str, list[int]] = {}
         self.flag_counts: Counter = Counter()
         self.permission_modes: Counter = Counter()
         self.denials: Counter = Counter()
@@ -2357,7 +2396,7 @@ class Fleet:
         self.bytes_scanned += st.st_size
         self.files_scanned += 1
 
-        cwd = model = None
+        cwd = model = session = None
         policy: str | None = None
         best: dict | None = None
         best_total = -1
@@ -2381,6 +2420,7 @@ class Fleet:
 
                     if kind == "session_meta":
                         cwd = payload.get("cwd") or cwd
+                        session = payload.get("id") or session
                     elif kind == "turn_context":
                         cwd = payload.get("cwd") or cwd
                         model = payload.get("model") or model
@@ -2422,7 +2462,8 @@ class Fleet:
         for cmd, ts, mode in pending:
             # Normalise Codex's shell_command onto the same "Bash" tool name the
             # Claude Code path uses, so the audit is one cross-agent view.
-            self.add_tool(project, "Bash", {"command": cmd}, ts, mode)
+            self.add_tool(project, "Bash", {"command": cmd}, ts, mode,
+                          session=session, agent="codex")
 
         if best:
             self.add_codex_session(project, model or "unknown", best, last_ts)
@@ -2450,8 +2491,9 @@ class Fleet:
         cwd = branch = None
         shutdown: dict | None = None
         shutdown_ts: datetime | None = None
-        calls: list[tuple[str, str, str, datetime | None]] = []   # (id, tool, command, ts)
+        calls: list[tuple[str, str, str, datetime | None, dict]] = []   # (id, tool, command, ts, args)
         prompted: set[str] = set()
+        prompted_any: set[str] = set()
         refusals: list[tuple[str, str, datetime | None]] = []     # (kind, id, ts)
         subagents: list[tuple[dict, datetime | None]] = []
         try:
@@ -2477,9 +2519,12 @@ class Fleet:
                         args = data.get("arguments")
                         cmd = args.get("command") if isinstance(args, dict) else None
                         cmd = cmd if name == "bash" and isinstance(cmd, str) else ""
-                        calls.append((str(data.get("toolCallId") or ""), name, cmd, ts))
+                        calls.append((str(data.get("toolCallId") or ""), name, cmd, ts,
+                                      args if isinstance(args, dict) else {}))
                     elif kind == "permission.requested":
                         req = data.get("permissionRequest")
+                        if isinstance(req, dict) and req.get("toolCallId"):
+                            prompted_any.add(str(req["toolCallId"]))
                         if isinstance(req, dict) and req.get("kind") == "shell" \
                                 and req.get("toolCallId"):
                             prompted.add(str(req["toolCallId"]))
@@ -2505,7 +2550,8 @@ class Fleet:
 
         active = False
         joined: dict[str, tuple[str, str]] = {}
-        for call_id, name, cmd, ts in calls:
+        sid = path.parent.name
+        for call_id, name, cmd, ts, targs in calls:
             if not in_window(ts):
                 continue
             active = True
@@ -2513,16 +2559,22 @@ class Fleet:
                 mode = "copilot:prompted" if call_id in prompted else "copilot:auto"
                 self.permission_modes[mode] += 1
                 # Normalised onto "Bash", as Codex is, so the audit is one view.
-                self.add_tool(project, "Bash", {"command": cmd}, ts, mode)
+                self.add_tool(project, "Bash", {"command": cmd}, ts, mode,
+                              session=sid, call_id=call_id, agent="copilot")
                 if call_id:
                     joined[call_id] = ("Bash", cmd[:MAX_SCAN_LINE])
             else:
-                self.add_tool(project, name, {}, ts)
+                # The arguments go to the network inventory only; add_tool
+                # counts nothing else for a non-Bash tool.
+                net_mode = "copilot:prompted" if call_id in prompted_any else "copilot:auto"
+                self.add_tool(project, name, targs, ts, net_mode,
+                              session=sid, call_id=call_id, agent="copilot")
                 if call_id:
                     joined[call_id] = (name, "")
         for kind, call_id, ts in refusals:
             if in_window(ts):
                 active = True
+                self._network_outcome(f"copilot:{call_id}", refused=True)
                 self.denials[kind] += 1
                 self.denials_by_project[project] += 1
                 self._record_refusal(kind, project, ts, joined.get(call_id))
@@ -2628,10 +2680,12 @@ class Fleet:
                 + (u.get("cache_read_input_tokens", 0) or 0) / 1e6 * in_rate * CACHE_READ_MULT)
 
     def add_tool(self, project: str, name: str, tool_input: dict, ts: datetime | None,
-                 mode: str | None = None) -> None:
+                 mode: str | None = None, *, session: str | None = None,
+                 call_id: str | None = None, agent: str | None = None) -> None:
         project = clean(project)[:120] or "unknown"
         name = clean(name)[:48] or "?"
         self.tools[name] += 1
+        self._add_network(project, name, tool_input or {}, ts, mode, session, call_id, agent)
         if name != "Bash":
             return
         cmd = (tool_input or {}).get("command") or ""
@@ -2761,7 +2815,9 @@ class Fleet:
                     # records that carry neither usage nor tool_use.
                     if ('"usage"' not in line and '"tool_use"' not in line
                             and '"permissionMode"' not in line
-                            and '"toolDenialKind"' not in line):
+                            and '"toolDenialKind"' not in line
+                            and '"is_error":true' not in line
+                            and '"is_error": true' not in line):
                         continue
                     try:
                         rec = json.loads(line)
@@ -2792,6 +2848,7 @@ class Fleet:
             self._mode = str(mode)
         if since and ts and ts < since:
             return
+        self._network_results(rec)
 
         if mode:
             self.permission_modes[mode] += 1
@@ -2829,12 +2886,61 @@ class Fleet:
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "tool_use":
                     self.add_tool(project, block.get("name") or "?",
-                                  block.get("input") or {}, ts, self._mode)
+                                  block.get("input") or {}, ts, self._mode,
+                                  session=rec.get("sessionId"), call_id=block.get("id"),
+                                  agent="claude")
                     if block.get("id"):
                         calls[block["id"]] = (
                             block.get("name") or "?",
                             ((block.get("input") or {}).get("command") or "")
                             [:MAX_SCAN_LINE])
+
+    def _add_network(self, project: str, name: str, tool_input: dict, ts: datetime | None,
+                     mode: str | None, session: str | None, call_id: str | None,
+                     agent: str | None) -> None:
+        if name == "Bash":
+            cmd = tool_input.get("command")
+            if not isinstance(cmd, str) or not cmd:
+                return
+            found, unparsed = network_items_from_command(cmd)
+            self.network_unparsed += unparsed
+        else:
+            found = network_items_from_tool(name, tool_input)
+        if not found:
+            return
+        if not agent:
+            agent = ("codex" if (mode or "").startswith("codex:")
+                     else "copilot" if (mode or "").startswith("copilot:") else "claude")
+        for item in found:
+            item.update(approval=network_approval(mode), agent=agent, project=project,
+                        session=clean(str(session))[:80] if session else None,
+                        ts=ts.isoformat() if ts else None,
+                        failed=False if agent == "claude" else None, trusted=False)
+            if call_id:
+                self._net_by_call.setdefault(f"{agent}:{call_id}", []).append(len(self.network))
+            self.network.append(item)
+
+    def _network_outcome(self, key: str, refused: bool) -> None:
+        """A call's result: refused calls leave the inventory, errors mark it failed."""
+        for i in self._net_by_call.pop(key, ()):
+            if refused:
+                self.network[i]["_refused"] = True
+            else:
+                self.network[i]["failed"] = True
+
+    def _network_results(self, rec: dict) -> None:
+        msg = rec.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not self._net_by_call or not isinstance(content, list):
+            return
+        refused = bool(rec.get("toolDenialKind"))
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error"):
+                self._network_outcome(f"claude:{b.get('tool_use_id') or ''}", refused)
+
+    @property
+    def network_items(self) -> list[dict]:
+        return [i for i in self.network if not i.get("_refused")]
 
     def scan_execution_log(self, path: Path, project: str,
                            since: "datetime | None") -> None:
