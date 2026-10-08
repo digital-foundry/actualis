@@ -22,6 +22,10 @@ and prints a report, across **Claude Code** and **Codex** together.
   stored — only a hash of it.
 - **Every command the agent ran**, audited for the risky shapes: `rm -rf`,
   piped installers, credential reads, egress to somewhere new.
+- **What it downloaded, and whether anyone asked.** Packages installed, repos
+  cloned, URLs fetched — each marked asked, unasked, or unknown — and, with
+  `--network-strict`, a finding for every unasked download from a source you
+  have not trusted.
 - **What happened while a credential was live.** Give it one fingerprint and
   it reconstructs the incident: the exposure window, every command that ran
   inside it, and the subset worth actually reading. A four-day window holds

@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Network inventory.** A NETWORK section and a `network` key in `--json` list
+  every download and fetch the agents made — packages installed, repos cloned,
+  URLs fetched — and whether a person approved each (`asked`, `unasked`, or
+  `unknown` in default mode, where an allowlist rule may have allowed it
+  silently). `--network-strict` turns unasked downloads from sources not in
+  `--network-trust` / `.actualis-network-trust` into medium findings. The
+  Action gains `network-strict` and `network-trust` inputs. `schema_version`
+  stays 1.
+- **Audit-config finding.** A high-severity finding that cannot be suppressed
+  fires when an agent writes `.actualis-network-trust` or
+  `.actualis-suppressions`, the files that decide what the audit lets through.
+- **Trust provenance.** The trust sources in force (`--network-trust`, or the
+  file with its path and sha256) appear in the report and as
+  `network.trust_sources` in `--json`.
+- **`--explain network`** explains the network inventory.
+
+### Fixed
+
+- **Security: `redact()` missed more shapes of embedded token.** It now masks
+  URL userinfo that has no password (`https://TOKEN@host`), all of the
+  userinfo up to the last `@`, and scp-style userinfo containing `:` or longer
+  than 20 characters. Before this, such tokens could appear in shell-audit
+  evidence and in `--json`.
+- **Security: control characters in transcripts are stripped from network
+  items,** so a crafted command cannot inject terminal escapes into the report.
+- **`bash.flags[].had_secret` is declared in the JSON schema.** It was always
+  emitted.
+
 ## 0.2.2 — 2026-10-08
 
 ### Fixed

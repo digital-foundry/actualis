@@ -25,6 +25,21 @@ inputs:
     required: false
     default: "critical"
 
+  network-strict:
+    description: >-
+      "true" makes every download the agent made without asking, from a source
+      not in network-trust or .actualis-network-trust, a medium finding (which
+      fail-on: any then fails on).
+    required: false
+    default: "false"
+
+  network-trust:
+    description: >-
+      Comma-separated trusted download sources, host or host/path
+      (e.g. "npmjs.org,github.com/your-org"). Added to .actualis-network-trust.
+    required: false
+    default: ""
+
   version:
     description: >-
       Version of actualis to install, e.g. `0.1.12`. Empty installs the latest.
@@ -80,6 +95,8 @@ runs:
         EXECUTION_FILE: ${{ inputs.execution-file }}
         FAIL_ON: ${{ inputs.fail-on }}
         JSON_REPORT: ${{ inputs.json-report }}
+        NETWORK_STRICT: ${{ inputs.network-strict }}
+        NETWORK_TRUST: ${{ inputs.network-trust }}
         SUMMARY: ${{ inputs.summary }}
       run: |
         set -uo pipefail
@@ -103,6 +120,13 @@ runs:
         args=(--ci-log "${EXECUTION_FILE}")
         [ "${FAIL_ON}" != "none" ] && args+=(--fail-on "${FAIL_ON}")
 
+        # Under set -u, an empty array expands as an error on bash older than
+        # 4.4, so every use below is the guarded form.
+        net_args=()
+        [ "${NETWORK_STRICT}" = "true" ] && net_args+=(--network-strict)
+        [ -n "${NETWORK_TRUST}" ] && net_args+=(--network-trust "${NETWORK_TRUST}")
+        args+=(${net_args[@]+"${net_args[@]}"})
+
         # The human-readable report, for the log and the summary. This run
         # carries the gate, so its exit code is the one that matters.
         set +e
@@ -115,7 +139,7 @@ runs:
         # The machine-readable one, once, without --fail-on: a gating exit
         # code must not truncate a report the user asked to keep. Everything
         # downstream reads this file rather than re-scanning.
-        actualis --ci-log "${EXECUTION_FILE}" --json > "${work}/report.json" 2>/dev/null || true
+        actualis --ci-log "${EXECUTION_FILE}" ${net_args[@]+"${net_args[@]}"} --json > "${work}/report.json" 2>/dev/null || true
         if [ -n "${JSON_REPORT}" ] && [ "${JSON_REPORT}" != "${work}/report.json" ]; then
           cp "${work}/report.json" "${JSON_REPORT}" && echo "wrote ${JSON_REPORT}"
         fi

@@ -31,6 +31,20 @@ class TestExpressionsAreComplete(unittest.TestCase):
                                      f"{path.name}:{n} has an empty or unclosed "
                                      f"expression GitHub will refuse to load: {line.strip()}")
 
+    def test_network_inputs_reach_both_runs(self):
+        text = (ROOT / "action.yml").read_text(encoding="utf-8")
+        for needle in ("network-strict:", "network-trust:",
+                       "NETWORK_STRICT: ${{ inputs.network-strict }}",
+                       "NETWORK_TRUST: ${{ inputs.network-trust }}"):
+            self.assertIn(needle, text)
+        self.assertEqual(text.count('net_args+=(--network-strict)'), 1)
+        # The audit script runs under `set -u`, where expanding an empty array
+        # errors on bash older than 4.4, so both uses are guarded.
+        guarded = '${net_args[@]+"${net_args[@]}"}'
+        self.assertIn("set -uo pipefail", text)
+        self.assertEqual(text.count(guarded), 2)
+        self.assertIn(f'actualis --ci-log "${{EXECUTION_FILE}}" {guarded} --json', text)
+
     def test_the_checker_catches_what_broke_v0_2_0(self):
         bad = "          # a run: block interpolates ${{ }} inside"
         self.assertNotEqual(len(OPEN.findall(bad)), len(COMPLETE.findall(bad)))
