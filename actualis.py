@@ -1275,6 +1275,32 @@ def _net_strip_prefixes(tokens: list[str]) -> list[str]:
     return tokens[i:]
 
 
+def _net_close_paren(text: str, start: int) -> int:
+    """Index of the ')' closing a '$(' whose body starts at `start`, or -1.
+    Parentheses inside quoted spans do not count; a backslash escapes outside
+    single quotes. One forward pass."""
+    depth, j = 1, start
+    while j < len(text):
+        ch = text[j]
+        if ch == "\\":
+            j += 2
+            continue
+        if ch in "\"'":
+            j += 1
+            while j < len(text) and text[j] != ch:
+                j += 2 if (ch == '"' and text[j] == "\\") else 1
+            if j >= len(text):
+                return -1
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return j
+        j += 1
+    return -1
+
+
 def _net_substitutions(text: str) -> tuple[list[str], str]:
     """The bodies of every $( ... ) and `...` in `text`, outermost first (an
     inner one is found again when its body is read), and `text` with them
@@ -1284,15 +1310,14 @@ def _net_substitutions(text: str) -> tuple[list[str], str]:
     i = 0
     while i < len(text):
         if text.startswith("$(", i):
-            depth, j = 1, i + 2
-            while j < len(text) and depth:
-                depth += (text[j] == "(") - (text[j] == ")")
-                j += 1
-            if depth == 0:
-                bodies.append(text[i + 2:j - 1])
-                out.append(" ")
-                i = j
-                continue
+            end = _net_close_paren(text, i + 2)
+            if end < 0:
+                out.append(text[i:])         # unbalanced: nothing later can balance either
+                break
+            bodies.append(text[i + 2:end])
+            out.append(" ")
+            i = end + 1
+            continue
         out.append(text[i])
         i += 1
     rest = "".join(out)
@@ -1347,6 +1372,8 @@ def _net_segments(cmd: str, depth: int = 0) -> tuple[list[list[str]], int]:
             inner, bad = _net_segments(body, depth + 1)
             out += inner
             unparsed += bad
+    elif bodies:
+        unparsed += 1                        # nested deeper than we read: say so
     parts, open_quote = _net_split(text)
     if open_quote:
         parts = parts[:-1]

@@ -219,6 +219,23 @@ class TestReviewFixes(unittest.TestCase):
         it = one("curl file:///etc/passwd")
         self.assertEqual((it["kind"], it["host"], it["dynamic"]), ("fetch", None, False))
 
+    def test_unbalanced_substitutions_are_linear(self):
+        import time
+        cmd = "$(" * 20000 + "curl https://a.io"
+        start = time.monotonic()
+        af.network_items_from_command(cmd)
+        self.assertLess(time.monotonic() - start, 1.0)
+
+    def test_paren_inside_quotes_does_not_end_substitution(self):
+        found, unparsed = af.network_items_from_command('x=$(echo ")"); curl https://b.io')
+        self.assertEqual(([i["host"] for i in found], unparsed), (["b.io"], 0))
+        found, unparsed = af.network_items_from_command('x=$(echo ")" ; curl https://a.io)')
+        self.assertEqual(([i["host"] for i in found], unparsed), (["a.io"], 0))
+
+    def test_nesting_beyond_the_cap_is_counted(self):
+        cmd = "echo $(echo $(echo $(echo $(echo $(curl https://a.io)))))"
+        self.assertGreaterEqual(af.network_items_from_command(cmd)[1], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
