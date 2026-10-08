@@ -295,3 +295,56 @@ A new `EXPLAIN` topic. It covers:
   network".
 - Export in security-tool formats (sub-project 2) and `--correlate`
   (sub-project 3).
+
+## 9. Amendments after the code survey (2026-10-08)
+
+A survey of `actualis.py` before planning changed these points. Each one
+overrides the section it names.
+
+- **§1.1, §6 — no `shlex`.** `actualis.py` already has a quote-aware
+  tokenizer, `_shell_tokens()`, and a heredoc stripper, `_without_heredocs()`,
+  which `command_head()` uses. Network parsing reuses them.
+  - **Why:** the parser then agrees with the rest of the audit, and the
+    import list, the CI allowlist and `--self-check` stay unchanged.
+  - **Unparsed segments:** a segment with an unbalanced quote is the
+    `unparsed` case.
+- **§1.2 — Codex has no fetch tool calls.** `actualis` reads no Codex record
+  other than `shell_command`, and the shape of a Codex web-search record is
+  unverified. Codex therefore contributes shell-command items only.
+- **§1.2 — Copilot tool calls.** Copilot tool calls are matched by the same
+  name rules: `web_fetch` is a fetch, `web_search` is a search, plus the
+  MCP-style name match.
+- **§1.3 — `failed` is Claude Code only.**
+  - `failed` comes from a Claude Code `tool_result` with `is_error: true`.
+    Codex and Copilot results are not read, so their items carry
+    `failed: null`.
+  - A refused call is dropped from the inventory. This covers a Claude Code
+    `tool_result` on a record with `toolDenialKind`, and a joined Copilot
+    refusal.
+- **§2 — approval mapping, as implemented.** One function maps the per-turn
+  mode key that `actualis` already tracks:
+  - `copilot:prompted` → `asked`;
+  - any key `is_ungated_mode()` accepts → `unasked`. That covers Claude Code
+    auto and `bypassPermissions`, `codex:never` and `copilot:auto`; a Copilot
+    call that needed no prompt ran under a standing rule;
+  - everything else, or no mode at all → `unknown`.
+  - **Claude Code `asked`:** it writes no per-call approval record, so Claude
+    Code never yields `asked`.
+- **§4 — finding id.** `flag_id("med", ["network-unasked"],
+  f"{program}@{host or '?'}")` keeps the 8-hex id format that
+  `.actualis-suppressions` and `--replay` validate.
+  - **Storage:** the finding is a `fleet.flags` entry with the existing keys.
+    It therefore reaches `--json` under `bash.flags`, and `--fail-on any`
+    picks it up through the existing medium-severity rule.
+- **§5.1 — "first seen this period" dropped.** `actualis` only sees the
+  window it scans, so every host would read as first seen. Hosts carry
+  `first_seen` (the earliest timestamp in the window) and nothing else.
+- **§5.2 — `--share` and `--card` do not read `network` at all.** They are
+  not given totals either; the leak tests prove network data never reaches
+  them.
+- **§7 — no demo-fleet change.** Any new record in
+  `tools/make-demo-fleet.py` shifts the seeded random stream, and that
+  changes the card goldens and README images. Coverage comes from unit
+  tests instead.
+- **§3 — trust entries.** Trust entries are lowercased, and the keyword
+  `none` does not exist.
