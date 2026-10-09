@@ -2706,7 +2706,7 @@ def apply_network_policy(fleet: "Fleet", trust: list[tuple[str, str]], strict: b
 
 NETWORK_ITEM_KEYS = ("kind", "program", "host", "host_inferred", "url", "dest", "source",
                      "ecosystem", "package", "version", "pinned", "exec", "dynamic", "alias",
-                     "failed", "approval", "trusted", "agent", "project", "session", "ts", "ioc")
+                     "failed", "approval", "trusted", "agent", "project", "session", "call_id", "ts", "ioc")
 
 
 def _net_public(i: dict, raw: bool = False) -> dict:
@@ -5436,6 +5436,7 @@ class Fleet:
                     item[k] = clean(v).replace("\n", " ")
             item.update(approval=network_approval(mode), agent=agent, project=project,
                         session=clean(str(session))[:80] if session else None,
+                        call_id=clean(str(call_id))[:120] if call_id else None,
                         ts=ts.isoformat() if ts else None,
                         failed=False if agent == "claude" else None, trusted=False, ioc=None)
             if call_id:
@@ -6862,6 +6863,11 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "go (go with a leading v), == for pypi, an @sha256: digest for images. For",
             "crates, cargo add is pinned only with =1.2.3 (x@1.2.3 is a caret",
             "requirement) and cargo install --version 1.2.3 is exact.",
+            "",
+            "To find the exact transcript record behind an item:",
+            "  actualis --network --json | jq -r '.items[0] | .session, .call_id'",
+            "  grep -l '<call_id>' ~/.claude/projects/*/*.jsonl",
+            "call_id is the tool call's id in the transcript (null when none).",
         ],
         "verify": "actualis --json | jq '.network.totals, .network.hosts[:5]'",
     },
@@ -9011,6 +9017,7 @@ JSON_SCHEMA: dict[str, str] = {
     "network.items[].agent": "str",
     "network.items[].project": "str",
     "network.items[].session": "str|null",
+    "network.items[].call_id": "str|null",
     "network.items[].ts": "str|null",
     "network.items_truncated": "bool",
     "network.strict": "bool",
