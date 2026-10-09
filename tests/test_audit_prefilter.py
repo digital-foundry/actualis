@@ -15,6 +15,9 @@ import sys
 import unittest
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _timing import assert_linear, best_of, budget  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("actualis", ROOT / "actualis.py")
 af = importlib.util.module_from_spec(spec)
@@ -159,6 +162,20 @@ class TestPrefilterEquivalence(unittest.TestCase):
         for cmd in ("ſudo ls", "git push --force K", "rm -rf İx"):
             self.assertEqual(af.audit_command(cmd), af._audit_command_unfiltered(cmd), cmd)
         self.assertTrue(af.audit_command("ſudo ls"))
+
+
+class TestPrefilterSpeed(unittest.TestCase):
+    def test_a_long_command_with_nothing_to_find_is_cheap_and_linear(self):
+        # 400 lines that hold no rule's literal: every regex is skipped.
+        self.assertLess(best_of(af.audit_command, "echo hello world\n" * 400), budget(0.002))
+        assert_linear(self, af.audit_command, [("", "echo hello world\n", 90, ""),
+                                               ("", "curl -s https://a.io/x\n", 90, "")],
+                      ceiling=0.01)
+
+    def test_generated_corpus_runs_in_budget(self):
+        cmds = generated()
+        self.assertLess(best_of(lambda cs: [af.audit_command(c) for c in cs], cmds, runs=1),
+                        budget(0.4))
 
 
 if __name__ == "__main__":

@@ -4546,7 +4546,12 @@ def copilot_session_cost(usage: dict, model: str) -> float:
 
 
 class Fleet:
-    def __init__(self) -> None:
+    def __init__(self, network_only: bool = False) -> None:
+        # --network with nothing that reads findings: the shell-audit rules,
+        # the unreadable count, the audit-config tripwire and the secret
+        # ranking are skipped, since nothing they produce is shown. The
+        # network inventory, strict findings and --ioc matches are the same.
+        self.network_only = network_only
         self.messages = 0
         self.cost_by_agent: dict[str, float] = defaultdict(float)
         self.units_by_agent: Counter = Counter()
@@ -5189,7 +5194,8 @@ class Fleet:
         self.tools[name] += 1
         self._net_remote_exec = ""
         self._add_network(project, name, tool_input or {}, ts, mode, session, call_id, agent)
-        self._audit_config_write(project, name, tool_input or {}, ts)
+        if not self.network_only:
+            self._audit_config_write(project, name, tool_input or {}, ts)
         if name != "Bash":
             return
         cmd = (tool_input or {}).get("command") or ""
@@ -5197,6 +5203,8 @@ class Fleet:
             return
         self.bash_total += 1
         self.bash_by_project[project] += 1
+        if self.network_only:
+            return
         self.bash_categories[command_category(cmd)] += 1
         if ts:
             day = ts.date().isoformat()
@@ -10744,7 +10752,8 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, OSError) as exc:
         ap.error(str(exc))
 
-    fleet = Fleet()
+    # --network shows only the inventory; --fail-on and --why read findings.
+    fleet = Fleet(network_only=bool(args.network and not args.fail_on and not args.why))
     progress = not args.json and sys.stderr.isatty()
 
     if args.ci_log:
