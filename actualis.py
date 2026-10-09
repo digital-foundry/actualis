@@ -9004,19 +9004,28 @@ def failing_findings(fleet: Fleet, level: str) -> list[str]:
         if low:
             out.append(f"{len(low)} low-priority credential(s)")
 
+    # Right after credentials, so a known-bad install is the first thing a
+    # failing pipeline prints. Split out of the generic flag counts below.
+    ioc_hit = [f for f in fleet.actionable_flags if "network-ioc" in f["categories"]]
+    ioc_unresolved = [f for f in fleet.actionable_flags if "network-ioc-unresolved" in f["categories"]]
+    if want_high and ioc_hit:
+        out.append(f"{len(ioc_hit)} known-bad download group(s) (IOC)")
+    if want_any and ioc_unresolved:
+        out.append(f"{len(ioc_unresolved)} unresolved IOC match group(s)")
+
     for finding in coach(fleet):
         if finding.severity == "critical" or (want_high and finding.severity == "high") \
            or (want_any and finding.severity == "info"):
             out.append(f"{finding.id} {finding.title}")
 
     if want_high:
-        fl = [f for f in fleet.actionable_flags if f["severity"] == "high"]
+        fl = [f for f in fleet.actionable_flags if f["severity"] == "high" and "network-ioc" not in f["categories"]]
         if fl:
             out.append(f"{len(fl)} high-severity shell command(s) flagged")
     if want_any:
         fl = [f for f in fleet.actionable_flags if f["severity"] == "med"]
-        net = [f for f in fl if f["categories"] == ["network-unasked"]]
-        fl = [f for f in fl if f["categories"] != ["network-unasked"]]
+        net = [f for f in fl if "network-unasked" in f["categories"]]
+        fl = [f for f in fl if not {"network-unasked", "network-ioc-unresolved"} & set(f["categories"])]
         if fl:
             out.append(f"{len(fl)} medium-severity shell command(s) flagged")
         if net:
@@ -10055,6 +10064,7 @@ _VALUE_HINT = {          # option -> how the shell should complete its argument
     "--ci-log": "file",
     "--diff": "file",
     "--out": "dir",
+    "--ioc": "file",
 }
 
 
@@ -10221,6 +10231,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--network-trust", metavar="HOST[/PATH],...", action="append",
                     help="trusted download sources for --network-strict; also read from "
                          "./.actualis-network-trust")
+    ap.add_argument("--ioc", metavar="FILE", action="append",
+                    help="known-bad packages and hosts to match the network inventory against: the "
+                         "actualis-ioc line format or OSV JSON/JSONL. Repeatable. Never read unless named.")
     ap.add_argument("--network-strict", action="store_true",
                     help="make every unasked download from an untrusted source a medium finding")
     ap.add_argument("--suppress", metavar="ID",
@@ -10254,6 +10267,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.card and args.json:
         ap.error("--card writes files; it cannot also emit --json.")
+    # --ioc is never silently ignored: a mode it cannot reach is an error.
+    if args.ioc and args.card:
+        ap.error("--ioc does not apply to --card; the card never shows downloads.")
+    if args.ioc and (args.watch or args.mcp):
+        ap.error("--ioc is not supported with --watch or --mcp yet.")
     if args.card:
         for flag, on in (("--fail-on", args.fail_on), ("--diff", args.diff),
                          ("--why", args.why), ("--share", args.share),
@@ -10387,10 +10405,12 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_OK
 
     # Loaded here, after every mode that never scans: a malformed trust file
-    # must not break --explain, --agents, --suppressions and the rest.
+    # or IOC list must not break --explain, --agents, --suppressions and the
+    # rest. The IOC list is read only from --ioc; there is no default path.
     try:
         network_trust, trust_sources = load_network_trust_sources(args.network_trust)
-    except ValueError as exc:
+        ioc = load_ioc(args.ioc) if args.ioc else None
+    except (ValueError, OSError) as exc:
         ap.error(str(exc))
 
     fleet = Fleet()
@@ -10457,6 +10477,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_CANNOT_RUN
 
     apply_network_policy(fleet, network_trust, args.network_strict, trust_sources)
+    apply_ioc(fleet, ioc)
 
     if args.diff:
         try:

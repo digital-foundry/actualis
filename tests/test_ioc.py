@@ -1105,3 +1105,143 @@ class TestOutput(FleetCase, unittest.TestCase):
             for lo, hi, why in af._STRIPPED_RANGES:
                 for ch in text:
                     self.assertFalse(lo <= ord(ch) <= hi, f"U+{ord(ch):04X} ({why})")
+
+
+def _call(tid, command, mode="bypassPermissions"):
+    return {"timestamp": "2026-10-01T10:00:00Z", "type": "assistant", "uuid": "a" + tid, "sessionId": "sess-1",
+            "permissionMode": mode,
+            "message": {"id": "m" + tid, "role": "assistant", "model": "claude-sonnet-5",
+                        "usage": {"input_tokens": 10, "output_tokens": 10},
+                        "content": [{"type": "tool_use", "id": tid, "name": "Bash",
+                                     "input": {"command": command}}]}}
+
+
+class TestCli(IocFiles, unittest.TestCase):
+    """main(): the load point, mode rules, exit codes and the gate. Transcripts
+    and HOME are temporary; nothing real is read."""
+
+    def setUp(self):
+        super().setUp()
+        root = self.dir / "transcripts" / "-Users-x-proj"
+        root.mkdir(parents=True)
+        recs = [_call("t1", "npm i evil@1.0.0"), _call("t2", "npm i pending"), _call("t3", "curl https://evil.io/x")]
+        (root / "s.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+        self.root = str(self.dir / "transcripts")
+        self.home = self.dir / "home"
+        self.home.mkdir()
+        self.cwd = self.dir / "cwd"
+        self.cwd.mkdir()
+
+    def main(self, *argv):
+        old_cwd, old_env = os.getcwd(), dict(os.environ)
+        os.environ.update(HOME=str(self.home), XDG_CONFIG_HOME=str(self.home / ".config"))
+        os.chdir(self.cwd)
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with redirect_stdout(out), redirect_stderr(err):
+                try:
+                    code = af.main(list(argv))
+                except SystemExit as exc:
+                    code = exc.code
+        finally:
+            os.chdir(old_cwd)
+            os.environ.clear()
+            os.environ.update(old_env)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_scan_with_ioc(self):
+        ioc = self.write("npm:evil@=1.0.0 id=MAL-1\nnpm:pending@=1.0.0\n")
+        code, out, err = self.main("--root", self.root, "--ioc", ioc, "--json")
+        self.assertEqual(code, 0, err)
+        j = json.loads(out)["network"]["ioc"]
+        self.assertEqual((j["enabled"], j["totals"]["match"], j["totals"]["unresolved"]), (True, 1, 1))
+        code, out, err = self.main("--root", self.root, "--ioc", ioc)
+        self.assertIn("IOC        1 match · 1 unresolved", out)
+
+    def test_gates(self):                                               # T-GATE-1, T-GATE-2
+        ioc = self.write("npm:evil@=1.0.0\nnpm:pending@=1.0.0\n")
+        code, _, err = self.main("--root", self.root, "--ioc", ioc, "--fail-on", "critical")
+        self.assertEqual(code, 0, err)
+        code, _, err = self.main("--root", self.root, "--ioc", ioc, "--fail-on", "high")
+        self.assertEqual(code, 3, err)
+        self.assertIn("1 known-bad download group(s) (IOC)", err)
+        self.assertNotIn("unresolved IOC", err)
+        self.assertNotIn("high-severity shell command", err)
+        code, _, err = self.main("--root", self.root, "--ioc", ioc, "--fail-on", "any")
+        self.assertEqual(code, 3)
+        self.assertIn("1 unresolved IOC match group(s)", err)
+        self.assertNotIn("medium-severity shell command", err)
+        only_unresolved = self.write("npm:pending@=1.0.0\n", "u.txt")
+        self.assertEqual(self.main("--root", self.root, "--ioc", only_unresolved, "--fail-on", "high")[0], 0)
+
+    def test_trusted_host_never_exempts(self):
+        ioc = self.write("host:evil.io\n")
+        code, out, err = self.main("--root", self.root, "--network-trust", "evil.io", "--ioc", ioc,
+                                   "--fail-on", "high", "--json")
+        self.assertEqual(code, 3, err)
+        j = json.loads(out)["network"]
+        self.assertTrue(next(i for i in j["items"] if i["host"] == "evil.io")["trusted"])
+        self.assertEqual(j["ioc"]["totals"]["match"], 1)
+
+    def test_load_errors_exit_2(self):                                  # T-CLI-1
+        for path, needle in ((str(self.dir / "missing.txt"), "cannot read"), (str(self.dir), "cannot read"),
+                             (self.write(b"npm:\xff\n", "bad.txt"), "bad.txt line 1"),
+                             (self.write("npm:a@^1.0.0\n", "g.txt"), "g.txt line 1")):
+            code, _, err = self.main("--root", self.root, "--ioc", path)
+            self.assertEqual(code, 2, path)
+            self.assertIn(needle, err)
+
+    def test_mode_rules(self):                                          # T-CLI-2
+        ioc = self.write("npm:evil\n")
+        for extra, needle in ((["--card"], "--ioc does not apply to --card"),
+                              (["--watch"], "--ioc is not supported with --watch or --mcp yet"),
+                              (["--mcp"], "--ioc is not supported with --watch or --mcp yet")):
+            code, _, err = self.main("--ioc", ioc, *extra)
+            self.assertEqual(code, 2, extra)
+            self.assertIn(needle, err)
+        broken = self.write("npm:a@^1\n", "broken.txt")
+        self.assertEqual(self.main("--explain", "cache", "--ioc", broken)[0], 0)
+        self.assertEqual(self.main("--suppressions", "--ioc", broken)[0], 0)
+
+    def test_cwd_file_is_ignored(self):                                 # T-CLI-3
+        (self.cwd / ".actualis-ioc").write_text("npm:evil\nhost:evil.io\n")
+        code, out, _ = self.main("--root", self.root, "--json")
+        self.assertEqual(code, 0)
+        self.assertFalse(json.loads(out)["network"]["ioc"]["enabled"])
+
+    def test_ioc_is_suppressible(self):                                 # T-GATE-4
+        ioc = self.write("npm:evil\n")
+        fid = af.flag_id("high", ["network-ioc"], "npm:evil@1.0.0")
+        self.assertEqual(self.main("--suppress", fid, "--reason", "private package of ours")[0], 0)
+        code, out, err = self.main("--root", self.root, "--ioc", ioc, "--fail-on", "high", "--json")
+        self.assertEqual(code, 0, err)
+        j = json.loads(out)
+        self.assertEqual((j["network"]["ioc"]["totals"]["suppressed"], j["suppressed_flags"]), (1, 1))
+        self.assertTrue(next(fl for fl in j["bash"]["flags"] if fl["id"] == fid)["suppressed"])
+
+    def test_completions_offer_ioc(self):                               # T-OUT-7
+        self.assertEqual(af._VALUE_HINT["--ioc"], "file")
+        self.assertIn("--ioc) COMPREPLY=($(compgen -f", af.completion_script("bash"))
+
+
+class TestGates(FleetCase, unittest.TestCase):
+    def test_match_and_unresolved(self):                                # T-GATE-1, T-GATE-2
+        f = self.fleet("npm:x@=1.0.0\nnpm:y@=1.0.0\n", "npm i x@1.0.0", "npm i y", "rm -rf /")
+        self.assertEqual(af.failing_findings(f, "critical"), [])
+        high = af.failing_findings(f, "high")
+        self.assertEqual(high[0], "1 known-bad download group(s) (IOC)")
+        self.assertIn("1 high-severity shell command(s) flagged", high)
+        anyl = af.failing_findings(f, "any")
+        self.assertEqual(anyl[:2], ["1 known-bad download group(s) (IOC)", "1 unresolved IOC match group(s)"])
+
+    def test_refused_and_clean_trip_nothing(self):                      # T-GATE-3
+        f = self.fleet("npm:x@=1.0.0\n", "npm i x@1.0.0", "npm i x@2.0.0", refuse=[0])
+        self.assertEqual(f.ioc_totals["clean_name_matches"], 1)
+        self.assertEqual(af.failing_findings(f, "any"), [])
+
+    def test_after_credentials(self):
+        f = self.fleet("npm:x\n", "npm i x@1.0.0",
+                       "export AWS_SECRET_ACCESS_KEY=" + "wJalrXUtnFEMI/K7MDENG/bPxRfiCYzzzzzzzzzz")
+        reasons = af.failing_findings(f, "any")
+        k = reasons.index("1 known-bad download group(s) (IOC)")
+        self.assertTrue(all("credential" in r for r in reasons[:k]))
