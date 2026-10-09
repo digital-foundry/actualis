@@ -7688,6 +7688,20 @@ def rule(c: C, title: str = "", width: int = 74) -> None:
         print(f"{c.dim}{'─' * width}{c.off}")
 
 
+def _local_host(host: str) -> bool:
+    """Loopback, private (RFC 1918), link-local, *.local and *.localhost hosts:
+    not third parties. IPv4 is parsed by hand."""
+    h = (host or "").lower().strip("[]").rstrip(".")
+    if h in ("localhost", "::1", "0.0.0.0") or h.endswith((".localhost", ".local")):
+        return True
+    parts = h.split(".")
+    if len(parts) == 4 and all(p.isdigit() and len(p) <= 3 for p in parts):
+        a, b = int(parts[0]), int(parts[1])
+        return (a in (10, 127) or (a == 172 and 16 <= b <= 31)
+                or (a == 192 and b == 168) or (a == 169 and b == 254))
+    return False
+
+
 def render_network(fleet: Fleet, c: C, top: int, raw: bool = False) -> None:
     """NETWORK: what came in, and from where; unasked first. Rows come from
     network_json, which is redacted unless raw; fleet.network_items is only
@@ -7738,18 +7752,21 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False) -> None:
 
     # Counts and dates only: host names are the same ones the rows below
     # print, and no item field is read here that network_json would redact.
+    # Only real remote hosts are ranked; the rest are counted on one line.
     unasked_hosts = {h["host"]: (h["unasked"], h["trusted"], h["first_seen"])
-                     for h in n["hosts"] if h["unasked"]}
-    nohost = [i for i in items if not i["host"] and i["approval"] == "unasked"]
-    if nohost:
-        stamps = [i["ts"] for i in nohost if i["ts"]]
-        unasked_hosts["(no host)"] = (len(nohost), False, min(stamps) if stamps else None)
-    if unasked_hosts:
+                     for h in n["hosts"] if h["unasked"] and not _local_host(h["host"])}
+    n_nohost = sum(1 for i in items if not i["host"] and i["approval"] == "unasked")
+    n_local = sum(h["unasked"] for h in n["hosts"] if _local_host(h["host"]))
+    if unasked_hosts or n_nohost or n_local:
         print(f"  {c.dim}TOP UNASKED   hosts by unasked downloads{c.off}")
         for host, (cnt, trusted, first) in sorted(
                 unasked_hosts.items(), key=lambda kv: (-kv[1][0], kv[0]))[:min(10, top)]:
             seen = "trusted" if trusted else f"first seen {first[:10] if first else '?'}"
             print(f"    {clip(host, 44):<44} {num(cnt):>7}  {c.dim}{seen}{c.off}")
+        extra = ([f"{num(n_nohost)} with no host (git remote names, $VAR URLs)"] if n_nohost else []) \
+            + ([f"{num(n_local)} local or private"] if n_local else [])
+        if extra:
+            print(f"    {c.dim}plus {' · '.join(extra)}{c.off}")
 
     rows = [i for i in n["items"] if i["approval"] in ("unasked", "unknown")]
     rows.sort(key=lambda i: i["approval"] != "unasked")   # stable: newest-first within each

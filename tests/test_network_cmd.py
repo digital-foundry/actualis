@@ -194,7 +194,8 @@ class TestTopUnasked(unittest.TestCase):
         for l in lines[i + 1:]:
             if not l.startswith("    "):
                 break
-            rows.append(l.strip())
+            if not l.strip().startswith("plus "):
+                rows.append(l.strip())
         return rows
 
     def test_ordering_ties_and_trust(self):
@@ -212,12 +213,42 @@ class TestTopUnasked(unittest.TestCase):
         self.assertEqual(len(self.block(self.out(f))), 10)
         self.assertEqual(len(self.block(self.out(f, top=4))), 4)
 
-    def test_hostless_items_are_grouped(self):
+    def test_hostless_items_are_counted_not_ranked(self):
         f = af.Fleet()
         f.add_tool("p", "WebSearch", {"query": "q"}, TS1, "auto")
         f.add_tool("p", "WebSearch", {"query": "r"}, TS1, "auto")
-        rows = self.block(self.out(f))
-        self.assertEqual(rows[0].split()[:3], ["(no", "host)", "2"])
+        text = self.out(f)
+        self.assertEqual(self.block(text), [])
+        self.assertIn("plus 2 with no host (git remote names, $VAR URLs)", text)
+
+    LOCAL = ["localhost", "app.localhost", "127.0.0.1", "127.9.9.9", "[::1]", "0.0.0.0", "10.1.2.3",
+             "172.16.0.1", "172.31.255.1", "192.168.1.1", "169.254.1.1", "printer.local"]
+
+    def test_local_and_hostless_are_not_ranked(self):
+        f = self.fleet([("a.io", 1, "auto", TS1), ("172.32.0.1", 1, "auto", TS1)]
+                       + [(h, 3, "auto", TS1) for h in self.LOCAL])
+        f.add_tool("p", "WebSearch", {"query": "q"}, TS1, "auto")
+        text = self.out(f)
+        rows = self.block(text)
+        self.assertEqual([r.split()[0] for r in rows], ["172.32.0.1", "a.io"])
+        self.assertIn(f"plus 1 with no host (git remote names, $VAR URLs) \u00b7 {3 * len(self.LOCAL)} local or private", text)
+        self.assertNotIn("(no host)", "\n".join(rows))
+        n = af.network_json(f)
+        self.assertEqual(n["totals"]["items"], 2 + 3 * len(self.LOCAL) + 1)
+
+    def test_summary_omits_zero_parts(self):
+        f = self.fleet([("a.io", 1, "auto", TS1), ("127.0.0.1", 2, "auto", TS1)])
+        text = self.out(f)
+        self.assertIn("plus 2 local or private", text)
+        self.assertNotIn("no host (git", text)
+        f = self.fleet([("a.io", 1, "auto", TS1)])
+        self.assertNotIn("plus ", self.out(f))
+
+    def test_all_local_fleet_has_summary_and_no_rows(self):
+        f = self.fleet([("localhost", 4, "auto", TS1)])
+        text = self.out(f)
+        self.assertIn("plus 4 local or private", text)
+        self.assertEqual(self.block(text), [])
 
     def test_no_block_without_unasked(self):
         f = self.fleet([("a.io", 2, "default", TS1)])
