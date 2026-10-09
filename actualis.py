@@ -2927,6 +2927,8 @@ def _ioc_parse_spec(eco: str, text: str | None) -> tuple | None:
     clauses (OR), each a tuple of comparators (AND)."""
     if text is None or text in _IOC_ANY_VERSION:
         return None
+    if text.count("||") >= IOC_CLAUSES_MAX:
+        raise _IocError(f"over {IOC_CLAUSES_MAX:,} alternatives", "split the entry over several lines")
     clauses = []
     for clause_text in text.split("||"):
         if not clause_text:
@@ -3011,6 +3013,10 @@ IOC_WHOLE_JSON_MAX = 64 << 20         # a line file, an OSV array, or a document
 IOC_LINE_MAX = 1 << 20                # one line of either format
 IOC_ENTRIES_MAX = 1_000_000           # across every file
 IOC_NAME_MAX = 214                    # npm's limit, applied to every ecosystem
+IOC_LINES_MAX = 4_000_000             # lines per file, blank and comment lines included
+IOC_CLAUSES_MAX = 10_000              # alternatives (|| or versions[]) in one entry
+IOC_EVENTS_MAX = 10_000               # events in one OSV range
+IOC_JSON_DEPTH = 64                   # nesting in one OSV document or JSONL record; real ones use 5
 
 _IOC_ECOSYSTEMS = {"npm": "npm", "pypi": "pypi", "pip": "pypi",
                    "crates": "crates", "crates.io": "crates", "cargo": "crates", "rust": "crates",
@@ -3068,6 +3074,7 @@ class IocSet:
         self.mtimes: list[float] = []
         self.has_window = False
         self.total = 0
+        self.bytes_read = 0            # across every file, for the 1 GiB cap
 
     def add(self, e: IocEntry) -> None:
         self.total += 1
@@ -3142,6 +3149,9 @@ def _ioc_attrs(tokens: list[str]) -> dict:
     return out
 
 
+_IOC_NO_ATTRS = {"ref": None, "label": None, "frm": None, "until": None}
+
+
 def _ioc_host_entry(body: str, attrs: dict, src: int, n: int | None, label: str) -> IocEntry:
     exact = body.startswith("=")
     text = body[1:] if exact else body
@@ -3163,13 +3173,16 @@ def _ioc_host_entry(body: str, attrs: dict, src: int, n: int | None, label: str)
 
 def _ioc_line(text: str, ioc: IocSet, src: int, n: int, label: str) -> None:
     """One line of the actualis-ioc format."""
-    tokens = [t for t in _IOC_WS.split(text) if t]
+    if " " in text or "\t" in text:
+        tokens = [t for t in _IOC_WS.split(text) if t]
+    else:
+        tokens = [text] if text else []
     if not tokens or tokens[0].startswith("#"):
         return
     if _IOC_LINE_CONTROL.search(text):
         raise _IocError("the line holds a control character", "remove it")
     entry = tokens[0]
-    attrs = _ioc_attrs(tokens[1:])
+    attrs = _ioc_attrs(tokens[1:]) if len(tokens) > 1 else _IOC_NO_ATTRS
     if "#" in entry:
         raise _IocError(f'"{entry}" holds a #', "a comment starts with # after a space")
     word, colon, body = entry.partition(":")
@@ -3179,7 +3192,8 @@ def _ioc_line(text: str, ioc: IocSet, src: int, n: int, label: str) -> None:
     if not colon or not body:
         raise _IocError(f'"{entry}" is not ecosystem:name or host:name',
                         "write npm:name@=1.2.3 or host:evil.example")
-    eco = _IOC_ECOSYSTEMS.get(word.lower()) if _IOC_ECO_WORD.fullmatch(word) else None
+    eco = _IOC_ECOSYSTEMS.get(word) or (_IOC_ECOSYSTEMS.get(word.lower()) if _IOC_ECO_WORD.fullmatch(word)
+                                        else None)
     if eco is None:
         if word.lower() in _IOC_NOT_CHECKABLE:
             nc = ioc.sources[src]["not_checkable"]
@@ -3195,9 +3209,9 @@ def _ioc_line(text: str, ioc: IocSet, src: int, n: int, label: str) -> None:
     norm = _ioc_norm_name(eco, name) if len(name) <= IOC_NAME_MAX else ""
     if not _ioc_valid_name(eco, norm):
         raise _IocError(f'"{name}" is not a valid {eco} name')
-    spec = _ioc_parse_spec(eco, spec_text)
-    ioc.add(IocEntry("package", eco, norm, spec, _ioc_spec_text(spec), None, "", False,
-                     attrs["ref"], attrs["label"], attrs["frm"], attrs["until"], src, n))
+    spec = _ioc_parse_spec(eco, spec_text) if spec_text is not None else None
+    ioc.add(IocEntry._make(("package", eco, norm, spec, _ioc_spec_text(spec) if spec else None, None, "",
+                            False, attrs["ref"], attrs["label"], attrs["frm"], attrs["until"], src, n)))
 
 
 def _ioc_lines(data: bytes, start: int = 1):
@@ -3217,11 +3231,18 @@ def _ioc_decode(raw: bytes, n: int) -> str:
         raise _IocError("not UTF-8", "save the file as UTF-8") from None
 
 
-def parse_ioc_lines(data: bytes, ioc: IocSet, src: int, label: str) -> None:
-    """The actualis-ioc line format, version 1. The first error stops the load."""
-    for n, raw in _ioc_lines(data):
+def parse_ioc_lines(lines, ioc: IocSet, src: int, label: str) -> None:
+    """The actualis-ioc line format, version 1, from (line, bytes) pairs. The
+    first error stops the load."""
+    for n, raw in lines:
         try:
-            _ioc_line(_ioc_decode(raw, n), ioc, src, n, label)
+            if len(raw) > IOC_LINE_MAX:
+                raise _IocError("the line is over 1 MiB")
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                raise _IocError("not UTF-8", "save the file as UTF-8") from None
+            _ioc_line(text, ioc, src, n, label)
         except _IocError as exc:
             raise ValueError(f"--ioc {label} line {n}: {exc}") from None
 
@@ -3258,7 +3279,7 @@ def _ioc_osv_range(eco: str, kind: str, events: object, source: dict) -> list | 
     it below and last_affected at, the earliest close winning. limit is
     ignored, which leaves the interval open above: over-matching is the safe
     direction. An empty clause, (), means any version."""
-    if not isinstance(events, list):
+    if not isinstance(events, list) or len(events) > IOC_EVENTS_MAX:
         source["skipped_ranges"] += 1
         return None
     parsed = []
@@ -3371,6 +3392,9 @@ def parse_ioc_osv(records, ioc: IocSet, src: int, label: str) -> None:
                         any_version = True
                     else:
                         clauses.append(c)
+            if len(clauses) > IOC_CLAUSES_MAX:
+                _ioc_skip(source, line)
+                continue
             spec = None if any_version or not usable else tuple(clauses)
             try:
                 ioc.add(IocEntry("package", eco, norm, spec, _ioc_spec_text(spec), None, "", False,
@@ -3385,6 +3409,7 @@ def _ioc_jsonl(lines, label: str):
         if not raw.strip():
             continue
         try:
+            _ioc_json_depth(raw)
             yield n, json.loads(_ioc_decode(raw, n))
         except _IocError as exc:
             raise ValueError(f"--ioc {label} line {n}: {exc}") from None
@@ -3394,30 +3419,75 @@ def _ioc_jsonl(lines, label: str):
             raise ValueError(f"--ioc {label} line {n}: JSON nested too deeply") from None
 
 
-def _ioc_stream(fh, digest, label: str):
-    """(line, bytes) from a file too big to read whole, hashing as it goes.
-    readline is bounded, so a file with no newline cannot fill memory."""
+_IOC_JSON_STRING = re.compile(rb'"(?:[^"\\]|\\.)*"', re.S)
+_IOC_NOT_BRACKETS = bytes(b for b in range(256) if b not in b"[]{}")
+
+
+def _ioc_json_depth(data: bytes) -> None:
+    """Refuse JSON nested deeper than IOC_JSON_DEPTH before json parses it.
+    Strings are removed first, so a bracket inside one does not count."""
+    if data.count(b"[") + data.count(b"{") <= IOC_JSON_DEPTH:
+        return
+    depth = 0
+    for b in _IOC_JSON_STRING.sub(b"", data).translate(None, _IOC_NOT_BRACKETS):
+        depth += 1 if b in (91, 123) else -1
+        if depth > IOC_JSON_DEPTH:
+            raise _IocError(f"JSON nested over {IOC_JSON_DEPTH} levels", "an OSV record is a few levels deep")
+
+
+def _ioc_size(n: int) -> str:
+    if n % (1 << 30) == 0:
+        return f"{n >> 30} GiB"
+    if n % (1 << 20) == 0:
+        return f"{n >> 20} MiB"
+    return f"{n:,} bytes"
+
+
+def _ioc_count_bytes(ioc: IocSet, n: int, label: str) -> None:
+    ioc.bytes_read += n
+    if ioc.bytes_read > IOC_FILE_MAX:
+        raise ValueError(f"--ioc {label}: over {_ioc_size(IOC_FILE_MAX)} across all --ioc files")
+
+
+_IOC_CHUNK = 1 << 20
+
+
+def _ioc_stream(fh, digest, label: str, ioc: IocSet, limit: int, hint: str):
+    """(line, bytes) from an open file, hashing every byte as it is read.
+    Reads are 1 MiB chunks; the unfinished tail of a line is carried and
+    refused once it passes IOC_LINE_MAX, so no line is ever buffered whole,
+    and the byte and line caps hold while reading."""
     n = total = 0
+    rest, head = b"", True
     while True:
-        raw = fh.readline(IOC_LINE_MAX + 3)
-        if not raw:
+        chunk = fh.read(_IOC_CHUNK)
+        if chunk:
+            total += len(chunk)
+            digest.update(chunk)
+            if total > limit:
+                raise ValueError(f"--ioc {label}: over {_ioc_size(limit)} — {hint}")
+            _ioc_count_bytes(ioc, len(chunk), label)
+            if head:
+                chunk, head = chunk.removeprefix(_IOC_BOM), False
+        parts = (rest + chunk).split(b"\n") if chunk else ([rest] if rest else [])
+        rest = parts.pop() if chunk else b""
+        if len(rest) > IOC_LINE_MAX:
+            raise ValueError(f"--ioc {label} line {n + len(parts) + 1}: the line is over 1 MiB")
+        if n + len(parts) > IOC_LINES_MAX:
+            raise ValueError(f"--ioc {label}: over {IOC_LINES_MAX:,} lines — split the file")
+        for raw in parts:
+            n += 1
+            yield n, raw[:-1] if raw.endswith(b"\r") else raw
+        if not chunk:
             return
-        n += 1
-        total += len(raw)
-        digest.update(raw)
-        if total > IOC_FILE_MAX:
-            raise ValueError(f"--ioc {label}: over 1 GiB")
-        if n == 1:
-            raw = raw.removeprefix(_IOC_BOM)
-        raw = raw[:-1] if raw.endswith(b"\n") else raw
-        yield n, raw[:-1] if raw.endswith(b"\r") else raw
 
 
 def _ioc_peek(fh) -> bytes:
     """The first byte that is not a BOM or whitespace, then rewind."""
-    first, head = b"", True
-    while not first:
+    first, head, seen = b"", True, 0
+    while not first and seen <= IOC_WHOLE_JSON_MAX:
         chunk = fh.read(1 << 16)
+        seen += len(chunk)
         if not chunk:
             break
         if head:
@@ -3431,6 +3501,10 @@ def _ioc_osv_document(data: bytes, first: bytes, label: str):
     """Records from an OSV file read whole: an object, an array, or JSONL
     when an object is followed by "Extra data"."""
     body = data.removeprefix(_IOC_BOM)
+    try:
+        _ioc_json_depth(body)
+    except _IocError as exc:
+        raise ValueError(f"--ioc {label}: {exc}") from None
     try:
         text = body.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -3448,33 +3522,35 @@ def _ioc_osv_document(data: bytes, first: bytes, label: str):
 
 
 def _ioc_load_file(path: Path, ioc: IocSet, src: int, label: str) -> None:
-    """One file: detect the format from its first byte, parse, hash every byte."""
+    """One file: detect the format from its first byte, parse, hash every
+    byte. Only a whole OSV document is read whole, and only up to
+    IOC_WHOLE_JSON_MAX; everything else is read a bounded line at a time."""
     source = ioc.sources[src]
     digest = hashlib.sha256()
     with path.open("rb") as fh:
         st = os.fstat(fh.fileno())
         if st.st_size > IOC_FILE_MAX:
-            raise ValueError(f"--ioc {label}: over 1 GiB")
-        if st.st_size > IOC_WHOLE_JSON_MAX:
-            first = _ioc_peek(fh)
-            if first == b"[":
-                raise ValueError(f"--ioc {label}: an OSV array over 64 MiB — convert to JSONL: "
-                                 "jq -c '.[]' f > f.jsonl")
-            if first != b"{":
-                raise ValueError(f"--ioc {label}: over 64 MiB — split the file")
+            raise ValueError(f"--ioc {label}: over {_ioc_size(IOC_FILE_MAX)}")
+        first = _ioc_peek(fh)
+        if first == b"[" and st.st_size > IOC_WHOLE_JSON_MAX:
+            raise ValueError(f"--ioc {label}: an OSV array over {_ioc_size(IOC_WHOLE_JSON_MAX)} — "
+                             "convert to JSONL: jq -c '.[]' f > f.jsonl")
+        if first == b"{" and st.st_size > IOC_WHOLE_JSON_MAX:
             source["format"] = "osv-jsonl"
-            parse_ioc_osv(_ioc_jsonl(_ioc_stream(fh, digest, label), label), ioc, src, label)
-        else:
+            lines = _ioc_stream(fh, digest, label, ioc, IOC_FILE_MAX, "split the file")
+            parse_ioc_osv(_ioc_jsonl(lines, label), ioc, src, label)
+        elif first in (b"{", b"["):
             data = fh.read(IOC_WHOLE_JSON_MAX + 1)
-            if len(data) > IOC_WHOLE_JSON_MAX:
-                raise ValueError(f"--ioc {label}: over 64 MiB — split the file")
+            if len(data) > IOC_WHOLE_JSON_MAX:     # grew since stat, or not a regular file
+                raise ValueError(f"--ioc {label}: over {_ioc_size(IOC_WHOLE_JSON_MAX)} — "
+                                 "convert to JSONL: jq -c '.[]' f > f.jsonl")
             digest.update(data)
-            first = _ioc_first_byte(data)
-            if first in (b"{", b"["):
-                records, source["format"] = _ioc_osv_document(data, first, label)
-                parse_ioc_osv(records, ioc, src, label)
-            else:
-                parse_ioc_lines(data, ioc, src, label)
+            _ioc_count_bytes(ioc, len(data), label)
+            records, source["format"] = _ioc_osv_document(data, first, label)
+            parse_ioc_osv(records, ioc, src, label)
+        else:
+            lines = _ioc_stream(fh, digest, label, ioc, IOC_WHOLE_JSON_MAX, "split the file")
+            parse_ioc_lines(lines, ioc, src, label)
     source["sha256"] = digest.hexdigest()
     ioc.mtimes.append(st.st_mtime)
 
@@ -3611,6 +3687,7 @@ def apply_ioc(fleet: "Fleet", ioc: IocSet | None) -> None:
     if ioc is None:
         return
     groups: dict[tuple[str, str], list[dict]] = {}
+    memo: dict[tuple, tuple | None] = {}
     for item in fleet.network:
         refused = bool(item.get("_refused"))
         if not refused:
@@ -3619,7 +3696,13 @@ def apply_ioc(fleet: "Fleet", ioc: IocSet | None) -> None:
                 totals["items_checked"] += 1
             else:
                 totals["items_not_checkable"][bucket] += 1
-        found = match_ioc(item, ioc)
+        # Items that agree on every field matching reads get the same answer, so
+        # forty installs of one package cost one lookup, however long the list.
+        memo_key = tuple(item.get(k) for k in ("kind", "ecosystem", "package", "version", "pinned",
+                                               "host", "host_inferred", "url"))
+        if memo_key not in memo:
+            memo[memo_key] = match_ioc(item, ioc)
+        found = memo[memo_key]
         if found is None:
             continue
         verdict, reason, matched, key = found

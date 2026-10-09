@@ -418,7 +418,7 @@ class TestOsv(IocFiles, unittest.TestCase):
             ioc = self.load("\n".join(json.dumps(r) for r in recs) + "\n", "big.json")
             self.assertEqual(len(entries(ioc)), 30)
             self.assertEqual(ioc.sources[0]["format"], "osv-jsonl")
-            self.fails("npm:x\n" * 300, "over 64 MiB")
+            self.fails("npm:x\n" * 300, "over 1,024 bytes")
             whole = "\n".join(json.dumps(r) for r in recs) + "\n"
             self.assertEqual(ioc.sources[0]["sha256"],
                              __import__("hashlib").sha256(whole.encode()).hexdigest())
@@ -643,3 +643,120 @@ class TestFlags(FleetCase, unittest.TestCase):
         [fl] = self.ioc_flags(f)
         self.assertNotIn(token, fl["evidence"])
         self.assertLessEqual(len(fl["evidence"]), 240)
+
+
+# Run in a child process so the time and the peak memory are the loader's own.
+_CHILD = r"""
+import importlib.util, json, resource, sys, time
+spec = importlib.util.spec_from_file_location("actualis", sys.argv[1])
+af = importlib.util.module_from_spec(spec); spec.loader.exec_module(af)
+for kv in sys.argv[2].split(",") if sys.argv[2] else ():
+    k, v = kv.split("="); setattr(af, k, int(v))
+unit = 1 if sys.platform == "darwin" else 1024
+base = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit
+t = time.perf_counter()
+err = None
+try:
+    ioc = af.load_ioc(sys.argv[3:])
+    info = {"entries": ioc.total, "sources": ioc.sources}
+except ValueError as exc:
+    err, info = str(exc), None
+dt = time.perf_counter() - t
+peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit
+print(json.dumps({"dt": dt, "mb": (peak - base) / 1e6, "err": err, "info": info}))
+"""
+
+
+class TestLoaderCaps(IocFiles, unittest.TestCase):
+    """Every cap is hard and enforced while reading: an IOC file may have been
+    downloaded, so it is untrusted. Each case exits 2 (a ValueError) or
+    degrades, within 2 s and modest memory."""
+
+    def child(self, *paths, patch=""):
+        import subprocess
+        out = subprocess.run([sys.executable, "-I", "-c", _CHILD, str(ROOT / "actualis.py"), patch, *paths],
+                             capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stderr[-2000:])
+        self.assertNotIn("Traceback", out.stderr)
+        return json.loads(out.stdout)
+
+    def bounded(self, r, seconds=2.0, mb=64):
+        # 2 s is the dev-Mac budget. A shared CI runner gets the spec's loose
+        # ceiling (section 11) so a slow neighbour cannot flake the suite.
+        self.assertLess(r["dt"], seconds if not os.environ.get("CI") else 10.0, r)
+        self.assertLess(r["mb"], mb, r)
+
+    def test_oversized_file(self):
+        path = self.dir / "big.jsonl"
+        with open(path, "wb") as fh:                   # sparse: no real disk used
+            fh.write(b"{")
+            fh.truncate(af.IOC_FILE_MAX + 1)
+        r = self.child(str(path))
+        self.bounded(r)
+        self.assertIn("over 1 GiB", r["err"])
+
+    def test_total_across_files(self):
+        a = self.write("npm:a\n" + "#" * 3000 + "\n", "a.txt")
+        b = self.write("npm:b\n" + "#" * 3000 + "\n", "b.txt")
+        r = self.child(a, b, patch="IOC_FILE_MAX=4096")
+        self.assertIn("b.txt", r["err"])
+        self.assertIn("across all --ioc files", r["err"])
+
+    def test_huge_single_line_is_never_buffered(self):
+        path = self.write(b"npm:x " + b"a" * (60 << 20), "line.txt")
+        r = self.child(path)
+        self.bounded(r, mb=32)
+        self.assertIn("line 1", r["err"])
+        self.assertIn("over 1 MiB", r["err"])
+
+    def test_deep_nesting(self):
+        deep = "[" * 100_000 + "]" * 100_000
+        for name, text in (("deep.json", deep), ("deep.jsonl", '{"a":' + deep + "}\n{}\n")):
+            with self.subTest(name=name):
+                r = self.child(self.write(text, name))
+                self.bounded(r)
+                self.assertIn("nested", r["err"])
+
+    def test_a_million_entries(self):
+        path = self.write("".join(f"npm:p{i}\n" for i in range(af.IOC_ENTRIES_MAX + 1)), "million.txt")
+        r = self.child(path)
+        self.assertIn("over 1,000,000 entries", r["err"])
+        self.bounded(r, mb=1024)                     # O(entries): the cap is the bound
+
+    def test_long_versions(self):
+        self.fails("npm:x@=" + "1" * 10_000 + "\n", "over 128")
+        rec = osv("x", versions=["1" * 10_000, "1.0.0"],
+                  ranges=[rng(("introduced", "1.0.0"), ("fixed", "2" * 10_000))])
+        e = only(self.load(json.dumps(rec), "o.json"))
+        self.assertEqual(e.spec_text, "=1.0.0||undecidable")
+
+    def test_many_events(self):
+        ev = [("introduced", f"1.0.{i}") for i in range(100_000)]
+        r = self.child(self.write(json.dumps(osv("x", ranges=[rng(*ev)])), "events.json"))
+        self.bounded(r, mb=128)
+        self.assertIsNone(r["err"])
+        self.assertEqual(r["info"]["sources"][0]["skipped_ranges"], 1)
+
+    def test_many_alternatives(self):
+        self.fails("npm:x@" + "||".join(f"=1.0.{i}" for i in range(af.IOC_CLAUSES_MAX + 1)) + "\n",
+                   "line 1", "alternatives")
+        rec = osv("x", versions=[f"1.0.{i}" for i in range(af.IOC_CLAUSES_MAX + 1)])
+        ioc = self.load(json.dumps([rec, osv("y")]), "o.json")
+        self.assertEqual((sorted(n for _, n in ioc.packages), ioc.sources[0]["skipped"]), (["y"], 1))
+
+    def test_a_file_of_comments_is_bounded(self):
+        r = self.child(self.write("#\n" * (30 << 20), "comments.txt"))
+        self.bounded(r)
+        self.assertIn("lines", r["err"])
+
+    def test_matching_cost_is_per_distinct_item(self):
+        lines = "".join(f"npm:x@=1.0.{i}\n" for i in range(20_000))
+        f = af.Fleet()
+        f.suppressions = {}
+        for k in range(2_000):
+            f.add_tool("p", "Bash", {"command": "npm i x@2.0.0"}, TS, "auto")
+        ioc = self.load(lines)
+        t = time.perf_counter()
+        af.apply_ioc(f, ioc)
+        self.assertLess(time.perf_counter() - t, 2.0)
+        self.assertEqual(f.ioc_totals["clean_name_matches"], 2_000)
