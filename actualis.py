@@ -2781,6 +2781,39 @@ def network_json(fleet: "Fleet", raw: bool = False) -> dict:
     }
 
 
+def network_reconciles(n: dict) -> list[str]:
+    """Why the network object's numbers do not add up; empty means they do.
+    Takes the dict network_json returns, so the check sees what --json shows."""
+    bad: list[str] = []
+    t, kinds, items = n["totals"], n["by_kind"], n["items"]
+    by_approval = t["asked"] + t["unasked"] + t["unknown"]
+    if t["items"] != by_approval:
+        bad.append(f"totals.items {t['items']} != asked + unasked + unknown {by_approval}")
+    if t["items"] != sum(kinds.values()):
+        bad.append(f"totals.items {t['items']} != sum of by_kind {sum(kinds.values())}")
+    if t["failed"] > t["items"]:
+        bad.append(f"totals.failed {t['failed']} > totals.items {t['items']}")
+    hosted = sum(h["count"] for h in n["hosts"])
+    if n["items_truncated"] or len(items) < t["items"]:
+        if hosted > t["items"]:                    # the cap hides items; only a bound is checkable
+            bad.append(f"hosts counts {hosted} > totals.items {t['items']}")
+    elif hosted != sum(1 for i in items if i["host"]):
+        bad.append(f"hosts counts {hosted} != items with a host "
+                   f"{sum(1 for i in items if i['host'])}")
+    for i in items:
+        if i["approval"] not in ("asked", "unasked", "unknown"):
+            bad.append(f"item approval {i['approval']!r} is not asked, unasked or unknown")
+            break
+    for i in items:
+        if i["kind"] not in ("install", "clone", "fetch", "search"):
+            bad.append(f"item kind {i['kind']!r} is not install, clone, fetch or search")
+            break
+    if n["items_truncated"] != (len(items) < t["items"]):
+        bad.append(f"items_truncated {n['items_truncated']} but {len(items)} of "
+                   f"{t['items']} items are listed")
+    return bad
+
+
 # --------------------------------------------------------------------------
 # --ioc: known-bad packages and hosts, matched offline
 #
@@ -7727,6 +7760,13 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False) -> None:
     n = network_json(fleet, raw)
     t = n["totals"]
     rule(c, "NETWORK")
+    try:                                   # a self-check on the numbers; never a crash
+        problems = network_reconciles(n)
+    except Exception as exc:               # noqa: BLE001
+        problems = [f"check failed: {type(exc).__name__}"]
+    if problems:
+        print(f"  {c.red}\u25b2 network totals do not reconcile: {'; '.join(problems)[:200]}. "
+              f"Do not trust these numbers.{c.off}")
     if not t["items"]:
         print(f"  {c.dim}no downloads seen{c.off}")
         render_ioc(fleet, c, raw)              # an empty inventory is still an answer to --ioc
@@ -9799,6 +9839,12 @@ def _self_check_corpus(roots: list[Path], sample: list[Path], result, c: C,
     copilot = [r for r in roots if r in copilot_roots()]
     if copilot:
         fleet.scan_copilot(copilot, since, None)
+
+    problems = network_reconciles(network_json(fleet))
+    result(not problems, "network totals reconcile",
+           "Items equal asked + unasked + unknown and the sum of kinds, hosts add up, "
+           "and every approval and kind is a known one."
+           if not problems else "; ".join(problems))
 
     changed = [str(f) for f in sample if _digest_file(f) != before[f]]
     result(not changed,
