@@ -400,6 +400,62 @@ BASH_RULES: list[Rule] = [
 
 COMPILED_RULES = [(sev, cat, re.compile(pat, re.IGNORECASE)) for sev, cat, pat in BASH_RULES]
 
+# One entry per BASH_RULES row, in the same order: lowercase literals of which
+# at least one must occur in a line for that rule to be able to match it. A
+# line holding none of them skips the regex. Written by hand from each rule,
+# never derived by parsing it, and each literal is a run the regex requires
+# contiguously (no \s inside one). None means the rule always runs.
+# re.IGNORECASE matches exactly four non-ASCII characters to ASCII letters
+# (U+0130 and U+0131 to i, U+017F to s, U+212A to k); _fold_lower maps them
+# before lowering, so no match is skipped. Checked against the unfiltered path
+# by tests/test_audit_prefilter.py.
+RULE_PREFILTERS: list[tuple[str, ...] | None] = [
+    ("rm",),                                            # rm -rf
+    ("mkfs", "fdisk", "diskutil"),
+    ("of=/dev/",),                                      # dd ... of=/dev/
+    ("truncate",),
+    ("-delete",),                                       # find ... -delete
+    ("sudo",),
+    ("su",),                                            # su -
+    ("777",),                                           # chmod 777
+    ("chown",),
+    ("curl", "wget"),                                   # ... | sh
+    ("curl", "wget"),                                   # ... | python
+    ("npx",),
+    ("pip",),
+    (".env", "id_rsa", "id_dsa", ".pem", ".p12", "credentials", ".netrc", ".npmrc", ".pypirc"),
+    ("find-generic-password", "find-internet-password"),
+    ("env",),                                           # printenv | env
+    ("aws_secret_access_key", "anthropic_api_key", "openai_api_key", "github_token"),
+    ("auth",),                                          # gh auth token
+    ("curl",),                                          # curl -d / --data / -F / -T
+    ("scp", "rsync"),
+    ("push",),                                          # git push --force
+    ("filter-branch", "filter-repo"),
+    ("--hard",),                                        # git reset --hard
+    ("clean",),
+    ("checkout",),
+    ("publish",),                                       # npm publish
+    ("twine", "cargo", "gem"),
+    ("kubectl", "helm"),
+    ("terraform",),
+    ("deploy",),
+    ("--delete",),                                      # aws s3 rm|sync --delete
+    ("drop", "truncate"),
+    ("delete",),                                        # DELETE FROM
+    ("psql", "mysql", "mongosh"),
+    ("history",),
+    ("histfile", "histsize=0"),
+]
+
+_ASCII_FOLD = str.maketrans({"\u0130": "i", "\u0131": "i", "\u017f": "s", "\u212a": "k"})
+
+
+def _fold_lower(text: str) -> str:
+    """Lowercase text for the prefilters, with the characters re.IGNORECASE
+    matches to an ASCII letter mapped to that letter first."""
+    return text.lower() if text.isascii() else text.translate(_ASCII_FOLD).lower()
+
 SEVERITY_ORDER = {"high": 0, "med": 1}
 
 
@@ -446,6 +502,19 @@ UNREADABLE_SHAPES = (
                 r"(?=[^\n]*(?:\b(?:urllib|requests|fetch|http\.client|socket)|LWP)\b)")),
 )
 
+# Lowercase literals per UNREADABLE_SHAPES row, as RULE_PREFILTERS is per rule.
+SHAPE_PREFILTERS: list[tuple[str, ...] | None] = [
+    ("$",),                                             # runs a variable
+    ("eval",),
+    ("curl", "wget"),
+    (".sh", ".bash", ".zsh", ".py", ".rb", ".pl"),      # runs a local script
+    ("source", "."),
+    ("-c",),                                            # shell -c with a variable
+    ("$'",),                                            # ANSI-C quoting
+    ("$(", "`"),                                        # pipes a substitution to a shell
+    ("urllib", "requests", "fetch", "http.client", "socket", "lwp"),
+]
+
 
 class AuditConfigId(ValueError):
     """--suppress was given the id of the audit-config finding."""
@@ -471,6 +540,14 @@ AUDIT_CONFIG_ID = flag_id("high", ["audit-config"], "audit-config")
 def unreadable_shapes(cmd: str) -> list[str]:
     """Which parts of this command the transcript does not actually contain."""
     text = cmd[:MAX_SCAN_TOTAL]
+    low = _fold_lower(text)
+    return [name for (name, rx), lits in zip(UNREADABLE_SHAPES, SHAPE_PREFILTERS)
+            if (lits is None or any(x in low for x in lits)) and rx.search(text)]
+
+
+def _unreadable_shapes_unfiltered(cmd: str) -> list[str]:
+    """unreadable_shapes with no prefilter: the reference the tests compare against."""
+    text = cmd[:MAX_SCAN_TOTAL]
     return [name for name, rx in UNREADABLE_SHAPES if rx.search(text)]
 
 
@@ -485,6 +562,23 @@ def audit_command(cmd: str) -> list[tuple[str, str, str]]:
     # line break. Scanning is therefore per line, and the whole-command retry
     # this used to do was both redundant and the entire cost: it doubled the
     # work on the slowest possible input.
+    lines = [ln[:MAX_SCAN_LINE] for ln in (cmd.splitlines() or [cmd])[:MAX_SCAN_LINES]]
+    lows = [_fold_lower(ln) for ln in lines]
+    whole = "\n".join(lows)
+    out: list[tuple[str, str, str]] = []
+    for (sev, cat, rx), lits in zip(COMPILED_RULES, RULE_PREFILTERS):
+        if lits is not None and not any(x in whole for x in lits):
+            continue                         # no line can hold one: skip every line
+        for ln, low in zip(lines, lows):
+            if (lits is None or any(x in low for x in lits)) and rx.search(ln):
+                out.append((sev, cat, clean(ln.strip())))
+                break
+    return out
+
+
+def _audit_command_unfiltered(cmd: str) -> list[tuple[str, str, str]]:
+    """audit_command with every rule run on every line: the reference the
+    prefilter is tested against."""
     lines = [ln[:MAX_SCAN_LINE] for ln in (cmd.splitlines() or [cmd])[:MAX_SCAN_LINES]]
     out: list[tuple[str, str, str]] = []
     for sev, cat, rx in COMPILED_RULES:
