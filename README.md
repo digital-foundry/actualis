@@ -22,6 +22,10 @@ and prints a report, across **Claude Code** and **Codex** together.
   stored — only a hash of it.
 - **Every command the agent ran**, audited for the risky shapes: `rm -rf`,
   piped installers, credential reads, egress to somewhere new.
+- **What it downloaded, and whether anyone asked.** Packages installed, repos
+  cloned, URLs fetched — each marked asked, unasked, or unknown (see them with
+  `actualis --network`) — and, with `--network-strict`, a finding for every unasked download from a source you
+  have not trusted.
 - **What happened while a credential was live.** Give it one fingerprint and
   it reconstructs the incident: the exposure window, every command that ran
   inside it, and the subset worth actually reading. A four-day window holds
@@ -190,6 +194,10 @@ python3 actualis.py --agent codex    # one agent only (claude | codex | copilot 
 | `--reason TEXT` | why that suppression is correct, recorded for review |
 | `--suppressions` | list current suppressions and where they are read from |
 | `--fail-on LEVEL` | exit 3 if any unsuppressed finding is at or above `critical`, `high` or `any`. For gating a pipeline |
+| `--network` | print only the NETWORK section, with the IOC block when `--ioc` is given. `--network --json` emits only the `network` object (no `schema_version`). Not with `--share`, `--card`, `--bash`, `--coach`, `--aisvs`, `--diff`, `--replay`, `--watch` or `--mcp` |
+| `--network-trust HOST[/PATH],...` | trusted download sources for `--network-strict` (repeatable). Also read from `./.actualis-network-trust`, one per line; the report prints that file's path and sha256 because the agent can write it |
+| `--network-strict` | make every unasked download from an untrusted source a medium finding, so `--fail-on any` and the suppressions file apply |
+| `--ioc FILE` | match every download the transcript shows against a known-bad list: the actualis-ioc line format or OSV JSON/JSONL (repeatable). A match is a high finding, an undecidable one medium. Read only when named; see [docs/ioc.md](docs/ioc.md) |
 | `--explain [TOPIC]` | how a number is computed, what it assumes, how to check it |
 | `--replay ID` | incident report for one credential: what ran while it was live, graded by proximity |
 | `--why AFxxx` | explain one finding against your actual numbers |
@@ -234,6 +242,7 @@ multiplier applied to each · `BY AGENT` · `BY MODEL` · `CACHE EFFICIENCY` ·
 | [docs/findings.md](docs/findings.md) | every coach finding `AF001`–`AF011`: what it means, when it fires, what to do |
 | [docs/secrets.md](docs/secrets.md) | which credential types are detected, and what is deliberately not flagged |
 | [docs/json.md](docs/json.md) | `--json` schema |
+| [docs/ioc.md](docs/ioc.md) | `--ioc`: the known-bad list format, OSV input, verdicts and the CI recipe |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | ground rules, and the CLA note that keeps dual licensing possible |
 | [SECURITY.md](SECURITY.md) | what counts as a vulnerability, and how to report one |
 | [CHANGELOG.md](CHANGELOG.md) | what changed |
@@ -505,12 +514,12 @@ no report.
 
 ## About the cost number
 
-Costs are Anthropic API list prices, verified 2026-08-22, including the cache
+Costs are Anthropic API list prices, verified 2026-10-08, including the cache
 multipliers that dominate agent workloads:
 
 | | multiplier on input rate |
 |---|---|
-| cache read | 0.10× |
+| cache read | 0.10× (0.05× Opus 5.5 and Sonnet 5.5; 0.025× Fable 5.1 and Mythos 5.1) |
 | cache write, 5m TTL | 1.25× |
 | cache write, 1h TTL | 2.00× |
 
@@ -546,6 +555,16 @@ scoring that drifts between runs. A command either matches a rule or it doesn't,
 and you can read every rule in the source. Categories: `destructive`, `privilege`,
 `remote-exec`, `credentials`, `egress`, `git`, `publish`, `database`, `audit`.
 
+One more category, `audit-config`, is always `high` and can never be suppressed. It
+is a heuristic tripwire, not a prevention. It fires when the agent writes
+`.actualis-network-trust`, `.actualis-suppressions` or the user-level
+`~/.config/actualis/suppressions` (through a file-write tool, or a shell command that
+names the file and is not a known reader such as `cat` or `grep`), or runs
+`actualis --suppress`. Those files decide what is reported, so an agent that could
+edit them could hide its own work; a suppression of this finding would be the same
+edit, and `--suppress` refuses its id. Known limits: Codex `apply_patch` edits are not
+read, and neither is a write made by a script run from another file.
+
 **A flag means "worth looking at", not "wrong".** Most `rm -rf` calls are a build
 directory. The point is that you can see them at all.
 
@@ -553,6 +572,25 @@ The rules were tuned against 48,000 real agent commands, and tuning meant deleti
 rules as much as adding them. A rule matching `>/dev/null 2>&1` as "audit
 tampering" fired 1,206 times at essentially 100% false positive, so it's gone; a
 noisy rule destroys trust in the rules that matter. Current flag rate is about 3.8%.
+
+## Did an agent install the bad version?
+
+During a supply-chain incident, `--ioc FILE` matches every download the
+transcripts show in the network inventory against a known-bad list, offline:
+
+```sh
+actualis --ioc iocs.txt --fail-on high
+```
+
+The list is a simple line format (`npm:@ctrl/tinycolor@=4.1.1||=4.1.2`,
+`pypi:name`, `host:evil.example`) or OSV JSON/JSONL, such as the OpenSSF
+malicious-packages records. A match is a `high` finding (`network-ioc`). A
+listed name whose version cannot be decided (`npm i x@latest`, a private
+registry) is `medium` (`network-ioc-unresolved`), never clean. Refused calls
+are listed and never fail the gate, and a trusted source never exempts a
+match. The list is read only when named; nothing is fetched. No match is not
+"not affected": lockfile installs, scripts and postinstall hooks are out of
+sight. See [docs/ioc.md](docs/ioc.md) and `actualis --explain ioc`.
 
 ## Using it in CI
 
@@ -602,12 +640,26 @@ exposing the path as its `execution_file` output.
     LOG: ${{ steps.claude.outputs.execution_file }}
 ```
 
+The action's inputs:
+
+| input | default | meaning |
+|---|---|---|
+| `execution-file` | required | path to the Claude Code Action's execution log; pass the upstream step's `execution_file` output |
+| `fail-on` | `critical` | fail the job at or above this level: `critical`, `high` or `any`; `none` reports without gating (a run that could not complete still prints a `::warning::`) |
+| `network-strict` | `false` | `"true"` makes every unasked download from a source not trusted a medium finding, which `fail-on: any` then fails on |
+| `network-trust` | empty | comma-separated trusted download sources, host or host/path (for example `npmjs.org,github.com/your-org`); added to `.actualis-network-trust` |
+| `ioc` | empty | paths to known-bad lists (actualis-ioc lines or OSV), one per line, each passed as `--ioc`. Fetch them in a step after the agent step, outside the workspace (for example `$RUNNER_TEMP`). Matches are `high`, so set `fail-on: high` to gate on them; with the default `critical` the action prints a warning |
+| `version` | latest | actualis version to install; pin it |
+| `json-report` | empty | path to write the redacted `--json` report to, for use as a `--diff` baseline |
+| `summary` | `true` | write the report to the job summary; set `false` on a public repository if command text alone is sensitive |
+
 The action's outputs are available whether or not the gate fires:
 
 | output | meaning |
 |---|---|
-| `exit-code` | `0` clean, `3` findings at or above `fail-on`, `1` could not run |
+| `exit-code` | `0` clean, `3` findings at or above `fail-on`, `1` could not run, `2` usage error (for example a bad `network-trust` entry) |
 | `findings` | coach findings plus unsuppressed credentials |
+| `ioc-matches` | unsuppressed `--ioc` matches (`network.ioc.matches[]` rows with verdict `match`, not refused); `0` without `ioc` |
 
 `--ci-log` reads that documented output rather than guessing at `~/.claude` on
 the runner. The action drives Claude Code through the SDK, so whether a
@@ -708,6 +760,9 @@ if handled like the other:
 ## Limitations
 - **Reporting only.** It observes; it does not enforce. Claude Code's own
   permission rules, sandboxing, and hooks are where enforcement belongs.
+- **`--ioc` sees only the inventory.** No match is not "not affected": lockfile
+  installs, scripts, postinstall hooks and transcripts no longer on the machine are
+  out of sight, and `from`/`until` windows are shown but not yet applied.
 - **Pattern matching has a ceiling.** A command that builds a string dynamically,
   or runs a script whose contents live in a file, will not be caught. This raises
   the floor on visibility; it is not a security boundary.

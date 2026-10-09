@@ -24,6 +24,9 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _timing import assert_linear  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("actualis", ROOT / "actualis.py")
 af = importlib.util.module_from_spec(spec)
@@ -622,6 +625,20 @@ class TestShareLeakage(unittest.TestCase):
             with self.subTest(needle=needle):
                 self.assertNotIn(needle, out)
 
+    def test_network_data_never_reaches_share(self):
+        import io, contextlib
+        f = af.Fleet()
+        ts = datetime(2026, 10, 1, tzinfo=timezone.utc)
+        f.add_tool("leaky-project", "Bash", {"command": "curl https://leaky-host.example/secret-path"},
+                   ts, "auto")
+        f.add_tool("leaky-project", "WebFetch", {"url": "https://other-leak.example/x"}, ts, "auto")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            af.render_share(f, af.C(False))
+        out = buf.getvalue()
+        for needle in ("leaky-host", "secret-path", "other-leak", "leaky-project"):
+            self.assertNotIn(needle, out)
+
     def test_model_line_shows_custom_for_unlisted_models(self):
         out = self._share_output()
         line = next(l for l in out.splitlines() if "models" in l and "%" in l)
@@ -687,17 +704,13 @@ class TestHardening(unittest.TestCase):
 
     def test_no_catastrophic_backtracking(self):
         """A 140k-character command took 164 SECONDS before input bounds."""
-        import time
-        for probe in (";".join(["echo x"] * 20000),
-                      "eyJ" + "A" * 30000 + "." + "B" * 30000,
-                      "curl " + "a" * 40000 + " -d x",
-                      "rm " + "-r" * 8000 + "f /"):
-            with self.subTest(n=len(probe)):
-                t = time.perf_counter()
-                af.audit_command(probe)
-                af.classify_secrets(probe)
-                af.redact(probe)
-                self.assertLess(time.perf_counter() - t, 2.0)
+        def all_three(probe):
+            af.audit_command(probe)
+            af.classify_secrets(probe)
+            af.redact(probe)
+        assert_linear(self, all_three, [
+            ("", "echo x;", 20000, ""), ("eyJ", "A", 30000, "." + "B" * 30000),
+            ("curl ", "a", 40000, " -d x"), ("rm ", "-r", 8000, "f /")], 2.0, epsilon=0.1)
 
     def test_terminal_escapes_are_stripped_from_evidence(self):
         """Escape sequences can HIDE the dangerous half of a command from the
@@ -776,6 +789,19 @@ class TestMCP(unittest.TestCase):
             self.assertEqual(len(s["fingerprint"]), 8)
             self.assertIn("priority", s)
 
+    def test_exposed_secrets_reports_distinct_values_at_one_location(self):
+        f = self._fleet_with_secrets()
+        ts = datetime(2026, 8, 2, tzinfo=timezone.utc)
+        for pw in ("Zq9firstPW1", "Zq9otherPW2"):
+            f.add_tool("proj", "Bash", {"command": f"curl -u alice:{pw} https://a.io"}, ts)
+        cache = af._MCPCache()
+        cache._store[(None, None)] = f
+        out = af._mcp_call("exposed_secrets", {}, cache)
+        loc = [s for s in out["secrets"] if "password option" in s["types"]]
+        self.assertEqual([(s["uses"], s["distinct_values"]) for s in loc], [(2, 2)])
+        self.assertTrue(all(isinstance(s["distinct_values"], int) for s in out["secrets"]))
+        self.assertNotIn("Zq9firstPW1", json.dumps(out))
+
     def test_ticket_lookup_accepts_bare_and_hashed(self):
         for q in ("#412", "412"):
             with self.subTest(q=q):
@@ -820,7 +846,7 @@ class TestExplainability(unittest.TestCase):
                    "BY MODEL": "cost", "CACHE EFFICIENCY": "cache",
                    "BY TICKET": "tickets", "TOOL CALLS": "shell",
                    "SUBAGENTS": "subagents", "SHELL AUDIT": "shell",
-                   "REFUSALS": "refusals", "SUPPRESSIONS": "suppressions",
+                   "REFUSALS": "refusals", "NETWORK": "network", "SUPPRESSIONS": "suppressions",
                    "COACH": "coach", "AGENT PLATFORMS": "agents",
                    "EXPLAIN": "sources", "DIFF": "diff",
                    "SELF CHECK": "verify", "INCIDENT": "replay",
@@ -1264,6 +1290,29 @@ class TestJSONSchemaFreeze(unittest.TestCase):
                         "totalDurationMs": 1000, "totalLines": 10, "status": "ok"}, ts)
         f.permission_modes["auto"] += 1
         f.denials["user-rejected"] += 1
+        # Real network data, so the schema tests walk the network paths too.
+        f.suppressions = {}
+        f.add_tool("proj", "Bash", {"command": "npm i y@1.0.0"}, ts, "default")
+        f.add_tool("proj", "Bash", {"command": "curl https://a.io/x"}, ts, "auto")
+        f.add_tool("proj", "Bash", {"command": "echo x >> .actualis-suppressions"}, ts, "auto")
+        f.add_tool("proj", "Bash", {"command": "curl -d @f https://x.io"}, ts, "auto")
+        # --ioc, from an in-memory line file: a package match, a host match, an
+        # unresolved row and a refused one, with from/until, so every str|null
+        # path under network.ioc is a string at least once.
+        f.add_tool("proj", "Bash", {"command": "npm i evil@1.0.0"}, ts, "auto")
+        f.add_tool("proj", "Bash", {"command": "npm i pending"}, ts, "auto")
+        f.add_tool("proj", "Bash", {"command": "git clone https://github.com/evil-org/r"}, ts, "auto")
+        f.add_tool("proj", "Bash", {"command": "npm i evil@1.0.1"}, ts, "default", call_id="t-refused")
+        f._network_outcome("claude:t-refused", refused=True)
+        af.apply_network_policy(f, af.parse_trust(["pypi.org"]), strict=True,
+                                sources=[{"source": "flag", "entries": ["pypi.org"]}])
+        ioc = af.IocSet()
+        ioc.sources.append(af._ioc_source(Path("iocs.txt")))
+        ioc.mtimes.append(0.0)
+        af.parse_ioc_lines(af._ioc_lines(
+            b"npm:evil@=1.0.0||=1.0.1 id=MAL-2025-1 label=wave1 from=2025-09-14 until=2025-09-17\n"
+            b"npm:pending@=2.0.0\nhost:github.com/evil-org label=exfil\nrubygems:x\n"), ioc, 0, "iocs.txt")
+        af.apply_ioc(f, ioc)
         return f
 
     def test_every_emitted_path_is_declared(self):
@@ -1351,6 +1400,9 @@ class TestReportDigest(unittest.TestCase):
         exact procedure documented in docs/json.md."""
         payload = af.to_json(self._fleet())
         body = {k: v for k, v in payload.items() if k != "report_sha256"}
+        body["pricing"] = {k: v for k, v in body["pricing"].items()
+                           if k not in ("age_days", "stale")}
+        body["coach"] = [f for f in body["coach"] if f["id"] != "AF013"]
         canonical = json.dumps(body, sort_keys=True, separators=(",", ":"),
                                ensure_ascii=False)
         import hashlib
@@ -1361,7 +1413,7 @@ class TestReportDigest(unittest.TestCase):
         """Self-reference would make it uncomputable. Tampering with the digest
         field must not change what the digest recomputes to -- otherwise there
         is no fixed point and no way for a reader to check the figure."""
-        self.assertEqual(af.REPORT_DIGEST_EXCLUDES, frozenset({"report_sha256"}))
+        self.assertIn("report_sha256", af.REPORT_DIGEST_EXCLUDES)
         payload = af.to_json(self._fleet())
         original = payload["report_sha256"]
         payload["report_sha256"] = "0" * 64
@@ -2611,6 +2663,18 @@ class TestDiffTwoRuns(unittest.TestCase):
         self.assertIn("curl", out)                  # the program IS reported
         self.assertNotIn("Authorization", out)      # the command is not
         self.assertNotIn("sk_live_", out)
+
+    def test_differing_digests_with_equal_totals_do_not_blame_volume(self):
+        """Only a baseline hashed by an older build can differ this way now that
+        the digest ignores the clock-dependent fields."""
+        old = self._report()
+        new = self._report(report_sha256="b" * 64)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            af.render_diff(af.diff_reports(old, new), af.C(False))
+        out = buf.getvalue()
+        self.assertNotIn("volume alone", out)
+        self.assertIn("not comparable", out)
 
     def test_render_never_raises_on_a_sparse_report(self):
         """Old payloads may lack whole sections; a diff must not crash on them."""

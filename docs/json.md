@@ -20,6 +20,7 @@ that and prints a warning.
 | `cost_note` | how unpriced models are rated, and in which direction that errs |
 | `pricing` | where each rate came from, how old the table is, and how much of the total rests on a published price. See [Rate provenance](#rate-provenance) |
 | `duplicate_usage_records_skipped` | repeated records for the same message, counted once |
+| `duplicate_tool_calls_skipped` | tool calls seen again in another transcript (resumed and forked sessions copy history), counted once, by tool call id; the copy in the file read first is kept |
 | `duplicate_note` | why repeats occur and how they are collapsed |
 | `tokens` | `input`, `output`, `cache_w_1h`, `cache_w_5m`, `cache_w_assumed`, `cache_read` |
 | `by_agent` | cost per agent (`claude-code`, `codex`, `copilot`) |
@@ -32,7 +33,7 @@ that and prints a warning.
 | `by_project` | cost per project |
 | `by_day` | cost per calendar day, ascending |
 | `tools` | tool-call counts, descending |
-| `bash` | `total`, `commands{}`, `flag_counts{}`, `flags[]` |
+| `bash` | `total`, `commands{}`, `flag_counts{}`, `oversized_commands` (commands over 32 KB, each also a medium `oversized-command` flag), `flags[]` |
 | `coach` | findings: `id`, `severity`, `title`, `evidence`, `action`, `impact` |
 | `secrets` | array; see below |
 | `secret_exposures` | commands containing credential material |
@@ -46,6 +47,7 @@ that and prints a warning.
 | `refusals` | what was stopped and by which gate, joined to the blocked command. See below |
 | `unreadable_commands` | commands whose real content the transcript does not contain. See below |
 | `vendors` | what each agent's transcript actually provides, and what it does not |
+| `network` | downloads and fetches the agents made, with approval. See [network](#network) |
 | `unknown_models` | models seen with no pricing entry, billed at Opus-tier rates |
 | `aggregator_priced_models` | models priced from a third party because the vendor publishes no rate for that id |
 
@@ -70,7 +72,7 @@ A cost tool that cannot say where a number came from is asking to be trusted
 rather than checked. `pricing` says.
 
 ```json
-{ "verified": "2026-08-24", "age_days": 0, "stale": false, "stale_after_days": 90,
+{ "verified": "2026-10-08", "age_days": 0, "stale": false, "stale_after_days": 90,
   "tier_order": ["vendor","vendor-doc","aggregator","family","default"],
   "confident_pct": 28.17,
   "cost_by_tier":   { "vendor": 3.0, "aggregator": 3.15, "family": 4.5 },
@@ -100,6 +102,22 @@ transcripts, but must not set the ceiling for a model that does not exist yet.
 **A total is only as sound as its weakest component**, and without this number
 a reader cannot tell a measured figure from a mostly-inferred one.
 
+### Cache-read and long-prompt rates
+
+The cache-read multiplier is per model. It is 0.10 of the input rate by
+default, 0.05 for Opus 5.5 and Sonnet 5.5, and 0.025 for Fable 5.1 and
+Mythos 5.1. `cache.saved_usd` uses each message's own multiplier, so a cheaper
+read raises the saving. Cache writes stay at 1.25x (5m) and 2.00x (1h) for every
+model.
+
+Haiku 5.5 has two tiers. A message whose prompt (input + cache read + cache
+write tokens) is 100,000 or fewer is priced at $0.10 / $0.50 per million; above
+100,000 the whole message is priced at $0.50 / $2.50. Fast mode, batch pricing
+and data-residency uplifts are not modelled.
+
+A model id that is not in the table is priced as the newest known model in its
+family (highest version number; the dearer one on a tie), tier `family`.
+
 ### Staleness
 
 The tool makes no network calls, so it cannot know whether a price changed. It
@@ -113,9 +131,15 @@ in the repository. The CLI will never fetch a price on your behalf.
 ## Verifying a report
 
 Every report is content-addressed. `report_sha256` is the SHA-256 of the payload
-with that one key removed, serialised canonically. The report itself prints the
-first 16 characters, so a screenshot can be checked against the payload it came
-from.
+with four things removed, serialised canonically: the `report_sha256` key itself,
+`pricing.age_days`, `pricing.stale`, and the `AF013` entry in `coach`. The last
+three depend on today's date and not on the transcripts, so excluding them keeps
+the same transcripts hashing the same tomorrow as today. A real change in
+the data still changes the hash. The report itself prints the first 16
+characters, so a screenshot can be checked against the payload it came from.
+
+Digests are not comparable with those from 0.2.2 and earlier, which hashed the
+clock-dependent fields. The schema did not change.
 
 Recompute it yourself, without trusting this tool:
 
@@ -126,6 +150,9 @@ python3 - <<'EOF'
 import hashlib, json
 p = json.load(open("report.json"))
 claimed = p.pop("report_sha256")
+p["pricing"].pop("age_days")
+p["pricing"].pop("stale")
+p["coach"] = [f for f in p["coach"] if f["id"] != "AF013"]
 canonical = json.dumps(p, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 actual = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 print("claimed:", claimed)
@@ -137,7 +164,7 @@ EOF
 Or in one line, if you have `jq` and prefer not to run Python:
 
 ```sh
-jq -Sc 'del(.report_sha256)' report.json | tr -d '\n' | shasum -a 256
+jq -Sc 'del(.report_sha256, .pricing.age_days, .pricing.stale) | .coach |= map(select(.id != "AF013"))' report.json | tr -d '\n' | shasum -a 256
 ```
 
 Three things about the canonical form, because they are the whole reason two
@@ -156,6 +183,93 @@ This is deliberately the simplest possible form of the thing. It proves a
 payload has not been altered since it was produced. It does **not** prove when
 it was produced, or that a sequence of reports is complete — those need a chain
 and a countersignature, which is separate work.
+
+## network
+
+Every download, clone, install and web fetch the transcripts show and actualis
+can read, recorded from shell commands and web tools. A shape the inventory does
+not parse (a script, `poetry add`, `npm exec`) gives no item.
+
+| key | meaning |
+|---|---|
+| `totals.items` | all network items found |
+| `totals.asked` / `unasked` / `unknown` | items by approval, see below |
+| `totals.failed` | items whose command is known to have failed |
+| `totals.unparsed_segments` | command segments that could not be read: a segment with a quote left open, or substitution nested deeper than three levels |
+| `by_kind` | counts of `install`, `clone`, `fetch` and `search` items |
+| `hosts[]` | per host: `count`, `unasked`, `first_seen`, and `trusted` if any item from it matched the trust list |
+| `packages[]` | per `ecosystem` and `name`: `versions` seen, `pinned` (every install named an exact version: a full `MAJOR.MINOR.PATCH` for npm, crates and go, `==` for pypi, an `@sha256:` digest for images; for crates, `cargo add` is pinned only with `=1.2.3` and `cargo install --version 1.2.3` is exact; ranges, tags and prefixes are not pinned), `exec` (any install ran code), `count` |
+| `items[]` | one record per item (`package`, `version` and `alias` are redacted like `url` unless `--no-redact`): `kind`, `program`, `host`, `host_inferred`, `url`, `dest`, `source`, `ecosystem`, `package`, `version`, `pinned`, `exec`, `dynamic`, `alias` (the name an npm alias installs under, `x` in `x@npm:evil@1.0.0`, where `package` is `evil`; else `null`), `failed` (`null` when unknown), `approval`, `trusted`, `agent`, `project`, `session`, `call_id` (the tool call's id in the transcript, an opaque string, `null` when there is none), `ts`, `ioc` (`match`, `unresolved` or `null`; see `network.ioc`) |
+| `items_truncated` | `true` when `items` was cut at the cap |
+| `strict` | whether `--network-strict` was on |
+| `trust` | the trusted host or host-and-path entries in force |
+| `trust_sources[]` | where the trust entries came from: `source` (`flag` or `file`), `path` and `sha256` (both `null` for a flag), and `entries`. It shows whether an agent-editable file supplied the trust, so a reader can tell. `path` is absolute and not redacted, like `scanned.roots` |
+
+**Finding the record behind an item.** `session` and `call_id` name it:
+
+```sh
+actualis --network --json | jq -r '.items[0] | .session, .call_id'
+grep -l '<call_id>' ~/.claude/projects/*/*.jsonl    # the transcript file(s) holding that tool call
+```
+
+**Approval values.** `asked`: the user was prompted and approved. `unasked`:
+the agent ran it without asking, in a mode that does not prompt. `unknown`:
+default mode, where an allowlist rule may have approved it without asking.
+
+**Cap.** `items` holds the newest 2000 items, newest first, in a fixed total
+order. `totals`, `hosts` and `packages` always cover every item.
+
+**Redaction.** `url`, `dest` and `source` are redacted unless `--no-redact`.
+
+Strict-mode findings are not repeated here. They are `bash.flags[]` entries
+with the category `network-unasked`.
+
+Verify: `actualis --json | jq '.network.totals'`
+
+## network.ioc
+
+What `--ioc` matched (see [ioc.md](ioc.md)). Always an object: without `--ioc`
+it is `{"enabled": false, "sources": [], "totals": {...all zero}, "matches": [],
+"matches_truncated": false}`, so every path keeps one type.
+
+| key | meaning |
+|---|---|
+| `enabled` | whether `--ioc` was given |
+| `sources[]` | one per `--ioc` file, in order: `path` (absolute, not redacted), `sha256` of every byte, `format`, `entries.package` / `entries.host`, `not_checkable.<ecosystem>`, `skipped` and `first_skipped_line` (malformed OSV records; `null` without a line), `withdrawn`, `ranges_git`, `ranges_with_limit`, `skipped_ranges` (OSV ranges that could not be read, treated as undecidable), `mtime_in_window` (the file changed between `window.from` and `window.to`) |
+| `totals.match` / `unresolved` | items, not refused, with that verdict. Suppressed ones are still counted |
+| `totals.refused` | matched items whose call a person refused |
+| `totals.suppressed` | suppressed IOC findings (groups) |
+| `totals.clean_name_matches` | items whose name was listed and whose version fell outside every spec |
+| `totals.undecidable` | items whose check could not be decided (an unordered version, an unreadable range, an error); each is `unresolved`, never clean |
+| `totals.items_checked` | downloads with a package or a named host to check |
+| `totals.items_not_checkable` | the rest: `lockfile` (an install naming no package), `no_host`, `other` |
+| `matches[]` | one row per matched item, refused ones included: `verdict`, `reason`, `refused`, `suppressed`, `flag_id` (`null` when refused), `refs` and `labels` (distinct, sorted, at most 20), `entry` (the first winning entry: `kind`, `ecosystem`, `name`, `spec`, `host`, `path`, `exact_host`, `ref`, `label`, `from`, `until`, `source`, `line`) and `item` (exactly as in `items[]`) |
+| `matches_truncated` | `true` when `matches` was cut at 2000 |
+
+**Enums.**
+
+- `verdict`: `match` or `unresolved`.
+- `reason`: `any-version`, `version-in-spec` or `host` (match);
+  `version-unresolved`, `undecidable`, `module-prefix` (a Go package inside a
+  listed module whose version cannot be ordered), `private-registry`,
+  `name-from-url` or `error` (unresolved).
+- `format`: `lines`, `osv-json` or `osv-jsonl`.
+- `entry.kind`: `package`, `host`, or `error` (a placeholder when checking the
+  item failed; `source` is then `-1`).
+
+**Order.** Not refused first, then match before unresolved, then newest, then
+the item, then the entry's `(source, line)`: the same input gives the same
+bytes.
+
+`report_sha256` covers `network.ioc`, so two runs against different lists have
+different digests. No `network.ioc` field depends on the clock: `from` and
+`until` are copied from the list, and `mtime_in_window` compares the file's
+modification time with the transcripts' window.
+
+The findings are `bash.flags[]` entries with the categories `network-ioc`
+(high) and `network-ioc-unresolved` (medium).
+
+Verify: `actualis --ioc f --json | jq '.network.ioc.totals'`
 
 ## Compatibility
 
@@ -213,6 +327,14 @@ finding is still listed here and still counted** — it is held back from the
 actionable list in the report, not hidden. A scan with many suppressions must
 not be indistinguishable from a clean one, and `suppressed_secrets` is the
 number that makes the difference visible.
+
+`distinct_values` is how many different values were seen under the id in this
+run. It is always 1 for an id taken from the value. For a password passed as an
+option, the id comes from where the password appears (see
+[secrets.md](secrets.md)), so it can be more than 1. When a suppressed id of that
+kind has more than one value, it is reported as `suppressed: false` with
+`suppressed_reason` "suppression covers one value; N seen", and it counts
+toward `--fail-on`.
 
 ## `by_ticket[]`
 

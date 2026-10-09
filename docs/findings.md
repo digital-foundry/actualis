@@ -27,6 +27,24 @@ user, and it is why the thresholds below are mostly relative rather than absolut
 | [AF012](#af012) | critical | a scan of ≥500 Claude Code messages collapsed zero repeated records |
 | [AF013](#af013) | high / info | the rate table has not been checked in over 90 days |
 
+## Network findings
+
+Shell-audit findings (`bash.flags[]`) raised from the network inventory. Each
+is one finding per group, suppressible, and still counted when suppressed.
+
+| category | severity | fires when | `--fail-on` |
+|---|---|---|---|
+| `network-unasked` | med | `--network-strict`: an unasked download from a source not trusted | `any` |
+| `network-ioc` | high | `--ioc`: a download matched a known-bad entry | `high`, `any` |
+| `network-ioc-unresolved` | med | `--ioc`: a listed name whose version cannot be decided, a private-registry install, a name read from a URL, or an item that could not be checked | `any` |
+| `audit-config` | high | an agent wrote the suppression or trust files; cannot be suppressed | `high`, `any` |
+
+**A finding's id hashes its severity and category. A change in severity is a
+new category, never an edit, or every existing suppression silently stops
+matching.** That is why a later rule that promotes an `unresolved` IOC match
+inside a time window will be a new category, `network-ioc-window`, rather than
+a change to `network-ioc-unresolved`.
+
 ---
 
 ## AF001

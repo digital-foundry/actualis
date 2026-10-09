@@ -43,6 +43,68 @@ names is one secret carrying both names.
 master, root, prod, payment, or billing — a variable called
 `STRIPE_SECRET_KEY` is critical whatever its value looks like.
 
+**Passwords passed as options** — `curl -u user:PASS` (also `-uuser:PASS`,
+`--user`, `--user=`, `-U`, `--proxy-user`), `wget --password PASS` (also
+`--http-password`, `--ftp-password`, `--proxy-password`), and
+`docker login --password PASS` or `docker login -p PASS`. `high`. The user
+part of `user:PASS` stays readable; only the password is masked. A `uid:gid`
+pair, a shell reference and a placeholder are left alone, and the generic
+`-p` (`mysql -pPASS`, `sshpass -p`) is not read: `-p` means other things in
+other programs.
+
+These ids are **not** `sha256(value)[:8]`. A person chose the password, so a
+hash of it published in a report, a CI log or a committed
+`.actualis-suppressions` would let anyone confirm a guess offline. The id is
+derived from where the password appears instead: `sha256("opt:" + program +
+":" + option + ":" + user)[:8]`. The program is lowercased. The option keeps
+its case (`-U`, curl's proxy password, is not `-u`), and two spellings of one
+option are one location (`--user` is `-u`, `--proxy-user` is `-U`, docker
+login's `-p` is `--password`). The user is taken from `user:PASS`, `-u`,
+`--username` or `--user` in the same command. `--password=PASS` and the other
+`=` forms are read the same way as the space forms.
+
+The same applies to every credential that actualis began counting in the same
+release, since any of them may be a short, person-chosen password:
+
+| credential | id from |
+|---|---|
+| a `PASSWORD`, `PASSWD` or `PASSPHRASE` variable whose value is 6 to 11 characters | the variable name and the command's program (`PGPASSWORD=… psql`) |
+| a URL password shorter than 6 characters | `user@host` |
+| an scp-style `user:password@host:` password | `user@host` |
+| a password-less URL or scp userinfo longer than 20 characters | the host |
+| an `Authorization:` header value with no recognised prefix | the program and the scheme word (`Bearer`, `Basic`, `token`) |
+
+Credentials counted before that release keep their value-based ids: tokens
+recognised by prefix, URL passwords of 6 characters or more, and named secrets
+of 12 characters or more. A prefixed token passed as an option (`curl -u
+alice:ghp_…`) is one entry with its value id, not two. Moving those to
+location ids is a later change.
+
+The trade-off is accepted: two different passwords at one location share one
+id, so rotating one and reusing the line still shows as the same entry.
+
+Because one such id can stand for several passwords, a suppression of it must
+not silence a password it was never about. During a run, actualis keeps the
+full `sha256` of each value seen under a location id, in memory only. They are
+never written to JSON, a report or a log, and they are discarded when the run
+ends. `--json` reports `distinct_values` for each secret, and the text report
+says "N distinct values" when N is more than 1. If a suppressed location id has
+more than one value in the run, it is treated as unsuppressed, for display and
+for `--fail-on`, with the reason "suppression covers one value; N seen".
+
+**The limit is per run.** Nothing about a value survives the run, so a new
+password that appears in a later run, alone under its id in that run, cannot be
+told apart from the one the suppression was recorded for. The suppression then
+still applies.
+
+**`--watch` and `--replay` work per id.** `--watch` alerts once per id, so a
+second password at a location that already alerted raises no new alert. The
+first alert stands for every password at that location. `--replay <id>` merges
+every password under a location id into one incident window, so the window
+can span several passwords and several rotations. To tell them apart, look at
+`distinct_values` in `--json` for the same window. Both are known limits of
+location ids; the code is unchanged.
+
 ## Deliberately not flagged
 
 Both classes below were found firing on real data and removed. A scanner that

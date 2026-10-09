@@ -1,5 +1,183 @@
 # Changelog
 
+## 0.3.0 (unreleased)
+
+### Upgrading from 0.2.2: what can change a gate
+
+The same transcripts can give a different exit code than they did on 0.2.2.
+Each of these is listed in full below.
+
+- **`--fail-on high` can newly exit 3** on transcripts 0.2.2 passed:
+  - new `high` `remote-exec` shapes (`bash <(curl …)`, `source <(…)`,
+    `sh -c "$(curl …)"`, dequoted `cu''rl … | s''h`, `curl … |& sh`, and a
+    shell at any later stage of the pipeline);
+  - newly counted credentials (passwords passed as options, short
+    `PASSWORD` variables, short URL and scp passwords, long password-less
+    userinfo, unprefixed `Authorization` headers), which are `high`;
+  - the new `audit-config` finding, which is `high` and cannot be suppressed.
+- **`--fail-on any` can newly exit 3** on the new `medium` `oversized-command`
+  flag.
+- **Coach findings move with cost.** The new pricing changes spend figures,
+  and spend-based findings (AF001, AF007, AF009, AF010) can appear or vanish.
+- **Only when you opt in:** `--network-strict` adds `network-unasked` findings
+  (`any`); `--ioc` adds `network-ioc` (`high`) and `network-ioc-unresolved`
+  (`any`).
+- **Counts rise** (`secret_exposures`, `secret_projects`,
+  `unreadable_commands`), and `report_sha256` is not comparable with 0.2.2. Take
+  a fresh `--diff` baseline.
+
+### Changed
+
+- **New `high` remote-exec detections.** Besides `curl … | sh`, the shell
+  audit now flags `bash <(curl …)`, `source <(…)` and `. <(…)`,
+  `sh -c "$(curl …)"` (any shell, any `-c` cluster such as `-lc`), a dequoted
+  `cu''rl … | s''h` or `c\url … | busybox sh`, `curl … |& sh`, and a shell at
+  any later stage of the pipeline (`curl … | tee f | sh`). Each command is
+  flagged once. These can newly fail `--fail-on high` (exit 3) on transcripts
+  0.2.2 passed.
+- **Location-based ids for person-chosen passwords.** A password passed as an
+  option (`curl -u user:PASS`, `--user=`, `-U`, `wget --password=`, `docker
+  login -p`), and every credential first counted in this release (see Fixed),
+  gets an id derived from where it appears (`sha256("opt:" + program + ":" +
+  option + ":" + user)[:8]` and the like), not a hash of the value, so a
+  published id cannot confirm a guessed password. Credentials counted in 0.2.2
+  keep their value ids. See [docs/secrets.md](docs/secrets.md).
+- **A suppression that covers more than one value is ignored.** When a
+  suppressed location id has seen more than one distinct value in the run, the
+  secret is treated as unsuppressed, for display and for `--fail-on`, with the
+  reason "suppression covers one value; N seen".
+- **`-u user:pw` masking fails closed.** The password after `-u`/`--user` is
+  masked for every program except a short list where `-u` names a user, not a
+  password (`docker` and `podman` `exec`/`run`/`create`, `docker compose exec`,
+  `sudo`, `su`, `ssh`, `chown`, `systemctl`, `git` and similar), and the program
+  that receives `-u` decides, past wrappers such as `sudo`, `env` and `timeout`.
+  A numeric `uid:gid` is never a credential.
+
+- **`report_sha256` no longer moves with the clock.** The digest excludes
+  `pricing.age_days`, `pricing.stale` and the `AF013` coach finding, which change
+  as days pass over unchanged transcripts. `report_sha256` values are not
+  comparable with 0.2.2 reports. This is a known break of digest comparability,
+  not of schema; `schema_version` stays 1. `--diff` says so when the digests
+  differ but nothing it compares has changed.
+- **Current-generation pricing.** Opus 5.5 ($4/$20), Sonnet 5.5 ($2/$10),
+  Haiku 5.5 ($0.10/$0.50, or $0.50/$2.50 for a message whose prompt exceeds
+  100,000 tokens), Fable 5.1 and Mythos 5.1 ($10/$50) are vendor rates,
+  verified 2026-10-08. The cache-read multiplier is now per model: 0.10 by
+  default, 0.05 for Opus 5.5 and Sonnet 5.5, 0.025 for Fable 5.1 and Mythos 5.1.
+  It applies to Claude Code, the subagent cost floor, Copilot and the cache
+  savings figure. An unknown model in a known family is now priced from the
+  newest known sibling, not the most expensive one. Fast mode, batch and data
+  residency are not modelled.
+
+### Added
+
+- **`--network`** prints only the NETWORK section (with the IOC block when
+  `--ioc` is given), and `--network --json` emits only the `network` object. The
+  full report gets a one-line `network` summary in FLEET when downloads exist,
+  and NETWORK gains a TOP UNASKED block: the ten hosts with the most unasked
+  downloads. Its UNASKED and UNKNOWN rows are capped at 5.
+- **`secrets[].distinct_values`** in `--json` and in the MCP `exposed_secrets`
+  tool: how many different values were seen under the id in this run. The
+  text report says "N distinct values" when it is more than 1.
+- **More unreadable shapes are counted** in `unreadable_commands`: ANSI-C
+  quoting that spells a letter (`$'\x63url'`), a substitution piped to a shell,
+  and an inline script that reaches the network (`python -c` with `urllib`,
+  `requests` or `socket`, `node -e` with `fetch`, `perl -MLWP`). They are
+  counted, not flagged.
+- **`bash.oversized_commands`** counts commands over 32 KB, and each raises a
+  `medium` `oversized-command` flag (see Fixed).
+- **`--ioc FILE`: did an agent install the bad version?** Matches every
+  download the transcripts show in the network inventory against a known-bad
+  list, offline and only
+  when named: the `actualis-ioc` line format (`npm:x@=1.2.3||=1.2.4`,
+  `pypi:name`, `host:evil.example`) or OSV JSON/JSONL. Names compare as each
+  ecosystem does (npm and Go exactly, pypi by PEP 503, images through the shared
+  Docker Hub normaliser); versions by SemVer 2.0.0 or PEP 440, written out in
+  the standard library. A match is a high finding (`network-ioc`); a listed name
+  whose version cannot be decided is medium (`network-ioc-unresolved`), never
+  clean. Refused calls are listed and never fail a gate, and the trust list
+  never exempts a match. `network.ioc` in `--json` (always an object),
+  `network.items[].ioc`, an IOC block in NETWORK, `--explain ioc` and
+  [docs/ioc.md](docs/ioc.md). Any problem loading a list, or a list with
+  nothing checkable, exits 2; every size, line, entry and nesting limit is hard.
+  The Action gains an `ioc` input and an `ioc-matches` output.
+- **Network inventory.** A NETWORK section and a `network` key in `--json` list
+  every download and fetch the transcripts show and actualis can read —
+  packages installed, repos cloned, URLs fetched, including those behind
+  control flow, wrappers (`sudo`, `timeout`, `xargs`, `eval`), `bash -c` and
+  substitutions — and whether a person approved each (`asked`, `unasked`, or
+  `unknown` in default mode, where an allowlist rule may have allowed it
+  silently). `--network-strict` turns unasked downloads from sources not in
+  `--network-trust` / `.actualis-network-trust` into medium findings. The
+  Action gains `network-strict` and `network-trust` inputs. `schema_version`
+  stays 1.
+- **Audit-config finding.** A high-severity finding that cannot be suppressed
+  fires when an agent writes `.actualis-network-trust`, `.actualis-suppressions`
+  or the user-level `~/.config/actualis/suppressions`, or runs
+  `actualis --suppress`. It is a heuristic tripwire, not a prevention: it reads
+  the commands and file-write tools the transcript shows (case-insensitively),
+  on the dequoted text, through assignments, `cd`, collapsed paths, globs and
+  the same wrappers the inventory reads. Any command that names a config file
+  without being a known reader (`cat`, `grep`, `git diff` and the like), and a
+  reader that redirects or writes into one, trips it. It misses Codex
+  `apply_patch` edits, writes made by a script run from another file, and
+  anything built at run time. `actualis --suppress` refuses its id, and
+  `--suppressions` marks a suppression of it as ignored. It can newly fail
+  `--fail-on high`.
+- **Trust provenance.** The trust sources in force (`--network-trust`, or the
+  file with its path and sha256) appear in the report and as
+  `network.trust_sources` in `--json`.
+- **`--explain network`** explains the network inventory.
+
+### Fixed
+
+- **Shell, secret and network counts no longer double-count tool calls copied
+  into resumed or forked sessions.** The same `tool_use` id in more than one
+  transcript is counted once (`duplicate_tool_calls_skipped` in `--json`), so
+  counts can drop slightly against 0.2.2 (about 0.5% on one real corpus).
+- **Security: `redact()` missed more shapes of embedded token.** It now masks
+  URL userinfo that has no password (`https://TOKEN@host`), all of the
+  userinfo up to the last `@`, and scp-style userinfo containing `:` or longer
+  than 20 characters. Before this, such tokens could appear in shell-audit
+  evidence and in `--json`.
+- **Security: control characters in transcripts are stripped from network
+  items,** so a crafted command cannot inject terminal escapes into the report.
+- **`bash.flags[].had_secret` is declared in the JSON schema.** It was always
+  emitted.
+- **Counts rise against 0.2.2 baselines.** `secret_exposures` and
+  `secret_projects` now count usernames in URL userinfo (`postgres://admin@db`),
+  credentials passed as option values (`curl -u user:pw`, `wget --password`,
+  `docker login -p`), `PASSWORD`/`PASSWD`/`PASSPHRASE` variables of 6 to 11
+  characters, URL passwords under 6 characters, scp-style passwords,
+  password-less URL or scp userinfo over 20 characters, and `Authorization:`
+  header values with no recognised prefix. These are `high`, so they can
+  newly fail `--fail-on high`. `unreadable_commands` rises with the new shapes
+  (see Added). Compare against a fresh baseline, not a saved one.
+- **Security: credentials passed as option values are masked** in evidence,
+  the text report and `--json` (`curl -u user:PASS` keeps the user readable).
+- **Security: terminal escapes in audit-config evidence and harness fields**
+  (permission mode, denial kind, model, approval and sandbox policy) are
+  stripped at ingest.
+- **Security: redaction runs before a cut.** Flag evidence and oversized
+  command text are redacted, then cut to their caps, so a token split by the
+  cut cannot survive.
+- **`pinned` means an exact version.** `npm i x@4`, `cargo add x@1.2` and
+  `go install m@v1.2` are ranges or prefixes, not pins. Image names are
+  normalised (`docker.io/library/nginx` is `nginx`), `npm i github:o/r` carries
+  a URL, an npm alias records its target (`alias` field), and `cargo add` and
+  `cargo install` are told apart in `program`.
+- **Strict mode no longer flags a remote name** (`git pull origin`). A remote
+  added or cloned earlier in the same session resolves to its host and is judged
+  normally.
+- **A command over 32 KB is a signal, and padding no longer hides what follows
+  it.** Each is counted once in `bash.oversized_commands` (and as unreadable),
+  shown as "N commands over 32 KB were only partly audited", and raises a
+  medium `oversized-command` flag. The audit-config tripwire, the remote-exec
+  shape and credential detection now read the whole command in overlapping
+  32 KB windows, up to 1 MiB; past that the command is counted unreadable.
+  Redacted text cut at the scan cap ends in `…[truncated]`.
+- **`-u user:pw` no longer masks a uid:gid** (`docker exec -u root:wheel`).
+
 ## 0.2.2 — 2026-10-08
 
 ### Fixed
