@@ -468,7 +468,7 @@ class TestResolution(FleetCase, unittest.TestCase):
 
     def test_npm_alias_target(self):                                    # T-RES-2
         self.assertEqual(self.verdict("npm:evil@=1.0.0\n", "npm i x@npm:evil@1.0.0"), MATCH_IN)
-        self.assertIsNone(self.verdict("npm:x@=1.0.0\n", "npm i x@npm:evil@1.0.0"))
+        self.assertEqual(self.verdict("npm:x@=1.0.0\n", "npm i x@npm:evil@1.0.0"), UNRESOLVED)
 
     def test_go(self):                                                  # T-RES-3
         ioc = "go:github.com/evil/mod@<v1.4.2\n"
@@ -760,3 +760,72 @@ class TestLoaderCaps(IocFiles, unittest.TestCase):
         af.apply_ioc(f, ioc)
         self.assertLess(time.perf_counter() - t, 2.0)
         self.assertEqual(f.ioc_totals["clean_name_matches"], 2_000)
+
+
+class TestBypassMatrix(FleetCase, unittest.TestCase):
+    """Each listed IOC is matched, or unresolved where the version truly cannot
+    be decided. None is ever silently clean."""
+    DIGEST = "sha256:" + "ab" * 32
+    MATRIX = [
+        # (ioc line, command, expected verdict)
+        ("pypi:Evil_Pkg", "pip install evil-pkg==1.0", "match"),
+        ("pypi:evil.pkg", "pip install EVIL-PKG==1.0", "match"),
+        ("pypi:EVIL-PKG@=1.0", "pip install Evil_Pkg==1.0", "match"),
+        ("pypi:evil-pkg@=1.0", "pip install 'evil-pkg[extra]==1.0'", "match"),
+        ("pypi:evil-pkg", "pip install 'evil.pkg[extra]>=1'", "match"),
+        ("npm:Evil", "npm i Evil@1.0.0", "match"),
+        ("npm:evil@=1.0.0", "npm i x@npm:evil@1.0.0", "match"),
+        ("npm:x", "npm i x@npm:evil@1.0.0", "match"),
+        ("npm:x@=1.0.0", "npm i x@npm:evil@1.0.0", "unresolved"),
+        ("npm:@scope/evil@=1.0.0", "npm i @scope/evil@1.0.0", "match"),
+        ("npm:@scope/evil", "npx @scope/evil", "match"),
+        ("npm:evil@=1.0.0", "npm i evil@v1.0.0", "match"),
+        ("npm:evil@=1.0.0", "npm i evil@=1.0.0", "match"),
+        ("npm:evil", "npm i https://evil.example/evil-1.0.0.tgz", "unresolved"),
+        ("npm:evil", "npm i https://registry.npmjs.org/evil/-/evil-1.0.0.tgz", "unresolved"),
+        ("npm:@s/evil", "npm i https://registry.npmjs.org/@s/evil/-/evil-1.0.0.tgz", "unresolved"),
+        ("npm:evil", "npm i git+https://github.com/org/evil.git", "unresolved"),
+        ("npm:evil@=1.0.0", "npm i github:org/evil", "unresolved"),
+        ("npm:evil@=1.0.0-beta", "npm i evil@1.0.0-beta", "match"),
+        ("npm:evil@=1.0.0", "npm i evil@1.0.0+build.7", "match"),
+        ("npm:evil@<1.0.0", "npm i evil@1.0.0-beta", "match"),
+        ("npm:evil@=1.0.0", "npm i evil", "unresolved"),
+        ("pypi:evil@=1!2.0", "pip install evil==1!2.0", "match"),
+        ("pypi:evil@=1.0", "pip install evil==1.0+local", "match"),
+        ("pypi:evil@>=1!0", "pip install evil==1!2.0", "match"),
+        ("go:evil.example/m@<v1.4.0", "go install evil.example/m@latest", "unresolved"),
+        ("go:evil.example/m@=v2.0.0", "go get evil.example/m@v2.0.0+incompatible", "match"),
+        ("go:evil.example/m@<v3.0.0", "go get evil.example/m@v2.1.0+incompatible", "match"),
+        ("oci:docker.io/library/evil", "docker pull evil", "match"),
+        ("oci:evil", "docker pull docker.io/library/evil:1.0", "match"),
+        (f"oci:evil@={DIGEST}", f"docker pull evil@{DIGEST}", "match"),
+        ("oci:evil@=1.0", f"docker pull evil@{DIGEST}", "unresolved"),
+        ("host:evil.io", "curl https://sub.evil.io/x", "match"),
+        ("host:evil.io", "curl https://SUB.EVIL.IO/x", "match"),
+        ("host:evil.io", "curl https://evil.io./x", "match"),
+        ("host:evil.io", "curl https://user:pw@evil.io/x", "match"),
+        ("host:=evil.io", "curl https://sub.evil.io/x", None),
+        ("host:=evil.io", "curl https://evil.io/x", "match"),
+        ("host:evil.io", "npm i --registry https://evil.io x", "match"),
+        ("host:evil.io", "pip install -i https://evil.io/simple x", "match"),
+    ]
+
+    def test_ioc_bypass_matrix(self):
+        for line, cmd, want in self.MATRIX:
+            with self.subTest(ioc=line, cmd=cmd):
+                f = self.fleet(line + "\n", cmd)
+                got = f.ioc_rows[0]["verdict"] if f.ioc_rows else None
+                self.assertEqual(got, want, (line, cmd, f.ioc_rows and f.ioc_rows[0]["reason"]))
+                if want is not None:
+                    self.assertEqual(f.ioc_totals["clean_name_matches"], 0)
+
+    def test_refused_is_listed_never_clean(self):
+        f = self.fleet("npm:evil\n", "npm i evil@1.0.0", refuse=[0])
+        self.assertEqual((f.ioc_rows[0]["verdict"], f.ioc_rows[0]["refused"]), ("match", True))
+        self.assertEqual(f.ioc_totals["clean_name_matches"], 0)
+
+    def test_trusted_host_never_exempts(self):
+        f = self.fleet("host:evil.io\nnpm:x\n", "curl https://evil.io/x", "npm i --registry https://evil.io x",
+                       trust=["evil.io"])
+        self.assertTrue(all(i["trusted"] for i in f.network_items))
+        self.assertEqual([r["verdict"] for r in f.ioc_rows], ["match", "match"])

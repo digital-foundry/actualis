@@ -3592,13 +3592,17 @@ def _ioc_zero_totals() -> dict:
 
 def _ioc_resolved(item: dict) -> list[tuple[str, str]]:
     """(normalised name, version) to compare, the version "" when the item
-    does not name exactly one release. npm aliases already carry the target
-    as `package` (`x@npm:evil@1.0.0` installs evil), so one pair suffices."""
+    does not name exactly one release. An npm alias (`x@npm:evil@1.0.0`)
+    carries the target as `package` (B1); the alias name is a second pair,
+    unresolved, since the version belongs to the target."""
     eco, ver = item["ecosystem"], item.get("version") or ""
     name = _ioc_norm_name(eco, item["package"])
     if eco == "npm":
         v = ver[1:] if ver[:1] in ("=", "v") else ver
-        return [(name, v if _ioc_semver_key(v) else "")]
+        pairs = [(name, v if _ioc_semver_key(v) else "")]
+        if item.get("alias"):
+            pairs.append((item["alias"], ""))
+        return pairs
     if eco == "pypi":
         return [(name, ver)]
     if eco == "crates":
@@ -3610,6 +3614,32 @@ def _ioc_resolved(item: dict) -> list[tuple[str, str]]:
         ok = _IOC_OCI_DIGEST.fullmatch(ver) or (ver and ver != "latest" and not ver.startswith("sha256:"))
         return [(name, ver if ok else "")]
     return [(name, "")]                                # brew records no version
+
+
+_IOC_TARBALL_VERSION = re.compile(r"-v?[0-9]+\.[0-9]+\.[0-9]+")
+
+
+def _ioc_url_name(item: dict) -> str | None:
+    """The npm package a git or tarball URL install most likely is: the name
+    before /-/ in a registry tarball URL, else the last path segment without
+    .git, .tgz and a -1.2.3 suffix. A guess, so a hit on it is only ever
+    unresolved (name-from-url), never a match and never clean."""
+    if item.get("ecosystem") != "npm" or not item.get("url"):
+        return None
+    path = url_path(item["url"]).replace("%40", "@").replace("%2f", "/").replace("%2F", "/")
+    if "/-/" in path:
+        name = path.split("/-/", 1)[0].strip("/")
+    else:
+        name = path.rstrip("/").rsplit("/", 1)[-1]
+        if len(name) > 2 * IOC_NAME_MAX:
+            return None
+        name = name.removesuffix(".git")
+        for ext in (".tgz", ".tar.gz"):
+            if name.endswith(ext):
+                name = name[:-len(ext)]
+                m = _IOC_TARBALL_VERSION.search(name)
+                name = name[:m.start()] if m else name
+    return name if _ioc_valid_name("npm", name) else None
 
 
 def _ioc_host_entries(ioc: IocSet, host: str) -> list[IocEntry]:
@@ -3651,6 +3681,9 @@ def match_ioc(item: dict, ioc: IocSet) -> tuple | None:
                    and item.get("host") != NETWORK_REGISTRY[eco]:
                     verdict, reason = "unresolved", "private-registry"
                 hits.append((verdict, reason, e, f"{eco}:{name}@{version or '?'}"))
+    url_name = _ioc_url_name(item) if item["kind"] == "install" else None
+    for e in ioc.packages.get(("npm", url_name), ()) if url_name else ():
+        hits.append(("unresolved", "name-from-url", e, f"npm:{url_name}@?"))
     host = (item.get("host") or "").removesuffix(".")
     if host and not item.get("host_inferred"):
         for e in _ioc_host_entries(ioc, host):
