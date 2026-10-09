@@ -1080,7 +1080,7 @@ class TestOptionValueRedaction(unittest.TestCase):
 
 
 class TestDetectorAgreement(unittest.TestCase):
-    """Roadmap S1: what redact() masks, classify_secrets() counts. The
+    """What redact() masks, classify_secrets() counts. The
     exceptions are masked for display and deliberately not counted."""
     EXCEPTIONS = {
         "export X=AKIAIOSFODNN7EXAMPLE": "AWS's documented example key: masked, never counted (#51)",
@@ -1242,7 +1242,7 @@ class TestEverydayShapes(unittest.TestCase):
 
 
 class TestEvasionParity(unittest.TestCase):
-    """Roadmap S2: the audit counts what it cannot read, and the network
+    """The audit counts what it cannot read, and the network
     extractor's dequoted view backs the remote-exec rule."""
 
     def rexec_flags(self, cmd):
@@ -1589,7 +1589,7 @@ class TestRound2Minors(unittest.TestCase):
 
 
 class TestInventoryCorrectness(unittest.TestCase):
-    """B1 (actualis-pro #57): pinned means an exact version, OCI names are one
+    """Pinned means an exact version, OCI names are one
     package, forge shorthand has a URL, aliases and cargo subcommands are told apart."""
 
     def test_pinned_table(self):

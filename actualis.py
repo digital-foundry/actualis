@@ -431,7 +431,7 @@ UNREADABLE_SHAPES = (
     ("sources a file",
      re.compile(r"(?:^|[|&;]\s*)\s*(?:source|\.)\s+[\w./$~-]+")),
     ("shell -c with a variable", re.compile(r"\b(?:ba|z|)sh\s+-c\s+[\"']?\$")),
-    # Roadmap S2: shapes that hide a download from every rule above. Each is
+    # Shapes that hide a download from every rule above. Each is
     # linear: a start is a literal token and every repeat is bounded or cannot
     # overlap the next start.
     # $'\x63url' spells a program with escapes. Only a hex, unicode or octal
@@ -1297,7 +1297,7 @@ def classify_secrets(cmd: str, value_digests: dict[str, set[str]] | None = None
     # never sha256(value)[:8].
     where = _SecretLocations(cmd)
 
-    # Roadmap S1: every form redact() masks is counted here too, through the
+    # Every form redact() masks is counted here too, through the
     # same compiled rules, so the rotation list and the masking cannot drift.
     if _OPTION_HINT.search(cmd):
         for rx, group in _OPTION_SECRETS:
@@ -5122,7 +5122,7 @@ class Fleet:
         matches = audit_command(cmd)
         if oversized and not any(cat == "remote-exec" for _, cat, _ in matches):
             matches += self._oversized_remote_exec(cmd, windows)
-        # Roadmap S2: `cu''rl … | s''h` and `curl … | busybox sh` evade the
+        # `cu''rl … | s''h` and `curl … | busybox sh` evade the
         # remote-exec regex on the raw text; the network tokenizer reads them
         # dequoted. One flag per command: added only when the rule did not fire.
         if self._net_remote_exec and not any(cat == "remote-exec" for _, cat, _ in matches):
