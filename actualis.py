@@ -8163,7 +8163,8 @@ def _render_network_items(fleet: "Fleet", c: "C", top: int, raw: bool,
     """Every item the filters kept, newest first, one block each."""
     order = sorted(fleet.network_items, key=_net_order_key, reverse=True)
     limit = max(top, 0) * 5
-    print(f"  {c.dim}FILTER   {' \u00b7 '.join(filters)}{c.off}"[:NET_VIEW_WIDTH + len(c.dim) + len(c.off)])
+    joined = " \u00b7 ".join(filters)
+    print(f"  {c.dim}FILTER   {joined}{c.off}"[:NET_VIEW_WIDTH + len(c.dim) + len(c.off)])
     print(f"  {c.dim}showing {num(min(limit, len(order)))} of {num(len(order))}, newest first{c.off}")
     pad = " " * 13
     width = NET_VIEW_WIDTH - len(pad)
