@@ -180,6 +180,8 @@ type report struct {
 	unsupPct     float64
 	hasUnsup     bool
 	invisPct     float64
+	netItems     int
+	netUnasked   int
 	findings     []finding
 	err          string
 	at           time.Time
@@ -228,6 +230,17 @@ func fetch(days int) report {
 
 	if v, ok := root["cost_usd"].(float64); ok {
 		r.cost = v
+	}
+	// network.totals exists from 0.3.0; an older CLI simply leaves these at zero.
+	if net, ok := root["network"].(map[string]any); ok {
+		if t, ok := net["totals"].(map[string]any); ok {
+			if v, ok := t["items"].(float64); ok {
+				r.netItems = int(v)
+			}
+			if v, ok := t["unasked"].(float64); ok {
+				r.netUnasked = int(v)
+			}
+		}
 	}
 	r.fingerprints = map[string]bool{}
 	if secrets, ok := root["secrets"].([]any); ok {
@@ -320,6 +333,7 @@ type ui struct {
 	primed  bool            // first scan must not fire a flood of alerts
 
 	mHeader, mSub, mCost, mShell, mUnsup, mInvis *systray.MenuItem
+	mNet, mNetReport                             *systray.MenuItem
 	mFindings                                    []*systray.MenuItem
 	mReport, mCopy, mRefresh, mQuit              *systray.MenuItem
 	mBug, mFeat, mSupport                        *systray.MenuItem
@@ -443,6 +457,7 @@ func (u *ui) onReady() {
 	u.mShell = addDisabled("")
 	u.mUnsup = addDisabled("")
 	u.mInvis = addDisabled("")
+	u.mNet = addDisabled("")
 	systray.AddSeparator()
 
 	for i := 0; i < 4; i++ {
@@ -451,6 +466,7 @@ func (u *ui) onReady() {
 	systray.AddSeparator()
 
 	u.mReport = systray.AddMenuItem("Open Full Report", "Run the CLI in a terminal")
+	u.mNetReport = systray.AddMenuItem("Open Network Report", "What the agents downloaded, and whether anyone asked")
 	u.mCopy = systray.AddMenuItem("Copy Shareable Summary", "Safe to post: nothing identifying")
 	u.mRefresh = systray.AddMenuItem("Refresh Now", "")
 
@@ -494,6 +510,8 @@ func (u *ui) loop() {
 			go copyToClipboard(shareText())
 		case <-u.mReport.ClickedCh:
 			go openReport()
+		case <-u.mNetReport.ClickedCh:
+			go openNetworkReport()
 		case <-u.mBug.ClickedCh:
 			go openBrowser(issueURL("Bug", "bug"))
 		case <-u.mFeat.ClickedCh:
@@ -611,6 +629,11 @@ func (u *ui) render() {
 	} else {
 		u.mInvis.Hide()
 	}
+	if r.netItems > 0 {
+		show(u.mNet, fmt.Sprintf("%s downloads  ·  %s unasked", comma(r.netItems), comma(r.netUnasked)))
+	} else {
+		u.mNet.Hide()
+	}
 
 	sort.SliceStable(r.findings, func(i, j int) bool {
 		rank := map[string]int{"critical": 0, "high": 1, "info": 2}
@@ -683,7 +706,13 @@ func copyToClipboard(text string) {
 }
 
 // openReport hands the user to the CLI. The tray is a glance; the CLI is the tool.
-func openReport() {
+func openReport() { openInTerminal("--coach", "") }
+
+// openNetworkReport shows only the NETWORK section, paged.
+func openNetworkReport() { openInTerminal("", "--network") }
+
+// openInTerminal runs `actualis <first>` (if any), then `actualis <args> | less -R`.
+func openInTerminal(first, args string) {
 	bin := findBinary()
 	if bin == "" {
 		return
@@ -697,19 +726,34 @@ func openReport() {
 		script := fmt.Sprintf(`tell application "Terminal"
 activate
 do script %s
-end tell`, appleScriptString(sh+" --coach; echo; "+sh+" | less -R"))
+end tell`, appleScriptString(termLine(sh, first, args)))
 		_ = exec.Command("osascript", "-e", script).Run()
 	case "windows":
-		_ = exec.Command("cmd", "/c", "start", "cmd", "/k",
-			`"`+bin+`" --coach && "`+bin+`"`).Start()
+		q := `"` + bin + `"`
+		line := q + " " + args
+		if first != "" {
+			line = q + " " + first + " && " + line
+		}
+		_ = exec.Command("cmd", "/c", "start", "cmd", "/k", strings.TrimSpace(line)).Start()
 	default:
 		for _, term := range []string{"x-terminal-emulator", "gnome-terminal", "konsole", "xterm"} {
 			if _, err := exec.LookPath(term); err == nil {
 				sh := shellQuote(bin)
 				_ = exec.Command(term, "-e", "sh", "-c",
-					sh+" --coach; echo; "+sh+" | less -R; exec sh").Start()
+					termLine(sh, first, args)+"; exec sh").Start()
 				return
 			}
 		}
 	}
+}
+
+// termLine is the POSIX shell line for a terminal: the optional first command,
+// then the paged report. sh is already shell-quoted; args are fixed flags.
+func termLine(sh, first, args string) string {
+	line := strings.TrimSpace(sh + " " + args)
+	paged := line + " | less -R"
+	if first == "" {
+		return paged
+	}
+	return sh + " " + first + "; echo; " + paged
 }

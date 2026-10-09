@@ -31,3 +31,13 @@ func TestAppleScriptString(t *testing.T) {
 		t.Errorf("backslash not escaped: %q", got)
 	}
 }
+
+func TestTermLine(t *testing.T) {
+	sh := "'/Users/a b/.local/bin/actualis'"
+	if got, want := termLine(sh, "--coach", ""), sh+" --coach; echo; "+sh+" | less -R"; got != want {
+		t.Fatalf("full report: got %q want %q", got, want)
+	}
+	if got, want := termLine(sh, "", "--network"), sh+" --network | less -R"; got != want {
+		t.Fatalf("network report: got %q want %q", got, want)
+	}
+}
