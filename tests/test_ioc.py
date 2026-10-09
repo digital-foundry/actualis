@@ -934,3 +934,174 @@ class TestFailClosed(FleetCase, unittest.TestCase):
         host = "a." * 200 + "evil.io"
         self.assertEqual(self.verdict("host:evil.io\n", f"curl https://{host}/x"), ("unresolved", "error"))
         self.assertIsNone(self.verdict("npm:zzz\n", f"curl https://{host}/x"))
+
+
+def text_of(fn):
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        fn()
+    return buf.getvalue()
+
+
+POPULATED = ("npm:evil@=1.0.0||=1.0.1 id=MAL-2025-1 label=wave1 from=2025-09-14 until=2025-09-17\n"
+             "npm:pending@=2.0.0 id=GHSA-aaaa-bbbb-cccc\n"
+             "host:github.com/evil-org label=exfil\n"
+             "rubygems:rest-client\n")
+POPULATED_CMDS = ("npm i evil@1.0.0", "npm i pending", "git clone https://github.com/evil-org/r",
+                  "npm i evil@1.0.1", "npm i fine@1.0.0")
+
+
+class TestOutput(FleetCase, unittest.TestCase):
+    def populated(self, **kw):
+        return self.fleet(POPULATED, *POPULATED_CMDS, refuse=[3], **kw)
+
+    def test_json_without_ioc(self):                                   # T-OUT-1
+        j = af.to_json(self.fleet(None, "npm i x"))["network"]
+        self.assertEqual(list(j)[-1], "ioc")
+        self.assertEqual(j["ioc"], {"enabled": False, "sources": [], "totals": af._ioc_zero_totals(),
+                                    "matches": [], "matches_truncated": False})
+        self.assertIsNone(j["items"][0]["ioc"])
+        self.assertEqual(af.to_json(af.Fleet())["network"]["ioc"]["enabled"], False)
+
+    def test_json_populated(self):
+        j = af.to_json(self.populated())["network"]["ioc"]
+        self.assertTrue(j["enabled"])
+        [src] = j["sources"]
+        self.assertEqual((src["format"], src["entries"], src["not_checkable"]),
+                         ("lines", {"package": 2, "host": 1}, {"rubygems": 1}))
+        self.assertTrue(Path(src["path"]).is_absolute())
+        self.assertFalse(src["mtime_in_window"])
+        t = j["totals"]
+        self.assertEqual((t["match"], t["unresolved"], t["refused"], t["clean_name_matches"]), (2, 1, 1, 0))
+        self.assertEqual([m["refused"] for m in j["matches"]], [False, False, False, True])
+        self.assertEqual([m["verdict"] for m in j["matches"][:3]], ["match", "match", "unresolved"])
+        first = next(m for m in j["matches"] if m["entry"]["name"] == "evil" and not m["refused"])
+        self.assertEqual((first["refs"], first["labels"], first["entry"]["from"], first["entry"]["until"]),
+                         (["MAL-2025-1"], ["wave1"], "2025-09-14", "2025-09-17"))
+        self.assertEqual(first["entry"]["spec"], "=1.0.0||=1.0.1")
+        self.assertEqual(first["item"]["ioc"], "match")
+        self.assertEqual(set(first["item"]), set(af.NETWORK_ITEM_KEYS))
+        refused = j["matches"][-1]
+        self.assertIsNone(refused["flag_id"])
+        host = next(m for m in j["matches"] if m["reason"] == "host")
+        self.assertEqual((host["entry"]["host"], host["entry"]["path"], host["entry"]["ecosystem"]),
+                         ("github.com", "/evil-org", None))
+
+    def test_mtime_in_window(self):
+        f = self.populated()
+        f.first_ts = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        f.last_ts = datetime(2100, 1, 1, tzinfo=timezone.utc)
+        self.assertTrue(af.to_json(f)["network"]["ioc"]["sources"][0]["mtime_in_window"])
+        self.assertIn("modified during the window", text_of(lambda: af.render_network(f, af.C(False), 12)))
+
+    def test_matches_are_capped(self):
+        old = af.NETWORK_ITEMS_CAP
+        af.NETWORK_ITEMS_CAP = 3
+        try:
+            j = af.to_json(self.fleet("npm:x\n", *[f"npm i x@1.0.{i}" for i in range(5)]))["network"]["ioc"]
+        finally:
+            af.NETWORK_ITEMS_CAP = old
+        self.assertEqual((len(j["matches"]), j["matches_truncated"]), (3, True))
+
+    def test_deterministic(self):                                       # T-OUT-2
+        a, b = self.populated(), self.populated()
+        self.assertEqual(json.dumps(af.to_json(a)), json.dumps(af.to_json(b)))
+        self.assertEqual(text_of(lambda: af.render(a, af.C(False), False, 12)),
+                         text_of(lambda: af.render(b, af.C(False), False, 12)))
+
+    def test_text_block(self):                                          # T-OUT-3
+        out = text_of(lambda: af.render_network(self.populated(), af.C(False), 12))
+        self.assertLess(out.index("IOC"), out.index("INSTALLED"))
+        self.assertIn("IOC        2 match · 1 unresolved · 1 refused", out)
+        self.assertIn("iocs.txt  sha256 ", out)
+        self.assertIn("2 package · 1 host", out)
+        self.assertIn("not checkable: rubygems 1", out)
+        self.assertIn("checked 4 of 4 downloads", out)
+        self.assertIn("from/until are shown, not yet applied", out)
+        self.assertRegex(out, r"MATCH +npm evil@1\.0\.0 +proj")
+        self.assertIn("MAL-2025-1", out)
+        self.assertRegex(out, r"MATCH +host github\.com/evil-org \(git\)")
+        self.assertRegex(out, r"UNRESOLVED npm pending \(no version\).*version not resolved")
+        self.assertRegex(out, r"REFUSED +npm evil@1\.0\.1 .*never ran")
+        self.assertIn('No match is not "not affected"', out)
+        self.assertLess(out.index("UNRESOLVED"), out.index("REFUSED"))
+
+    def test_text_block_with_no_downloads(self):
+        f = af.Fleet()
+        f.suppressions = {}
+        af.apply_network_policy(f, [], False)
+        af.apply_ioc(f, self.load("npm:x\n"))
+        out = text_of(lambda: af.render_network(f, af.C(False), 12))
+        self.assertIn("no downloads seen", out)
+        self.assertIn("IOC        no match in 0 checkable downloads (1 entries)", out)
+        self.assertIn('No match is not "not affected"', out)
+        self.assertNotIn("from/until", out)
+
+    def test_no_block_without_ioc(self):
+        out = text_of(lambda: af.render_network(self.fleet(None, "npm i x"), af.C(False), 12))
+        self.assertNotIn("IOC", out)
+
+    def test_row_cap_ignores_top(self):
+        f = self.fleet("npm:x\n", *[f"npm i x@1.0.{i}" for i in range(55)])
+        out = text_of(lambda: af.render_network(f, af.C(False), 3))
+        self.assertEqual(out.count("MATCH "), 50)
+        self.assertIn("+5 more (--json for all)", out)
+
+    def test_suppressed_row(self):
+        fid = af.flag_id("high", ["network-ioc"], "npm:x@1.0.0")
+        f = self.fleet("npm:x id=MAL-9\n", "npm i x@1.0.0", suppress={fid: "ours"})
+        out = text_of(lambda: af.render_network(f, af.C(False), 12))
+        self.assertIn("1 suppressed", out)
+        self.assertRegex(out, r"MATCH .* suppressed")
+        self.assertNotIn("MAL-9", out.split("MATCH", 1)[1].split("\n")[0])
+
+    def test_diff_against_old_baselines(self):                          # T-OUT-4
+        new = af.to_json(self.populated())
+        old_branch = json.loads(json.dumps(new))
+        del old_branch["network"]["ioc"]
+        old_branch["bash"]["flags"] = [fl for fl in old_branch["bash"]["flags"]
+                                       if not fl["categories"][0].startswith("network-ioc")]
+        old_branch["report_sha256"] = "0" * 64
+        old_022 = {k: v for k, v in old_branch.items() if k != "network"}
+        for old in (old_022, old_branch):
+            d = af.diff_reports(old, new)
+            out = text_of(lambda: af.render_diff(d, af.C(False)))
+            self.assertIn("network-ioc", json.dumps(d) + out)
+
+    def test_share_and_card_leak_nothing(self):                         # T-OUT-5
+        canaries = ["canarypkg", "CANARY-REF-1", "canarylabel", "canary-host.example", "canarydir"]
+        d = self.dir / "canarydir"
+        d.mkdir()
+        (d / "list.txt").write_text("npm:canarypkg id=CANARY-REF-1 label=canarylabel\n"
+                                    "host:canary-host.example\n")
+        f = af.Fleet()
+        f.suppressions = {}
+        f.add_tool("p", "Bash", {"command": "npm i canarypkg@1.0.0"}, TS, "auto")
+        f.add_tool("p", "Bash", {"command": "curl https://canary-host.example/x"}, TS, "auto")
+        af.apply_network_policy(f, [], False)
+        af.apply_ioc(f, af.load_ioc([str(d / "list.txt")]))
+        self.assertEqual(f.ioc_totals["match"], 2)
+        outs = {"share": text_of(lambda: af.render_share(f, af.C(False)))}
+        for mode in ("cost", "supervision", "volume"):
+            outs["card-" + mode] = json.dumps(af.card_model(f, mode), ensure_ascii=False)
+        for name, text in outs.items():
+            for canary in canaries + ["IOC", "ioc", "known-bad"]:
+                self.assertNotIn(canary, text, (name, canary))
+
+    def test_escape_canary(self):                                       # T-OUT-6
+        bad = "\x1b[2J\r‮\x9b31m"
+        rec = osv("evil" + bad, versions=["1.0.0"])
+        ioc_text = json.dumps([rec, osv("evil", versions=["1.0.0"])])
+        f = af.Fleet()
+        f.suppressions = {}
+        f.add_tool("p" + bad, "Bash", {"command": f"npm i evil@1.0.0 # {bad}"}, TS, "auto" + bad)
+        f.add_tool("p" + bad, "Bash", {"command": f"curl https://evil.io/{bad}"}, TS, "auto")
+        af.apply_network_policy(f, [], False)
+        ioc = self.load(ioc_text + "", "o.json")
+        self.assertEqual(ioc.sources[0]["skipped"], 1)
+        af.apply_ioc(f, ioc)
+        outs = [text_of(lambda: af.render(f, af.C(False), False, 12)), json.dumps(af.to_json(f), ensure_ascii=False)]
+        for text in outs:
+            for lo, hi, why in af._STRIPPED_RANGES:
+                for ch in text:
+                    self.assertFalse(lo <= ord(ch) <= hi, f"U+{ord(ch):04X} ({why})")

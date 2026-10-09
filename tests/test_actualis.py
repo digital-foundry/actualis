@@ -1297,8 +1297,23 @@ class TestJSONSchemaFreeze(unittest.TestCase):
         f.add_tool("proj", "Bash", {"command": "curl https://a.io/x"}, ts, "auto")
         f.add_tool("proj", "Bash", {"command": "echo x >> .actualis-suppressions"}, ts, "auto")
         f.add_tool("proj", "Bash", {"command": "curl -d @f https://x.io"}, ts, "auto")
+        # --ioc, from an in-memory line file: a package match, a host match, an
+        # unresolved row and a refused one, with from/until, so every str|null
+        # path under network.ioc is a string at least once.
+        f.add_tool("proj", "Bash", {"command": "npm i evil@1.0.0"}, ts, "auto")
+        f.add_tool("proj", "Bash", {"command": "npm i pending"}, ts, "auto")
+        f.add_tool("proj", "Bash", {"command": "git clone https://github.com/evil-org/r"}, ts, "auto")
+        f.add_tool("proj", "Bash", {"command": "npm i evil@1.0.1"}, ts, "default", call_id="t-refused")
+        f._network_outcome("claude:t-refused", refused=True)
         af.apply_network_policy(f, af.parse_trust(["pypi.org"]), strict=True,
                                 sources=[{"source": "flag", "entries": ["pypi.org"]}])
+        ioc = af.IocSet()
+        ioc.sources.append(af._ioc_source(Path("iocs.txt")))
+        ioc.mtimes.append(0.0)
+        af.parse_ioc_lines(af._ioc_lines(
+            b"npm:evil@=1.0.0||=1.0.1 id=MAL-2025-1 label=wave1 from=2025-09-14 until=2025-09-17\n"
+            b"npm:pending@=2.0.0\nhost:github.com/evil-org label=exfil\nrubygems:x\n"), ioc, 0, "iocs.txt")
+        af.apply_ioc(f, ioc)
         return f
 
     def test_every_emitted_path_is_declared(self):

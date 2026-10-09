@@ -2706,7 +2706,25 @@ def apply_network_policy(fleet: "Fleet", trust: list[tuple[str, str]], strict: b
 
 NETWORK_ITEM_KEYS = ("kind", "program", "host", "host_inferred", "url", "dest", "source",
                      "ecosystem", "package", "version", "pinned", "exec", "dynamic", "alias",
-                     "failed", "approval", "trusted", "agent", "project", "session", "ts")
+                     "failed", "approval", "trusted", "agent", "project", "session", "ts", "ioc")
+
+
+def _net_public(i: dict, raw: bool = False) -> dict:
+    """An item as --json shows it: NETWORK_ITEM_KEYS, with url, dest and
+    source redacted unless raw."""
+    out = {k: i[k] for k in NETWORK_ITEM_KEYS}
+    if not raw:
+        for k in ("url", "dest", "source"):
+            if out[k]:
+                out[k] = redact(out[k])
+    return out
+
+
+def _net_order_key(i: dict) -> tuple:
+    """Every field that can differ, so no two distinct items tie."""
+    return tuple(str(i[k] or "") for k in (
+        "ts", "agent", "project", "program", "host", "url", "package", "version", "kind",
+        "dest", "source", "session", "approval"))
 
 
 def network_json(fleet: "Fleet", raw: bool = False) -> dict:
@@ -2741,18 +2759,7 @@ def network_json(fleet: "Fleet", raw: bool = False) -> dict:
         p["pinned"] = p["pinned"] and i["pinned"]
         p["exec"] = p["exec"] or i["exec"]
 
-    def public(i: dict) -> dict:
-        out = {k: i[k] for k in NETWORK_ITEM_KEYS}
-        if not raw:
-            for k in ("url", "dest", "source"):
-                if out[k]:
-                    out[k] = redact(out[k])
-        return out
-
-    # Every field that can differ is in the key, so no two distinct items tie.
-    order = sorted(items, key=lambda i: tuple(str(i[k] or "") for k in (
-        "ts", "agent", "project", "program", "host", "url", "package", "version", "kind",
-        "dest", "source", "session", "approval")), reverse=True)
+    order = sorted(items, key=_net_order_key, reverse=True)
     return {
         "totals": {"items": len(items), "asked": approval["asked"], "unasked": approval["unasked"],
                    "unknown": approval["unknown"],
@@ -2762,13 +2769,14 @@ def network_json(fleet: "Fleet", raw: bool = False) -> dict:
         "hosts": sorted(hosts.values(), key=lambda h: (-h["count"], h["host"])),
         "packages": [{**p, "versions": sorted(p["versions"])}
                      for _, p in sorted(packages.items(), key=lambda kv: (-kv[1]["count"], kv[0]))],
-        "items": [public(i) for i in order[:NETWORK_ITEMS_CAP]],
+        "items": [_net_public(i, raw) for i in order[:NETWORK_ITEMS_CAP]],
         "items_truncated": len(items) > NETWORK_ITEMS_CAP,
         "strict": fleet.network_strict,
         "trust": list(fleet.network_trust),
         "trust_sources": [{"source": t["source"], "path": t.get("path"),
                            "sha256": t.get("sha256"), "entries": list(t["entries"])}
                           for t in fleet.network_trust_sources],
+        "ioc": ioc_json(fleet, raw),
     }
 
 
@@ -3850,6 +3858,136 @@ def apply_ioc(fleet: "Fleet", ioc: IocSet | None) -> None:
         })
         for r in rows:
             r["flag_id"], r["suppressed"] = fid, suppressed
+
+
+IOC_ROWS_SHOWN = 50
+IOC_REFS_CAP = 20
+_IOC_REASON_TEXT = {"version-unresolved": "version not resolved", "undecidable": "undecidable",
+                    "private-registry": "private registry", "name-from-url": "name from URL",
+                    "error": "could not check"}
+
+
+def _ioc_entry_json(e: IocEntry) -> dict:
+    return {"kind": e.kind, "ecosystem": e.eco, "name": e.name, "spec": e.spec_text,
+            "host": e.host, "path": e.path or None, "exact_host": e.exact_host,
+            "ref": e.ref, "label": e.label,
+            "from": e.frm.isoformat() if e.frm else None,
+            "until": e.until.isoformat() if e.until else None,
+            "source": e.source, "line": e.line}
+
+
+def _ioc_utc(ts: datetime | None) -> datetime | None:
+    return ts.replace(tzinfo=timezone.utc) if ts is not None and ts.tzinfo is None else ts
+
+
+def _ioc_ordered_rows(fleet: "Fleet") -> list[dict]:
+    """Rows in a total order, so the bytes are deterministic: not refused
+    first, then match before unresolved, then newest, then the item, then
+    (source, line) of the first entry."""
+    rows = sorted(fleet.ioc_rows, key=lambda r: (r["entries"][0].source, r["entries"][0].line or 0))
+    rows.sort(key=lambda r: _net_order_key(r["item"]), reverse=True)
+    rows.sort(key=lambda r: (r["refused"], -_IOC_RANK[r["verdict"]]))
+    return rows
+
+
+def ioc_json(fleet: "Fleet", raw: bool = False) -> dict:
+    """network.ioc. Always an object: without --ioc it is enabled false with
+    zero totals, so every path keeps one type."""
+    t = fleet.ioc_totals
+    totals = {**t, "items_not_checkable": dict(t["items_not_checkable"])}
+    ioc = fleet.ioc
+    if ioc is None:
+        return {"enabled": False, "sources": [], "totals": totals, "matches": [], "matches_truncated": False}
+    start, end = _ioc_utc(fleet.first_ts), _ioc_utc(fleet.last_ts)
+    sources = []
+    for s, mtime in zip(ioc.sources, ioc.mtimes):
+        modified = datetime.fromtimestamp(mtime, timezone.utc)
+        sources.append({**s, "entries": dict(s["entries"]), "not_checkable": dict(sorted(s["not_checkable"].items())),
+                        "mtime_in_window": bool(start and end and start <= modified <= end)})
+    rows = _ioc_ordered_rows(fleet)
+    matches = []
+    for r in rows[:NETWORK_ITEMS_CAP]:
+        matches.append({
+            "verdict": r["verdict"], "reason": r["reason"], "refused": r["refused"],
+            "suppressed": r["suppressed"], "flag_id": r["flag_id"],
+            "refs": sorted({e.ref for e in r["entries"] if e.ref})[:IOC_REFS_CAP],
+            "labels": sorted({e.label for e in r["entries"] if e.label})[:IOC_REFS_CAP],
+            "entry": _ioc_entry_json(r["entries"][0]),
+            "item": _net_public(r["item"], raw),
+        })
+    return {"enabled": True, "sources": sources, "totals": totals, "matches": matches,
+            "matches_truncated": len(rows) > NETWORK_ITEMS_CAP}
+
+
+def render_ioc(fleet: "Fleet", c: "C", raw: bool = False) -> None:
+    """The IOC block of NETWORK. Nothing without --ioc. Every printed field
+    is cleaned; item fields come from the redacted public view."""
+    if fleet.ioc is None:
+        return
+    j = ioc_json(fleet, raw)
+    t = j["totals"]
+    pad = " " * 13
+    listed = sum(s["entries"]["package"] + s["entries"]["host"] for s in j["sources"])
+    rows = j["matches"]
+    if not rows:
+        print(f"  {'IOC':<11}{c.green}no match{c.off} in {num(t['items_checked'])} checkable downloads "
+              f"({num(listed)} entries)")
+    else:
+        parts = [f"{c.red}{num(t['match'])} match{c.off}", f"{c.yellow}{num(t['unresolved'])} unresolved{c.off}"]
+        parts += [f"{num(t[k])} {k}" for k in ("refused", "suppressed") if t[k]]
+        print(f"  {'IOC':<11}" + " · ".join(parts))
+    for s in j["sources"]:
+        print(f"{pad}{clip(clean(Path(s['path']).name), 32)}  sha256 {s['sha256'][:12]}  {s['format']}  "
+              f"{num(s['entries']['package'])} package · {num(s['entries']['host'])} host"
+              + (f"  {c.yellow}modified during the window{c.off}" if s["mtime_in_window"] else ""))
+        extra = []
+        if s["not_checkable"]:
+            extra.append("not checkable: " + " · ".join(f"{clean(k)} {num(v)}" for k, v in sorted(
+                s["not_checkable"].items(), key=lambda kv: (-kv[1], kv[0]))))
+        if s["skipped"]:
+            extra.append(f"skipped {num(s['skipped'])} malformed"
+                         + (f" (first at line {s['first_skipped_line']})" if s["first_skipped_line"] else ""))
+        if s["withdrawn"]:
+            extra.append(f"withdrawn {num(s['withdrawn'])}")
+        if s["skipped_ranges"]:
+            extra.append(f"{num(s['skipped_ranges'])} unusable range(s), read as undecidable")
+        if extra:
+            print(f"{pad}{c.dim}{' · '.join(extra)}{c.off}")
+    if rows:
+        nc = [f"{k.replace('_', ' ')} {num(v)}" for k, v in t["items_not_checkable"].items() if v]
+        seen = t["items_checked"] + sum(t["items_not_checkable"].values())
+        print(f"{pad}{c.dim}checked {num(t['items_checked'])} of {num(seen)} downloads"
+              + (" · not checkable: " + " · ".join(nc) if nc else "")
+              + (f" · undecidable {num(t['undecidable'])}" if t["undecidable"] else "") + c.off)
+    if fleet.ioc.has_window:
+        print(f"{pad}{c.dim}from/until are shown, not yet applied{c.off}")
+    for r in rows[:IOC_ROWS_SHOWN]:
+        i, e = r["item"], r["entry"]
+        if e["kind"] == "host":
+            what = f"host {e['host']}{e['path'] or ''} ({i['program']})"
+        else:
+            name = i["package"] or e["name"] or i["host"] or "?"
+            eco = i["ecosystem"] or i["program"]
+            what = (f"{eco} {name} ({i['version'] or 'no version'})" if r["verdict"] == "unresolved"
+                    else f"{eco} {name}@{i['version']}" if i["version"] else f"{eco} {name}")
+        if r["refused"]:
+            tail = "never ran"
+        elif r["suppressed"]:
+            tail = "suppressed"
+        elif r["verdict"] == "match":
+            tail = (r["refs"] or r["labels"] or ["listed"])[0]
+        else:
+            tail = _IOC_REASON_TEXT.get(r["reason"], r["reason"])
+        label = "REFUSED" if r["refused"] else r["verdict"].upper()
+        color = c.dim if r["refused"] else c.red if r["verdict"] == "match" else c.yellow
+        print(f"  {color}{label:<11}{c.off}{clip(clean(what), 34):<34} {c.dim}{clip(clean(i['project']), 10):<10} "
+              f"{(i['ts'] or '')[:10]:<10} {('—' if r['refused'] else i['approval']):<8}{c.off} {clean(tail)}")
+    more = len(fleet.ioc_rows) - min(len(rows), IOC_ROWS_SHOWN)
+    if more > 0:
+        print(f"  {'':<11}{c.dim}+{num(more)} more (--json for all){c.off}")
+    print(f"  {c.dim}No match is not \"not affected\": this covers the transcripts still on this machine in the{c.off}")
+    print(f"  {c.dim}window, and lockfile installs, scripts and postinstall hooks are not visible. "
+          f"See --explain ioc.{c.off}")
 
 
 # --------------------------------------------------------------------------
@@ -7452,6 +7590,7 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False) -> None:
     rule(c, "NETWORK")
     if not t["items"]:
         print(f"  {c.dim}no downloads seen{c.off}")
+        render_ioc(fleet, c, raw)              # an empty inventory is still an answer to --ioc
         return
     print(f"  {num(t['items'])} download{'' if t['items'] == 1 else 's'} · {c.yellow}{num(t['unasked'])} unasked{c.off}"
           f" · {num(t['unknown'])} unknown"
@@ -7470,6 +7609,7 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False) -> None:
             else:
                 parts.append(f"--network-trust {count}")
         print(f"  {c.dim}trust: {' · '.join(parts)}{c.off}")
+    render_ioc(fleet, c, raw)
     items = fleet.network_items
 
     eco = Counter(i["ecosystem"] for i in items if i["kind"] == "install" and i["ecosystem"])
@@ -8710,9 +8850,64 @@ JSON_SCHEMA: dict[str, str] = {
     "network.trust_sources[].entries[]": "str",
     "network.trust_sources[].path": "str|null",
     "network.trust_sources[].sha256": "str|null",
+    "network.items[].ioc": "str|null",
+    "network.ioc.enabled": "bool",
+    "network.ioc.sources": "array",
+    "network.ioc.sources[].path": "str",
+    "network.ioc.sources[].sha256": "str",
+    "network.ioc.sources[].format": "str",
+    "network.ioc.sources[].entries.package": "int",
+    "network.ioc.sources[].entries.host": "int",
+    "network.ioc.sources[].not_checkable.*": "int",
+    "network.ioc.sources[].skipped": "int",
+    "network.ioc.sources[].first_skipped_line": "int|null",
+    "network.ioc.sources[].withdrawn": "int",
+    "network.ioc.sources[].ranges_git": "int",
+    "network.ioc.sources[].ranges_with_limit": "int",
+    "network.ioc.sources[].skipped_ranges": "int",
+    "network.ioc.sources[].mtime_in_window": "bool",
+    "network.ioc.totals.match": "int",
+    "network.ioc.totals.unresolved": "int",
+    "network.ioc.totals.refused": "int",
+    "network.ioc.totals.suppressed": "int",
+    "network.ioc.totals.clean_name_matches": "int",
+    "network.ioc.totals.undecidable": "int",
+    "network.ioc.totals.items_checked": "int",
+    "network.ioc.totals.items_not_checkable.lockfile": "int",
+    "network.ioc.totals.items_not_checkable.no_host": "int",
+    "network.ioc.totals.items_not_checkable.other": "int",
+    "network.ioc.matches": "array",
+    "network.ioc.matches[].verdict": "str",
+    "network.ioc.matches[].reason": "str",
+    "network.ioc.matches[].refused": "bool",
+    "network.ioc.matches[].suppressed": "bool",
+    "network.ioc.matches[].flag_id": "str|null",
+    "network.ioc.matches[].refs": "array",
+    "network.ioc.matches[].refs[]": "str",
+    "network.ioc.matches[].labels": "array",
+    "network.ioc.matches[].labels[]": "str",
+    "network.ioc.matches[].entry.kind": "str",
+    "network.ioc.matches[].entry.ecosystem": "str|null",
+    "network.ioc.matches[].entry.name": "str|null",
+    "network.ioc.matches[].entry.spec": "str|null",
+    "network.ioc.matches[].entry.host": "str|null",
+    "network.ioc.matches[].entry.path": "str|null",
+    "network.ioc.matches[].entry.exact_host": "bool",
+    "network.ioc.matches[].entry.ref": "str|null",
+    "network.ioc.matches[].entry.label": "str|null",
+    "network.ioc.matches[].entry.from": "str|null",
+    "network.ioc.matches[].entry.until": "str|null",
+    "network.ioc.matches[].entry.source": "int",
+    "network.ioc.matches[].entry.line": "int|null",
+    "network.ioc.matches_truncated": "bool",
     "unknown_models.*": "int",
     "aggregator_priced_models.*": "int",
 }
+
+# A matched item is shown exactly as network.items shows it.
+JSON_SCHEMA.update({f"network.ioc.matches[].item.{k}": JSON_SCHEMA[f"network.items[].{k}"]
+                    for k in NETWORK_ITEM_KEYS})
+
 
 def canonical_json(payload: dict) -> str:
     """The exact bytes the report hash is taken over.
