@@ -2770,6 +2770,239 @@ def network_json(fleet: "Fleet", raw: bool = False) -> dict:
 
 
 # --------------------------------------------------------------------------
+# --ioc: known-bad packages and hosts, matched offline
+#
+# A list someone else published (a malware feed, an incident write-up) is
+# compared against the network inventory: did an agent install X@bad, or
+# contact evil.example, and did anyone approve it? Nothing is fetched, and the
+# list is read only when named on the command line.
+#
+# The list is untrusted input. Every regex below is anchored, with bounded
+# repeats; none is built from file content. Versions are ordered with SemVer
+# 2.0.0 section 11 (npm, crates, go) and PEP 440 (pypi), both written out here
+# because the standard library has neither.
+# --------------------------------------------------------------------------
+
+IOC_VERSION_MAX = 128
+_IOC_UNDECIDABLE = "undecidable"     # a clause that can never decide: an OSV range it cannot order
+_IOC_ANY_VERSION = frozenset({"*", ">=0", ">=0.0.0"})
+_IOC_OPS = ("===", "==", ">=", "<=", "=", ">", "<")      # longest first
+_IOC_VERSION_CHARS = re.compile(r"[A-Za-z0-9.\-+_!:]{1,128}")
+_IOC_WORD = re.compile(r"[A-Za-z]+")
+_IOC_SEMVER = re.compile(
+    r"v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?", re.ASCII)
+# PEP 440 Appendix B, VERSION_PATTERN, anchored by fullmatch.
+_IOC_PEP440 = re.compile(r"""
+    \s*v?
+    (?:
+        (?:(?P<epoch>[0-9]+)!)?
+        (?P<release>[0-9]+(?:\.[0-9]+)*)
+        (?P<pre>[-_\.]?(?P<pre_l>alpha|a|beta|b|preview|pre|c|rc)[-_\.]?(?P<pre_n>[0-9]+)?)?
+        (?P<post>(?:-(?P<post_n1>[0-9]+))|(?:[-_\.]?(?P<post_l>post|rev|r)[-_\.]?(?P<post_n2>[0-9]+)?))?
+        (?P<dev>[-_\.]?(?P<dev_l>dev)[-_\.]?(?P<dev_n>[0-9]+)?)?
+    )
+    (?:\+(?P<local>[a-z0-9]+(?:[-_\.][a-z0-9]+)*))?
+    \s*""", re.VERBOSE | re.IGNORECASE | re.ASCII)
+_IOC_PEP440_PRE = {"a": 0, "alpha": 0, "b": 1, "beta": 1, "c": 2, "rc": 2, "pre": 2, "preview": 2}
+_IOC_OCI_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+_IOC_OCI_TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
+
+
+class _IocError(ValueError):
+    """A problem in one IOC entry: what is wrong, and how to write it.
+    The caller adds the file and line."""
+
+    def __init__(self, what: str, how: str = "") -> None:
+        super().__init__(what + (f" — {how}" if how else ""))
+        self.what, self.how = what, how
+
+
+def _ioc_semver_key(v: str) -> tuple | None:
+    """SemVer 2.0.0 precedence (section 11) as a sortable tuple, or None.
+
+    (major, minor, patch, pre): pre is (1,) for a release, else (0, ids) with
+    each id (0, int) when numeric and (1, str) otherwise. A pre-release sorts
+    below its release, numeric ids below alphanumeric, and a longer id list
+    above an equal prefix. A leading v and build metadata (+incompatible) are
+    ignored. Go pseudo-versions are ordinary pre-releases."""
+    if not v or len(v) > IOC_VERSION_MAX:
+        return None
+    m = _IOC_SEMVER.fullmatch(v)
+    if not m:
+        return None
+    pre = (1,) if m.group(4) is None else (0, tuple(
+        (0, int(p)) if p.isdigit() else (1, p) for p in m.group(4).split(".")))
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), pre)
+
+
+def _ioc_pep440_key(v: str) -> tuple | None:
+    """PEP 440 ordering as a sortable tuple, or None.
+
+    (epoch, release, pre, post, dev), following `packaging`: trailing zeros
+    of the release are dropped (1.0 == 1.0.0); a dev release with no pre or
+    post sorts before every pre-release; a missing post sorts below post0; a
+    missing dev sorts above any dev. Each slot is (0,) for "below everything",
+    (2,) for "above everything", or (1, value). The local part is ignored."""
+    if not v or len(v) > IOC_VERSION_MAX:
+        return None
+    m = _IOC_PEP440.fullmatch(v)
+    if not m:
+        return None
+    release = [int(p) for p in m.group("release").split(".")]
+    while len(release) > 1 and release[-1] == 0:
+        release.pop()
+    has_pre, has_post, has_dev = m.group("pre_l"), m.group("post"), m.group("dev_l")
+    if has_pre:
+        pre = (1, _IOC_PEP440_PRE[has_pre.lower()], int(m.group("pre_n") or 0))
+    elif has_dev and not has_post:
+        pre = (0,)
+    else:
+        pre = (2,)
+    post = (1, int(m.group("post_n1") or m.group("post_n2") or 0)) if has_post else (0,)
+    dev = (1, int(m.group("dev_n") or 0)) if has_dev else (2,)
+    return (int(m.group("epoch") or 0), tuple(release), pre, post, dev)
+
+
+def _ioc_version_key(eco: str, v: str) -> tuple | None:
+    return _ioc_pep440_key(v) if eco == "pypi" else _ioc_semver_key(v)
+
+
+def _ioc_bad_version(eco: str, v: str) -> _IocError:
+    """The error for a comparator version that does not parse, naming the fix."""
+    if eco == "oci":
+        return _IocError(f'"{v}" is not an image tag or sha256 digest', "write =TAG or =sha256:<64 hex>")
+    if _IOC_WORD.fullmatch(v):
+        return _IocError(f'"{v}" is not a version', "an IOC names versions; latest moves")
+    if eco == "pypi":
+        return _IocError(f'"{v}" is not a PEP 440 version for pypi', "write 1.2.3, or ===TEXT for an exact string")
+    parts = v.lstrip("v").split(".")
+    if 1 <= len(parts) < 3 and all(p.isdigit() for p in parts):
+        full = ".".join(parts + ["0"] * (3 - len(parts)))
+        return _IocError(f'"{v}" is not a full version for {eco}', f"write {full}")
+    return _IocError(f'"{v}" is not a SemVer version for {eco}', "write MAJOR.MINOR.PATCH")
+
+
+def _ioc_comparator(eco: str, text: str) -> tuple:
+    """One comparator as (op, key, raw). op is =, ===, >=, <=, > or <."""
+    op = next((o for o in _IOC_OPS if text.startswith(o)), "")
+    v = text[len(op):]
+    op = "=" if op in ("", "==") else op
+    if not v:
+        raise _IocError(f'"{text}" has no version', "write =1.2.3")
+    if v[0] in "^~":
+        raise _IocError(f'"{text}" is a range', "^ and ~ ranges are not accepted; write >=X,<Y")
+    if len(v) > IOC_VERSION_MAX:
+        raise _IocError(f"a version is over {IOC_VERSION_MAX} characters")
+    if any(p in ("x", "X", "*") for p in v.split(".")):
+        raise _IocError(f'"{text}" is a wildcard', "wildcards are not accepted; write >=1.0.0,<2.0.0")
+    if not _IOC_VERSION_CHARS.fullmatch(v):
+        raise _ioc_bad_version(eco, v)
+    if eco == "oci":
+        if op != "=":
+            raise _IocError(f'"{text}": an image has no version order', "write =TAG or =sha256:<digest>, joined by ||")
+        if v == "latest":
+            raise _IocError('"latest" is not an image version', "an IOC names versions; latest moves")
+        if not (_IOC_OCI_DIGEST.fullmatch(v) or (_IOC_OCI_TAG.fullmatch(v) and not v.startswith("sha256:"))):
+            raise _ioc_bad_version(eco, v)
+        return ("=", v, v)
+    if op == "===":
+        if eco != "pypi":
+            raise _IocError(f'"{text}": === is PEP 440 only', "write =1.2.3")
+        return ("===", None, v)
+    key = _ioc_version_key(eco, v)
+    if key is None:
+        raise _ioc_bad_version(eco, v)
+    return (op, key, v)
+
+
+def _ioc_parse_spec(eco: str, text: str | None) -> tuple | None:
+    """A version spec, parsed once: None for any version, else a tuple of
+    clauses (OR), each a tuple of comparators (AND)."""
+    if text is None or text in _IOC_ANY_VERSION:
+        return None
+    clauses = []
+    for clause_text in text.split("||"):
+        if not clause_text:
+            raise _IocError(f'"{text}" has an empty clause', "write A||B, with a version on each side of ||")
+        comps = []
+        for comp in clause_text.split(","):
+            if not comp:
+                raise _IocError(f'"{text}" has an empty comparator', "write >=1.0.0,<2.0.0")
+            if comp == "*":
+                raise _IocError(f'"{text}" is a wildcard', "wildcards are not accepted; write >=1.0.0,<2.0.0")
+            comps.append(_ioc_comparator(eco, comp))
+        if sum(1 for op, _, _ in comps if op in ("=", "===")) > 1:
+            raise _IocError(f'"{text}" puts two versions in one clause',
+                            "a comma means AND; use || between alternative versions")
+        clauses.append(tuple(comps))
+    return tuple(clauses)
+
+
+def _ioc_spec_text(spec: tuple | None) -> str | None:
+    """The canonical text of a spec, for output: =4.1.1||=4.1.2, >=1.0.0,<2.0.0."""
+    if spec is None:
+        return None
+    return "||".join(_IOC_UNDECIDABLE if c == _IOC_UNDECIDABLE else ",".join(op + raw for op, _, raw in c)
+                     for c in spec)
+
+
+def _ioc_compare(op: str, entry_key, version_key) -> bool:
+    if op == "=":
+        return version_key == entry_key
+    if op == ">=":
+        return version_key >= entry_key
+    if op == "<=":
+        return version_key <= entry_key
+    if op == ">":
+        return version_key > entry_key
+    return version_key < entry_key
+
+
+def _ioc_oci_digest(v: str) -> bool:
+    return v.startswith("sha256:")
+
+
+def _ioc_spec_contains(eco: str, spec: tuple | None, version: str) -> bool | None:
+    """Whether a resolved item version is inside a spec. None when it cannot
+    be decided: an OSV range that does not order, a version that does not
+    parse, or an image digest compared with a tag."""
+    if spec is None:
+        return True
+    raw = version[3:] if eco == "pypi" and version.startswith("===") else version
+    key = None if eco == "oci" else _ioc_version_key(eco, raw)
+    undecided = False
+    for clause in spec:
+        if clause == _IOC_UNDECIDABLE:
+            undecided = True
+            continue
+        result: bool | None = True
+        for op, ekey, eraw in clause:
+            if eco == "oci":
+                r = (raw == eraw) if _ioc_oci_digest(raw) == _ioc_oci_digest(eraw) else None
+            elif op == "===":
+                r = raw == eraw
+            elif ekey is None:                  # an OSV versions[] string that does not parse
+                r = raw.removeprefix("v") == eraw.removeprefix("v")
+            elif key is None:
+                r = None
+            else:
+                r = _ioc_compare(op, ekey, key)
+            if r is False:
+                result = False
+                break
+            if r is None:
+                result = None
+        if result is True:
+            return True
+        if result is None:
+            undecided = True
+    return None if undecided else False
+
+
+# --------------------------------------------------------------------------
 # Suppressions
 #
 # A detector that cries wolf gets ignored, so there has to be a way to tell it
