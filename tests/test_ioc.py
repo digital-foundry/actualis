@@ -17,6 +17,9 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _timing import budget  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 if "actualis" in sys.modules:
     af = sys.modules["actualis"]
@@ -649,13 +652,19 @@ class TestFlags(FleetCase, unittest.TestCase):
 
 # Run in a child process so the time and the peak memory are the loader's own.
 _CHILD = r"""
-import importlib.util, json, resource, sys, time
+import importlib.util, json, sys, time
+try:
+    import resource
+except ImportError:                        # Windows
+    resource = None
 spec = importlib.util.spec_from_file_location("actualis", sys.argv[1])
 af = importlib.util.module_from_spec(spec); spec.loader.exec_module(af)
 for kv in sys.argv[2].split(",") if sys.argv[2] else ():
     k, v = kv.split("="); setattr(af, k, int(v))
 unit = 1 if sys.platform == "darwin" else 1024
-base = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit
+def rss():
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit if resource else None
+base = rss()
 t = time.perf_counter()
 err = None
 try:
@@ -664,8 +673,8 @@ try:
 except ValueError as exc:
     err, info = str(exc), None
 dt = time.perf_counter() - t
-peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit
-print(json.dumps({"dt": dt, "mb": (peak - base) / 1e6, "err": err, "info": info}))
+peak = rss()
+print(json.dumps({"dt": dt, "mb": (peak - base) / 1e6 if resource else None, "err": err, "info": info}))
 """
 
 
@@ -685,8 +694,9 @@ class TestLoaderCaps(IocFiles, unittest.TestCase):
     def bounded(self, r, seconds=2.0, mb=64):
         # 2 s is the dev-Mac budget. A shared CI runner gets the spec's loose
         # ceiling (section 11) so a slow neighbour cannot flake the suite.
-        self.assertLess(r["dt"], max(seconds, 10.0) if os.environ.get("CI") else seconds, r)
-        self.assertLess(r["mb"], mb, r)
+        self.assertLess(r["dt"], budget(seconds), r)
+        if r["mb"] is not None:                  # no `resource` module on Windows: time and exit code only
+            self.assertLess(r["mb"], mb, r)
 
     def test_oversized_file(self):
         path = self.dir / "big.jsonl"
@@ -774,7 +784,7 @@ class TestLoaderCaps(IocFiles, unittest.TestCase):
         ioc = self.load(lines)
         t = time.perf_counter()
         af.apply_ioc(f, ioc)
-        self.assertLess(time.perf_counter() - t, 2.0)
+        self.assertLess(time.perf_counter() - t, budget(2.0))
         self.assertEqual(f.ioc_totals["clean_name_matches"], 2_000)
 
 
@@ -913,7 +923,7 @@ class TestRegexTiming(unittest.TestCase):
                 for fn in (p.fullmatch, p.search, p.match):
                     t = time.perf_counter()
                     fn(data)
-                    self.assertLess(time.perf_counter() - t, 0.1, (name, fn.__name__, b[:16]))
+                    self.assertLess(time.perf_counter() - t, budget(0.1), (name, fn.__name__, b[:16]))
 
     def test_every_scanner(self):
         scanners = [af._ioc_semver_key, af._ioc_pep440_key, lambda v: af._ioc_url_name(
@@ -927,7 +937,7 @@ class TestRegexTiming(unittest.TestCase):
                     fn(b)
                 except af._IocError:
                     pass
-                self.assertLess(time.perf_counter() - t, 0.1, (k, b[:16]))
+                self.assertLess(time.perf_counter() - t, budget(0.1), (k, b[:16]))
         for spec in self.bodies():
             for eco in ("npm", "pypi", "oci"):
                 t = time.perf_counter()
@@ -935,7 +945,7 @@ class TestRegexTiming(unittest.TestCase):
                     af._ioc_parse_spec(eco, spec)
                 except af._IocError:
                     pass
-                self.assertLess(time.perf_counter() - t, 0.1, (eco, spec[:16]))
+                self.assertLess(time.perf_counter() - t, budget(0.1), (eco, spec[:16]))
 
 
 class TestFailClosed(FleetCase, unittest.TestCase):
@@ -1370,7 +1380,7 @@ class TestPerformance(FleetCase, unittest.TestCase):                    # T-PERF
             ioc = af.load_ioc([p])
             dt = time.perf_counter() - t
             self.assertEqual(ioc.total, 100_000)
-            self.assertLess(dt, 10.0 if self.CI else 2.0, (p, dt))
+            self.assertLess(dt, budget(2.0), (p, dt))
 
     def test_match_10k_items_against_100k_entries(self):
         ioc = af.load_ioc([self.write("".join(f"npm:pkg-{i}@=1.0.{i % 7}\nhost:h{i}.evil.example\n"
@@ -1384,7 +1394,7 @@ class TestPerformance(FleetCase, unittest.TestCase):                    # T-PERF
         af.apply_ioc(f, ioc)
         dt = time.perf_counter() - t
         self.assertEqual(sum(1 for r in f.ioc_rows if r["reason"] == "host"), 10_000)
-        self.assertLess(dt, 5.0 if self.CI else 1.0, dt)
+        self.assertLess(dt, budget(1.0), dt)
 
     def test_pathological_lines(self):
         for ch in "@.":
@@ -1392,7 +1402,7 @@ class TestPerformance(FleetCase, unittest.TestCase):                    # T-PERF
             t = time.perf_counter()
             with self.assertRaises(ValueError):
                 af.load_ioc([path])
-            self.assertLess(time.perf_counter() - t, 0.05)
+            self.assertLess(time.perf_counter() - t, budget(0.05))
 
 
 class TestErrorMessagesAreClean(IocFiles, unittest.TestCase):

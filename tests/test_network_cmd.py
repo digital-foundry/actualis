@@ -96,7 +96,7 @@ class TestNetworkFlag(Cli):
 
     def test_ioc_block_is_included(self):
         ioc = self.home / "bad.ioc"
-        ioc.write_text("npm:left-pad\n")
+        ioc.write_bytes(b"npm:left-pad\n")
         code, out, err = self.run_main("--network", "--ioc", str(ioc))
         self.assertEqual(code, 0, err)
         self.assertIn("NETWORK", out)
@@ -283,7 +283,7 @@ class TestRowsAreRemoteOnly(TestTopUnasked):
         text = self.out(f)
         rows = [l for l in text.splitlines() if re.search(r"\d{4}-\d\d-\d\d (?:unasked|unknown)$", l)]
         self.assertEqual(len(rows), 2)
-        self.assertTrue(all(("a.io" in l or "b.io" in l) for l in rows), rows)
+        self.assertEqual({l.split()[1] for l in rows}, {"a.io", "b.io"}, rows)
         self.assertNotIn("?  ", "\n".join(rows))
         self.assertIn("plus 1 with no host", text)
         self.assertIn("3 local or private", text)

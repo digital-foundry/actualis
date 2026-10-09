@@ -10,6 +10,8 @@ that could not load because a comment explaining the problem contained `${{ }}`.
 """
 
 import re
+import shutil
+import sys
 import unittest
 from pathlib import Path
 
@@ -84,6 +86,7 @@ class TestExpressionsAreComplete(unittest.TestCase):
         self.assertIn('[ "${FAIL_ON}" = "critical" ]', text)
         self.assertIn('echo "::warning::IOC matches are high severity; set fail-on: high to gate on them"', text)
 
+    @unittest.skipIf(sys.platform == "win32" or not shutil.which("bash"), "needs bash on PATH")
     def test_the_ioc_loop_runs_in_bash(self):
         """The input loop, run for real: blank lines and padding dropped, a comma kept."""
         import subprocess

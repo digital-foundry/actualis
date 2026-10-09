@@ -24,6 +24,9 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _timing import assert_linear  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("actualis", ROOT / "actualis.py")
 af = importlib.util.module_from_spec(spec)
@@ -701,17 +704,13 @@ class TestHardening(unittest.TestCase):
 
     def test_no_catastrophic_backtracking(self):
         """A 140k-character command took 164 SECONDS before input bounds."""
-        import time
-        for probe in (";".join(["echo x"] * 20000),
-                      "eyJ" + "A" * 30000 + "." + "B" * 30000,
-                      "curl " + "a" * 40000 + " -d x",
-                      "rm " + "-r" * 8000 + "f /"):
-            with self.subTest(n=len(probe)):
-                t = time.perf_counter()
-                af.audit_command(probe)
-                af.classify_secrets(probe)
-                af.redact(probe)
-                self.assertLess(time.perf_counter() - t, 2.0)
+        def all_three(probe):
+            af.audit_command(probe)
+            af.classify_secrets(probe)
+            af.redact(probe)
+        assert_linear(self, all_three, [
+            ("", "echo x;", 20000, ""), ("eyJ", "A", 30000, "." + "B" * 30000),
+            ("curl ", "a", 40000, " -d x"), ("rm ", "-r", 8000, "f /")], 2.0, epsilon=0.1)
 
     def test_terminal_escapes_are_stripped_from_evidence(self):
         """Escape sequences can HIDE the dangerous half of a command from the

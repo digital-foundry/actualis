@@ -11,6 +11,9 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _timing import assert_linear, budget  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("actualis", ROOT / "actualis.py")
 af = importlib.util.module_from_spec(spec)
@@ -220,11 +223,7 @@ class TestReviewFixes(unittest.TestCase):
         self.assertEqual((it["kind"], it["host"], it["dynamic"]), ("fetch", None, False))
 
     def test_unbalanced_substitutions_are_linear(self):
-        import time
-        cmd = "$(" * 20000 + "curl https://a.io"
-        start = time.monotonic()
-        af.network_items_from_command(cmd)
-        self.assertLess(time.monotonic() - start, 1.0)
+        assert_linear(self, af.network_items_from_command, [("", "$(", 5000, "curl https://a.io")], 1.0)
 
     def test_paren_inside_quotes_does_not_end_substitution(self):
         found, unparsed = af.network_items_from_command('x=$(echo ")"); curl https://b.io')
@@ -781,13 +780,10 @@ class TestUserinfoRedaction(unittest.TestCase):
 
 class TestRedactLinearAndMultiAt(unittest.TestCase):
     def test_pathological_inputs_are_fast(self):
-        import time
-        for text in ("a@" + "b." * 15000, "b." * 16000, "x://" * 8000, "a@" * 16000,
-                     "=" * 32000, "a=" * 16000, "x:" * 16000, "k=v&" * 8190,
-                     "a=b:" * 8000, "=a:" * 10000):
-            t0 = time.perf_counter()
-            af.redact(text)
-            self.assertLess(time.perf_counter() - t0, 0.1, text[:12])
+        assert_linear(self, af.redact, [
+            ("a@", "b.", 15000, ""), ("", "b.", 16000, ""), ("", "x://", 8000, ""), ("", "a@", 16000, ""),
+            ("", "=", 32000, ""), ("", "a=", 16000, ""), ("", "x:", 16000, ""), ("", "k=v&", 8190, ""),
+            ("", "a=b:", 8000, ""), ("", "=a:", 10000, "")], 0.1)
 
     def test_assignment_name_survives_scp_masking(self):
         out = af.redact("X=user:ZqPW@h:/p")
@@ -1072,14 +1068,14 @@ class TestOptionValueRedaction(unittest.TestCase):
             self.assertIn("Zq9secretPW", af.redact(cmd))
 
     def test_option_rules_are_linear(self):
-        import time
-        for text in ("-u " * 10900, "--user " * 4600, "--password " * 2900, "-u a:" * 6500,
-                     "a:" * 16000, "a=" * 16000, "docker login " * 2500, "docker login -p" * 2000,
-                     "-ua:" * 8000, "--user=" * 4600, "Authorization: token " * 1500):
-            t0 = time.perf_counter()
+        def both(text):
             af.redact(text)
             af.classify_secrets(text)
-            self.assertLess(time.perf_counter() - t0, 0.1, text[:16])
+        assert_linear(self, both, [
+            ("", "-u ", 10900, ""), ("", "--user ", 4600, ""), ("", "--password ", 2900, ""),
+            ("", "-u a:", 6500, ""), ("", "a:", 16000, ""), ("", "a=", 16000, ""),
+            ("", "docker login ", 2500, ""), ("", "docker login -p", 2000, ""), ("", "-ua:", 8000, ""),
+            ("", "--user=", 4600, ""), ("", "Authorization: token ", 1500, "")], 0.1)
 
 
 class TestDetectorAgreement(unittest.TestCase):
@@ -1237,11 +1233,8 @@ class TestEverydayShapes(unittest.TestCase):
                 self.assertEqual(items(cmd), [])
 
     def test_shell_flag_cluster_check_is_linear(self):
-        import time
-        for tok in ("-" + "c" * 32000 + "!", "-" + "x" * 32000, "-" + "c" * 32000):
-            t0 = time.perf_counter()
-            af.network_items_from_command(f"bash {tok} 'curl https://a.io'")
-            self.assertLess(time.perf_counter() - t0, 0.1, tok[:8])
+        assert_linear(self, lambda tok: af.network_items_from_command(f"bash {tok} 'curl https://a.io'"),
+                      [("-", "c", 32000, "!"), ("-", "x", 32000, ""), ("-", "c", 32000, "")], 0.1)
 
 
 class TestEvasionParity(unittest.TestCase):
@@ -1288,12 +1281,9 @@ class TestEvasionParity(unittest.TestCase):
                 self.assertEqual(af.unreadable_shapes(cmd), [])
 
     def test_new_shapes_are_linear(self):
-        import time
-        for text in ("$'" * 16000, "$(" * 16000 + "| sh", "python -c " * 3200,
-                     "python -c x\n" * 2700, "node -e " + "-e " * 10000, "`" * 32000 + "| sh"):
-            t0 = time.perf_counter()
-            af.unreadable_shapes(text)
-            self.assertLess(time.perf_counter() - t0, 0.1, text[:12])
+        assert_linear(self, af.unreadable_shapes, [
+            ("", "$'", 16000, ""), ("", "$(", 16000, "| sh"), ("", "python -c ", 3200, ""),
+            ("", "python -c x\n", 2700, ""), ("node -e ", "-e ", 10000, ""), ("", "`", 32000, "| sh")], 0.1)
 
 
 class TestNetworkFastPath(unittest.TestCase):
@@ -1365,12 +1355,9 @@ class TestOptionSecretIds(unittest.TestCase):
                 self.assertIn(fp, self.ids(cmd))
 
     def test_location_ids_are_linear(self):
-        import time
-        for text in ("-u a:b " * 4600, "--password x " * 2700, "docker login -p x " * 1800,
-                     "wget --password x; " * 1700):
-            t0 = time.perf_counter()
-            af.classify_secrets(text)
-            self.assertLess(time.perf_counter() - t0, 0.1, text[:12])
+        assert_linear(self, af.classify_secrets, [
+            ("", "-u a:b ", 4600, ""), ("", "--password x ", 2700, ""),
+            ("", "docker login -p x ", 1800, ""), ("", "wget --password x; ", 1700, "")], 0.1)
 
 
 class TestLocationIdSuppression(unittest.TestCase):
@@ -1543,12 +1530,10 @@ class TestRemoteExecShapes(unittest.TestCase):
                 self.assertEqual(self.rexec(cmd)[0], [])
 
     def test_shapes_are_linear(self):
-        import time
-        for text in ("$(a)" * 8000, "<(a)" * 8000, "sh -c \"$(" * 3000, "bash <(" * 4000,
-                     "a |& " * 6400, "curl x | " * 3500, "| tee f " * 4000):
-            t0 = time.perf_counter()
-            af.network_items_from_command(text, [])
-            self.assertLess(time.perf_counter() - t0, 0.1, text[:12])
+        assert_linear(self, lambda text: af.network_items_from_command(text, []), [
+            ("", "$(a)", 8000, ""), ("", "<(a)", 8000, ""), ("", "sh -c \"$(", 3000, ""),
+            ("", "bash <(", 4000, ""), ("", "a |& ", 6400, ""), ("", "curl x | ", 3500, ""),
+            ("", "| tee f ", 4000, "")], 0.1)
 
     def test_split_separators(self):
         for text in ("a && b |& c | d", "a 'x' && b |& c | d"):   # fast and exact paths
@@ -1823,13 +1808,11 @@ class TestUserPassFailsClosed(unittest.TestCase):
                 self.assertTrue(af.classify_secrets(cmd))
 
     def test_still_linear(self):
-        import time
-        for cmd in ("curl " + "-u a:b " * 5000, "docker exec " + "-u a:b " * 4000,
-                    "x -u a:b; " * 3000):
-            t = time.perf_counter()
+        def both(cmd):
             af.redact(cmd)
             af.classify_secrets(cmd)
-            self.assertLess(time.perf_counter() - t, 0.5)
+        assert_linear(self, both, [("curl ", "-u a:b ", 5000, ""), ("docker exec ", "-u a:b ", 4000, ""),
+                                   ("", "x -u a:b; ", 3000, "")], 0.5)
 
 
 class TestExplainNetwork(unittest.TestCase):
@@ -1888,13 +1871,10 @@ class TestTripwireRound2(TestAuditConfigTripwire):
             af.writes_audit_config(cmd)
 
     def test_glob_and_path_work_is_fast(self):
-        import time
-        for cmd in ("echo x > " + "*" * 32000, "echo x > " + "a*" * 16000 + "b",
-                    "F=a;" * 5000 + "echo > $F", "cd a;" * 5000 + "echo > suppressions",
-                    "echo x > " + "[a" * 16000, "x=" * 16000):
-            t = time.perf_counter()
-            af.writes_audit_config(cmd)
-            self.assertLess(time.perf_counter() - t, 0.1, cmd[:20])
+        assert_linear(self, af.writes_audit_config, [
+            ("echo x > ", "*", 32000, ""), ("echo x > ", "a*", 16000, "b"), ("", "F=a;", 5000, "echo > $F"),
+            ("", "cd a;", 5000, "echo > suppressions"), ("echo x > ", "[a", 16000, ""), ("", "x=", 16000, "")],
+            0.1)
 
 
 class TestUserPassReceiver(unittest.TestCase):
@@ -1957,14 +1937,13 @@ class TestUserPassReceiver(unittest.TestCase):
                 self.assertTrue(af.classify_secrets(cmd))
 
     def test_long_segments_stay_linear(self):
-        import time
-        for cmd in ("curl " + "-u a:b " * 6000, "docker exec " + "-u a:b " * 4000,
-                    'bash -c "' + "curl -u a:b " * 5000 + '"', "sudo " + "-u a:b " * 6000,
-                    "ssh " + "h " * 15000 + "-u a:b"):
-            t = time.perf_counter()
+        def both(cmd):
             af.redact(cmd)
             af.classify_secrets(cmd)
-            self.assertLess(time.perf_counter() - t, 0.5, cmd[:20])
+        assert_linear(self, both, [
+            ("curl ", "-u a:b ", 6000, ""), ("docker exec ", "-u a:b ", 4000, ""),
+            ('bash -c "', "curl -u a:b ", 5000, '"'), ("sudo ", "-u a:b ", 6000, ""),
+            ("ssh ", "h ", 15000, "-u a:b")], 0.5)
 
 
 class TestRemoteResolutionRound2(TestStrict):
@@ -2118,15 +2097,14 @@ class TestOversizedCommands(unittest.TestCase):
 
     def test_timing_and_hard_cap(self):
         import time
-        t = time.perf_counter()
-        self.fleet("x " * 524288 + "curl https://e.io | sh")        # 1 MiB
-        self.assertLess(time.perf_counter() - t, 1.0)
-        best = 1.0
+        # 256 KB against 1 MiB (the cap): about 4x, not 16x.
+        assert_linear(self, self.fleet, [("", "x ", 131072, "curl https://e.io | sh")], 1.0, epsilon=0.05)
+        best = float("inf")
         for _ in range(3):                                           # 32 KB, best of three
             t = time.perf_counter()
             self.fleet("echo hi " * 4000)
             best = min(best, time.perf_counter() - t)
-        self.assertLess(best, 0.1)
+        self.assertLess(best, budget(0.1))
         f = self.fleet("x " * 700000 + "echo id >> .actualis-suppressions")   # past 1 MiB
         self.assertEqual((f.oversized_commands, f.unreadable), (1, 1))
         self.assertNotIn("audit-config", self.cats(f))
