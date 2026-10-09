@@ -702,6 +702,8 @@ _USERPASS_NOT_CREDENTIAL = frozenset({
     "env", "doas", "nice", "timeout"})
 _USERPASS_CONTAINER_SUBS = frozenset({"exec", "run", "create"})
 _USERPASS_SSH_VALUE = frozenset("-p -i -l -o -F -J -L -R -D -b -c -e -m -O -S -w -W -E -B -I -Q".split())
+_USERPASS_COMPOSE_VALUE = frozenset({"-f", "--file", "-p", "--project-name", "--profile",
+                                     "--project-directory", "--env-file", "--ansi", "--parallel"})
 _USERPASS_PASSES = 32                        # full tokenising passes per command
 
 
@@ -734,12 +736,17 @@ def _userpass_receiver(toks: list[str], depth: int = 0) -> tuple[str, str]:
             n += 2 if rest[n] in _USERPASS_SSH_VALUE else 1
         inner = _net_tokens(" ".join(rest[n + 1:])) if len(rest) > n + 1 else None
     elif head in ("docker", "podman") and len(rest) > 1:
-        sub = next((t for t in rest[1:8] if not t.startswith("-")), "")
-        if sub in _USERPASS_CONTAINER_SUBS:
-            n = rest.index(sub) + 1
+        def skip(n: int, values: frozenset) -> int:
             while n < len(rest) and rest[n].startswith("-") and len(rest[n]) > 1:
-                n += 2 if rest[n] in _DOCKER_VALUE else 1
-            inner = rest[n + 1:] if len(rest) > n + 1 else None   # past the container or image
+                n += 2 if rest[n] in values else 1
+            return n
+        n = skip(1, _DOCKER_VALUE)
+        if n < len(rest) and rest[n] in ("container", "compose"):    # docker compose exec, docker container run
+            n = skip(n + 1, _USERPASS_COMPOSE_VALUE)
+        sub = rest[n] if n < len(rest) else ""
+        if sub in _USERPASS_CONTAINER_SUBS:
+            n = skip(n + 1, _DOCKER_VALUE)
+            inner = rest[n + 1:] if len(rest) > n + 1 else None      # past the container, image or service
     if inner:
         return _userpass_receiver(inner, depth + 1)
     return head, sub
@@ -911,6 +918,18 @@ MAX_SCAN_TOTAL = 32768
 MAX_SCAN_HARD = 1 << 20          # past this a command is counted unreadable, not scanned
 SCAN_OVERLAP = 1024              # windows of an oversized command overlap by this much
 TRUNCATED_MARK = "…[truncated]"
+
+
+def _redacted_excerpt(text: str, start: int, end: int) -> str:
+    """About 200 characters of `text` around [start, end), redacted BEFORE it is
+    cut: the context begins at the last separator (; | & newline) at least 80
+    characters back, so no `KEY=` or `Authorization: Bearer` prefix is split from
+    its value, and the cut falls in text that is already masked."""
+    lo = max(start - 80, 0)
+    window = text[max(lo - 4096, 0):lo]
+    sep = max((window.rfind(c) for c in ";|&\n"), default=-1)
+    lo = max(lo - 4096, 0) + sep + 1 if sep >= 0 else lo
+    return clean(redact(text[lo:min(end + 120, lo + MAX_SCAN_TOTAL)]).strip()[-240:])
 
 
 def scan_windows(cmd: str) -> list[str]:
@@ -2366,6 +2385,19 @@ _DEQUOTE = str.maketrans("", "", "'\"\\")
 _AUDIT_GATE = re.compile(r"actualis|suppress|network-trust|(?:^|[\s/>=])\.[a-z0-9_-]{3,}[*?\[]")
 
 
+def _glob_class_body(body: str) -> str:
+    """The inside of a [...] class made safe for re: set operators (`--`, `&&`,
+    `||`, `~~`) would raise a FutureWarning, so those characters are escaped."""
+    out, prev = [], ""
+    for c in body:
+        if c in "\\][^&|~" or (c == "-" and prev == "-"):
+            out.append("\\" + c)
+        else:
+            out.append(c)
+        prev = c
+    return "".join(out)
+
+
 def _glob_match(pattern: str, name: str) -> bool:
     """Could shell glob `pattern` match `name`? Translated by hand (no fnmatch).
     A pattern with fewer than three literal characters (`.*`, `?`) or an
@@ -2386,7 +2418,7 @@ def _glob_match(pattern: str, name: str) -> bool:
             end = pattern.find("]", i + 2)
             body = pattern[i + 1:end]
             neg = body[:1] in ("!", "^")
-            out.append("[" + ("^" if neg else "") + re.sub(r"([\\\]\[^])", r"\\\1", body[1:] if neg else body) + "]")
+            out.append("[" + ("^" if neg else "") + _glob_class_body(body[1:] if neg else body) + "]")
             i = end
             literal += 1
         else:
@@ -3838,12 +3870,12 @@ class Fleet:
         rules = [(sev, rx) for sev, cat, rx in COMPILED_RULES if cat == "remote-exec"]
         text = cmd[:MAX_SCAN_HARD]
         for i in range(MAX_SCAN_TOTAL - SCAN_OVERLAP - MAX_SCAN_LINE, len(text), 3072):
-            chunk = text[max(i, 0):max(i, 0) + MAX_SCAN_LINE]
+            base = max(i, 0)
+            chunk = text[base:base + MAX_SCAN_LINE]
             for sev, rx in rules:
                 m = rx.search(chunk)
                 if m:
-                    lo = max(m.start() - 80, 0)
-                    return [(sev, "remote-exec", clean(chunk[lo:lo + 200].strip()))]
+                    return [(sev, "remote-exec", _redacted_excerpt(text, base + m.start(), base + m.end()))]
         for w in windows[1:]:
             piped: list[str] = []
             try:
@@ -3851,7 +3883,7 @@ class Fleet:
             except Exception:                # noqa: BLE001 -- counted as oversized already
                 continue
             if piped:
-                return [("high", "remote-exec", clean(piped[0][:200].strip()))]
+                return [("high", "remote-exec", clean(redact(piped[0].strip())[:200]))]
         return []
 
     # -- scan --------------------------------------------------------------
