@@ -286,3 +286,141 @@ class TestLoadErrors(IocFiles, unittest.TestCase):
         xs = ioc.packages[("npm", "x")]
         self.assertEqual([(e.source, e.line) for e in xs], [(0, 1), (1, 1)])
         self.assertEqual([Path(s["path"]).name for s in ioc.sources], ["b.txt", "a.txt"])
+
+
+def osv(name="evil", eco="npm", versions=None, ranges=None, rid="MAL-2025-6022", **extra):
+    affected = {"package": {"name": name, "ecosystem": eco}}
+    if versions is not None:
+        affected["versions"] = versions
+    if ranges is not None:
+        affected["ranges"] = ranges
+    rec = {"id": rid, "affected": [affected]}
+    rec.update(extra)
+    return rec
+
+
+def rng(*events, kind="SEMVER"):
+    return {"type": kind, "events": [dict([e]) for e in events]}
+
+
+class TestOsv(IocFiles, unittest.TestCase):
+    def jsonl(self, *records, name="mal.jsonl"):
+        return self.load("\n".join(json.dumps(r) for r in records) + "\n", name)
+
+    def contains(self, entry, version):
+        return af._ioc_spec_contains(entry.eco, entry.spec, version)
+
+    def test_versions_list(self):                                       # T-OSV-1
+        rec = osv("eslint-config-prettier", versions=["8.10.1", "9.1.1", "10.1.6", "10.1.7"],
+                  summary="x", references=[{"type": "WEB", "url": "https://evil.example/x"}])
+        ioc = self.load(json.dumps(rec), "MAL-2025-6022.json")
+        e = only(ioc)
+        self.assertEqual(len(e.spec), 4)
+        self.assertEqual(e.spec_text, "=8.10.1||=9.1.1||=10.1.6||=10.1.7")
+        self.assertEqual((e.ref, e.line, ioc.sources[0]["format"]), ("MAL-2025-6022", None, "osv-json"))
+        self.assertTrue(self.contains(e, "10.1.6"))
+        self.assertFalse(self.contains(e, "10.1.8"))
+
+    def test_introduced_zero_is_any_version(self):                      # T-OSV-2
+        self.assertIsNone(only(self.jsonl(osv(ranges=[rng(("introduced", "0"))]))).spec)
+        self.assertIsNone(only(self.jsonl(osv())).spec)
+
+    def test_ranges(self):                                              # T-OSV-3
+        e = only(self.jsonl(osv(ranges=[rng(("fixed", "1.5.0"), ("introduced", "1.0.0"))])))
+        self.assertEqual(e.spec_text, ">=1.0.0,<1.5.0")
+        self.assertTrue(self.contains(e, "1.4.9"))
+        self.assertFalse(self.contains(e, "1.5.0"))
+        self.assertFalse(self.contains(e, "0.9.0"))
+        e = only(self.jsonl(osv(ranges=[rng(("introduced", "1.0.0"), ("last_affected", "1.2.0"))])))
+        self.assertEqual(e.spec_text, ">=1.0.0,<=1.2.0")
+        self.assertTrue(self.contains(e, "1.2.0"))
+        e = only(self.jsonl(osv(ranges=[rng(("introduced", "0"), ("fixed", "2.0.0"),
+                                            ("introduced", "3.0.0"))])))
+        self.assertEqual(e.spec_text, "<2.0.0||>=3.0.0")
+        self.assertTrue(self.contains(e, "3.1.0"))
+        self.assertFalse(self.contains(e, "2.5.0"))
+
+    def test_limit(self):                                               # T-OSV-4
+        ioc = self.jsonl(osv(ranges=[rng(("introduced", "1.0.0"), ("limit", "2.0.0"))]))
+        self.assertEqual(only(ioc).spec_text, ">=1.0.0")
+        self.assertEqual(ioc.sources[0]["ranges_with_limit"], 1)
+
+    def test_git_range(self):                                           # T-OSV-5
+        ioc = self.jsonl(osv(versions=["1.0.0"], ranges=[rng(("introduced", "abc"), kind="GIT")]))
+        self.assertEqual((ioc.sources[0]["ranges_git"], only(ioc).spec_text), (1, "=1.0.0"))
+
+    def test_withdrawn(self):                                           # T-OSV-6
+        ioc = self.jsonl(osv(withdrawn="2025-01-01T00:00:00Z"), osv("other"))
+        self.assertEqual((ioc.sources[0]["withdrawn"], only(ioc).name), (1, "other"))
+        ioc = self.jsonl(osv(withdrawn=None))
+        self.assertEqual(ioc.sources[0]["withdrawn"], 0)
+
+    def test_malformed_is_counted_never_fatal(self):                    # T-OSV-7
+        recs = [osv("ok"), [1, 2], {"id": "X", "affected": [{"package": {"ecosystem": "npm"}}]},
+                osv("ok2", ranges=[rng(("introduced", "1.0.0"), ("bogus", "2.0.0"))]),
+                osv("ok3", ranges=[{"type": "WHAT", "events": []}]),
+                {"id": "Y", "affected": []}, osv("Bad Name")]
+        ioc = self.jsonl(*recs)
+        s = ioc.sources[0]
+        self.assertEqual((s["skipped"], s["first_skipped_line"], s["skipped_ranges"]), (4, 2, 2))
+        self.assertEqual(sorted(n for _, n in ioc.packages), ["ok", "ok2", "ok3"])
+
+    def test_shapes_agree(self):                                        # T-OSV-8
+        recs = [osv("a", versions=["1.0.0"]), osv("b", ranges=[rng(("introduced", "1.0.0"))])]
+        one_ = self.load(json.dumps(recs[0]), "one.json")
+        arr = self.load(json.dumps(recs), "arr.json")
+        lines = self.jsonl(*recs)
+
+        def shape(ioc):
+            return sorted((e.eco, e.name, e.spec, e.ref) for e in entries(ioc))
+        self.assertEqual(shape(arr), shape(lines))
+        self.assertEqual(shape(one_), shape(arr)[:1])
+        self.assertEqual(arr.sources[0]["format"], "osv-json")
+        self.assertEqual(lines.sources[0]["format"], "osv-jsonl")
+        self.fails('{"id": "x"}\n{"id": \n', "line 2")
+        self.fails('[{"id": "x"}, ', "byte offset")
+
+    def test_extra_data_falls_back_to_jsonl(self):                      # T-OSV-8
+        a, b = osv("a", versions=["1.0.0"]), osv("b", versions=["2.0.0"])
+        ioc = self.load(json.dumps(a) + "\n" + json.dumps(b) + "\n", "x.json")
+        self.assertEqual(sorted(e.name for e in entries(ioc)), ["a", "b"])
+        self.assertEqual(ioc.sources[0]["format"], "osv-jsonl")
+        self.assertEqual([e.line for e in entries(ioc)], [1, 2])
+
+    def test_ecosystem_mapping_is_exact(self):                          # T-OSV-9
+        recs = [osv("a", "npm"), osv("b", "PyPI"), osv("c", "crates.io"), osv("github.com/x/d", "Go"),
+                osv("e", "pypi"), osv("f", "RubyGems"), osv("g", "Debian:12"), osv("h", "Foo")]
+        ioc = self.jsonl(*recs)
+        self.assertEqual(sorted(ioc.packages), [("crates", "c"), ("go", "github.com/x/d"),
+                                                ("npm", "a"), ("pypi", "b")])
+        self.assertEqual(ioc.sources[0]["not_checkable"], {"pypi": 1, "rubygems": 1, "debian": 1, "foo": 1})
+
+    def test_unparseable_pypi_range_is_undecidable(self):               # T-OSV-10
+        e = only(self.jsonl(osv("x", "PyPI", ranges=[rng(("introduced", "1.0"), ("fixed", "not-a-version"),
+                                                         kind="ECOSYSTEM")])))
+        self.assertIsNone(self.contains(e, "1.5"))
+        e = only(self.jsonl(osv("x", "PyPI", ranges=[rng(("introduced", "1.0"), ("fixed", "2.0"),
+                                                         kind="ECOSYSTEM")])))
+        self.assertTrue(self.contains(e, "1.5"))
+        self.assertFalse(self.contains(e, "2.0.post1"))
+
+    def test_references_make_no_host_entry(self):                       # T-OSV-11
+        ioc = self.jsonl(osv(references=[{"type": "WEB", "url": "https://evil.example/"}]))
+        self.assertEqual((ioc.host_suffix, ioc.host_exact), ({}, {}))
+        self.assertEqual(ioc.sources[0]["entries"], {"package": 1, "host": 0})
+
+    def test_over_the_whole_document_cap(self):                         # T-OSV-12
+        recs = [osv(f"p{i}", versions=["1.0.0"]) for i in range(30)]
+        old = af.IOC_WHOLE_JSON_MAX
+        af.IOC_WHOLE_JSON_MAX = 1024
+        try:
+            self.fails(json.dumps(recs), "convert to JSONL", "jq -c")
+            ioc = self.load("\n".join(json.dumps(r) for r in recs) + "\n", "big.json")
+            self.assertEqual(len(entries(ioc)), 30)
+            self.assertEqual(ioc.sources[0]["format"], "osv-jsonl")
+            self.fails("npm:x\n" * 300, "over 64 MiB")
+            whole = "\n".join(json.dumps(r) for r in recs) + "\n"
+            self.assertEqual(ioc.sources[0]["sha256"],
+                             __import__("hashlib").sha256(whole.encode()).hexdigest())
+        finally:
+            af.IOC_WHOLE_JSON_MAX = old

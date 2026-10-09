@@ -2794,9 +2794,10 @@ _IOC_SEMVER = re.compile(
     r"(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
     r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?"
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?", re.ASCII)
-# PEP 440 Appendix B, VERSION_PATTERN, anchored by fullmatch.
+# PEP 440 Appendix B, VERSION_PATTERN, anchored by fullmatch. The surrounding
+# whitespace it allows is not: a version reaches output, and a list has no reason to pad one.
 _IOC_PEP440 = re.compile(r"""
-    \s*v?
+    v?
     (?:
         (?:(?P<epoch>[0-9]+)!)?
         (?P<release>[0-9]+(?:\.[0-9]+)*)
@@ -2805,7 +2806,7 @@ _IOC_PEP440 = re.compile(r"""
         (?P<dev>[-_\.]?(?P<dev_l>dev)[-_\.]?(?P<dev_n>[0-9]+)?)?
     )
     (?:\+(?P<local>[a-z0-9]+(?:[-_\.][a-z0-9]+)*))?
-    \s*""", re.VERBOSE | re.IGNORECASE | re.ASCII)
+    """, re.VERBOSE | re.IGNORECASE | re.ASCII)
 _IOC_PEP440_PRE = {"a": 0, "alpha": 0, "b": 1, "beta": 1, "c": 2, "rc": 2, "pre": 2, "preview": 2}
 _IOC_OCI_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _IOC_OCI_TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
@@ -3235,18 +3236,242 @@ def _ioc_source(path: Path) -> dict:
             "ranges_git": 0, "ranges_with_limit": 0, "skipped_ranges": 0}
 
 
+_IOC_OSV_ECOSYSTEMS = {"npm": "npm", "PyPI": "pypi", "crates.io": "crates", "Go": "go"}
+_IOC_OSV_EVENTS = ("introduced", "fixed", "last_affected", "limit")
+_IOC_BOM = b"\xef\xbb\xbf"
+
+
+def _ioc_skip(source: dict, line: int | None) -> None:
+    source["skipped"] += 1
+    if source["first_skipped_line"] is None and line is not None:
+        source["first_skipped_line"] = line
+
+
+def _ioc_osv_range(eco: str, kind: str, events: object, source: dict) -> list | str | None:
+    """One OSV SEMVER or ECOSYSTEM range as clauses, _IOC_UNDECIDABLE when an
+    event version does not order, or None when the range is dropped.
+
+    Events are sorted by version; introduced opens an interval, fixed closes
+    it below and last_affected at, the earliest close winning. limit is
+    ignored, which leaves the interval open above: over-matching is the safe
+    direction. An empty clause, (), means any version."""
+    if not isinstance(events, list):
+        source["skipped_ranges"] += 1
+        return None
+    parsed = []
+    for ev in events:
+        if not isinstance(ev, dict) or len(ev) != 1:
+            source["skipped_ranges"] += 1
+            return None
+        [(k, v)] = ev.items()
+        if k not in _IOC_OSV_EVENTS or not isinstance(v, str):
+            source["skipped_ranges"] += 1
+            return None
+        parsed.append((k, v))
+    if any(k == "limit" for k, _ in parsed):
+        source["ranges_with_limit"] += 1
+    check = _ioc_semver_key if kind == "SEMVER" or eco != "pypi" else _ioc_pep440_key
+    keyed = []
+    for k, v in parsed:
+        if k == "limit":
+            continue
+        if k == "introduced" and v == "0":
+            keyed.append(((0,), 0, k, v, None))
+            continue
+        key = _ioc_version_key(eco, v) if check(v) is not None else None
+        if key is None:
+            return _IOC_UNDECIDABLE
+        keyed.append(((1, key), 0 if k == "introduced" else 1, k, v, key))
+    keyed.sort(key=lambda t: t[:2])
+    clauses: list = []
+    low, is_open = None, False
+    for _, _, k, v, key in keyed:
+        if k == "introduced":
+            if not is_open:
+                is_open, low = True, (None if key is None else (">=", key, v))
+        elif is_open:
+            high = ("<" if k == "fixed" else "<=", key, v)
+            clauses.append((low, high) if low else (high,))
+            is_open = False
+    if is_open:
+        clauses.append((low,) if low else ())
+    if not clauses:                          # no introduced: the schema requires one
+        source["skipped_ranges"] += 1
+        return None
+    return clauses
+
+
+def parse_ioc_osv(records, ioc: IocSet, src: int, label: str) -> None:
+    """OSV records, as (line or None, record) pairs. Malformed records and
+    affected[] elements are counted and skipped, never fatal; an ecosystem
+    this inventory cannot see is counted as not checkable. references[] never
+    become host entries."""
+    source = ioc.sources[src]
+    nc = source["not_checkable"]
+    for line, rec in records:
+        if not isinstance(rec, dict):
+            _ioc_skip(source, line)
+            continue
+        if rec.get("withdrawn") is not None:
+            source["withdrawn"] += 1
+            continue
+        rid = rec.get("id")
+        ref = rid if isinstance(rid, str) and _IOC_ATTR_VALUE["id"].fullmatch(rid) else None
+        affected = rec.get("affected")
+        if not isinstance(affected, list) or not affected:
+            _ioc_skip(source, line)
+            continue
+        for aff in affected:
+            pkg = aff.get("package") if isinstance(aff, dict) else None
+            name = pkg.get("name") if isinstance(pkg, dict) else None
+            eco_text = pkg.get("ecosystem") if isinstance(pkg, dict) else None
+            if not (isinstance(name, str) and name and isinstance(eco_text, str) and eco_text):
+                _ioc_skip(source, line)
+                continue
+            eco = _IOC_OSV_ECOSYSTEMS.get(eco_text)
+            if eco is None:
+                key = re.sub(r"[^a-z0-9.-]", "-", eco_text.lower().split(":", 1)[0])[:32] or "-"
+                nc[key] = nc.get(key, 0) + 1
+                continue
+            norm = _ioc_norm_name(eco, name) if len(name) <= IOC_NAME_MAX else ""
+            if not _ioc_valid_name(eco, norm):
+                _ioc_skip(source, line)
+                continue
+            clauses: list = []
+            usable = any_version = False
+            versions = aff.get("versions")
+            for v in versions if isinstance(versions, list) else ():
+                # versions[] is the authority's own strings: kept even when they do not
+                # parse, compared as text then. A string that could not be printed is dropped.
+                if isinstance(v, str) and _IOC_VERSION_CHARS.fullmatch(v):
+                    k = _ioc_version_key(eco, v)
+                    clauses.append((("=", k, v if k is not None else v.removeprefix("v")),))
+                    usable = True
+            ranges = aff.get("ranges")
+            for r in ranges if isinstance(ranges, list) else ():
+                kind = r.get("type") if isinstance(r, dict) else None
+                if kind == "GIT":
+                    source["ranges_git"] += 1
+                    continue
+                if kind not in ("SEMVER", "ECOSYSTEM"):
+                    source["skipped_ranges"] += 1
+                    continue
+                out = _ioc_osv_range(eco, kind, r.get("events"), source)
+                if out is None:
+                    continue
+                usable = True
+                if out == _IOC_UNDECIDABLE:
+                    clauses.append(_IOC_UNDECIDABLE)
+                    continue
+                for c in out:
+                    if c == ():
+                        any_version = True
+                    else:
+                        clauses.append(c)
+            spec = None if any_version or not usable else tuple(clauses)
+            try:
+                ioc.add(IocEntry("package", eco, norm, spec, _ioc_spec_text(spec), None, "", False,
+                                 ref, None, None, None, src, line))
+            except _IocError as exc:
+                raise ValueError(f"--ioc {label}" + (f" line {line}" if line else "") + f": {exc}") from None
+
+
+def _ioc_jsonl(lines, label: str):
+    """(line, record) for each non-blank JSONL line."""
+    for n, raw in lines:
+        if not raw.strip():
+            continue
+        try:
+            yield n, json.loads(_ioc_decode(raw, n))
+        except _IocError as exc:
+            raise ValueError(f"--ioc {label} line {n}: {exc}") from None
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"--ioc {label} line {n}: invalid JSON ({exc.msg}) — one OSV record per line") from None
+        except RecursionError:
+            raise ValueError(f"--ioc {label} line {n}: JSON nested too deeply") from None
+
+
+def _ioc_stream(fh, digest, label: str):
+    """(line, bytes) from a file too big to read whole, hashing as it goes.
+    readline is bounded, so a file with no newline cannot fill memory."""
+    n = total = 0
+    while True:
+        raw = fh.readline(IOC_LINE_MAX + 3)
+        if not raw:
+            return
+        n += 1
+        total += len(raw)
+        digest.update(raw)
+        if total > IOC_FILE_MAX:
+            raise ValueError(f"--ioc {label}: over 1 GiB")
+        if n == 1:
+            raw = raw.removeprefix(_IOC_BOM)
+        raw = raw[:-1] if raw.endswith(b"\n") else raw
+        yield n, raw[:-1] if raw.endswith(b"\r") else raw
+
+
+def _ioc_peek(fh) -> bytes:
+    """The first byte that is not a BOM or whitespace, then rewind."""
+    first, head = b"", True
+    while not first:
+        chunk = fh.read(1 << 16)
+        if not chunk:
+            break
+        if head:
+            chunk, head = chunk.removeprefix(_IOC_BOM), False
+        first = chunk.lstrip(b" \t\r\n")[:1]
+    fh.seek(0)
+    return first
+
+
+def _ioc_osv_document(data: bytes, first: bytes, label: str):
+    """Records from an OSV file read whole: an object, an array, or JSONL
+    when an object is followed by "Extra data"."""
+    body = data.removeprefix(_IOC_BOM)
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"--ioc {label} byte offset {exc.start + len(data) - len(body)}: not UTF-8") from None
+    try:
+        doc = json.loads(text)
+    except json.JSONDecodeError as exc:
+        if first == b"{" and exc.msg == "Extra data":
+            return _ioc_jsonl(_ioc_lines(data), label), "osv-jsonl"
+        offset = len(text[:exc.pos].encode("utf-8")) + len(data) - len(body)
+        raise ValueError(f"--ioc {label} byte offset {offset}: invalid JSON ({exc.msg})") from None
+    except RecursionError:
+        raise ValueError(f"--ioc {label}: JSON nested too deeply") from None
+    return ((None, r) for r in (doc if isinstance(doc, list) else [doc])), "osv-json"
+
+
 def _ioc_load_file(path: Path, ioc: IocSet, src: int, label: str) -> None:
+    """One file: detect the format from its first byte, parse, hash every byte."""
     source = ioc.sources[src]
     digest = hashlib.sha256()
     with path.open("rb") as fh:
         st = os.fstat(fh.fileno())
         if st.st_size > IOC_FILE_MAX:
             raise ValueError(f"--ioc {label}: over 1 GiB")
-        data = fh.read(IOC_WHOLE_JSON_MAX + 1)
-        if len(data) > IOC_WHOLE_JSON_MAX:
-            raise ValueError(f"--ioc {label}: over 64 MiB")
-        digest.update(data)
-        parse_ioc_lines(data, ioc, src, label)
+        if st.st_size > IOC_WHOLE_JSON_MAX:
+            first = _ioc_peek(fh)
+            if first == b"[":
+                raise ValueError(f"--ioc {label}: an OSV array over 64 MiB — convert to JSONL: "
+                                 "jq -c '.[]' f > f.jsonl")
+            if first != b"{":
+                raise ValueError(f"--ioc {label}: over 64 MiB — split the file")
+            source["format"] = "osv-jsonl"
+            parse_ioc_osv(_ioc_jsonl(_ioc_stream(fh, digest, label), label), ioc, src, label)
+        else:
+            data = fh.read(IOC_WHOLE_JSON_MAX + 1)
+            if len(data) > IOC_WHOLE_JSON_MAX:
+                raise ValueError(f"--ioc {label}: over 64 MiB — split the file")
+            digest.update(data)
+            first = _ioc_first_byte(data)
+            if first in (b"{", b"["):
+                records, source["format"] = _ioc_osv_document(data, first, label)
+                parse_ioc_osv(records, ioc, src, label)
+            else:
+                parse_ioc_lines(data, ioc, src, label)
     source["sha256"] = digest.hexdigest()
     ioc.mtimes.append(st.st_mtime)
 
