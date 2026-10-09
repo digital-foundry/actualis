@@ -3835,7 +3835,9 @@ class Fleet:
             "program": prog,
             "project": project,
             "when": ts.isoformat() if ts else None,
-            "evidence": evidence[:240],
+            # Stored whole (up to one scan line): redacted first, cut to 240 on the way
+            # out, so a token is never cut short of the length its pattern needs.
+            "evidence": evidence[:MAX_SCAN_LINE],
             "had_secret": contains_secret(cmd),
             "suppressed": suppressed,
             "suppressed_reason": self.suppressions.get(fid, ""),
@@ -7760,9 +7762,8 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
             "commands": dict(fleet.bash_first_token.most_common(50)),
             "flag_counts": dict(fleet.flag_counts),
             "oversized_commands": fleet.oversized_commands,
-            "flags": fleet.flags if raw else [
-                {**f, "evidence": redact(f["evidence"])} for f in fleet.flags
-            ],
+            "flags": [{**f, "evidence": (f["evidence"] if raw else redact(f["evidence"]))[:240]}
+                      for f in fleet.flags],
         },
         "coach": [{"id": f.id, "severity": f.severity, "title": f.title,
                    "evidence": f.evidence, "action": f.action, "impact": f.impact}
