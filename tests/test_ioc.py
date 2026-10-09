@@ -1329,6 +1329,23 @@ class TestDocsAndSelfCheck(unittest.TestCase):
             self.assertIn(word, json_doc)
 
 
+class TestChangelog(unittest.TestCase):
+    """Wave D review I4: everything since 0.2.2 that changes counts or exit
+    codes is in the Unreleased section."""
+
+    def test_unreleased_lists_what_changes_a_gate(self):
+        text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        unreleased = text[text.index("## Unreleased"):text.index("## 0.2.2")]
+        for needle in ("bash <(curl", "source <(", 'sh -c "$(curl', "cu''rl", "|& sh", "later stage",
+                       "--fail-on high", "exit 3", "location", "covers more than one value",
+                       "distinct_values", "exposed_secrets", "unreadable_commands", "ANSI-C",
+                       "bash.oversized_commands", "oversized-command", "audit-config", "uid:gid",
+                       "Current-generation pricing", "report_sha256", "--ioc", "network-ioc",
+                       "--network-strict", "the transcripts show"):
+            self.assertIn(needle, unreleased, needle)
+        self.assertNotIn("every download and fetch the agents made", unreleased)
+
+
 class TestPerformance(FleetCase, unittest.TestCase):                    # T-PERF-1
     """Section 11 budgets: 2 s to load 100k entries and 1 s to match 10k items
     on the dev Mac; the loose CI ceilings are 10 s and 5 s."""
