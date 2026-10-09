@@ -241,6 +241,7 @@ multiplier applied to each · `BY AGENT` · `BY MODEL` · `CACHE EFFICIENCY` ·
 | [docs/findings.md](docs/findings.md) | every coach finding `AF001`–`AF011`: what it means, when it fires, what to do |
 | [docs/secrets.md](docs/secrets.md) | which credential types are detected, and what is deliberately not flagged |
 | [docs/json.md](docs/json.md) | `--json` schema |
+| [docs/ioc.md](docs/ioc.md) | `--ioc`: the known-bad list format, OSV input, verdicts and the CI recipe |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | ground rules, and the CLA note that keeps dual licensing possible |
 | [SECURITY.md](SECURITY.md) | what counts as a vulnerability, and how to report one |
 | [CHANGELOG.md](CHANGELOG.md) | what changed |
@@ -571,6 +572,25 @@ rules as much as adding them. A rule matching `>/dev/null 2>&1` as "audit
 tampering" fired 1,206 times at essentially 100% false positive, so it's gone; a
 noisy rule destroys trust in the rules that matter. Current flag rate is about 3.8%.
 
+## Did an agent install the bad version?
+
+During a supply-chain incident, `--ioc FILE` matches every download in the
+network inventory against a known-bad list, offline:
+
+```sh
+actualis --ioc iocs.txt --fail-on high
+```
+
+The list is a simple line format (`npm:@ctrl/tinycolor@=4.1.1||=4.1.2`,
+`pypi:name`, `host:evil.example`) or OSV JSON/JSONL, such as the OpenSSF
+malicious-packages records. A match is a `high` finding (`network-ioc`). A
+listed name whose version cannot be decided (`npm i x@latest`, a private
+registry) is `medium` (`network-ioc-unresolved`), never clean. Refused calls
+are listed and never fail the gate, and a trusted source never exempts a
+match. The list is read only when named; nothing is fetched. No match is not
+"not affected": lockfile installs, scripts and postinstall hooks are out of
+sight. See [docs/ioc.md](docs/ioc.md) and `actualis --explain ioc`.
+
 ## Using it in CI
 
 An exit code is the smallest possible integration, and it fits the read-only
@@ -627,6 +647,7 @@ The action's inputs:
 | `fail-on` | `critical` | fail the job at or above this level: `critical`, `high` or `any`; `none` reports without gating (a run that could not complete still prints a `::warning::`) |
 | `network-strict` | `false` | `"true"` makes every unasked download from a source not trusted a medium finding, which `fail-on: any` then fails on |
 | `network-trust` | empty | comma-separated trusted download sources, host or host/path (for example `npmjs.org,github.com/your-org`); added to `.actualis-network-trust` |
+| `ioc` | empty | paths to known-bad lists (actualis-ioc lines or OSV), one per line, each passed as `--ioc`. Fetch them in a step after the agent step, outside the workspace (for example `$RUNNER_TEMP`). Matches are `high`, so set `fail-on: high` to gate on them; with the default `critical` the action prints a warning |
 | `version` | latest | actualis version to install; pin it |
 | `json-report` | empty | path to write the redacted `--json` report to, for use as a `--diff` baseline |
 | `summary` | `true` | write the report to the job summary; set `false` on a public repository if command text alone is sensitive |
@@ -637,6 +658,7 @@ The action's outputs are available whether or not the gate fires:
 |---|---|
 | `exit-code` | `0` clean, `3` findings at or above `fail-on`, `1` could not run, `2` usage error (for example a bad `network-trust` entry) |
 | `findings` | coach findings plus unsuppressed credentials |
+| `ioc-matches` | unsuppressed `--ioc` matches (`network.ioc.matches[]` rows with verdict `match`, not refused); `0` without `ioc` |
 
 `--ci-log` reads that documented output rather than guessing at `~/.claude` on
 the runner. The action drives Claude Code through the SDK, so whether a
@@ -737,6 +759,9 @@ if handled like the other:
 ## Limitations
 - **Reporting only.** It observes; it does not enforce. Claude Code's own
   permission rules, sandboxing, and hooks are where enforcement belongs.
+- **`--ioc` sees only the inventory.** No match is not "not affected": lockfile
+  installs, scripts, postinstall hooks and transcripts no longer on the machine are
+  out of sight, and `from`/`until` windows are shown but not yet applied.
 - **Pattern matching has a ceiling.** A command that builds a string dynamically,
   or runs a script whose contents live in a file, will not be caught. This raises
   the floor on visibility; it is not a security boundary.

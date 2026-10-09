@@ -40,6 +40,15 @@ inputs:
     required: false
     default: ""
 
+  ioc:
+    description: >-
+      Paths to known-bad lists (actualis-ioc lines or OSV). Fetch them in a step
+      after the agent step, outside the workspace, e.g. $RUNNER_TEMP. One path
+      per line; each is passed as --ioc. Matches are high, so set fail-on: high
+      to gate on them.
+    required: false
+    default: ""
+
   version:
     description: >-
       Version of actualis to install, e.g. `0.1.12`. Empty installs the latest.
@@ -71,6 +80,9 @@ outputs:
   findings:
     description: "Number of unsuppressed findings, or empty if the scan could not run."
     value: ${{ steps.audit.outputs.findings }}
+  ioc-matches:
+    description: "Number of unsuppressed --ioc matches (not refused), or empty if the scan could not run."
+    value: ${{ steps.audit.outputs.ioc-matches }}
 
 runs:
   using: composite
@@ -94,6 +106,7 @@ runs:
       env:
         EXECUTION_FILE: ${{ inputs.execution-file }}
         FAIL_ON: ${{ inputs.fail-on }}
+        IOC: ${{ inputs.ioc }}
         JSON_REPORT: ${{ inputs.json-report }}
         NETWORK_STRICT: ${{ inputs.network-strict }}
         NETWORK_TRUST: ${{ inputs.network-trust }}
@@ -125,6 +138,15 @@ runs:
         net_args=()
         [ "${NETWORK_STRICT}" = "true" ] && net_args+=(--network-strict)
         [ -n "${NETWORK_TRUST}" ] && net_args+=(--network-trust "${NETWORK_TRUST}")
+        # One path per line, so a comma in a path is safe. Both runs get them.
+        while IFS= read -r ioc_path; do
+          ioc_path="${ioc_path#"${ioc_path%%[![:space:]]*}"}"
+          ioc_path="${ioc_path%"${ioc_path##*[![:space:]]}"}"
+          [ -n "${ioc_path}" ] && net_args+=(--ioc "${ioc_path}")
+        done <<< "${IOC}"
+        if [ -n "${IOC//[[:space:]]/}" ] && [ "${FAIL_ON}" = "critical" ]; then
+          echo "::warning::IOC matches are high severity; set fail-on: high to gate on them"
+        fi
         args+=(${net_args[@]+"${net_args[@]}"})
 
         # The human-readable report, for the log and the summary. This run
@@ -148,6 +170,8 @@ runs:
         # excluded here for the same reason they do not fail the build: a
         # recorded, reasoned decision should not keep showing up as a number.
         findings=$(python3 -c "import json; d=json.load(open('${work}/report.json')); print(len(d.get('coach', [])) + len([s for s in d.get('secrets', []) if not s.get('suppressed')]))" 2>/dev/null || echo "")
+        # Unsuppressed --ioc matches. A separate output: findings keeps its meaning.
+        ioc_matches=$(python3 -c "import json; d=json.load(open('${work}/report.json')); m=d.get('network', {}).get('ioc', {}).get('matches', []); print(len([r for r in m if r.get('verdict') == 'match' and not r.get('refused') and not r.get('suppressed')]))" 2>/dev/null || echo "")
 
         # With fail-on: none there is no Gate step, so a run that could not
         # complete (1) or was refused as a usage error (2) would otherwise be green.
@@ -157,6 +181,7 @@ runs:
 
         echo "exit-code=${rc}" >> "$GITHUB_OUTPUT"
         echo "findings=${findings}" >> "$GITHUB_OUTPUT"
+        echo "ioc-matches=${ioc_matches}" >> "$GITHUB_OUTPUT"
 
         if [ "${SUMMARY}" = "true" ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
           {

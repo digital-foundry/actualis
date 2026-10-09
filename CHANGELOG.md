@@ -22,6 +22,20 @@
 
 ### Added
 
+- **`--ioc FILE`: did an agent install the bad version?** Matches every
+  download in the network inventory against a known-bad list, offline and only
+  when named: the `actualis-ioc` line format (`npm:x@=1.2.3||=1.2.4`,
+  `pypi:name`, `host:evil.example`) or OSV JSON/JSONL. Names compare as each
+  ecosystem does (npm and Go exactly, pypi by PEP 503, images through the shared
+  Docker Hub normaliser); versions by SemVer 2.0.0 or PEP 440, written out in
+  the standard library. A match is a high finding (`network-ioc`); a listed name
+  whose version cannot be decided is medium (`network-ioc-unresolved`), never
+  clean. Refused calls are listed and never fail a gate, and the trust list
+  never exempts a match. `network.ioc` in `--json` (always an object),
+  `network.items[].ioc`, an IOC block in NETWORK, `--explain ioc` and
+  [docs/ioc.md](docs/ioc.md). Any problem loading a list, or a list with
+  nothing checkable, exits 2; every size, line, entry and nesting limit is hard.
+  The Action gains an `ioc` input and an `ioc-matches` output.
 - **Network inventory.** A NETWORK section and a `network` key in `--json` list
   every download and fetch the agents made — packages installed, repos cloned,
   URLs fetched — and whether a person approved each (`asked`, `unasked`, or

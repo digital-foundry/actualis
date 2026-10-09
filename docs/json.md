@@ -197,7 +197,7 @@ shell commands and web tools.
 | `by_kind` | counts of `install`, `clone`, `fetch` and `search` items |
 | `hosts[]` | per host: `count`, `unasked`, `first_seen`, and `trusted` if any item from it matched the trust list |
 | `packages[]` | per `ecosystem` and `name`: `versions` seen, `pinned` (every install named an exact version: a full `MAJOR.MINOR.PATCH` for npm, crates and go, `==` for pypi, an `@sha256:` digest for images; for crates, `cargo add` is pinned only with `=1.2.3` and `cargo install --version 1.2.3` is exact; ranges, tags and prefixes are not pinned), `exec` (any install ran code), `count` |
-| `items[]` | one record per item: `kind`, `program`, `host`, `host_inferred`, `url`, `dest`, `source`, `ecosystem`, `package`, `version`, `pinned`, `exec`, `dynamic`, `alias` (the name an npm alias installs under, `x` in `x@npm:evil@1.0.0`, where `package` is `evil`; else `null`), `failed` (`null` when unknown), `approval`, `trusted`, `agent`, `project`, `session`, `ts` |
+| `items[]` | one record per item: `kind`, `program`, `host`, `host_inferred`, `url`, `dest`, `source`, `ecosystem`, `package`, `version`, `pinned`, `exec`, `dynamic`, `alias` (the name an npm alias installs under, `x` in `x@npm:evil@1.0.0`, where `package` is `evil`; else `null`), `failed` (`null` when unknown), `approval`, `trusted`, `agent`, `project`, `session`, `ts`, `ioc` (`match`, `unresolved` or `null`; see `network.ioc`) |
 | `items_truncated` | `true` when `items` was cut at the cap |
 | `strict` | whether `--network-strict` was on |
 | `trust` | the trusted host or host-and-path entries in force |
@@ -216,6 +216,50 @@ Strict-mode findings are not repeated here. They are `bash.flags[]` entries
 with the category `network-unasked`.
 
 Verify: `actualis --json | jq '.network.totals'`
+
+## network.ioc
+
+What `--ioc` matched (see [ioc.md](ioc.md)). Always an object: without `--ioc`
+it is `{"enabled": false, "sources": [], "totals": {...all zero}, "matches": [],
+"matches_truncated": false}`, so every path keeps one type.
+
+| key | meaning |
+|---|---|
+| `enabled` | whether `--ioc` was given |
+| `sources[]` | one per `--ioc` file, in order: `path` (absolute, not redacted), `sha256` of every byte, `format`, `entries.package` / `entries.host`, `not_checkable.<ecosystem>`, `skipped` and `first_skipped_line` (malformed OSV records; `null` without a line), `withdrawn`, `ranges_git`, `ranges_with_limit`, `skipped_ranges` (OSV ranges that could not be read, treated as undecidable), `mtime_in_window` (the file changed between `window.from` and `window.to`) |
+| `totals.match` / `unresolved` | items, not refused, with that verdict. Suppressed ones are still counted |
+| `totals.refused` | matched items whose call a person refused |
+| `totals.suppressed` | suppressed IOC findings (groups) |
+| `totals.clean_name_matches` | items whose name was listed and whose version fell outside every spec |
+| `totals.undecidable` | items whose check could not be decided (an unordered version, an unreadable range, an error); each is `unresolved`, never clean |
+| `totals.items_checked` | downloads with a package or a named host to check |
+| `totals.items_not_checkable` | the rest: `lockfile` (an install naming no package), `no_host`, `other` |
+| `matches[]` | one row per matched item, refused ones included: `verdict`, `reason`, `refused`, `suppressed`, `flag_id` (`null` when refused), `refs` and `labels` (distinct, sorted, at most 20), `entry` (the first winning entry: `kind`, `ecosystem`, `name`, `spec`, `host`, `path`, `exact_host`, `ref`, `label`, `from`, `until`, `source`, `line`) and `item` (exactly as in `items[]`) |
+| `matches_truncated` | `true` when `matches` was cut at 2000 |
+
+**Enums.**
+
+- `verdict`: `match` or `unresolved`.
+- `reason`: `any-version`, `version-in-spec` or `host` (match);
+  `version-unresolved`, `undecidable`, `private-registry`, `name-from-url` or
+  `error` (unresolved).
+- `format`: `lines`, `osv-json` or `osv-jsonl`.
+- `entry.kind`: `package`, `host`, or `error` (a placeholder when checking the
+  item failed; `source` is then `-1`).
+
+**Order.** Not refused first, then match before unresolved, then newest, then
+the item, then the entry's `(source, line)`: the same input gives the same
+bytes.
+
+`report_sha256` covers `network.ioc`, so two runs against different lists have
+different digests. No `network.ioc` field depends on the clock: `from` and
+`until` are copied from the list, and `mtime_in_window` compares the file's
+modification time with the transcripts' window.
+
+The findings are `bash.flags[]` entries with the categories `network-ioc`
+(high) and `network-ioc-unresolved` (medium).
+
+Verify: `actualis --ioc f --json | jq '.network.ioc.totals'`
 
 ## Compatibility
 

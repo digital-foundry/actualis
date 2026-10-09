@@ -1245,3 +1245,77 @@ class TestGates(FleetCase, unittest.TestCase):
         reasons = af.failing_findings(f, "any")
         k = reasons.index("1 known-bad download group(s) (IOC)")
         self.assertTrue(all("credential" in r for r in reasons[:k]))
+
+
+class TestDocsAndSelfCheck(unittest.TestCase):
+    def test_explain_ioc(self):                                         # T-OUT-7
+        self.assertEqual(set(af.EXPLAIN["ioc"]), set(af.EXPLAIN["network"]))
+        out = text_of(lambda: af.render_explain("ioc", af.C(False)))
+        for needle in ("never exempts", "not yet applied", "No match is not", "refused", "suppress",
+                       "jq '.network.ioc.totals'"):
+            self.assertIn(needle, out)
+        self.assertIn("--explain ioc", text_of(lambda: af.render_explain("network", af.C(False))))
+
+    def test_imports_are_unchanged(self):                               # T-OUT-8
+        src = (ROOT / "actualis.py").read_text(encoding="utf-8")
+        self.assertEqual(sorted(set(af.imports_in(src))),
+                         ["__future__", "argparse", "collections", "datetime", "hashlib", "json", "os",
+                          "pathlib", "re", "shutil", "struct", "subprocess", "sys", "time", "typing", "zlib"])
+        # --self-check itself runs end to end in test_actualis (TestLegacyTerminalEncoding).
+
+    def test_docs(self):
+        doc = (ROOT / "docs" / "ioc.md").read_text(encoding="utf-8")
+        for needle in ("malware lists, not vulnerability databases", "after the agent step", "$RUNNER_TEMP",
+                       "sha256sum -c", "origin", "mtime_in_window", "jq -c"):
+            self.assertIn(needle, doc)
+        self.assertNotIn("GHSA malware", doc)
+        findings = (ROOT / "docs" / "findings.md").read_text(encoding="utf-8")
+        self.assertIn("A change in severity is a\nnew category, never an edit", findings)
+        for cat in ("network-ioc", "network-ioc-unresolved"):
+            self.assertIn(f"`{cat}`", findings)
+        json_doc = (ROOT / "docs" / "json.md").read_text(encoding="utf-8")
+        for word in ("any-version", "version-in-spec", "version-unresolved", "undecidable", "private-registry",
+                     "name-from-url", "osv-jsonl", "totals.undecidable"):
+            self.assertIn(word, json_doc)
+
+
+class TestPerformance(FleetCase, unittest.TestCase):                    # T-PERF-1
+    """Section 11 budgets: 2 s to load 100k entries and 1 s to match 10k items
+    on the dev Mac; the loose CI ceilings are 10 s and 5 s."""
+    CI = bool(os.environ.get("CI"))
+
+    def test_load_100k_lines_and_osv(self):
+        lines = "".join(f"npm:pkg-{i}@>=1.0.0,<1.{i % 50}.0||=2.0.{i}\n" for i in range(100_000))
+        path = self.write(lines, "lines.txt")
+        rec = '{"id":"MAL-2025-%d","affected":[{"package":{"name":"pkg-%d","ecosystem":"npm"},' \
+              '"versions":["1.0.0","1.0.1"],"ranges":[{"type":"SEMVER","events":[{"introduced":"0"},' \
+              '{"fixed":"1.2.%d"}]}]}],"summary":"' + "x" * 900 + '"}\n'
+        osv_path = self.write("".join(rec % (i, i, i) for i in range(100_000)), "mal.jsonl")
+        for p in (path, osv_path):
+            t = time.perf_counter()
+            ioc = af.load_ioc([p])
+            dt = time.perf_counter() - t
+            self.assertEqual(ioc.total, 100_000)
+            self.assertLess(dt, 10.0 if self.CI else 2.0, (p, dt))
+
+    def test_match_10k_items_against_100k_entries(self):
+        ioc = af.load_ioc([self.write("".join(f"npm:pkg-{i}@=1.0.{i % 7}\nhost:h{i}.evil.example\n"
+                                              for i in range(50_000)))])
+        f = af.Fleet()
+        f.suppressions = {}
+        for i in range(10_000):
+            f.add_tool("p", "Bash", {"command": f"npm i pkg-{i}@1.0.{i % 5} && curl https://a.h{i}.evil.example/x"},
+                       TS, "auto")
+        t = time.perf_counter()
+        af.apply_ioc(f, ioc)
+        dt = time.perf_counter() - t
+        self.assertEqual(sum(1 for r in f.ioc_rows if r["reason"] == "host"), 10_000)
+        self.assertLess(dt, 5.0 if self.CI else 1.0, dt)
+
+    def test_pathological_lines(self):
+        for ch in "@.":
+            path = self.write("npm:" + ch * ((1 << 20) - 8) + "\n", "p.txt")
+            t = time.perf_counter()
+            with self.assertRaises(ValueError):
+                af.load_ioc([path])
+            self.assertLess(time.perf_counter() - t, 0.05)
