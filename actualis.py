@@ -2830,6 +2830,7 @@ NETWORK_ITEM_KEYS = ("kind", "program", "host", "host_inferred", "url", "dest", 
 # why and prompt: what the assistant said before a call, and what the person
 # last asked. Both are kept short, redacted and cleaned when they are read.
 NET_CONTEXT_MAX = 160
+NET_COMMAND_MAX = 200                # the text view's command line, after redaction
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 # Text that wraps harness output or instructions, not the person's own words.
 _NOT_A_PROMPT = ("<command-name>", "<command-message>", "<command-args>", "<local-command-",
@@ -5763,6 +5764,16 @@ class Fleet:
         # Worked out only for a call that reached the network: redaction is the cost.
         why_raw, prompt_raw, where = context
         why, prompt = _net_context(why_raw, last_sentence=True), _net_context(prompt_raw)
+        # What the text view prints as `command`: cleaned and on one line here,
+        # redacted when printed (unless --no-redact), never in --json.
+        if name == "Bash":
+            command = " ".join(clean(tool_input.get("command") or "").split())
+        else:
+            target = tool_input.get("url")
+            command = clean(f"{name} {target}" if isinstance(target, str) else name)
+            command = " ".join(command.split())
+        cut = command.find(" ", 4 * NET_COMMAND_MAX)
+        command = command[:cut] if cut > 0 else command[:MAX_SCAN_LINE]
         where = ({"root": clean(str(where.get("root") or "")),
                   "file": clean(str(where.get("file") or "")).replace("\n", " "),
                   "line": where.get("line") if isinstance(where.get("line"), int) else None}
@@ -5777,7 +5788,8 @@ class Fleet:
                         ts=ts.isoformat() if ts else None,
                         failed=False if agent == "claude" else None, trusted=False, ioc=None,
                         mode=clean(str(mode))[:48] or None if mode else None,
-                        why=why, prompt=prompt, transcript=dict(where) if where else None)
+                        why=why, prompt=prompt, transcript=dict(where) if where else None,
+                        _command=command)
             if call_id:
                 self._net_by_call.setdefault(f"{agent}:{call_id}", []).append(len(self.network))
             self.network.append(item)
@@ -8085,10 +8097,118 @@ def _local_host(host: str) -> bool:
     return False
 
 
-def render_network(fleet: Fleet, c: C, top: int, raw: bool = False) -> None:
-    """NETWORK: what came in, and from where; unasked first. Rows come from
-    network_json, which is redacted unless raw; fleet.network_items is only
-    counted here, never printed."""
+NET_VIEW_WIDTH = 100
+NET_DETAIL_PER_HOST = 3
+
+
+def _net_wrap(text: str, width: int, breaks: str = " ") -> list[str]:
+    """Lines of at most `width`, broken after a character in `breaks` where one
+    falls in the last third of the line, else hard. Concatenating the lines
+    (with a space when a break was a space) gives the text back."""
+    out: list[str] = []
+    while len(text) > width:
+        cut = max(text.rfind(b, width * 2 // 3, width) for b in breaks)
+        if cut < 0:
+            out.append(text[:width])
+            text = text[width:]
+        elif text[cut] == " ":
+            out.append(text[:cut])
+            text = text[cut + 1:]
+        else:
+            out.append(text[:cut + 1])
+            text = text[cut + 1:]
+    return out + [text] if text or not out else out
+
+
+def _net_when(ts: str | None) -> str:
+    return ts[:16].replace("T", " ") if ts else "time unknown"
+
+
+def _net_what(r: dict) -> str:
+    """The program and what it fetched, as one short phrase (fields as printed)."""
+    if r["package"]:
+        what = r["package"] + (f"@{r['version']}" if r["version"] else "")
+    else:
+        what = r["url"] or r["dest"] or ""
+    return f"{r['program']} {what}".rstrip()
+
+
+def _net_command(i: dict, raw: bool) -> str:
+    cmd = i.get("_command") or ""
+    return clip(cmd if raw else redact(cmd), NET_COMMAND_MAX)
+
+
+def _net_path(t: dict | None) -> str:
+    """root/file:line, with the home directory written as ~, or "-"."""
+    if not t or not t.get("file"):
+        return "-"
+    path = str(Path(t["root"]) / t["file"]) if t.get("root") else t["file"]
+    home = str(Path.home())
+    if home not in ("", "/") and path.startswith(home + os.sep):
+        path = "~" + path[len(home):]
+    return path + (f":{t['line']}" if t.get("line") else "")
+
+
+def _net_host_hint(host: str, room: int) -> str:
+    """A --host value that fits in `room`: the host, or its shortest parent
+    suffix that does (a broader filter, never a broken one)."""
+    labels = host.split(".")
+    while len(".".join(labels)) > room and len(labels) > 2:
+        labels = labels[1:]
+    return ".".join(labels)
+
+
+def _render_network_items(fleet: "Fleet", c: "C", top: int, raw: bool,
+                          filters: list[str]) -> None:
+    """Every item the filters kept, newest first, one block each."""
+    order = sorted(fleet.network_items, key=_net_order_key, reverse=True)
+    limit = max(top, 0) * 5
+    print(f"  {c.dim}FILTER   {' \u00b7 '.join(filters)}{c.off}"[:NET_VIEW_WIDTH + len(c.dim) + len(c.off)])
+    print(f"  {c.dim}showing {num(min(limit, len(order)))} of {num(len(order))}, newest first{c.off}")
+    pad = " " * 13
+    width = NET_VIEW_WIDTH - len(pad)
+    for i in order[:limit]:
+        r = _net_public(i, raw, prompts=True)
+        kind = r["kind"] + ((", pinned" if r["pinned"] else ", unpinned") if r["kind"] == "install" else "")
+        print()
+        head = f"  {r['host'] or '(no host)'}  \u00b7  {_net_what(r)}"
+        tail = f"  ({kind})"
+        print(clip(head, NET_VIEW_WIDTH - len(tail)) + tail)
+        lead = f"{_net_when(r['ts'])}  \u00b7  {r['agent']} \u00b7 project "
+        sess = f" \u00b7 session {(r['session'] or '-')[:8]}"
+        fields = [("when", lead + clip(r["project"], max(width - len(lead) - len(sess), 8)) + sess, True)]
+        asked = f"{r['approval']} ({r['mode'] or 'mode not recorded'})"
+        asked += (" \u00b7 failed" if r["failed"] else "") + (" \u00b7 trusted" if r["trusted"] else "") \
+            + (f" \u00b7 ioc {r['ioc']}" if r["ioc"] else "")
+        fields.append(("asked", asked, True))
+        fields.append(("command", _net_command(i, raw), False))
+        if r["why"]:
+            fields.append(("why", r["why"], False))
+        if r["prompt"]:
+            fields.append(("prompt", r["prompt"], False))
+        for label, value, one_line in fields:
+            lines = [clip(value, width)] if one_line else _net_wrap(value, width)
+            print(f"    {label:<9}{lines[0]}")
+            for more in lines[1:]:
+                print(pad + more)
+        trace = f"{r['call_id'] or '-'} \u00b7 {_net_path(r['transcript'])}"
+        if len(trace) <= width:
+            print(f"    {'trace':<9}{trace}")
+        else:                                # the path whole, broken after a /, never cut
+            print(f"    {'trace':<9}{clip(r['call_id'] or '-', width)}")
+            for part in _net_wrap(_net_path(r["transcript"]), width, "/"):
+                print(pad + part)
+    if len(order) > limit:
+        print()
+        print(f"  {c.dim}\u2026 {num(len(order) - limit)} more, narrow with --days or --session{c.off}")
+
+
+def render_network(fleet: Fleet, c: C, top: int, raw: bool = False,
+                   filters: list[str] | None = None) -> None:
+    """NETWORK: what came in, and from where; unasked first. Every printed
+    field comes from network_json or _net_public, redacted unless raw, or
+    from _net_command, which redacts too. `filters`, when given, names the
+    --network filters in force and switches to one block per item."""
     n = network_json(fleet, raw)
     t = n["totals"]
     rule(c, "NETWORK")
@@ -8122,6 +8242,9 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False) -> None:
         print(f"  {c.dim}trust: {' · '.join(parts)}{c.off}")
     render_ioc(fleet, c, raw)
     items = fleet.network_items
+    if filters:
+        _render_network_items(fleet, c, top, raw, filters)
+        return
 
     eco = Counter(i["ecosystem"] for i in items if i["kind"] == "install" and i["ecosystem"])
     unpinned = sum(1 for p in n["packages"] if not p["pinned"])
@@ -8149,10 +8272,27 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False) -> None:
     n_local = sum(h["unasked"] for h in n["hosts"] if _local_host(h["host"]))
     if unasked_hosts or n_nohost or n_local:
         print(f"  {c.dim}TOP UNASKED   hosts by unasked downloads{c.off}")
-        for host, (cnt, trusted, first) in sorted(
-                unasked_hosts.items(), key=lambda kv: (-kv[1][0], kv[0]))[:min(10, top)]:
+        ranked = sorted(unasked_hosts.items(), key=lambda kv: (-kv[1][0], kv[0]))[:min(10, top)]
+        # Each ranked host's newest downloads, any approval, newest first.
+        recent: dict[str, list[dict]] = {h: [] for h, _ in ranked}
+        for i in sorted(items, key=_net_order_key, reverse=True):
+            got = recent.get(i["host"])
+            if got is not None and len(got) < NET_DETAIL_PER_HOST:
+                got.append(i)
+        for host, (cnt, trusted, first) in ranked:
             seen = "trusted" if trusted else f"first seen {first[:10] if first else '?'}"
             print(f"    {clip(host, 44):<44} {num(cnt):>7}  {c.dim}{seen}{c.off}")
+            for i in recent[host]:
+                r = _net_public(i, raw)
+                left = (f"      {_net_when(r['ts']):<16}  {clip(r['project'], 16):<16}  "
+                        f"{(r['session'] or '-')[:8]:<8}  {r['approval']:<7}  ")
+                print(left + clip(_net_what(r), NET_VIEW_WIDTH - len(left)))
+                if r["why"]:
+                    print(f"        {c.dim}why: {clip(r['why'], NET_VIEW_WIDTH - 13)}{c.off}")
+            hint = "      \u2192 actualis --network --host "
+            narrow = _net_host_hint(host, NET_VIEW_WIDTH - len(hint))
+            if len(hint + narrow) <= NET_VIEW_WIDTH:     # no hint rather than a broken one
+                print(f"{c.dim}{hint}{narrow}{c.off}")
         extra = ([f"{num(n_nohost)} with no host (git remote names, $VAR URLs)"] if n_nohost else []) \
             + ([f"{num(n_local)} local or private"] if n_local else [])
         if extra:
@@ -8177,10 +8317,10 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False) -> None:
 
 
 def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
-           network_only: bool = False) -> None:
+           network_only: bool = False, network_filters: list[str] | None = None) -> None:
     if network_only:
         # --network: the NETWORK section and the redaction note, nothing else.
-        render_network(fleet, c, top, raw)
+        render_network(fleet, c, top, raw, network_filters)
         print()
         print(f"{c.dim}  Ask how this was read:  actualis --explain network")
         if not raw:
@@ -10841,8 +10981,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def network_filtered(args) -> bool:
     """Whether any --network filter was given."""
-    return bool(args.network and (args.host or args.package is not None
-                                  or args.session is not None or args.unasked))
+    return bool(network_filter_names(args))
+
+
+def network_filter_names(args) -> list[str]:
+    """The --network filters in force, as the filtered view names them."""
+    if not args.network:
+        return []
+    return ([f"host {clean(args.host)}"] if args.host else []) \
+        + ([f"package {clean(args.package)}"] if args.package is not None else []) \
+        + ([f"session {clean(args.session)}"] if args.session is not None else []) \
+        + (["unasked only"] if args.unasked else [])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -11130,7 +11279,7 @@ def main(argv: list[str] | None = None) -> int:
         render_coach(coach(fleet), C(use_color()))
     else:
         render(fleet, C(use_color()), bash_only=args.bash, top=args.top, raw=args.no_redact,
-               network_only=args.network)
+               network_only=args.network, network_filters=network_filter_names(args))
 
     if args.fail_on:
         reasons = failing_findings(fleet, args.fail_on)

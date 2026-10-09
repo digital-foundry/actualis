@@ -194,6 +194,8 @@ class TestTopUnasked(unittest.TestCase):
         for l in lines[i + 1:]:
             if not l.startswith("    "):
                 break
+            if l.startswith("      "):         # a host's recent downloads and its hint
+                continue
             if not l.strip().startswith("plus "):
                 rows.append(l.strip())
         return rows

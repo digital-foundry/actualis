@@ -28,6 +28,12 @@ Each of these is listed in full below.
 
 ### Changed
 
+- **Faster.** The shell-audit rules and unreadable shapes check a hand-written
+  literal prefilter before each regex (results are identical; a test compares
+  both paths over every test string and 5,000 generated commands), and
+  `--network` without `--fail-on` skips the audit and secret ranking it never
+  shows. On a 1,169-file corpus `--network` went from 43 s to about 6 s and a
+  full run from 44 s to about 21 s.
 - **New `high` remote-exec detections.** Besides `curl … | sh`, the shell
   audit now flags `bash <(curl …)`, `source <(…)` and `. <(…)`,
   `sh -c "$(curl …)"` (any shell, any `-c` cluster such as `-lc`), a dequoted
@@ -75,7 +81,29 @@ Each of these is listed in full below.
   `--ioc` is given), and `--network --json` emits only the `network` object. The
   full report gets a one-line `network` summary in FLEET when downloads exist,
   and NETWORK gains a TOP UNASKED block: the ten hosts with the most unasked
-  downloads. Its UNASKED and UNKNOWN rows are capped at 5.
+  downloads. Its UNASKED and UNKNOWN rows are capped at 5. Under each top host
+  it shows that host's three newest downloads (time, project, session,
+  approval, package or URL, and the agent's `why`) and the
+  `actualis --network --host <h>` command that lists them all.
+- **`--host`, `--package`, `--session` and `--unasked`** narrow `--network`
+  (text and `--json`), combinable with each other, `--project` and `--days`.
+  `--host` is a suffix on a label boundary, `--package` the exact name (npm
+  case-sensitive, pypi by PEP 503), `--session` a prefix. The filter runs
+  before `--network-strict` and `--ioc`, so totals, findings and matches are of
+  the filtered set. Filtered, the text view prints a block per item, newest
+  first and capped at `--top` x 5: host and target, when, agent, project and
+  session, approval with the mode it was judged from, the redacted command,
+  `why`, the prompt, and a `trace` line (call id, file and line) that
+  `sed -n '<line>p' <file>` turns into the exact record. Without `--network`
+  each is a usage error.
+- **`network.items[]` gains `mode`, `why`, `prompt` and `transcript`.** `mode`
+  is the permission-mode key approval was judged from. `why` is the agent's
+  own text before the call (last sentence, 160 characters); `prompt` is the
+  person's last real message before the turn (160 characters), emitted only
+  with the new `--with-prompts` and `null` otherwise. Both are redacted and
+  cleaned when read. `transcript` is `{root, file, line}`. What Claude Code,
+  Codex and Copilot each provide is in `actualis --explain network`.
+  `schema_version` stays 1; `--share` and `--card` carry none of it.
 - **`secrets[].distinct_values`** in `--json` and in the MCP `exposed_secrets`
   tool: how many different values were seen under the id in this run. The
   text report says "N distinct values" when it is more than 1.
