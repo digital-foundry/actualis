@@ -3622,9 +3622,13 @@ def load_ioc(paths: list[str]) -> IocSet:
         try:
             _ioc_load_file(path, ioc, src, label)
         except OSError as exc:
-            raise ValueError(f"--ioc {label}: cannot read: {exc.strerror or exc}") from None
+            raise ValueError(f"--ioc {label}: cannot read: {clean(exc.strerror or str(exc))}") from None
         except _IocError as exc:                 # an entry past the cap
-            raise ValueError(f"--ioc {label}: {exc}") from None
+            raise ValueError(f"--ioc {label}: {clean(str(exc))}") from None
+        except ValueError as exc:
+            # Messages quote the offending text so it can be fixed. It comes
+            # from an untrusted file, so it is cleaned before it reaches stderr.
+            raise ValueError(clean(str(exc)).replace("\n", " ")) from None
     checkable = sum(s["entries"]["package"] + s["entries"]["host"] for s in ioc.sources)
     if checkable == 0:
         nc: Counter = Counter()

@@ -1319,3 +1319,19 @@ class TestPerformance(FleetCase, unittest.TestCase):                    # T-PERF
             with self.assertRaises(ValueError):
                 af.load_ioc([path])
             self.assertLess(time.perf_counter() - t, 0.05)
+
+
+class TestErrorMessagesAreClean(IocFiles, unittest.TestCase):
+    """A load error quotes the offending text so it can be fixed; that text is
+    from an untrusted file and must not carry a terminal escape to stderr."""
+
+    def test_no_stripped_character_in_an_error(self):
+        bad = "\u202e\x9b31m\u200f"                # no C0 byte: those are refused before any echo
+        for content in (f"npm:a{bad}b@^1\n", f"npm:x {bad}=1\n", f"npm:x id={bad}\n", f"zz{bad}:x\n",
+                        f"host:{bad}evil.io\n", f"npm:x@{bad}\n"):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError) as cm:
+                    self.load(content)
+                for lo, hi, why in af._STRIPPED_RANGES:
+                    for ch in str(cm.exception):
+                        self.assertFalse(lo <= ord(ch) <= hi, f"U+{ord(ch):04X} ({why}): {cm.exception!r}")
