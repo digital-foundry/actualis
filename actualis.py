@@ -2792,11 +2792,6 @@ _IOC_ANY_VERSION = frozenset({"*", ">=0", ">=0.0.0"})
 _IOC_OPS = ("===", "==", ">=", "<=", "=", ">", "<")      # longest first
 _IOC_VERSION_CHARS = re.compile(r"[A-Za-z0-9.\-+_!:]{1,128}")
 _IOC_WORD = re.compile(r"[A-Za-z]+")
-_IOC_SEMVER = re.compile(
-    r"v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
-    r"(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
-    r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?"
-    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?", re.ASCII)
 # PEP 440 Appendix B, VERSION_PATTERN, anchored by fullmatch. The surrounding
 # whitespace it allows is not: a version reaches output, and a list has no reason to pad one.
 _IOC_PEP440 = re.compile(r"""
@@ -2824,6 +2819,16 @@ class _IocError(ValueError):
         self.what, self.how = what, how
 
 
+def _ioc_semver_number(p: str) -> bool:
+    """A SemVer numeric identifier: ASCII digits, no leading zero."""
+    return p.isascii() and p.isdigit() and (p == "0" or p[0] != "0")
+
+
+def _ioc_semver_ident(p: str) -> bool:
+    """A SemVer identifier: non-empty, [0-9A-Za-z-] only."""
+    return bool(p) and p.isascii() and (p.replace("-", "").isalnum() or set(p) == {"-"})
+
+
 def _ioc_semver_key(v: str) -> tuple | None:
     """SemVer 2.0.0 precedence (section 11) as a sortable tuple, or None.
 
@@ -2831,15 +2836,34 @@ def _ioc_semver_key(v: str) -> tuple | None:
     each id (0, int) when numeric and (1, str) otherwise. A pre-release sorts
     below its release, numeric ids below alphanumeric, and a longer id list
     above an equal prefix. A leading v and build metadata (+incompatible) are
-    ignored. Go pseudo-versions are ordinary pre-releases."""
+    ignored. Go pseudo-versions are ordinary pre-releases.
+
+    Scanned by hand, not by regex: the SemVer grammar's pre-release
+    alternation backtracks quadratically on a long run of digits."""
     if not v or len(v) > IOC_VERSION_MAX:
         return None
-    m = _IOC_SEMVER.fullmatch(v)
-    if not m:
+    if v[0] == "v":
+        v = v[1:]
+    v, plus, build = v.partition("+")
+    if plus and not all(_ioc_semver_ident(b) for b in build.split(".")):
         return None
-    pre = (1,) if m.group(4) is None else (0, tuple(
-        (0, int(p)) if p.isdigit() else (1, p) for p in m.group(4).split(".")))
-    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), pre)
+    core, dash, pre = v.partition("-")
+    parts = core.split(".")
+    if len(parts) != 3 or not all(_ioc_semver_number(p) for p in parts):
+        return None
+    if not dash:
+        return (int(parts[0]), int(parts[1]), int(parts[2]), (1,))
+    ids = []
+    for p in pre.split("."):
+        if not _ioc_semver_ident(p):
+            return None
+        if p.isdigit():
+            if not _ioc_semver_number(p):
+                return None
+            ids.append((0, int(p)))
+        else:
+            ids.append((1, p))
+    return (int(parts[0]), int(parts[1]), int(parts[2]), (0, tuple(ids)))
 
 
 def _ioc_pep440_key(v: str) -> tuple | None:
@@ -3271,9 +3295,12 @@ def _ioc_skip(source: dict, line: int | None) -> None:
         source["first_skipped_line"] = line
 
 
-def _ioc_osv_range(eco: str, kind: str, events: object, source: dict) -> list | str | None:
-    """One OSV SEMVER or ECOSYSTEM range as clauses, _IOC_UNDECIDABLE when an
-    event version does not order, or None when the range is dropped.
+def _ioc_osv_range(eco: str, kind: str, events: object, source: dict) -> list | str:
+    """One OSV SEMVER or ECOSYSTEM range as clauses, or _IOC_UNDECIDABLE when
+    it cannot be used: an event version that does not order, a malformed or
+    unknown event, or more than IOC_EVENTS_MAX events. Those last are counted
+    in skipped_ranges. A range is never just dropped: a dropped range would
+    leave the versions inside it clean.
 
     Events are sorted by version; introduced opens an interval, fixed closes
     it below and last_affected at, the earliest close winning. limit is
@@ -3281,16 +3308,16 @@ def _ioc_osv_range(eco: str, kind: str, events: object, source: dict) -> list | 
     direction. An empty clause, (), means any version."""
     if not isinstance(events, list) or len(events) > IOC_EVENTS_MAX:
         source["skipped_ranges"] += 1
-        return None
+        return _IOC_UNDECIDABLE
     parsed = []
     for ev in events:
         if not isinstance(ev, dict) or len(ev) != 1:
             source["skipped_ranges"] += 1
-            return None
+            return _IOC_UNDECIDABLE
         [(k, v)] = ev.items()
         if k not in _IOC_OSV_EVENTS or not isinstance(v, str):
             source["skipped_ranges"] += 1
-            return None
+            return _IOC_UNDECIDABLE
         parsed.append((k, v))
     if any(k == "limit" for k, _ in parsed):
         source["ranges_with_limit"] += 1
@@ -3321,7 +3348,7 @@ def _ioc_osv_range(eco: str, kind: str, events: object, source: dict) -> list | 
         clauses.append((low,) if low else ())
     if not clauses:                          # no introduced: the schema requires one
         source["skipped_ranges"] += 1
-        return None
+        return _IOC_UNDECIDABLE
     return clauses
 
 
@@ -3377,13 +3404,12 @@ def parse_ioc_osv(records, ioc: IocSet, src: int, label: str) -> None:
                 if kind == "GIT":
                     source["ranges_git"] += 1
                     continue
+                usable = True
                 if kind not in ("SEMVER", "ECOSYSTEM"):
                     source["skipped_ranges"] += 1
+                    clauses.append(_IOC_UNDECIDABLE)
                     continue
                 out = _ioc_osv_range(eco, kind, r.get("events"), source)
-                if out is None:
-                    continue
-                usable = True
                 if out == _IOC_UNDECIDABLE:
                     clauses.append(_IOC_UNDECIDABLE)
                     continue
@@ -3392,10 +3418,10 @@ def parse_ioc_osv(records, ioc: IocSet, src: int, label: str) -> None:
                         any_version = True
                     else:
                         clauses.append(c)
-            if len(clauses) > IOC_CLAUSES_MAX:
-                _ioc_skip(source, line)
-                continue
-            spec = None if any_version or not usable else tuple(clauses)
+            if len(clauses) > IOC_CLAUSES_MAX:       # too many to compare: every version is undecidable
+                source["skipped_ranges"] += 1
+                clauses = [_IOC_UNDECIDABLE]
+            spec = None if any_version or not usable else tuple(dict.fromkeys(clauses))
             try:
                 ioc.add(IocEntry("package", eco, norm, spec, _ioc_spec_text(spec), None, "", False,
                                  ref, None, None, None, src, line))
@@ -3419,20 +3445,42 @@ def _ioc_jsonl(lines, label: str):
             raise ValueError(f"--ioc {label} line {n}: JSON nested too deeply") from None
 
 
-_IOC_JSON_STRING = re.compile(rb'"(?:[^"\\]|\\.)*"', re.S)
-_IOC_NOT_BRACKETS = bytes(b for b in range(256) if b not in b"[]{}")
+_IOC_JSON_SPECIAL = re.compile(rb'["\[\]{}]')
 
 
 def _ioc_json_depth(data: bytes) -> None:
     """Refuse JSON nested deeper than IOC_JSON_DEPTH before json parses it.
-    Strings are removed first, so a bracket inside one does not count."""
+
+    A hand-written scan, linear in the input: it jumps from one quote or
+    bracket to the next, and over each string to its closing quote, so a
+    bracket inside a string does not count. (A regex for JSON strings
+    backtracks quadratically on a run of escaped quotes.)"""
     if data.count(b"[") + data.count(b"{") <= IOC_JSON_DEPTH:
         return
-    depth = 0
-    for b in _IOC_JSON_STRING.sub(b"", data).translate(None, _IOC_NOT_BRACKETS):
-        depth += 1 if b in (91, 123) else -1
-        if depth > IOC_JSON_DEPTH:
-            raise _IocError(f"JSON nested over {IOC_JSON_DEPTH} levels", "an OSV record is a few levels deep")
+    depth = pos = 0
+    find = _IOC_JSON_SPECIAL.search
+    while True:
+        m = find(data, pos)
+        if m is None:
+            return
+        c, pos = data[m.start()], m.end()
+        if c == 34:                                  # " : skip the string
+            while True:
+                q = data.find(b'"', pos)
+                if q < 0:
+                    return                           # unclosed: json refuses it
+                k = q
+                while k > pos and data[k - 1] == 92:     # count the backslashes before it
+                    k -= 1
+                pos = q + 1
+                if (q - k) % 2 == 0:
+                    break
+        elif c in (91, 123):
+            depth += 1
+            if depth > IOC_JSON_DEPTH:
+                raise _IocError(f"JSON nested over {IOC_JSON_DEPTH} levels", "an OSV record is a few levels deep")
+        else:
+            depth -= 1
 
 
 def _ioc_size(n: int) -> str:
@@ -3587,7 +3635,7 @@ _IOC_DOWNGRADE = ("npm", "pypi", "crates")      # a registry the entry may not d
 
 def _ioc_zero_totals() -> dict:
     return {"match": 0, "unresolved": 0, "refused": 0, "suppressed": 0, "clean_name_matches": 0,
-            "items_checked": 0, "items_not_checkable": {"lockfile": 0, "no_host": 0, "other": 0}}
+            "undecidable": 0, "items_checked": 0, "items_not_checkable": {"lockfile": 0, "no_host": 0, "other": 0}}
 
 
 def _ioc_resolved(item: dict) -> list[tuple[str, str]]:
@@ -3643,19 +3691,22 @@ def _ioc_url_name(item: dict) -> str | None:
 
 
 def _ioc_host_entries(ioc: IocSet, host: str) -> list[IocEntry]:
-    """Host entries that could match: exact on the host, suffix on each label boundary."""
+    """Host entries that could match: exact on the host, suffix on each label
+    boundary. A host of more labels than DNS allows is refused rather than
+    partly checked, so the caller fails closed."""
+    if not ioc.host_suffix and not ioc.host_exact:
+        return []
+    labels = host.split(".")
+    if len(labels) > _IOC_HOST_LABELS:
+        raise _IocError(f"a host of over {_IOC_HOST_LABELS} labels")
     found = list(ioc.host_exact.get(host, ()))
-    for _ in range(_IOC_HOST_LABELS):
-        found += ioc.host_suffix.get(host, ())
-        dot = host.find(".")
-        if dot < 0:
-            break
-        host = host[dot + 1:]
+    for i in range(len(labels)):
+        found += ioc.host_suffix.get(".".join(labels[i:]), ())
     return found
 
 
 def match_ioc(item: dict, ioc: IocSet) -> tuple | None:
-    """(verdict, reason, entries, flag key) for one item, or None.
+    """(verdict, reason, entries, flag key, undecided) for one item, or None.
 
     The verdict is the strongest over every entry: match, then unresolved;
     "clean" when names matched and every version fell outside. entries are
@@ -3672,7 +3723,10 @@ def match_ioc(item: dict, ioc: IocSet) -> tuple | None:
                 elif not version:
                     verdict, reason = "unresolved", "version-unresolved"
                 else:
-                    inside = _ioc_spec_contains(eco, e.spec, version)
+                    try:
+                        inside = _ioc_spec_contains(eco, e.spec, version)
+                    except Exception:            # noqa: BLE001 -- fail closed: undecidable, never clean
+                        inside = None
                     if inside is False:
                         clean_hit = True
                         continue
@@ -3690,11 +3744,21 @@ def match_ioc(item: dict, ioc: IocSet) -> tuple | None:
             if _host_path_match(e.host, e.path, item, e.exact_host):
                 hits.append(("match", "host", e, f"host:{'=' if e.exact_host else ''}{e.host}{e.path}"))
     if not hits:
-        return ("clean", None, [], None) if clean_hit else None
+        return ("clean", None, [], None, False) if clean_hit else None
     best = max(_IOC_RANK[h[0]] for h in hits)
     top = sorted((h for h in hits if _IOC_RANK[h[0]] == best),
                  key=lambda h: (h[2].source, h[2].line or 0))
-    return top[0][0], top[0][1], [h[2] for h in top], top[0][3]
+    undecided = any(h[1] == "undecidable" for h in hits)
+    return top[0][0], top[0][1], [h[2] for h in top], top[0][3], undecided
+
+
+def _ioc_failed_closed(item: dict) -> tuple:
+    """What an item becomes when checking it raised: unresolved, reason
+    "error", against a placeholder entry, so it is listed, flagged medium
+    and counted, never clean."""
+    entry = IocEntry("error", item.get("ecosystem"), None, None, None, None, "", False,
+                     None, None, None, None, -1, None)
+    return "unresolved", "error", [entry], f"error:{item.get('ecosystem') or item.get('program') or '?'}", True
 
 
 def _ioc_coverage(item: dict) -> str:
@@ -3734,11 +3798,15 @@ def apply_ioc(fleet: "Fleet", ioc: IocSet | None) -> None:
         memo_key = tuple(item.get(k) for k in ("kind", "ecosystem", "package", "version", "pinned",
                                                "host", "host_inferred", "url"))
         if memo_key not in memo:
-            memo[memo_key] = match_ioc(item, ioc)
+            try:
+                memo[memo_key] = match_ioc(item, ioc)
+            except Exception:                    # noqa: BLE001 -- fail closed, never clean
+                memo[memo_key] = _ioc_failed_closed(item)
         found = memo[memo_key]
         if found is None:
             continue
-        verdict, reason, matched, key = found
+        verdict, reason, matched, key, undecided = found
+        totals["undecidable"] += 1 if undecided and not refused else 0
         if verdict == "clean":
             totals["clean_name_matches"] += 0 if refused else 1
             continue
@@ -3764,7 +3832,9 @@ def apply_ioc(fleet: "Fleet", ioc: IocSet | None) -> None:
         latest = max(items, key=lambda i: (i["ts"] or "", i["project"]))
         program = latest["program"]
         why = {"private-registry": f"installed from {latest['host']}; the entry describes the public registry",
-               "undecidable": "the version cannot be ordered against the entry"}.get(first["reason"])
+               "undecidable": "the version cannot be ordered against the entry",
+               "name-from-url": "the name is read from the URL",
+               "error": "the item could not be checked; treated as unresolved"}.get(first["reason"])
         evidence = (f"{len(items)} {'download' if key.startswith('host:') else 'install'}(s) of {key} "
                     f"via {program} ({latest['approval']})"
                     + (f" — ran it ({program})" if any(i["exec"] for i in items) else "")

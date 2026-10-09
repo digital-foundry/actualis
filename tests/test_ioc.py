@@ -364,6 +364,8 @@ class TestOsv(IocFiles, unittest.TestCase):
         s = ioc.sources[0]
         self.assertEqual((s["skipped"], s["first_skipped_line"], s["skipped_ranges"]), (4, 2, 2))
         self.assertEqual(sorted(n for _, n in ioc.packages), ["ok", "ok2", "ok3"])
+        for name in ("ok2", "ok3"):                  # an unusable range is undecidable, never dropped
+            self.assertEqual(ioc.packages[("npm", name)][0].spec_text, "undecidable")
 
     def test_shapes_agree(self):                                        # T-OSV-8
         recs = [osv("a", versions=["1.0.0"]), osv("b", ranges=[rng(("introduced", "1.0.0"))])]
@@ -742,7 +744,8 @@ class TestLoaderCaps(IocFiles, unittest.TestCase):
                    "line 1", "alternatives")
         rec = osv("x", versions=[f"1.0.{i}" for i in range(af.IOC_CLAUSES_MAX + 1)])
         ioc = self.load(json.dumps([rec, osv("y")]), "o.json")
-        self.assertEqual((sorted(n for _, n in ioc.packages), ioc.sources[0]["skipped"]), (["y"], 1))
+        self.assertEqual(ioc.packages[("npm", "x")][0].spec_text, "undecidable")     # never dropped
+        self.assertEqual(ioc.sources[0]["skipped_ranges"], 1)
 
     def test_a_file_of_comments_is_bounded(self):
         r = self.child(self.write("#\n" * (30 << 20), "comments.txt"))
@@ -829,3 +832,105 @@ class TestBypassMatrix(FleetCase, unittest.TestCase):
                        trust=["evil.io"])
         self.assertTrue(all(i["trusted"] for i in f.network_items))
         self.assertEqual([r["verdict"] for r in f.ioc_rows], ["match", "match"])
+
+
+class TestRegexTiming(unittest.TestCase):
+    """Every pattern the IOC code adds (and _TRUST_ENTRY, which host entries
+    use) stays under 0.1 s on 32 KB adversarial input, however it is called."""
+    N = 32 * 1024
+    UNITS = [".", "-", "0", "+", "@", "a", "1", "a-", "a.", "0.", "1.0-", "-0.0", "\\\"", "\"", "[", "{",
+             "]", "[]", "a@", "a/", "/a", "1!", "a_", "~", "a.b-", "x:", "||", ",=", "1.", "-a"]
+
+    def bodies(self):
+        for unit in self.UNITS:
+            s = (unit * (self.N // len(unit) + 1))[:self.N]
+            yield from (s, s + "!", "a" + s + "\x00", "1.0.0-" + s, "1.0.0+" + s, "v1." + s, s + "]", "[" + s)
+
+    def patterns(self):
+        pats = {k: v for k, v in vars(af).items()
+                if k.startswith(("_IOC", "IOC")) and hasattr(v, "fullmatch") and hasattr(v, "pattern")}
+        pats.update({f"_IOC_NAME[{k}]": v for k, v in af._IOC_NAME.items()})
+        pats.update({f"_IOC_ATTR_VALUE[{k}]": v for k, v in af._IOC_ATTR_VALUE.items()})
+        pats["_TRUST_ENTRY"] = af._TRUST_ENTRY
+        return pats
+
+    def test_every_pattern(self):
+        pats = self.patterns()
+        self.assertGreaterEqual(len(pats), 20)
+        for name, p in pats.items():
+            for b in self.bodies():
+                data = b.encode() if isinstance(p.pattern, bytes) else b
+                for fn in (p.fullmatch, p.search, p.match):
+                    t = time.perf_counter()
+                    fn(data)
+                    self.assertLess(time.perf_counter() - t, 0.1, (name, fn.__name__, b[:16]))
+
+    def test_every_scanner(self):
+        scanners = [af._ioc_semver_key, af._ioc_pep440_key, lambda v: af._ioc_url_name(
+                        {"ecosystem": "npm", "url": "https://x.io/" + v}),
+                    lambda v: af._ioc_norm_name("pypi", v), lambda v: af._ioc_json_depth(v.encode()),
+                    lambda v: af._ioc_valid_name("go", v)]
+        for k, fn in enumerate(scanners):
+            for b in self.bodies():
+                t = time.perf_counter()
+                try:
+                    fn(b)
+                except af._IocError:
+                    pass
+                self.assertLess(time.perf_counter() - t, 0.1, (k, b[:16]))
+        for spec in self.bodies():
+            for eco in ("npm", "pypi", "oci"):
+                t = time.perf_counter()
+                try:
+                    af._ioc_parse_spec(eco, spec)
+                except af._IocError:
+                    pass
+                self.assertLess(time.perf_counter() - t, 0.1, (eco, spec[:16]))
+
+
+class TestFailClosed(FleetCase, unittest.TestCase):
+    """An error or a cap hit while checking an item never leaves it clean: it
+    is unresolved (medium) and counted in totals.undecidable."""
+
+    def test_a_raising_comparator(self):
+        old = af._ioc_spec_contains
+
+        def boom(*a):
+            raise RuntimeError("comparator bug")
+        af._ioc_spec_contains = boom
+        try:
+            f = self.fleet("npm:evil@=1.0.0\n", "npm i evil@1.0.0")
+        finally:
+            af._ioc_spec_contains = old
+        self.assertEqual((f.ioc_rows[0]["verdict"], f.ioc_rows[0]["reason"]), ("unresolved", "undecidable"))
+        self.assertEqual((f.ioc_totals["undecidable"], f.ioc_totals["unresolved"]), (1, 1))
+        self.assertEqual([fl["categories"] for fl in self.ioc_flags(f)], [["network-ioc-unresolved"]])
+
+    def test_a_raising_item_evaluation(self):
+        old = af._ioc_resolved
+
+        def boom(item):
+            raise RuntimeError("resolver bug")
+        af._ioc_resolved = boom
+        try:
+            f = self.fleet("npm:evil@=1.0.0\n", "npm i evil@1.0.0")
+        finally:
+            af._ioc_resolved = old
+        row = f.ioc_rows[0]
+        self.assertEqual((row["verdict"], row["reason"], row["entries"][0].kind), ("unresolved", "error", "error"))
+        self.assertEqual((f.ioc_totals["undecidable"], f.network_items[0]["ioc"]), (1, "unresolved"))
+        [fl] = self.ioc_flags(f)
+        self.assertEqual((fl["severity"], fl["program"]), ("med", "error:npm"))
+        self.assertEqual(af.failing_findings(f, "any") != [], True)
+
+    def test_an_over_long_item_version(self):
+        long = "1.0.0-" + "a" * 10_000
+        self.assertEqual(self.verdict("npm:evil@=1.0.0\n", f"npm i evil@{long}"), UNRESOLVED)
+        f = self.fleet("pypi:evil@=1.0\n", "pip install evil==1." + "0" * 10_000)
+        self.assertEqual((f.ioc_rows[0]["verdict"], f.ioc_rows[0]["reason"]), ("unresolved", "undecidable"))
+        self.assertEqual(f.ioc_totals["undecidable"], 1)
+
+    def test_a_host_past_the_label_cap(self):
+        host = "a." * 200 + "evil.io"
+        self.assertEqual(self.verdict("host:evil.io\n", f"curl https://{host}/x"), ("unresolved", "error"))
+        self.assertIsNone(self.verdict("npm:zzz\n", f"curl https://{host}/x"))
