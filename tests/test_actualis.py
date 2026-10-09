@@ -1386,6 +1386,9 @@ class TestReportDigest(unittest.TestCase):
         exact procedure documented in docs/json.md."""
         payload = af.to_json(self._fleet())
         body = {k: v for k, v in payload.items() if k != "report_sha256"}
+        body["pricing"] = {k: v for k, v in body["pricing"].items()
+                           if k not in ("age_days", "stale")}
+        body["coach"] = [f for f in body["coach"] if f["id"] != "AF013"]
         canonical = json.dumps(body, sort_keys=True, separators=(",", ":"),
                                ensure_ascii=False)
         import hashlib
@@ -1396,7 +1399,7 @@ class TestReportDigest(unittest.TestCase):
         """Self-reference would make it uncomputable. Tampering with the digest
         field must not change what the digest recomputes to -- otherwise there
         is no fixed point and no way for a reader to check the figure."""
-        self.assertEqual(af.REPORT_DIGEST_EXCLUDES, frozenset({"report_sha256"}))
+        self.assertIn("report_sha256", af.REPORT_DIGEST_EXCLUDES)
         payload = af.to_json(self._fleet())
         original = payload["report_sha256"]
         payload["report_sha256"] = "0" * 64
@@ -2646,6 +2649,18 @@ class TestDiffTwoRuns(unittest.TestCase):
         self.assertIn("curl", out)                  # the program IS reported
         self.assertNotIn("Authorization", out)      # the command is not
         self.assertNotIn("sk_live_", out)
+
+    def test_differing_digests_with_equal_totals_do_not_blame_volume(self):
+        """Only a baseline hashed by an older build can differ this way now that
+        the digest ignores the clock-dependent fields."""
+        old = self._report()
+        new = self._report(report_sha256="b" * 64)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            af.render_diff(af.diff_reports(old, new), af.C(False))
+        out = buf.getvalue()
+        self.assertNotIn("volume alone", out)
+        self.assertIn("not comparable", out)
 
     def test_render_never_raises_on_a_sparse_report(self):
         """Old payloads may lack whole sections; a diff must not crash on them."""

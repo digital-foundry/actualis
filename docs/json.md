@@ -130,9 +130,15 @@ in the repository. The CLI will never fetch a price on your behalf.
 ## Verifying a report
 
 Every report is content-addressed. `report_sha256` is the SHA-256 of the payload
-with that one key removed, serialised canonically. The report itself prints the
-first 16 characters, so a screenshot can be checked against the payload it came
-from.
+with four things removed, serialised canonically: the `report_sha256` key itself,
+`pricing.age_days`, `pricing.stale`, and the `AF013` entry in `coach`. The last
+three depend on today's date and not on the transcripts, so excluding them keeps
+the same transcripts hashing the same tomorrow as today. A real change in
+the data still changes the hash. The report itself prints the first 16
+characters, so a screenshot can be checked against the payload it came from.
+
+Digests are not comparable with those from 0.2.2 and earlier, which hashed the
+clock-dependent fields. The schema did not change.
 
 Recompute it yourself, without trusting this tool:
 
@@ -143,6 +149,9 @@ python3 - <<'EOF'
 import hashlib, json
 p = json.load(open("report.json"))
 claimed = p.pop("report_sha256")
+p["pricing"].pop("age_days")
+p["pricing"].pop("stale")
+p["coach"] = [f for f in p["coach"] if f["id"] != "AF013"]
 canonical = json.dumps(p, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 actual = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 print("claimed:", claimed)
@@ -154,7 +163,7 @@ EOF
 Or in one line, if you have `jq` and prefer not to run Python:
 
 ```sh
-jq -Sc 'del(.report_sha256)' report.json | tr -d '\n' | shasum -a 256
+jq -Sc 'del(.report_sha256, .pricing.age_days, .pricing.stale) | .coach |= map(select(.id != "AF013"))' report.json | tr -d '\n' | shasum -a 256
 ```
 
 Three things about the canonical form, because they are the whole reason two

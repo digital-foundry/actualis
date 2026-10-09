@@ -4,6 +4,12 @@
 
 ### Changed
 
+- **`report_sha256` no longer moves with the clock.** The digest excludes
+  `pricing.age_days`, `pricing.stale` and the `AF013` coach finding, which change
+  as days pass over unchanged transcripts. `report_sha256` values are not
+  comparable with 0.2.2 reports. This is a known break of digest comparability,
+  not of schema; `schema_version` stays 1. `--diff` says so when the digests
+  differ but nothing it compares has changed.
 - **Current-generation pricing.** Opus 5.5 ($4/$20), Sonnet 5.5 ($2/$10),
   Haiku 5.5 ($0.10/$0.50, or $0.50/$2.50 for a message whose prompt exceeds
   100,000 tokens), Fable 5.1 and Mythos 5.1 ($10/$50) are vendor rates,

@@ -217,3 +217,61 @@ class TestCurrentGenerationPricing(unittest.TestCase):
 
     def test_pricing_verified_date(self):
         self.assertEqual(af.PRICING_VERIFIED, "2026-10-08")
+
+
+class TestDigestIgnoresTheClock(unittest.TestCase):
+    """C2: report_sha256 is a function of the transcripts, not of today's date."""
+
+    @staticmethod
+    def _fleet(tokens=10):
+        f = af.Fleet()
+        f.add_usage("proj", "claude-sonnet-5",
+                    {"input_tokens": tokens, "output_tokens": 1000},
+                    datetime(2026, 8, 1, tzinfo=timezone.utc), "main")
+        return f
+
+    def _payload_at(self, now, tokens=10):
+        class Frozen(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+        with mock.patch.object(af, "datetime", Frozen):
+            return af.to_json(self._fleet(tokens))
+
+    def test_a_day_later_gives_the_same_digest(self):
+        a = self._payload_at(datetime(2026, 10, 9, tzinfo=timezone.utc))
+        b = self._payload_at(datetime(2026, 10, 10, tzinfo=timezone.utc))
+        self.assertNotEqual(a["pricing"]["age_days"], b["pricing"]["age_days"])
+        self.assertEqual(a["report_sha256"], b["report_sha256"])
+
+    def test_crossing_the_stale_line_gives_the_same_digest(self):
+        # Verified 2026-10-08; 90 days on is not stale, 91 days on is, and AF013
+        # joins the coach list. None of that is a change in the transcripts.
+        a = self._payload_at(datetime(2027, 1, 6, tzinfo=timezone.utc))
+        b = self._payload_at(datetime(2027, 1, 7, tzinfo=timezone.utc))
+        self.assertFalse(a["pricing"]["stale"])
+        self.assertTrue(b["pricing"]["stale"])
+        self.assertNotIn("AF013", [f["id"] for f in a["coach"]])
+        self.assertIn("AF013", [f["id"] for f in b["coach"]])
+        self.assertEqual(a["report_sha256"], b["report_sha256"])
+
+    def test_a_content_change_still_changes_it(self):
+        now = datetime(2026, 10, 9, tzinfo=timezone.utc)
+        self.assertNotEqual(self._payload_at(now, 10)["report_sha256"],
+                            self._payload_at(now, 11)["report_sha256"])
+
+    def test_the_documented_recipe_reproduces_the_hash(self):
+        import hashlib
+        p = self._payload_at(datetime(2027, 1, 7, tzinfo=timezone.utc))
+        claimed = p.pop("report_sha256")
+        p["pricing"].pop("age_days")
+        p["pricing"].pop("stale")
+        p["coach"] = [f for f in p["coach"] if f["id"] != "AF013"]
+        canonical = json.dumps(p, sort_keys=True, separators=(",", ":"),
+                               ensure_ascii=False)
+        self.assertEqual(hashlib.sha256(canonical.encode("utf-8")).hexdigest(), claimed)
+
+    def test_the_payload_still_reports_the_clock_fields(self):
+        p = self._payload_at(datetime(2027, 1, 7, tzinfo=timezone.utc))
+        self.assertEqual(p["pricing"]["age_days"], 91)
+        self.assertTrue(p["pricing"]["stale"])

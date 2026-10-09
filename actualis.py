@@ -4715,8 +4715,17 @@ def render_diff(d: dict, c: C) -> None:
                   f"Compare the saved payloads directly to see every row.{c.off}")
 
     if not changed:
-        print(f"\n  {c.dim}No credential, finding or command-kind changed. "
-              f"The digests differ on volume alone.{c.off}")
+        if d["totals"] and all(ov == nv for ov, nv in d["totals"].values()):
+            # The digest ignores the clock (pricing.age_days, pricing.stale,
+            # AF013), so this is a baseline from a build that hashed them in.
+            print(f"\n  {c.dim}No credential, finding or command-kind changed, and "
+                  f"cost and message counts are equal. The digests differ because "
+                  f"the baseline was written by a version that hashed the "
+                  f"clock-dependent fields; digests from 0.2.2 and earlier are not "
+                  f"comparable.{c.off}")
+        else:
+            print(f"\n  {c.dim}No credential, finding or command-kind changed. "
+                  f"The digests differ on volume alone.{c.off}")
 
     if d["totals"]:
         print(f"\n  {c.bold}totals{c.off}")
@@ -7630,18 +7639,35 @@ def canonical_json(payload: dict) -> str:
 
 
 def report_digest(payload: dict) -> str:
-    """sha256 of the report, excluding the digest field itself.
+    """sha256 of the report, excluding the digest and the fields that move with the clock.
 
     Self-referential by construction otherwise: the hash cannot cover a field
-    whose value is the hash. Removing exactly that one key is what makes the
-    figure independently recomputable, and REPORT_DIGEST_EXCLUDES names it in
-    one place so the emitter and any verifier cannot disagree.
+    whose value is the hash. The same goes for pricing.age_days, pricing.stale
+    and finding AF013, which change as days pass over unchanged transcripts. The
+    digest then answers "did the evidence change", not "what day is it".
+    REPORT_DIGEST_EXCLUDES and REPORT_DIGEST_CLOCK_FINDINGS name all of it in one
+    place so the emitter and any verifier cannot disagree.
     """
-    body = {k: v for k, v in payload.items() if k not in REPORT_DIGEST_EXCLUDES}
+    def keep(node: dict, prefix: str) -> dict:
+        out = {}
+        for k, v in node.items():
+            path = prefix + k
+            if path in REPORT_DIGEST_EXCLUDES:
+                continue
+            out[k] = keep(v, path + ".") if isinstance(v, dict) else v
+        return out
+    body = keep(payload, "")
+    if isinstance(body.get("coach"), list):
+        body["coach"] = [f for f in body["coach"]
+                         if not (isinstance(f, dict)
+                                 and f.get("id") in REPORT_DIGEST_CLOCK_FINDINGS)]
     return hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
 
 
-REPORT_DIGEST_EXCLUDES = frozenset({"report_sha256"})
+# Dotted paths into the payload (a top-level key is a path of one part).
+REPORT_DIGEST_EXCLUDES = frozenset({"report_sha256", "pricing.age_days", "pricing.stale"})
+# Coach findings whose presence depends on today's date, not on the transcripts.
+REPORT_DIGEST_CLOCK_FINDINGS = frozenset({"AF013"})
 
 # --------------------------------------------------------------------------
 # Exit codes
