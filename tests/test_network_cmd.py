@@ -273,3 +273,17 @@ class TestTopUnasked(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRowsAreRemoteOnly(TestTopUnasked):
+    def test_rows_skip_hostless_and_local(self):
+        f = self.fleet([("a.io", 1, "auto", TS1), ("127.0.0.1", 3, "auto", TS2),
+                        ("10.0.0.5", 1, "default", TS2), ("b.io", 1, "default", TS1)])
+        f.add_tool("p", "WebSearch", {"query": "q"}, TS2, "auto")
+        text = self.out(f)
+        rows = [l for l in text.splitlines() if re.search(r"\d{4}-\d\d-\d\d (?:unasked|unknown)$", l)]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(("a.io" in l or "b.io" in l) for l in rows), rows)
+        self.assertNotIn("?  ", "\n".join(rows))
+        self.assertIn("plus 1 with no host", text)
+        self.assertIn("3 local or private", text)

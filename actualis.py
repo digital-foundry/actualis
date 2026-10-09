@@ -7768,7 +7768,10 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False) -> None:
         if extra:
             print(f"    {c.dim}plus {' · '.join(extra)}{c.off}")
 
-    rows = [i for i in n["items"] if i["approval"] in ("unasked", "unknown")]
+    # Remote hosts only: host-less and local items are counted on the "plus"
+    # line above, so a row reading `?  git` says nothing a reader can act on.
+    rows = [i for i in n["items"] if i["approval"] in ("unasked", "unknown")
+            and i["host"] and not _local_host(i["host"])]
     rows.sort(key=lambda i: i["approval"] != "unasked")   # stable: newest-first within each
     last = None
     for i in rows[:min(top, 5)]:
