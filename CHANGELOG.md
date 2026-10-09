@@ -131,6 +131,10 @@ Each of these is listed in full below.
 
 ### Fixed
 
+- **Shell, secret and network counts no longer double-count tool calls copied
+  into resumed or forked sessions.** The same `tool_use` id in more than one
+  transcript is counted once (`duplicate_tool_calls_skipped` in `--json`), so
+  counts can drop slightly against 0.2.2 (about 0.5% on one real corpus).
 - **Security: `redact()` missed more shapes of embedded token.** It now masks
   URL userinfo that has no password (`https://TOKEN@host`), all of the
   userinfo up to the last `@`, and scp-style userinfo containing `:` or longer

@@ -4554,6 +4554,10 @@ class Fleet:
         # always guarded its own version of this; this is the Claude equivalent.
         self.seen_message_ids: set[str] = set()
         self.duplicate_usage_records = 0
+        # Resumed and forked sessions copy history into a new file, so one
+        # tool call can sit in several transcripts. Keyed (agent, call id).
+        self.seen_tool_calls: set[tuple[str, str]] = set()
+        self.duplicate_tool_calls_skipped = 0
         self.first_ts: datetime | None = None
         self.last_ts: datetime | None = None
         self.roots: list[Path] = []
@@ -5045,6 +5049,14 @@ class Fleet:
     def add_tool(self, project: str, name: str, tool_input: dict, ts: datetime | None,
                  mode: str | None = None, *, session: str | None = None,
                  call_id: str | None = None, agent: str | None = None) -> None:
+        if call_id:
+            who = agent or ("codex" if (mode or "").startswith("codex:")
+                            else "copilot" if (mode or "").startswith("copilot:") else "claude")
+            key = (who, str(call_id))
+            if key in self.seen_tool_calls:
+                self.duplicate_tool_calls_skipped += 1      # counted once, in the file read first
+                return
+            self.seen_tool_calls.add(key)
         project = clean(project)[:120] or "unknown"
         name = clean(name)[:48] or "?"
         self.tools[name] += 1
@@ -8858,6 +8870,7 @@ JSON_SCHEMA: dict[str, str] = {
     "pricing.note": "str",
     "cost_note": "str",
     "duplicate_usage_records_skipped": "int",
+    "duplicate_tool_calls_skipped": "int",
     "duplicate_note": "str",
     "tokens.*": "int",
     "by_agent.*": "float",
@@ -9234,6 +9247,7 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
                      "known range for their provider, so that share is an upper "
                      "bound among current models rather than a measurement",
         "duplicate_usage_records_skipped": fleet.duplicate_usage_records,
+        "duplicate_tool_calls_skipped": fleet.duplicate_tool_calls_skipped,
         "duplicate_note": "one billable message can appear many times in a "
                           "transcript while a response streams; repeats are "
                           "counted once, by message id",

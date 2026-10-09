@@ -20,6 +20,7 @@ that and prints a warning.
 | `cost_note` | how unpriced models are rated, and in which direction that errs |
 | `pricing` | where each rate came from, how old the table is, and how much of the total rests on a published price. See [Rate provenance](#rate-provenance) |
 | `duplicate_usage_records_skipped` | repeated records for the same message, counted once |
+| `duplicate_tool_calls_skipped` | tool calls seen again in another transcript (resumed and forked sessions copy history), counted once, by tool call id; the copy in the file read first is kept |
 | `duplicate_note` | why repeats occur and how they are collapsed |
 | `tokens` | `input`, `output`, `cache_w_1h`, `cache_w_5m`, `cache_w_assumed`, `cache_read` |
 | `by_agent` | cost per agent (`claude-code`, `codex`, `copilot`) |
