@@ -3002,6 +3002,280 @@ def _ioc_spec_contains(eco: str, spec: tuple | None, version: str) -> bool | Non
     return None if undecided else False
 
 
+IOC_FILE_MAX = 1 << 30                # 1 GiB, the most any --ioc file may be
+IOC_WHOLE_JSON_MAX = 64 << 20         # a line file, an OSV array, or a document parsed whole
+IOC_LINE_MAX = 1 << 20                # one line of either format
+IOC_ENTRIES_MAX = 1_000_000           # across every file
+IOC_NAME_MAX = 214                    # npm's limit, applied to every ecosystem
+
+_IOC_ECOSYSTEMS = {"npm": "npm", "pypi": "pypi", "pip": "pypi",
+                   "crates": "crates", "crates.io": "crates", "cargo": "crates", "rust": "crates",
+                   "go": "go", "golang": "go", "oci": "oci", "docker": "oci", "container": "oci",
+                   "brew": "brew", "homebrew": "brew"}
+IOC_CHECKABLE = ("npm", "pypi", "crates", "go", "oci", "brew")
+# Accepted so one list can serve several tools, but this inventory never sees them.
+_IOC_NOT_CHECKABLE = ("rubygems", "nuget", "maven", "packagist", "composer", "pub", "hex", "erlang",
+                      "swift", "swifturl", "actions", "github-actions", "vscode", "open-vsx", "git")
+_IOC_ECO_WORD = re.compile(r"[A-Za-z0-9.-]{1,64}")
+_IOC_NAME = {
+    "npm": re.compile(r"(?:@[a-z0-9~][a-z0-9._~-]*/)?[A-Za-z0-9~][A-Za-z0-9._~-]*"),
+    "pypi": re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"),
+    "crates": re.compile(r"[a-z0-9][a-z0-9-]{0,63}"),
+    "go": re.compile(r"[A-Za-z0-9.~_+-]+(?:/[A-Za-z0-9.~_+-]+)*"),
+    "oci": re.compile(r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[0-9]+)?(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*"),
+    "brew": re.compile(r"[a-z0-9][a-z0-9@+._-]*(?:/[a-z0-9][a-z0-9@+._-]*){0,2}"),
+}
+_IOC_ATTR_VALUE = {"id": re.compile(r"[A-Za-z0-9._:-]{1,64}"),
+                   "label": re.compile(r"[A-Za-z0-9._-]{1,48}")}
+_IOC_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_IOC_WS = re.compile(r"[ \t]+")
+_IOC_LINE_CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+# A host entry with no path naming one of these would match every download from it.
+_IOC_BROAD_HOSTS = frozenset({"github.com", "gitlab.com", "bitbucket.org", "registry.npmjs.org",
+                              "pypi.org", "files.pythonhosted.org", "crates.io", "proxy.golang.org",
+                              "registry-1.docker.io", "ghcr.io"})
+
+
+class IocEntry(NamedTuple):
+    kind: str                 # "package" | "host"
+    eco: str | None           # npm pypi crates go oci brew; None for a host
+    name: str | None          # normalised by _ioc_norm_name
+    spec: tuple | None        # None: any version; else clauses (OR) of comparators (AND)
+    spec_text: str | None     # canonical: "=4.1.1||=4.1.2", ">=1.0.0,<2.0.0"
+    host: str | None
+    path: str                 # "" or "/a/b"
+    exact_host: bool
+    ref: str | None
+    label: str | None
+    frm: date | None          # shown, not applied (N2a)
+    until: date | None
+    source: int               # index into IocSet.sources, the --ioc order
+    line: int | None
+
+
+class IocSet:
+    """Every loaded entry, indexed for lookup by package key and by host."""
+
+    def __init__(self) -> None:
+        self.packages: dict[tuple[str, str], list[IocEntry]] = {}
+        self.host_suffix: dict[str, list[IocEntry]] = {}
+        self.host_exact: dict[str, list[IocEntry]] = {}
+        self.sources: list[dict] = []
+        self.mtimes: list[float] = []
+        self.has_window = False
+        self.total = 0
+
+    def add(self, e: IocEntry) -> None:
+        self.total += 1
+        if self.total > IOC_ENTRIES_MAX:
+            raise _IocError("over 1,000,000 entries; split by ecosystem")
+        if e.frm or e.until:
+            self.has_window = True
+        if e.kind == "package":
+            self.packages.setdefault((e.eco, e.name), []).append(e)
+        else:
+            (self.host_exact if e.exact_host else self.host_suffix).setdefault(e.host, []).append(e)
+        self.sources[e.source]["entries"][e.kind] += 1
+
+
+def _ioc_norm_name(eco: str, name: str) -> str:
+    """The one name normaliser, for IOC entries and inventory items alike.
+    npm and go compare exactly; pypi by PEP 503; images as _oci_name does."""
+    if eco == "pypi":
+        return re.sub(r"[-_.]+", "-", name).lower()
+    if eco == "crates":
+        return name.lower().replace("_", "-")
+    if eco == "oci":
+        return _oci_name(name)[0]
+    if eco == "brew":
+        return name.lower()
+    return name
+
+
+def _ioc_valid_name(eco: str, name: str) -> bool:
+    if not name or len(name) > IOC_NAME_MAX or not _IOC_NAME[eco].fullmatch(name):
+        return False
+    if eco == "go":
+        parts = name.split("/")
+        return "." in parts[0] and not any(p in (".", "..") for p in parts)
+    return True
+
+
+def _ioc_attrs(tokens: list[str]) -> dict:
+    """id=, label=, from= and until=, validated. Stops at a comment."""
+    attrs: dict[str, str] = {}
+    for t in tokens:
+        if t.startswith("#"):
+            break
+        key, eq, value = t.partition("=")
+        if not eq:
+            raise _IocError(f'"{t}" is not key=value', "a spec holds no spaces; write >=1.0.0,<2.0.0")
+        if "#" in t:
+            raise _IocError(f'"{t}" holds a #', "a comment starts with # after a space")
+        key = key.lower()
+        if key not in ("id", "label", "from", "until"):
+            raise _IocError(f'unknown attribute "{key}"', "use id=, label=, from= or until=")
+        if key in attrs:
+            raise _IocError(f'"{key}=" is repeated', "give each attribute once")
+        attrs[key] = value
+    out: dict = {"ref": None, "label": None, "frm": None, "until": None}
+    for key, pattern in _IOC_ATTR_VALUE.items():
+        if key in attrs:
+            if not pattern.fullmatch(attrs[key]):
+                raise _IocError(f'"{key}={attrs[key]}" is not a valid {key}',
+                                "letters, digits and . _ - (and : in an id)")
+            out["ref" if key == "id" else key] = attrs[key]
+    for key in ("from", "until"):
+        if key in attrs:
+            try:
+                if not _IOC_DATE.fullmatch(attrs[key]):
+                    raise ValueError
+                out["frm" if key == "from" else key] = date.fromisoformat(attrs[key])
+            except ValueError:
+                raise _IocError(f'"{key}={attrs[key]}" is not a date', "write YYYY-MM-DD") from None
+    if out["frm"] and out["until"] and out["until"] < out["frm"]:
+        raise _IocError("until= is before from=", "swap them")
+    return out
+
+
+def _ioc_host_entry(body: str, attrs: dict, src: int, n: int | None, label: str) -> IocEntry:
+    exact = body.startswith("=")
+    text = body[1:] if exact else body
+    host, slash, path = text.lower().partition("/")
+    host = host.removesuffix(".")
+    m = _TRUST_ENTRY.fullmatch(host + (slash + path if slash else ""))
+    if "://" in text or "*" in text or not m:
+        raise _IocError(f'"host:{body}" is not a host or host/path',
+                        "no scheme, port, wildcard or IPv6; write host:evil.example or host:github.com/evil-org")
+    path = (m.group(2) or "").rstrip("/")
+    if any(seg in (".", "..") for seg in path.split("/")):
+        raise _IocError(f'"host:{body}" has a . or .. segment', "write the path as the server sees it")
+    if not path and m.group(1) in _IOC_BROAD_HOSTS:
+        print(f"actualis: --ioc {label} line {n}: host:{m.group(1)} matches every download from "
+              f"{m.group(1)}; add a path", file=sys.stderr)
+    return IocEntry("host", None, None, None, None, m.group(1), path, exact,
+                    attrs["ref"], attrs["label"], attrs["frm"], attrs["until"], src, n)
+
+
+def _ioc_line(text: str, ioc: IocSet, src: int, n: int, label: str) -> None:
+    """One line of the actualis-ioc format."""
+    tokens = [t for t in _IOC_WS.split(text) if t]
+    if not tokens or tokens[0].startswith("#"):
+        return
+    if _IOC_LINE_CONTROL.search(text):
+        raise _IocError("the line holds a control character", "remove it")
+    entry = tokens[0]
+    attrs = _ioc_attrs(tokens[1:])
+    if "#" in entry:
+        raise _IocError(f'"{entry}" holds a #', "a comment starts with # after a space")
+    word, colon, body = entry.partition(":")
+    if word.lower() == "host" and colon:
+        ioc.add(_ioc_host_entry(body, attrs, src, n, label))
+        return
+    if not colon or not body:
+        raise _IocError(f'"{entry}" is not ecosystem:name or host:name',
+                        "write npm:name@=1.2.3 or host:evil.example")
+    eco = _IOC_ECOSYSTEMS.get(word.lower()) if _IOC_ECO_WORD.fullmatch(word) else None
+    if eco is None:
+        if word.lower() in _IOC_NOT_CHECKABLE:
+            nc = ioc.sources[src]["not_checkable"]
+            nc[word.lower()] = nc.get(word.lower(), 0) + 1
+            return
+        raise _IocError(f'unknown ecosystem "{word}"',
+                        f"known: {' '.join(IOC_CHECKABLE)} (and not-checkable: {' '.join(_IOC_NOT_CHECKABLE)})")
+    at = (-1 if eco == "brew" else body.rfind("@") if eco == "oci"
+          else body.find("@", 1) if eco == "npm" else body.find("@"))
+    name, spec_text = (body, None) if at < 0 else (body[:at], body[at + 1:])
+    if spec_text == "":
+        raise _IocError(f'"{entry}" ends in @', "write name@=1.2.3, or the name alone for any version")
+    norm = _ioc_norm_name(eco, name) if len(name) <= IOC_NAME_MAX else ""
+    if not _ioc_valid_name(eco, norm):
+        raise _IocError(f'"{name}" is not a valid {eco} name')
+    spec = _ioc_parse_spec(eco, spec_text)
+    ioc.add(IocEntry("package", eco, norm, spec, _ioc_spec_text(spec), None, "", False,
+                     attrs["ref"], attrs["label"], attrs["frm"], attrs["until"], src, n))
+
+
+def _ioc_lines(data: bytes, start: int = 1):
+    """(line number, bytes) for each line, CR LF or LF, with a leading BOM removed."""
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    for n, raw in enumerate(data.split(b"\n"), start):
+        yield n, raw[:-1] if raw.endswith(b"\r") else raw
+
+
+def _ioc_decode(raw: bytes, n: int) -> str:
+    if len(raw) > IOC_LINE_MAX:
+        raise _IocError("the line is over 1 MiB")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise _IocError("not UTF-8", "save the file as UTF-8") from None
+
+
+def parse_ioc_lines(data: bytes, ioc: IocSet, src: int, label: str) -> None:
+    """The actualis-ioc line format, version 1. The first error stops the load."""
+    for n, raw in _ioc_lines(data):
+        try:
+            _ioc_line(_ioc_decode(raw, n), ioc, src, n, label)
+        except _IocError as exc:
+            raise ValueError(f"--ioc {label} line {n}: {exc}") from None
+
+
+def _ioc_first_byte(data: bytes) -> bytes:
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    return data.lstrip(b" \t\r\n")[:1]
+
+
+def _ioc_source(path: Path) -> dict:
+    return {"path": str(path.resolve()), "sha256": "", "format": "lines",
+            "entries": {"package": 0, "host": 0}, "not_checkable": {},
+            "skipped": 0, "first_skipped_line": None, "withdrawn": 0,
+            "ranges_git": 0, "ranges_with_limit": 0, "skipped_ranges": 0}
+
+
+def _ioc_load_file(path: Path, ioc: IocSet, src: int, label: str) -> None:
+    source = ioc.sources[src]
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        st = os.fstat(fh.fileno())
+        if st.st_size > IOC_FILE_MAX:
+            raise ValueError(f"--ioc {label}: over 1 GiB")
+        data = fh.read(IOC_WHOLE_JSON_MAX + 1)
+        if len(data) > IOC_WHOLE_JSON_MAX:
+            raise ValueError(f"--ioc {label}: over 64 MiB")
+        digest.update(data)
+        parse_ioc_lines(data, ioc, src, label)
+    source["sha256"] = digest.hexdigest()
+    ioc.mtimes.append(st.st_mtime)
+
+
+def load_ioc(paths: list[str]) -> IocSet:
+    """Every --ioc file, in order. Any problem is a ValueError naming the file,
+    and the line where there is one. Never called unless --ioc was given."""
+    ioc = IocSet()
+    for src, given in enumerate(paths):
+        label = clean(given)
+        path = Path(given)
+        ioc.sources.append(_ioc_source(path))
+        try:
+            _ioc_load_file(path, ioc, src, label)
+        except OSError as exc:
+            raise ValueError(f"--ioc {label}: cannot read: {exc.strerror or exc}") from None
+        except _IocError as exc:                 # an entry past the cap
+            raise ValueError(f"--ioc {label}: {exc}") from None
+    checkable = sum(s["entries"]["package"] + s["entries"]["host"] for s in ioc.sources)
+    if checkable == 0:
+        nc: Counter = Counter()
+        for s in ioc.sources:
+            nc.update(s["not_checkable"])
+        detail = ", ".join(f"{k} {v}" for k, v in sorted(nc.items(), key=lambda kv: (-kv[1], kv[0])))
+        raise ValueError(f"--ioc: none of the {sum(nc.values())} entries can be checked"
+                         + (f" (not checkable: {detail})" if detail else ""))
+    return ioc
+
+
 # --------------------------------------------------------------------------
 # Suppressions
 #
