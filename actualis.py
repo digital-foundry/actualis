@@ -2798,6 +2798,30 @@ def apply_network_policy(fleet: "Fleet", trust: list[tuple[str, str]], strict: b
         })
 
 
+def network_filter(fleet: "Fleet", host: str | None = None, package: str | None = None,
+                   session: str | None = None, unasked: bool = False) -> None:
+    """Keep only the items every given filter matches, before --network-strict
+    and --ioc run, so totals, hosts, packages, findings and matches are all of
+    the filtered set. host: a suffix on a label boundary, as trust matches
+    (host/path also works). package: the exact name, compared as the IOC
+    matcher compares it (npm exactly, pypi by PEP 503). session: a prefix."""
+    trust = parse_trust([host], "--host") if host else []
+
+    def keep(i: dict) -> bool:
+        if trust and not network_trusted(i, trust):
+            return False
+        if package is not None:
+            eco = i.get("ecosystem") or ""
+            if not i.get("package") or _ioc_norm_name(eco, i["package"]) != _ioc_norm_name(eco, package):
+                return False
+        if session is not None and not (i.get("session") or "").startswith(session):
+            return False
+        return not unasked or i.get("approval") == "unasked"
+
+    fleet.network = [i for i in fleet.network if keep(i)]
+    fleet._net_by_call = {}              # positions are stale; every outcome is already applied
+
+
 NETWORK_ITEM_KEYS = ("kind", "program", "host", "host_inferred", "url", "dest", "source",
                      "ecosystem", "package", "version", "pinned", "exec", "dynamic", "alias",
                      "failed", "approval", "trusted", "agent", "project", "session", "call_id", "ts", "ioc",
@@ -10783,6 +10807,14 @@ def build_parser() -> argparse.ArgumentParser:
                           "actualis-ioc line format or OSV JSON/JSONL. Repeatable. Never read unless named.")
     net.add_argument("--network-strict", action="store_true",
                      help="make every unasked download from an untrusted source a medium finding")
+    net.add_argument("--host", metavar="HOST",
+                     help="--network: only downloads from HOST or a subdomain of it")
+    net.add_argument("--package", metavar="NAME",
+                     help="--network: only installs of this exact package (npm exactly, pypi by PEP 503)")
+    net.add_argument("--session", metavar="ID",
+                     help="--network: only sessions whose id starts with ID")
+    net.add_argument("--unasked", action="store_true",
+                     help="--network: only downloads that ran without asking")
     net.add_argument("--with-prompts", action="store_true",
                      help="--json: include network.items[].prompt, the person's last message "
                           "before each download (redacted, 160 characters). Null otherwise")
@@ -10807,6 +10839,12 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def network_filtered(args) -> bool:
+    """Whether any --network filter was given."""
+    return bool(args.network and (args.host or args.package is not None
+                                  or args.session is not None or args.unasked))
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = build_parser()
     args = ap.parse_args(argv)
@@ -10825,6 +10863,15 @@ def main(argv: list[str] | None = None) -> int:
                          ("--coach", args.coach), ("--aisvs", args.aisvs)):
             if on:
                 ap.error(f"--network cannot be combined with {flag}.")
+    for flag, on in (("--host", args.host), ("--package", args.package),
+                     ("--session", args.session), ("--unasked", args.unasked)):
+        if on is not None and on is not False and not args.network:
+            ap.error(f"{flag} requires --network: it narrows the network view.")
+    if args.host:
+        try:
+            parse_trust([args.host], "--host")
+        except ValueError as exc:
+            ap.error(str(exc))
     if args.with_prompts and not args.json:
         ap.error("--with-prompts applies only to --json; the text view already shows prompts.")
     if args.ioc and args.card:
@@ -11037,6 +11084,8 @@ def main(argv: list[str] | None = None) -> int:
         print(dead_end_message(fleet, args), file=sys.stderr)
         return EXIT_CANNOT_RUN
 
+    if network_filtered(args):
+        network_filter(fleet, args.host, args.package, args.session, args.unasked)
     apply_network_policy(fleet, network_trust, args.network_strict, trust_sources)
     apply_ioc(fleet, ioc)
 
