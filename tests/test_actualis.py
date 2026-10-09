@@ -631,12 +631,15 @@ class TestShareLeakage(unittest.TestCase):
         ts = datetime(2026, 10, 1, tzinfo=timezone.utc)
         f.add_tool("leaky-project", "Bash", {"command": "curl https://leaky-host.example/secret-path"},
                    ts, "auto")
-        f.add_tool("leaky-project", "WebFetch", {"url": "https://other-leak.example/x"}, ts, "auto")
+        f.add_tool("leaky-project", "WebFetch", {"url": "https://other-leak.example/x"}, ts, "auto",
+                   why="Fetching the leaky-why-sentence now.", prompt="leaky-prompt-words please",
+                   where={"root": "/leaky-root", "file": "leaky-file.jsonl", "line": 7})
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             af.render_share(f, af.C(False))
         out = buf.getvalue()
-        for needle in ("leaky-host", "secret-path", "other-leak", "leaky-project"):
+        for needle in ("leaky-host", "secret-path", "other-leak", "leaky-project",
+                       "leaky-why", "leaky-prompt", "leaky-root", "leaky-file"):
             self.assertNotIn(needle, out)
 
     def test_model_line_shows_custom_for_unlisted_models(self):

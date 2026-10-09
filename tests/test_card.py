@@ -675,9 +675,12 @@ class TestCardLeaksNothing(unittest.TestCase):
         ts = datetime(2026, 8, 1, tzinfo=timezone.utc)
         f.add_tool("leaky-project", "Bash", {"command": "curl https://leaky-host.example/secret-path"},
                    ts, "auto")
-        f.add_tool("leaky-project", "WebFetch", {"url": "https://other-leak.example/x"}, ts, "auto")
+        f.add_tool("leaky-project", "WebFetch", {"url": "https://other-leak.example/x"}, ts, "auto",
+                   why="Fetching the leaky-why-sentence now.", prompt="leaky-prompt-words please",
+                   where={"root": "/leaky-root", "file": "leaky-file.jsonl", "line": 7})
         for mode, surface, text in self._surfaces(f):
-            for needle in ("leaky-host", "secret-path", "other-leak", "leaky-project"):
+            for needle in ("leaky-host", "secret-path", "other-leak", "leaky-project",
+                       "leaky-why", "leaky-prompt", "leaky-root", "leaky-file"):
                 with self.subTest(mode=mode, surface=surface, needle=needle):
                     self.assertNotIn(needle, text)
 
