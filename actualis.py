@@ -2651,21 +2651,24 @@ def _net_item_path(item: dict) -> str | None:
     return path.lower()
 
 
+def _host_path_match(host: str, path: str, item: dict, exact: bool = False) -> bool:
+    """Whether an item's host and path fall under host[/path]: the host equal,
+    or (unless exact) a suffix on a label boundary; the path a prefix on a
+    segment boundary. An item with no known host, or a path that cannot be
+    known, never matches a path."""
+    ih = (item.get("host") or "").removesuffix(".")
+    if not ih or (ih != host and (exact or not ih.endswith("." + host))):
+        return False
+    if not path:
+        return True
+    ip = _net_item_path(item)
+    return ip is not None and (ip == path or ip.startswith(path + "/"))
+
+
 def network_trusted(item: dict, trust: list[tuple[str, str]]) -> bool:
     """Host suffix on a label boundary; path prefix on a segment boundary.
     An item with no known host is never trusted."""
-    host = (item.get("host") or "").removesuffix(".")
-    if not host:
-        return False
-    path = _net_item_path(item)
-    for h, p in trust:
-        if host != h and not host.endswith("." + h):
-            continue
-        if not p:
-            return True
-        if path is not None and (path == p or path.startswith(p + "/")):
-            return True
-    return False
+    return any(_host_path_match(h, p, item) for h, p in trust)
 
 
 def apply_network_policy(fleet: "Fleet", trust: list[tuple[str, str]], strict: bool,
@@ -3501,6 +3504,168 @@ def load_ioc(paths: list[str]) -> IocSet:
     return ioc
 
 
+_IOC_RANK = {"match": 2, "unresolved": 1}
+_IOC_HOST_LABELS = 127
+_IOC_DOWNGRADE = ("npm", "pypi", "crates")      # a registry the entry may not describe
+
+
+def _ioc_zero_totals() -> dict:
+    return {"match": 0, "unresolved": 0, "refused": 0, "suppressed": 0, "clean_name_matches": 0,
+            "items_checked": 0, "items_not_checkable": {"lockfile": 0, "no_host": 0, "other": 0}}
+
+
+def _ioc_resolved(item: dict) -> list[tuple[str, str]]:
+    """(normalised name, version) to compare, the version "" when the item
+    does not name exactly one release. npm aliases already carry the target
+    as `package` (`x@npm:evil@1.0.0` installs evil), so one pair suffices."""
+    eco, ver = item["ecosystem"], item.get("version") or ""
+    name = _ioc_norm_name(eco, item["package"])
+    if eco == "npm":
+        v = ver[1:] if ver[:1] in ("=", "v") else ver
+        return [(name, v if _ioc_semver_key(v) else "")]
+    if eco == "pypi":
+        return [(name, ver)]
+    if eco == "crates":
+        v = ver.removeprefix("=")
+        return [(name, v if item.get("pinned") and _ioc_semver_key(v) else "")]
+    if eco == "go":
+        return [(name, ver if ver.startswith("v") and _ioc_semver_key(ver) else "")]
+    if eco == "oci":
+        ok = _IOC_OCI_DIGEST.fullmatch(ver) or (ver and ver != "latest" and not ver.startswith("sha256:"))
+        return [(name, ver if ok else "")]
+    return [(name, "")]                                # brew records no version
+
+
+def _ioc_host_entries(ioc: IocSet, host: str) -> list[IocEntry]:
+    """Host entries that could match: exact on the host, suffix on each label boundary."""
+    found = list(ioc.host_exact.get(host, ()))
+    for _ in range(_IOC_HOST_LABELS):
+        found += ioc.host_suffix.get(host, ())
+        dot = host.find(".")
+        if dot < 0:
+            break
+        host = host[dot + 1:]
+    return found
+
+
+def match_ioc(item: dict, ioc: IocSet) -> tuple | None:
+    """(verdict, reason, entries, flag key) for one item, or None.
+
+    The verdict is the strongest over every entry: match, then unresolved;
+    "clean" when names matched and every version fell outside. entries are
+    all the entries at that strength, by (source, line). The trust list is
+    never consulted."""
+    hits: list[tuple[str, str, IocEntry, str]] = []
+    clean_hit = False
+    eco = item.get("ecosystem")
+    if item["kind"] == "install" and eco in IOC_CHECKABLE and item.get("package"):
+        for name, version in _ioc_resolved(item):
+            for e in ioc.packages.get((eco, name), ()):
+                if e.spec is None:
+                    verdict, reason = "match", "any-version"
+                elif not version:
+                    verdict, reason = "unresolved", "version-unresolved"
+                else:
+                    inside = _ioc_spec_contains(eco, e.spec, version)
+                    if inside is False:
+                        clean_hit = True
+                        continue
+                    verdict, reason = ("match", "version-in-spec") if inside else ("unresolved", "undecidable")
+                if verdict == "match" and eco in _IOC_DOWNGRADE and not item.get("host_inferred") \
+                   and item.get("host") != NETWORK_REGISTRY[eco]:
+                    verdict, reason = "unresolved", "private-registry"
+                hits.append((verdict, reason, e, f"{eco}:{name}@{version or '?'}"))
+    host = (item.get("host") or "").removesuffix(".")
+    if host and not item.get("host_inferred"):
+        for e in _ioc_host_entries(ioc, host):
+            if _host_path_match(e.host, e.path, item, e.exact_host):
+                hits.append(("match", "host", e, f"host:{'=' if e.exact_host else ''}{e.host}{e.path}"))
+    if not hits:
+        return ("clean", None, [], None) if clean_hit else None
+    best = max(_IOC_RANK[h[0]] for h in hits)
+    top = sorted((h for h in hits if _IOC_RANK[h[0]] == best),
+                 key=lambda h: (h[2].source, h[2].line or 0))
+    return top[0][0], top[0][1], [h[2] for h in top], top[0][3]
+
+
+def _ioc_coverage(item: dict) -> str:
+    """items_checked, or which items_not_checkable bucket an item is in."""
+    if (item["kind"] == "install" and item["ecosystem"] in IOC_CHECKABLE and item["package"]) \
+       or (item["host"] and not item["host_inferred"]):
+        return "checked"
+    if item["kind"] == "install" and not item["package"]:
+        return "lockfile"
+    return "no_host" if not item["host"] else "other"
+
+
+def apply_ioc(fleet: "Fleet", ioc: IocSet | None) -> None:
+    """Match every inventory item, refused ones included, and turn each
+    (verdict, key) group of the rest into one flag: match is high
+    (network-ioc), unresolved is medium (network-ioc-unresolved). Refused
+    rows are listed and never flagged. Run once, after apply_network_policy."""
+    fleet.ioc = ioc
+    fleet.ioc_rows = []
+    fleet.ioc_totals = totals = _ioc_zero_totals()
+    for item in fleet.network:
+        item["ioc"] = None
+    if ioc is None:
+        return
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for item in fleet.network:
+        refused = bool(item.get("_refused"))
+        if not refused:
+            bucket = _ioc_coverage(item)
+            if bucket == "checked":
+                totals["items_checked"] += 1
+            else:
+                totals["items_not_checkable"][bucket] += 1
+        found = match_ioc(item, ioc)
+        if found is None:
+            continue
+        verdict, reason, matched, key = found
+        if verdict == "clean":
+            totals["clean_name_matches"] += 0 if refused else 1
+            continue
+        row = {"verdict": verdict, "reason": reason, "refused": refused, "entries": matched,
+               "item": item, "key": key, "flag_id": None, "suppressed": False}
+        fleet.ioc_rows.append(row)
+        if refused:
+            totals["refused"] += 1
+            continue
+        item["ioc"] = verdict
+        totals[verdict] += 1
+        groups.setdefault((verdict, key), []).append(row)
+    for (verdict, key), rows in sorted(groups.items()):
+        severity, category = ("high", "network-ioc") if verdict == "match" else ("med", "network-ioc-unresolved")
+        fid = flag_id(severity, [category], key)
+        suppressed = fid in fleet.suppressions
+        if suppressed:
+            fleet.suppressed_flags += 1
+            totals["suppressed"] += 1
+        first = min(rows, key=lambda r: (r["entries"][0].source, r["entries"][0].line or 0))
+        entry = first["entries"][0]
+        items = [r["item"] for r in rows]
+        latest = max(items, key=lambda i: (i["ts"] or "", i["project"]))
+        program = latest["program"]
+        why = {"private-registry": f"installed from {latest['host']}; the entry describes the public registry",
+               "undecidable": "the version cannot be ordered against the entry"}.get(first["reason"])
+        evidence = (f"{len(items)} {'download' if key.startswith('host:') else 'install'}(s) of {key} "
+                    f"via {program} ({latest['approval']})"
+                    + (f" — ran it ({program})" if any(i["exec"] for i in items) else "")
+                    + (" (call failed)" if any(i["failed"] is True for i in items) else "")
+                    + f"; {entry.ref or entry.label or 'listed'}"
+                    + (f"; {why}" if why else ""))
+        fleet.flags.append({
+            "id": fid, "severity": severity, "categories": [category],
+            "program": key, "project": latest["project"], "when": latest["ts"],
+            "evidence": redact(clean(evidence))[:240],
+            "had_secret": False, "suppressed": suppressed,
+            "suppressed_reason": fleet.suppressions.get(fid, ""),
+        })
+        for r in rows:
+            r["flag_id"], r["suppressed"] = fid, suppressed
+
+
 # --------------------------------------------------------------------------
 # Suppressions
 #
@@ -3950,6 +4115,11 @@ class Fleet:
         self.network_trust: list[str] = []
         self.network_trust_sources: list[dict] = []
         self.network_strict = False
+        # --ioc: the loaded list (None without the flag), one row per matched
+        # item (refused ones included), and the counts network.ioc reports.
+        self.ioc: IocSet | None = None
+        self.ioc_rows: list[dict] = []
+        self.ioc_totals: dict = _ioc_zero_totals()
         self._net_by_call: dict[str, list[int]] = {}
         self._git_remotes: dict[tuple[str, str], dict[str, str]] = {}   # per (agent, session)
         # Location-based secret id -> sha256 of every value seen under it, for
@@ -4881,7 +5051,7 @@ class Fleet:
             item.update(approval=network_approval(mode), agent=agent, project=project,
                         session=clean(str(session))[:80] if session else None,
                         ts=ts.isoformat() if ts else None,
-                        failed=False if agent == "claude" else None, trusted=False)
+                        failed=False if agent == "claude" else None, trusted=False, ioc=None)
             if call_id:
                 self._net_by_call.setdefault(f"{agent}:{call_id}", []).append(len(self.network))
             self.network.append(item)
