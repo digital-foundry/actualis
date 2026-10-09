@@ -3,7 +3,8 @@
 During a supply-chain incident the first question is: did any coding agent on
 this machine, or in CI, install `X@bad-version` or contact `evil.example`, and
 did anyone approve it? `--ioc FILE` answers it offline. It compares the network
-inventory (see `--explain network`) against a list you supply.
+inventory (see `--explain network`), every download the transcripts show and
+actualis can read, against a list you supply.
 
 ```sh
 actualis --ioc iocs.txt                       # the IOC block in NETWORK
@@ -24,11 +25,18 @@ actualis --ioc iocs.txt --json | jq '.network.ioc.totals'
 | verdict | when | finding |
 |---|---|---|
 | `match` | an any-version entry names the package; the installed version is inside the entry's spec; or a host entry matches the host the download came from | high, category `network-ioc` |
-| `unresolved` | the name matches but the comparison cannot be decided: the install named no single version (`latest`, `^4.1.0`, none), the versions do not order, the package came from a private registry, the name was read from a git or tarball URL, or checking the item failed | medium, category `network-ioc-unresolved` |
+| `unresolved` | the name matches but the comparison cannot be decided: the install named no single version (`latest`, `^4.1.0`, none), the versions do not order, the package came from a private registry, the name was read from a git or tarball URL, a Go package inside a listed module could not be ordered, or checking the item failed | medium, category `network-ioc-unresolved` |
 
 The `reason` says which: `any-version`, `version-in-spec` or `host` for a
-match; `version-unresolved`, `undecidable`, `private-registry`,
-`name-from-url` or `error` for unresolved.
+match; `version-unresolved`, `undecidable`, `module-prefix`,
+`private-registry`, `name-from-url` or `error` for unresolved.
+
+**Go modules.** A Go install names a package (`go install
+evil.example/m/cmd/x@v1.0.0`); lists name the module (`go:evil.example/m`). A Go
+item is checked against its own path and every `/`-boundary prefix of it,
+longest first, so a package inside a listed module matches with the version the
+command named. When that version cannot be ordered against the module's spec,
+the reason is `module-prefix`.
 
 - **Refused calls** (a person denied the tool call) are listed with
   `refused: true`. They never produce a finding and never fail a gate.
@@ -123,8 +131,10 @@ split at the first `@` (npm: the first `@` after the scope's; oci: the last
 host and every subdomain, on a label boundary (`host:evil.io` matches
 `a.evil.io`, not `notevil.io`), and a path on a segment boundary.
 `host:=hostname` matches that host only. No scheme, port, wildcard or IPv6. A
-host entry never matches a host that was inferred (the default registry of
-`npm i x`), only one the command named. A host entry with no path naming
+host entry matches a host the command named, or one the session supplied as a
+URL: a git remote added or cloned earlier in the session (`git pull up`), or a
+`brew tap`'s `github.com/<owner>/homebrew-<repo>`. It never matches the default
+registry a bare install implies (`registry.npmjs.org` for `npm i x`). A host entry with no path naming
 `github.com`, a registry or another shared host loads with a warning, because
 it matches every download from there.
 
@@ -149,7 +159,7 @@ record per line), `[` is an array of records. Mapped as the
 - withdrawn records are skipped and counted; `GIT` ranges are counted;
 - a range that cannot be read (a version that does not order, an unknown event
   or type, too many events) is undecidable: a name match against it is
-  `unresolved`, never clean, and it is counted in `skipped_ranges`;
+  `unresolved`, never clean, and every such range is counted in `skipped_ranges`;
 - malformed records are counted and reported with the first line, never fatal;
 - `references[]` never become host entries.
 

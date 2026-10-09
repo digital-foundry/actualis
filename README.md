@@ -196,7 +196,7 @@ python3 actualis.py --agent codex    # one agent only (claude | codex | copilot 
 | `--fail-on LEVEL` | exit 3 if any unsuppressed finding is at or above `critical`, `high` or `any`. For gating a pipeline |
 | `--network-trust HOST[/PATH],...` | trusted download sources for `--network-strict` (repeatable). Also read from `./.actualis-network-trust`, one per line; the report prints that file's path and sha256 because the agent can write it |
 | `--network-strict` | make every unasked download from an untrusted source a medium finding, so `--fail-on any` and the suppressions file apply |
-| `--ioc FILE` | match every download against a known-bad list: the actualis-ioc line format or OSV JSON/JSONL (repeatable). A match is a high finding, an undecidable one medium. Read only when named; see [docs/ioc.md](docs/ioc.md) |
+| `--ioc FILE` | match every download the transcript shows against a known-bad list: the actualis-ioc line format or OSV JSON/JSONL (repeatable). A match is a high finding, an undecidable one medium. Read only when named; see [docs/ioc.md](docs/ioc.md) |
 | `--explain [TOPIC]` | how a number is computed, what it assumes, how to check it |
 | `--replay ID` | incident report for one credential: what ran while it was live, graded by proximity |
 | `--why AFxxx` | explain one finding against your actual numbers |
@@ -574,8 +574,8 @@ noisy rule destroys trust in the rules that matter. Current flag rate is about 3
 
 ## Did an agent install the bad version?
 
-During a supply-chain incident, `--ioc FILE` matches every download in the
-network inventory against a known-bad list, offline:
+During a supply-chain incident, `--ioc FILE` matches every download the
+transcripts show in the network inventory against a known-bad list, offline:
 
 ```sh
 actualis --ioc iocs.txt --fail-on high

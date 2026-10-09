@@ -2714,7 +2714,7 @@ def _net_public(i: dict, raw: bool = False) -> dict:
     source redacted unless raw."""
     out = {k: i[k] for k in NETWORK_ITEM_KEYS}
     if not raw:
-        for k in ("url", "dest", "source"):
+        for k in ("url", "dest", "source", "package", "version", "alias"):
             if out[k]:
                 out[k] = redact(out[k])
     return out
@@ -2767,7 +2767,8 @@ def network_json(fleet: "Fleet", raw: bool = False) -> dict:
                    "unparsed_segments": fleet.network_unparsed},
         "by_kind": {k: kinds.get(k, 0) for k in ("install", "clone", "fetch", "search")},
         "hosts": sorted(hosts.values(), key=lambda h: (-h["count"], h["host"])),
-        "packages": [{**p, "versions": sorted(p["versions"])}
+        "packages": [{**p, "name": p["name"] if raw else redact(p["name"]),
+                      "versions": sorted(p["versions"] if raw else {redact(v) for v in p["versions"]})}
                      for _, p in sorted(packages.items(), key=lambda kv: (-kv[1]["count"], kv[0]))],
         "items": [_net_public(i, raw) for i in order[:NETWORK_ITEMS_CAP]],
         "items_truncated": len(items) > NETWORK_ITEMS_CAP,
@@ -2816,6 +2817,15 @@ _IOC_PEP440 = re.compile(r"""
 _IOC_PEP440_PRE = {"a": 0, "alpha": 0, "b": 1, "beta": 1, "c": 2, "rc": 2, "pre": 2, "preview": 2}
 _IOC_OCI_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _IOC_OCI_TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
+
+
+IOC_QUOTE_MAX = 80
+
+
+def _ioc_q(text: str) -> str:
+    """Quote a token from the list for an error message, clipped: the message
+    names what to fix without copying a megabyte of the file into a CI log."""
+    return '"' + (text if len(text) <= IOC_QUOTE_MAX else text[:IOC_QUOTE_MAX - 1] + "\u2026") + '"'
 
 
 class _IocError(ValueError):
@@ -2909,16 +2919,16 @@ def _ioc_version_key(eco: str, v: str) -> tuple | None:
 def _ioc_bad_version(eco: str, v: str) -> _IocError:
     """The error for a comparator version that does not parse, naming the fix."""
     if eco == "oci":
-        return _IocError(f'"{v}" is not an image tag or sha256 digest', "write =TAG or =sha256:<64 hex>")
+        return _IocError(f'{_ioc_q(v)} is not an image tag or sha256 digest', "write =TAG or =sha256:<64 hex>")
     if _IOC_WORD.fullmatch(v):
-        return _IocError(f'"{v}" is not a version', "an IOC names versions; latest moves")
+        return _IocError(f'{_ioc_q(v)} is not a version', "an IOC names versions; latest moves")
     if eco == "pypi":
-        return _IocError(f'"{v}" is not a PEP 440 version for pypi', "write 1.2.3, or ===TEXT for an exact string")
+        return _IocError(f'{_ioc_q(v)} is not a PEP 440 version for pypi', "write 1.2.3, or ===TEXT for an exact string")
     parts = v.lstrip("v").split(".")
     if 1 <= len(parts) < 3 and all(p.isdigit() for p in parts):
         full = ".".join(parts + ["0"] * (3 - len(parts)))
-        return _IocError(f'"{v}" is not a full version for {eco}', f"write {full}")
-    return _IocError(f'"{v}" is not a SemVer version for {eco}', "write MAJOR.MINOR.PATCH")
+        return _IocError(f'{_ioc_q(v)} is not a full version for {eco}', f"write {full}")
+    return _IocError(f'{_ioc_q(v)} is not a SemVer version for {eco}', "write MAJOR.MINOR.PATCH")
 
 
 def _ioc_comparator(eco: str, text: str) -> tuple:
@@ -2927,18 +2937,18 @@ def _ioc_comparator(eco: str, text: str) -> tuple:
     v = text[len(op):]
     op = "=" if op in ("", "==") else op
     if not v:
-        raise _IocError(f'"{text}" has no version', "write =1.2.3")
+        raise _IocError(f'{_ioc_q(text)} has no version', "write =1.2.3")
     if v[0] in "^~":
-        raise _IocError(f'"{text}" is a range', "^ and ~ ranges are not accepted; write >=X,<Y")
+        raise _IocError(f'{_ioc_q(text)} is a range', "^ and ~ ranges are not accepted; write >=X,<Y")
     if len(v) > IOC_VERSION_MAX:
         raise _IocError(f"a version is over {IOC_VERSION_MAX} characters")
     if any(p in ("x", "X", "*") for p in v.split(".")):
-        raise _IocError(f'"{text}" is a wildcard', "wildcards are not accepted; write >=1.0.0,<2.0.0")
+        raise _IocError(f'{_ioc_q(text)} is a wildcard', "wildcards are not accepted; write >=1.0.0,<2.0.0")
     if not _IOC_VERSION_CHARS.fullmatch(v):
         raise _ioc_bad_version(eco, v)
     if eco == "oci":
         if op != "=":
-            raise _IocError(f'"{text}": an image has no version order', "write =TAG or =sha256:<digest>, joined by ||")
+            raise _IocError(f'{_ioc_q(text)}: an image has no version order', "write =TAG or =sha256:<digest>, joined by ||")
         if v == "latest":
             raise _IocError('"latest" is not an image version', "an IOC names versions; latest moves")
         if not (_IOC_OCI_DIGEST.fullmatch(v) or (_IOC_OCI_TAG.fullmatch(v) and not v.startswith("sha256:"))):
@@ -2946,7 +2956,7 @@ def _ioc_comparator(eco: str, text: str) -> tuple:
         return ("=", v, v)
     if op == "===":
         if eco != "pypi":
-            raise _IocError(f'"{text}": === is PEP 440 only', "write =1.2.3")
+            raise _IocError(f'{_ioc_q(text)}: === is PEP 440 only', "write =1.2.3")
         return ("===", None, v)
     key = _ioc_version_key(eco, v)
     if key is None:
@@ -2964,16 +2974,16 @@ def _ioc_parse_spec(eco: str, text: str | None) -> tuple | None:
     clauses = []
     for clause_text in text.split("||"):
         if not clause_text:
-            raise _IocError(f'"{text}" has an empty clause', "write A||B, with a version on each side of ||")
+            raise _IocError(f'{_ioc_q(text)} has an empty clause', "write A||B, with a version on each side of ||")
         comps = []
         for comp in clause_text.split(","):
             if not comp:
-                raise _IocError(f'"{text}" has an empty comparator', "write >=1.0.0,<2.0.0")
+                raise _IocError(f'{_ioc_q(text)} has an empty comparator', "write >=1.0.0,<2.0.0")
             if comp == "*":
-                raise _IocError(f'"{text}" is a wildcard', "wildcards are not accepted; write >=1.0.0,<2.0.0")
+                raise _IocError(f'{_ioc_q(text)} is a wildcard', "wildcards are not accepted; write >=1.0.0,<2.0.0")
             comps.append(_ioc_comparator(eco, comp))
         if sum(1 for op, _, _ in comps if op in ("=", "===")) > 1:
-            raise _IocError(f'"{text}" puts two versions in one clause',
+            raise _IocError(f'{_ioc_q(text)} puts two versions in one clause',
                             "a comma means AND; use || between alternative versions")
         clauses.append(tuple(comps))
     return tuple(clauses)
@@ -3152,12 +3162,12 @@ def _ioc_attrs(tokens: list[str]) -> dict:
             break
         key, eq, value = t.partition("=")
         if not eq:
-            raise _IocError(f'"{t}" is not key=value', "a spec holds no spaces; write >=1.0.0,<2.0.0")
+            raise _IocError(f'{_ioc_q(t)} is not key=value', "a spec holds no spaces; write >=1.0.0,<2.0.0")
         if "#" in t:
-            raise _IocError(f'"{t}" holds a #', "a comment starts with # after a space")
+            raise _IocError(f'{_ioc_q(t)} holds a #', "a comment starts with # after a space")
         key = key.lower()
         if key not in ("id", "label", "from", "until"):
-            raise _IocError(f'unknown attribute "{key}"', "use id=, label=, from= or until=")
+            raise _IocError(f'unknown attribute {_ioc_q(key)}', "use id=, label=, from= or until=")
         if key in attrs:
             raise _IocError(f'"{key}=" is repeated', "give each attribute once")
         attrs[key] = value
@@ -3165,7 +3175,7 @@ def _ioc_attrs(tokens: list[str]) -> dict:
     for key, pattern in _IOC_ATTR_VALUE.items():
         if key in attrs:
             if not pattern.fullmatch(attrs[key]):
-                raise _IocError(f'"{key}={attrs[key]}" is not a valid {key}',
+                raise _IocError(f'{_ioc_q(key + "=" + attrs[key])} is not a valid {key}',
                                 "letters, digits and . _ - (and : in an id)")
             out["ref" if key == "id" else key] = attrs[key]
     for key in ("from", "until"):
@@ -3175,7 +3185,7 @@ def _ioc_attrs(tokens: list[str]) -> dict:
                     raise ValueError
                 out["frm" if key == "from" else key] = date.fromisoformat(attrs[key])
             except ValueError:
-                raise _IocError(f'"{key}={attrs[key]}" is not a date', "write YYYY-MM-DD") from None
+                raise _IocError(f'{_ioc_q(key + "=" + attrs[key])} is not a date', "write YYYY-MM-DD") from None
     if out["frm"] and out["until"] and out["until"] < out["frm"]:
         raise _IocError("until= is before from=", "swap them")
     return out
@@ -3191,11 +3201,11 @@ def _ioc_host_entry(body: str, attrs: dict, src: int, n: int | None, label: str)
     host = host.removesuffix(".")
     m = _TRUST_ENTRY.fullmatch(host + (slash + path if slash else ""))
     if "://" in text or "*" in text or not m:
-        raise _IocError(f'"host:{body}" is not a host or host/path',
+        raise _IocError(f'{_ioc_q("host:" + body)} is not a host or host/path',
                         "no scheme, port, wildcard or IPv6; write host:evil.example or host:github.com/evil-org")
     path = (m.group(2) or "").rstrip("/")
     if any(seg in (".", "..") for seg in path.split("/")):
-        raise _IocError(f'"host:{body}" has a . or .. segment', "write the path as the server sees it")
+        raise _IocError(f'{_ioc_q("host:" + body)} has a . or .. segment', "write the path as the server sees it")
     if not path and m.group(1) in _IOC_BROAD_HOSTS:
         print(f"actualis: --ioc {label} line {n}: host:{m.group(1)} matches every download from "
               f"{m.group(1)}; add a path", file=sys.stderr)
@@ -3216,13 +3226,13 @@ def _ioc_line(text: str, ioc: IocSet, src: int, n: int, label: str) -> None:
     entry = tokens[0]
     attrs = _ioc_attrs(tokens[1:]) if len(tokens) > 1 else _IOC_NO_ATTRS
     if "#" in entry:
-        raise _IocError(f'"{entry}" holds a #', "a comment starts with # after a space")
+        raise _IocError(f'{_ioc_q(entry)} holds a #', "a comment starts with # after a space")
     word, colon, body = entry.partition(":")
     if word.lower() == "host" and colon:
         ioc.add(_ioc_host_entry(body, attrs, src, n, label))
         return
     if not colon or not body:
-        raise _IocError(f'"{entry}" is not ecosystem:name or host:name',
+        raise _IocError(f'{_ioc_q(entry)} is not ecosystem:name or host:name',
                         "write npm:name@=1.2.3 or host:evil.example")
     eco = _IOC_ECOSYSTEMS.get(word) or (_IOC_ECOSYSTEMS.get(word.lower()) if _IOC_ECO_WORD.fullmatch(word)
                                         else None)
@@ -3231,16 +3241,16 @@ def _ioc_line(text: str, ioc: IocSet, src: int, n: int, label: str) -> None:
             nc = ioc.sources[src]["not_checkable"]
             nc[word.lower()] = nc.get(word.lower(), 0) + 1
             return
-        raise _IocError(f'unknown ecosystem "{word}"',
+        raise _IocError(f'unknown ecosystem {_ioc_q(word)}',
                         f"known: {' '.join(IOC_CHECKABLE)} (and not-checkable: {' '.join(_IOC_NOT_CHECKABLE)})")
     at = (-1 if eco == "brew" else body.rfind("@") if eco == "oci"
           else body.find("@", 1) if eco == "npm" else body.find("@"))
     name, spec_text = (body, None) if at < 0 else (body[:at], body[at + 1:])
     if spec_text == "":
-        raise _IocError(f'"{entry}" ends in @', "write name@=1.2.3, or the name alone for any version")
+        raise _IocError(f'{_ioc_q(entry)} ends in @', "write name@=1.2.3, or the name alone for any version")
     norm = _ioc_norm_name(eco, name) if len(name) <= IOC_NAME_MAX else ""
     if not _ioc_valid_name(eco, norm):
-        raise _IocError(f'"{name}" is not a valid {eco} name')
+        raise _IocError(f'{_ioc_q(name)} is not a valid {eco} name')
     spec = _ioc_parse_spec(eco, spec_text) if spec_text is not None else None
     ioc.add(IocEntry._make(("package", eco, norm, spec, _ioc_spec_text(spec) if spec else None, None, "",
                             False, attrs["ref"], attrs["label"], attrs["frm"], attrs["until"], src, n)))
@@ -3339,6 +3349,7 @@ def _ioc_osv_range(eco: str, kind: str, events: object, source: dict) -> list | 
             continue
         key = _ioc_version_key(eco, v) if check(v) is not None else None
         if key is None:
+            source["skipped_ranges"] += 1
             return _IOC_UNDECIDABLE
         keyed.append(((1, key), 0 if k == "introduced" else 1, k, v, key))
     keyed.sort(key=lambda t: t[:2])
@@ -3717,6 +3728,35 @@ def _ioc_host_entries(ioc: IocSet, host: str) -> list[IocEntry]:
     return found
 
 
+# Every item field matching reads, and nothing else: apply_ioc hands
+# match_ioc a view of exactly these, and memoises on them, so a field added
+# to matching without being added here cannot be read (and the memo cannot
+# confuse two items that differ in it).
+IOC_ITEM_FIELDS = ("kind", "program", "ecosystem", "package", "version", "pinned", "alias",
+                   "host", "host_inferred", "url")
+
+
+def _ioc_go_prefixes(path: str) -> list[str]:
+    """The /-boundary prefixes of a Go package path, longest first: the
+    modules it could belong to (`evil.example/m/cmd/x` is in `evil.example/m`).
+    Only prefixes an entry could name: a dot in the first element, at most
+    IOC_NAME_MAX characters."""
+    if "." not in path.split("/", 1)[0]:
+        return []
+    out, cut = [], path.rfind("/", 0, IOC_NAME_MAX + 1)
+    while cut > 0:
+        out.append(path[:cut])
+        cut = path.rfind("/", 0, cut)
+    return [p for p in out if "/" in p or "." in p]
+
+
+def _ioc_host_checkable(item: dict) -> bool:
+    """A host the command named, or one the session itself supplied as a URL
+    (a resolved git remote, a brew tap's repository). A registry default
+    (`npm i x` and registry.npmjs.org) has no URL and is never matched."""
+    return bool(item.get("host")) and (not item.get("host_inferred") or bool(item.get("url")))
+
+
 def match_ioc(item: dict, ioc: IocSet) -> tuple | None:
     """(verdict, reason, entries, flag key, undecided) for one item, or None.
 
@@ -3729,29 +3769,33 @@ def match_ioc(item: dict, ioc: IocSet) -> tuple | None:
     eco = item.get("ecosystem")
     if item["kind"] == "install" and eco in IOC_CHECKABLE and item.get("package"):
         for name, version in _ioc_resolved(item):
-            for e in ioc.packages.get((eco, name), ()):
-                if e.spec is None:
-                    verdict, reason = "match", "any-version"
-                elif not version:
-                    verdict, reason = "unresolved", "version-unresolved"
-                else:
-                    try:
-                        inside = _ioc_spec_contains(eco, e.spec, version)
-                    except Exception:            # noqa: BLE001 -- fail closed: undecidable, never clean
-                        inside = None
-                    if inside is False:
-                        clean_hit = True
-                        continue
-                    verdict, reason = ("match", "version-in-spec") if inside else ("unresolved", "undecidable")
-                if verdict == "match" and eco in _IOC_DOWNGRADE and not item.get("host_inferred") \
-                   and item.get("host") != NETWORK_REGISTRY[eco]:
-                    verdict, reason = "unresolved", "private-registry"
-                hits.append((verdict, reason, e, f"{eco}:{name}@{version or '?'}"))
+            # A Go install names a package; lists name the module it is in.
+            names = [(name, False)] + [(m, True) for m in (_ioc_go_prefixes(name) if eco == "go" else ())]
+            for listed, prefix in names:
+                for e in ioc.packages.get((eco, listed), ()):
+                    if e.spec is None:
+                        verdict, reason = "match", "any-version"
+                    elif not version:
+                        verdict, reason = "unresolved", "version-unresolved"
+                    else:
+                        try:
+                            inside = _ioc_spec_contains(eco, e.spec, version)
+                        except Exception:        # noqa: BLE001 -- fail closed: undecidable, never clean
+                            inside = None
+                        if inside is False:
+                            clean_hit = True
+                            continue
+                        verdict, reason = (("match", "version-in-spec") if inside
+                                           else ("unresolved", "module-prefix" if prefix else "undecidable"))
+                    if verdict == "match" and eco in _IOC_DOWNGRADE and not item.get("host_inferred") \
+                       and item.get("host") != NETWORK_REGISTRY[eco]:
+                        verdict, reason = "unresolved", "private-registry"
+                    hits.append((verdict, reason, e, f"{eco}:{listed}@{redact(version) if version else '?'}"))
     url_name = _ioc_url_name(item) if item["kind"] == "install" else None
     for e in ioc.packages.get(("npm", url_name), ()) if url_name else ():
         hits.append(("unresolved", "name-from-url", e, f"npm:{url_name}@?"))
     host = (item.get("host") or "").removesuffix(".")
-    if host and not item.get("host_inferred"):
+    if _ioc_host_checkable(item):
         for e in _ioc_host_entries(ioc, host):
             if _host_path_match(e.host, e.path, item, e.exact_host):
                 hits.append(("match", "host", e, f"host:{'=' if e.exact_host else ''}{e.host}{e.path}"))
@@ -3760,7 +3804,7 @@ def match_ioc(item: dict, ioc: IocSet) -> tuple | None:
     best = max(_IOC_RANK[h[0]] for h in hits)
     top = sorted((h for h in hits if _IOC_RANK[h[0]] == best),
                  key=lambda h: (h[2].source, h[2].line or 0))
-    undecided = any(h[1] == "undecidable" for h in hits)
+    undecided = any(h[1] in ("undecidable", "module-prefix") for h in hits)
     return top[0][0], top[0][1], [h[2] for h in top], top[0][3], undecided
 
 
@@ -3776,7 +3820,7 @@ def _ioc_failed_closed(item: dict) -> tuple:
 def _ioc_coverage(item: dict) -> str:
     """items_checked, or which items_not_checkable bucket an item is in."""
     if (item["kind"] == "install" and item["ecosystem"] in IOC_CHECKABLE and item["package"]) \
-       or (item["host"] and not item["host_inferred"]):
+       or _ioc_host_checkable(item):
         return "checked"
     if item["kind"] == "install" and not item["package"]:
         return "lockfile"
@@ -3807,13 +3851,13 @@ def apply_ioc(fleet: "Fleet", ioc: IocSet | None) -> None:
                 totals["items_not_checkable"][bucket] += 1
         # Items that agree on every field matching reads get the same answer, so
         # forty installs of one package cost one lookup, however long the list.
-        memo_key = tuple(item.get(k) for k in ("kind", "ecosystem", "package", "version", "pinned",
-                                               "host", "host_inferred", "url"))
+        view = {k: item.get(k) for k in IOC_ITEM_FIELDS}
+        memo_key = tuple(view.values())
         if memo_key not in memo:
             try:
-                memo[memo_key] = match_ioc(item, ioc)
+                memo[memo_key] = match_ioc(view, ioc)
             except Exception:                    # noqa: BLE001 -- fail closed, never clean
-                memo[memo_key] = _ioc_failed_closed(item)
+                memo[memo_key] = _ioc_failed_closed(view)
         found = memo[memo_key]
         if found is None:
             continue
@@ -3845,6 +3889,7 @@ def apply_ioc(fleet: "Fleet", ioc: IocSet | None) -> None:
         program = latest["program"]
         why = {"private-registry": f"installed from {latest['host']}; the entry describes the public registry",
                "undecidable": "the version cannot be ordered against the entry",
+               "module-prefix": "the package is inside the listed module; the version cannot be ordered against it",
                "name-from-url": "the name is read from the URL",
                "error": "the item could not be checked; treated as unresolved"}.get(first["reason"])
         evidence = (f"{len(items)} {'download' if key.startswith('host:') else 'install'}(s) of {key} "
@@ -3867,6 +3912,7 @@ def apply_ioc(fleet: "Fleet", ioc: IocSet | None) -> None:
 IOC_ROWS_SHOWN = 50
 IOC_REFS_CAP = 20
 _IOC_REASON_TEXT = {"version-unresolved": "version not resolved", "undecidable": "undecidable",
+                    "module-prefix": "in a listed module",
                     "private-registry": "private registry", "name-from-url": "name from URL",
                     "error": "could not check"}
 
@@ -6813,8 +6859,11 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "Each download in the network inventory is compared with every entry",
             "in the --ioc files: package entries by ecosystem and name, then by",
             "version; host entries by host suffix on a label boundary and path",
-            "prefix on a segment boundary. A host is matched only when the command",
-            "named it, never the default registry it implies.",
+            "prefix on a segment boundary. A host is matched when the command named",
+            "it or the session supplied it as a URL (a git remote added earlier, a",
+            "brew tap's repository), never the default registry a bare install",
+            "implies. A Go package also matches the module it is in:",
+            "go install evil.example/m/cmd/x@v1 is checked against evil.example/m.",
             "",
             "verdict  match       an any-version entry, a version inside the",
             "                     entry's spec, or a host entry. High finding,",
@@ -6824,7 +6873,9 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "                     (version-unresolved), the versions do not order",
             "                     (undecidable), a private registry served it",
             "                     (private-registry), the name was read from a git",
-            "                     or tarball URL (name-from-url), or checking failed",
+            "                     or tarball URL (name-from-url), a Go package inside",
+            "                     a listed module could not be ordered",
+            "                     (module-prefix), or checking failed",
             "                     (error). Medium finding, network-ioc-unresolved.",
             "A listed name whose version is outside every spec is clean, and only",
             "counted (clean_name_matches).",

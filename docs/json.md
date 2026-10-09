@@ -185,8 +185,9 @@ and a countersignature, which is separate work.
 
 ## network
 
-Every download, clone, install and web fetch the agents made, recorded from
-shell commands and web tools.
+Every download, clone, install and web fetch the transcripts show and actualis
+can read, recorded from shell commands and web tools. A shape the inventory does
+not parse (a script, `poetry add`, `npm exec`) gives no item.
 
 | key | meaning |
 |---|---|
@@ -197,7 +198,7 @@ shell commands and web tools.
 | `by_kind` | counts of `install`, `clone`, `fetch` and `search` items |
 | `hosts[]` | per host: `count`, `unasked`, `first_seen`, and `trusted` if any item from it matched the trust list |
 | `packages[]` | per `ecosystem` and `name`: `versions` seen, `pinned` (every install named an exact version: a full `MAJOR.MINOR.PATCH` for npm, crates and go, `==` for pypi, an `@sha256:` digest for images; for crates, `cargo add` is pinned only with `=1.2.3` and `cargo install --version 1.2.3` is exact; ranges, tags and prefixes are not pinned), `exec` (any install ran code), `count` |
-| `items[]` | one record per item: `kind`, `program`, `host`, `host_inferred`, `url`, `dest`, `source`, `ecosystem`, `package`, `version`, `pinned`, `exec`, `dynamic`, `alias` (the name an npm alias installs under, `x` in `x@npm:evil@1.0.0`, where `package` is `evil`; else `null`), `failed` (`null` when unknown), `approval`, `trusted`, `agent`, `project`, `session`, `ts`, `ioc` (`match`, `unresolved` or `null`; see `network.ioc`) |
+| `items[]` | one record per item (`package`, `version` and `alias` are redacted like `url` unless `--no-redact`): `kind`, `program`, `host`, `host_inferred`, `url`, `dest`, `source`, `ecosystem`, `package`, `version`, `pinned`, `exec`, `dynamic`, `alias` (the name an npm alias installs under, `x` in `x@npm:evil@1.0.0`, where `package` is `evil`; else `null`), `failed` (`null` when unknown), `approval`, `trusted`, `agent`, `project`, `session`, `ts`, `ioc` (`match`, `unresolved` or `null`; see `network.ioc`) |
 | `items_truncated` | `true` when `items` was cut at the cap |
 | `strict` | whether `--network-strict` was on |
 | `trust` | the trusted host or host-and-path entries in force |
@@ -241,8 +242,9 @@ it is `{"enabled": false, "sources": [], "totals": {...all zero}, "matches": [],
 
 - `verdict`: `match` or `unresolved`.
 - `reason`: `any-version`, `version-in-spec` or `host` (match);
-  `version-unresolved`, `undecidable`, `private-registry`, `name-from-url` or
-  `error` (unresolved).
+  `version-unresolved`, `undecidable`, `module-prefix` (a Go package inside a
+  listed module whose version cannot be ordered), `private-registry`,
+  `name-from-url` or `error` (unresolved).
 - `format`: `lines`, `osv-json` or `osv-jsonl`.
 - `entry.kind`: `package`, `host`, or `error` (a placeholder when checking the
   item failed; `source` is then `-1`).
