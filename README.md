@@ -511,12 +511,12 @@ no report.
 
 ## About the cost number
 
-Costs are Anthropic API list prices, verified 2026-08-22, including the cache
+Costs are Anthropic API list prices, verified 2026-10-08, including the cache
 multipliers that dominate agent workloads:
 
 | | multiplier on input rate |
 |---|---|
-| cache read | 0.10× |
+| cache read | 0.10× (0.05× Opus 5.5 and Sonnet 5.5; 0.025× Fable 5.1 and Mythos 5.1) |
 | cache write, 5m TTL | 1.25× |
 | cache write, 1h TTL | 2.00× |
 

@@ -71,7 +71,7 @@ A cost tool that cannot say where a number came from is asking to be trusted
 rather than checked. `pricing` says.
 
 ```json
-{ "verified": "2026-08-24", "age_days": 0, "stale": false, "stale_after_days": 90,
+{ "verified": "2026-10-08", "age_days": 0, "stale": false, "stale_after_days": 90,
   "tier_order": ["vendor","vendor-doc","aggregator","family","default"],
   "confident_pct": 28.17,
   "cost_by_tier":   { "vendor": 3.0, "aggregator": 3.15, "family": 4.5 },
@@ -100,6 +100,22 @@ transcripts, but must not set the ceiling for a model that does not exist yet.
 `confident_pct` is the share of `cost_usd` priced from a provider's own rates.
 **A total is only as sound as its weakest component**, and without this number
 a reader cannot tell a measured figure from a mostly-inferred one.
+
+### Cache-read and long-prompt rates
+
+The cache-read multiplier is per model. It is 0.10 of the input rate by
+default, 0.05 for Opus 5.5 and Sonnet 5.5, and 0.025 for Fable 5.1 and
+Mythos 5.1. `cache.saved_usd` uses each message's own multiplier, so a cheaper
+read raises the saving. Cache writes stay at 1.25x (5m) and 2.00x (1h) for every
+model.
+
+Haiku 5.5 has two tiers. A message whose prompt (input + cache read + cache
+write tokens) is 100,000 or fewer is priced at $0.10 / $0.50 per million; above
+100,000 the whole message is priced at $0.50 / $2.50. Fast mode, batch pricing
+and data-residency uplifts are not modelled.
+
+A model id that is not in the table is priced as the newest known model in its
+family (highest version number; the dearer one on a tie), tier `family`.
 
 ### Staleness
 

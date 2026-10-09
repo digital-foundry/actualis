@@ -43,9 +43,10 @@ __version__ = "0.2.2"
 # Pricing
 #
 # USD per million tokens, Anthropic first-party API rates.
-# Source: Anthropic pricing, verified 2026-08-22.
+# Source: Anthropic pricing, verified 2026-10-08.
 # Cache multipliers apply to the model's INPUT rate:
-#   read           0.10x
+#   read           0.10x by default; 0.05x Opus 5.5 / Sonnet 5.5,
+#                  0.025x Fable 5.1 / Mythos 5.1 (Rate.cache_read)
 #   write  5m TTL  1.25x
 #   write  1h TTL  2.00x
 #
@@ -102,7 +103,7 @@ RATE_TIERS = (VENDOR, VENDOR_DOC, AGGREGATOR, FAMILY, DEFAULT)
 # How far a rate can drift out of date before the report stops presenting it
 # without comment. Model prices move on the order of months, so a table older
 # than a quarter is a number worth doubting rather than quoting.
-PRICING_VERIFIED = "2026-08-24"
+PRICING_VERIFIED = "2026-10-08"
 PRICING_STALE_DAYS = 90
 
 RATE_SOURCES = {
@@ -123,6 +124,12 @@ class Rate(NamedTuple):
     # must not set the ceiling for a model that does not exist yet: opus-4-1 at
     # $15/$75 would price a future Opus at three times the current rate.
     retired: bool = False
+    # Cache reads cost this multiple of the input rate. 0.10 unless the model's
+    # row says otherwise, so a cheaper read is a property of the model.
+    cache_read: float = CACHE_READ_MULT
+    # Haiku 5.5 reprices a whole message once its prompt exceeds
+    # LONG_PROMPT_TOKENS. Applied by Fleet.add_usage only.
+    long_prompt: "Rate | None" = None
 
     @property
     def confident(self) -> bool:
@@ -130,7 +137,17 @@ class Rate(NamedTuple):
         return self.tier in (VENDOR, VENDOR_DOC)
 
 
+LONG_PROMPT_TOKENS = 100_000
+
 PRICING: dict[str, Rate] = {
+    "claude-fable-5-1":   Rate(10.0, 50.0, "anthropic", VENDOR, cache_read=0.025),
+    "claude-mythos-5-1":  Rate(10.0, 50.0, "anthropic", VENDOR, cache_read=0.025),
+    "claude-opus-5-5":    Rate(4.0, 20.0, "anthropic", VENDOR, cache_read=0.05),
+    "claude-sonnet-5-5":  Rate(2.0, 10.0, "anthropic", VENDOR, cache_read=0.05),
+    # Prompt > 100,000 tokens (input + cache read + cache write of one message)
+    # prices the whole message at 0.50 / 2.50.
+    "claude-haiku-5-5":   Rate(0.10, 0.50, "anthropic", VENDOR,
+                               long_prompt=Rate(0.50, 2.50, "anthropic", VENDOR)),
     "claude-fable-5":     Rate(10.0, 50.0, "anthropic", VENDOR),
     "claude-mythos-5":    Rate(10.0, 50.0, "anthropic", VENDOR),
     "claude-opus-5":      Rate(5.0, 25.0, "anthropic", VENDOR),
@@ -216,11 +233,21 @@ def _family_rate(model: str) -> Rate | None:
                     if k.startswith(family) and not r.retired}
         if not siblings:
             continue
-        # Highest-priced sibling, for the same reason the ceiling is used above.
-        name, best = max(siblings.items(), key=lambda kv: (kv[1].output, kv[1].input))
-        return Rate(best.input, best.output, provider, FAMILY,
-                    f"not in the table; priced as {name}, the most expensive "
-                    f"known {family} model")
+        # A dated id (claude-haiku-4-5-20251001) is that model, not a new one.
+        dated = [k for k in siblings if re.fullmatch(re.escape(k) + r"-\d{8}", model)]
+        if dated:
+            name = max(dated, key=len)
+            best = siblings[name]
+            return best._replace(tier=FAMILY, note=f"dated id; priced as {name}")
+        # Newest generation in the family, not the dearest sibling: the highest
+        # version number wins, and on a tie the more expensive one.
+        def newest(kv: tuple[str, Rate]) -> tuple:
+            ver = tuple(int(n) for n in re.findall(r"\d+", kv[0][len(family):]))
+            return (ver, kv[1].output, kv[1].input)
+        name, best = max(siblings.items(), key=newest)
+        return best._replace(provider=provider, tier=FAMILY,
+                             note=f"not in the table; priced as {name}, the newest "
+                                  f"known {family} model")
     return None
 
 
@@ -3113,7 +3140,7 @@ def copilot_session_cost(usage: dict, model: str) -> float:
     wr = usage.get("cacheWriteTokens", 0) or 0
     out = usage.get("outputTokens", 0) or 0
     fresh = max(total_in - rd - wr, 0)
-    read_mult = OPENAI_CACHED_MULT if r.provider == "openai" else CACHE_READ_MULT
+    read_mult = OPENAI_CACHED_MULT if r.provider == "openai" else r.cache_read
     return (fresh / 1e6 * r.input
             + rd / 1e6 * r.input * read_mult
             + wr / 1e6 * r.input * CACHE_WRITE_ASSUMED_MULT
@@ -3135,6 +3162,11 @@ class Fleet:
         # varies by model and cannot be recovered from totals afterwards.
         self.cache_actual: dict[str, float] = defaultdict(float)
         self.cache_uncached: dict[str, float] = defaultdict(float)
+        # Cache-read tokens at the full input rate, and what they were billed at.
+        # Their ratio is the project's effective read multiplier (it differs by
+        # model), which the cache-efficiency finding needs to price a miss.
+        self.cache_read_list: dict[str, float] = defaultdict(float)
+        self.cache_read_paid: dict[str, float] = defaultdict(float)
         self.msgs_by_project: Counter = Counter()
         self.cost_by_ticket: dict[str, float] = defaultdict(float)
         self.msgs_by_ticket: Counter = Counter()
@@ -3275,6 +3307,11 @@ class Fleet:
         rd = usage.get("cache_read_input_tokens", 0) or 0
 
         in_rate, out_rate, _provider, known, src = rates_for(model, ts)
+        rate = rate_for(model)
+        if rate.long_prompt and inp + rd + w1h + w5m + assumed > LONG_PROMPT_TOKENS:
+            rate = rate.long_prompt     # the whole message, not just the excess
+            in_rate, out_rate = rate.input, rate.output
+        read_mult = rate.cache_read
         if not known:
             self.unknown_models[model] += 1
         elif src == AGGREGATOR:
@@ -3286,7 +3323,7 @@ class Fleet:
             + w1h / 1e6 * in_rate * CACHE_WRITE_1H_MULT
             + w5m / 1e6 * in_rate * CACHE_WRITE_5M_MULT
             + assumed / 1e6 * in_rate * CACHE_WRITE_ASSUMED_MULT
-            + rd / 1e6 * in_rate * CACHE_READ_MULT
+            + rd / 1e6 * in_rate * read_mult
         )
 
         if not known:
@@ -3317,7 +3354,9 @@ class Fleet:
             + w1h / 1e6 * in_rate * CACHE_WRITE_1H_MULT
             + w5m / 1e6 * in_rate * CACHE_WRITE_5M_MULT
             + assumed / 1e6 * in_rate * CACHE_WRITE_ASSUMED_MULT
-            + rd / 1e6 * in_rate * CACHE_READ_MULT)
+            + rd / 1e6 * in_rate * read_mult)
+        self.cache_read_list[project] += rd / 1e6 * in_rate
+        self.cache_read_paid[project] += rd / 1e6 * in_rate * read_mult
         self.cache_uncached[project] += (inp + w1h + w5m + assumed + rd) / 1e6 * in_rate
 
         bucket = branch_bucket(branch)
@@ -3718,13 +3757,14 @@ class Fleet:
         if isinstance(u, dict):
             base = model.replace("[1m]", "")
             in_rate, out_rate, _prov, _known, _src = rates_for(base, ts)
+            read_mult = rate_for(base).cache_read
             cc = u.get("cache_creation") or {}
             self.sub_cost_floor += (
                 (u.get("input_tokens", 0) or 0) / 1e6 * in_rate
                 + (u.get("output_tokens", 0) or 0) / 1e6 * out_rate
                 + (cc.get("ephemeral_1h_input_tokens", 0) or 0) / 1e6 * in_rate * CACHE_WRITE_1H_MULT
                 + (cc.get("ephemeral_5m_input_tokens", 0) or 0) / 1e6 * in_rate * CACHE_WRITE_5M_MULT
-                + (u.get("cache_read_input_tokens", 0) or 0) / 1e6 * in_rate * CACHE_READ_MULT)
+                + (u.get("cache_read_input_tokens", 0) or 0) / 1e6 * in_rate * read_mult)
 
     def add_tool(self, project: str, name: str, tool_input: dict, ts: datetime | None,
                  mode: str | None = None, *, session: str | None = None,
@@ -4317,8 +4357,11 @@ def coach(fleet: "Fleet") -> list[Finding]:
         med = _median(list(ratios.values()))
         for proj, r in sorted(ratios.items(), key=lambda kv: kv[1]):
             if r < med - 15 and r < 90:
+                listed = fleet.cache_read_list.get(proj, 0)
+                mult = (fleet.cache_read_paid[proj] / listed if listed
+                        else CACHE_READ_MULT)
                 waste = max(fleet.cache_uncached.get(proj, 0) * (med - r) / 100
-                            * (1 - CACHE_READ_MULT), 0.0)
+                            * (1 - mult), 0.0)
                 out.append(Finding(
                     "AF002", "high", "Cache efficiency below your own median",
                     f"{proj} reads {r:.0f}% of tokens from cache; your median project "
@@ -5208,7 +5251,13 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "  input        x rate",
             "  output       x rate",
             "  cache write  x rate x 2.00  (1h TTL)  or  x 1.25  (5m TTL)",
-            "  cache read   x rate x 0.10",
+            "  cache read   x rate x the model's read multiplier",
+            "",
+            "The cache-read multiplier is per model: 0.10 by default, 0.05 for Opus 5.5",
+            "and Sonnet 5.5, 0.025 for Fable 5.1 and Mythos 5.1. Haiku 5.5 reprices a",
+            "whole message at $0.50 / $2.50 when its prompt (input + cache read +",
+            "cache write) exceeds 100,000 tokens, and $0.10 / $0.50 otherwise.",
+            "Fast mode, batch pricing and data-residency uplifts are not modelled.",
             "",
             "OpenAI differs: input_tokens INCLUDES cached, so the cached portion is",
             "billed at 0.10x and only the remainder at full rate.",
@@ -6419,7 +6468,7 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
                          ("cache_w_1h", "cache write 1h  ×2.00"),
                          ("cache_w_5m", "cache write 5m  ×1.25"),
                          ("cache_w_assumed", "cache write ?   ×2.00"),
-                         ("cache_read", "cache read      ×0.10")):
+                         ("cache_read", "cache read      per model")):
             v = fleet.tokens.get(k, 0)
             # The assumed bucket is only shown when it is non-zero: a row of
             # zeroes explaining an inference nobody's data triggered is noise.
@@ -6720,7 +6769,7 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
     print(f"{c.dim}  Ask how any of this was computed:  actualis --explain")
     print(f"  Ask why a finding fired:            actualis --why AF004{c.off}")
     print()
-    print(f"{c.dim}  Costs are Anthropic API list prices (verified 2026-08-22). On a Pro/Max")
+    print(f"{c.dim}  Costs are Anthropic API list prices (verified 2026-10-08). On a Pro/Max")
     print(f"  subscription your actual outlay is the flat fee; read this as consumption.")
     print(f"  Flags mean 'worth looking at', not 'wrong'. Nothing left this machine.")
     if not raw:

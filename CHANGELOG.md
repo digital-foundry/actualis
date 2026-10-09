@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Changed
+
+- **Current-generation pricing.** Opus 5.5 ($4/$20), Sonnet 5.5 ($2/$10),
+  Haiku 5.5 ($0.10/$0.50, or $0.50/$2.50 for a message whose prompt exceeds
+  100,000 tokens), Fable 5.1 and Mythos 5.1 ($10/$50) are vendor rates,
+  verified 2026-10-08. The cache-read multiplier is now per model: 0.10 by
+  default, 0.05 for Opus 5.5 and Sonnet 5.5, 0.025 for Fable 5.1 and Mythos 5.1.
+  It applies to Claude Code, the subagent cost floor, Copilot and the cache
+  savings figure. An unknown model in a known family is now priced from the
+  newest known sibling, not the most expensive one. Fast mode, batch and data
+  residency are not modelled.
+
 ### Added
 
 - **Network inventory.** A NETWORK section and a `network` key in `--json` list
