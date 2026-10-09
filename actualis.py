@@ -6780,7 +6780,7 @@ EXPLAIN: dict[str, dict[str, object]] = {
         "verify": "actualis --json | jq '.refusals.total, .refusals.by_program'",
     },
     "network": {
-        "measures": "Downloads and fetches the agents made, and whether a person approved each.",
+        "measures": "Downloads and fetches the agents made (actualis --network), and whether a person approved each.",
         "formula": [
             "The inventory is a tripwire, not a guarantee. It reads only what the",
             "transcript shows. Shell commands are split on && || ; | and newlines",
@@ -7736,10 +7736,25 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False) -> None:
         fhosts = {i["host"] for i in fetches if i["host"]}
         print(f"  {'FETCHED':<11} {num(len(fetches))}   {num(len(fhosts))} host(s)")
 
+    # Counts and dates only: host names are the same ones the rows below
+    # print, and no item field is read here that network_json would redact.
+    unasked_hosts = {h["host"]: (h["unasked"], h["trusted"], h["first_seen"])
+                     for h in n["hosts"] if h["unasked"]}
+    nohost = [i for i in items if not i["host"] and i["approval"] == "unasked"]
+    if nohost:
+        stamps = [i["ts"] for i in nohost if i["ts"]]
+        unasked_hosts["(no host)"] = (len(nohost), False, min(stamps) if stamps else None)
+    if unasked_hosts:
+        print(f"  {c.dim}TOP UNASKED   hosts by unasked downloads{c.off}")
+        for host, (cnt, trusted, first) in sorted(
+                unasked_hosts.items(), key=lambda kv: (-kv[1][0], kv[0]))[:min(10, top)]:
+            seen = "trusted" if trusted else f"first seen {first[:10] if first else '?'}"
+            print(f"    {clip(host, 44):<44} {num(cnt):>7}  {c.dim}{seen}{c.off}")
+
     rows = [i for i in n["items"] if i["approval"] in ("unasked", "unknown")]
     rows.sort(key=lambda i: i["approval"] != "unasked")   # stable: newest-first within each
     last = None
-    for i in rows[:top]:
+    for i in rows[:min(top, 5)]:
         label = i["approval"].upper() if i["approval"] != last else ""
         last = i["approval"]
         what = i["url"] or i["package"] or ""
@@ -7751,7 +7766,19 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False) -> None:
               f" {c.dim}{clip(i['project'], 10):<10} {(i['ts'] or '')[:10]} {i['approval']}{c.off}")
 
 
-def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> None:
+def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
+           network_only: bool = False) -> None:
+    if network_only:
+        # --network: the NETWORK section and the redaction note, nothing else.
+        render_network(fleet, c, top, raw)
+        print()
+        print(f"{c.dim}  Ask how this was read:  actualis --explain network")
+        if not raw:
+            print(f"  Credentials are redacted; --no-redact disables that.{c.off}")
+        else:
+            print(f"  {c.red}--no-redact is on: this output may contain live secrets.{c.off}")
+        print()
+        return
     span = fleet.span_days
     active = fleet.active_days
 
@@ -7767,6 +7794,11 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False) -> 
         for r in fleet.roots:
             print(f"  {c.dim}source        {r}{c.off}")
         print(f"  messages      {num(fleet.messages)}")
+        if fleet.network_items:
+            n_un = sum(1 for i in fleet.network_items if i["approval"] == "unasked")
+            n_all = len(fleet.network_items)
+            print(f"  network       {num(n_all)} download{'' if n_all == 1 else 's'}"
+                  f" · {num(n_un)} unasked → actualis --network")
         # Printed so a screenshot of this report can be checked against the
         # --json payload it came from. Same fleet, same digest.
         print(f"  {c.dim}digest        {report_digest(_to_json_body(fleet)):.16}"
@@ -10335,14 +10367,18 @@ def build_parser() -> argparse.ArgumentParser:
                     help="exit 3 if any unsuppressed finding is at or above "
                          f"LEVEL ({', '.join(FAIL_ON_LEVELS)}); 2 is a usage error. "
                          "For gating a pipeline. Still changes nothing and blocks nothing.")
-    ap.add_argument("--network-trust", metavar="HOST[/PATH],...", action="append",
-                    help="trusted download sources for --network-strict; also read from "
-                         "./.actualis-network-trust")
-    ap.add_argument("--ioc", metavar="FILE", action="append",
-                    help="known-bad packages and hosts to match the network inventory against: the "
-                         "actualis-ioc line format or OSV JSON/JSONL. Repeatable. Never read unless named.")
-    ap.add_argument("--network-strict", action="store_true",
-                    help="make every unasked download from an untrusted source a medium finding")
+    net = ap.add_argument_group("Network")
+    net.add_argument("--network", action="store_true",
+                     help="print only the NETWORK section (with --ioc, the IOC block too). "
+                          "--network --json emits only the network object, without schema_version")
+    net.add_argument("--network-trust", metavar="HOST[/PATH],...", action="append",
+                     help="trusted download sources for --network-strict; also read from "
+                          "./.actualis-network-trust")
+    net.add_argument("--ioc", metavar="FILE", action="append",
+                     help="known-bad packages and hosts to match the network inventory against: the "
+                          "actualis-ioc line format or OSV JSON/JSONL. Repeatable. Never read unless named.")
+    net.add_argument("--network-strict", action="store_true",
+                     help="make every unasked download from an untrusted source a medium finding")
     ap.add_argument("--suppress", metavar="ID",
                     help="mark a finding as a false positive on this machine. "
                          "It stays counted; it leaves the actionable list.")
@@ -10375,6 +10411,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.card and args.json:
         ap.error("--card writes files; it cannot also emit --json.")
     # --ioc is never silently ignored: a mode it cannot reach is an error.
+    if args.network:
+        for flag, on in (("--share", args.share), ("--card", args.card), ("--bash", args.bash),
+                         ("--diff", args.diff), ("--replay", args.replay),
+                         ("--watch", args.watch), ("--mcp", args.mcp),
+                         ("--coach", args.coach), ("--aisvs", args.aisvs)):
+            if on:
+                ap.error(f"--network cannot be combined with {flag}.")
     if args.ioc and args.card:
         ap.error("--ioc does not apply to --card; the card never shows downloads.")
     if args.ioc and (args.watch or args.mcp):
@@ -10616,7 +10659,8 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_OK
 
     if args.json:
-        json.dump(to_json(fleet, raw=args.no_redact), sys.stdout, indent=2)
+        json.dump(network_json(fleet, raw=args.no_redact) if args.network
+                  else to_json(fleet, raw=args.no_redact), sys.stdout, indent=2)
         print()
     elif args.share:
         render_share(fleet, C(use_color()))
@@ -10625,7 +10669,8 @@ def main(argv: list[str] | None = None) -> int:
     elif args.coach:
         render_coach(coach(fleet), C(use_color()))
     else:
-        render(fleet, C(use_color()), bash_only=args.bash, top=args.top, raw=args.no_redact)
+        render(fleet, C(use_color()), bash_only=args.bash, top=args.top, raw=args.no_redact,
+               network_only=args.network)
 
     if args.fail_on:
         reasons = failing_findings(fleet, args.fail_on)

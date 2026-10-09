@@ -908,9 +908,12 @@ class TestReportFixes(unittest.TestCase):
             f.add_tool("project-number-one", "Bash",
                        {"command": f"curl https://example-host-{k}.io/a/very/long/path/segment/{k}/more"},
                        TS, "auto")
-        rows = [l for l in self.out(f, top=50).splitlines() if "example-host" in l and "auto" not in l
-                and "unasked" in l]
-        self.assertEqual(len(rows), 50)
+        text = self.out(f, top=50)
+        rows = [l for l in text.splitlines() if "example-host" in l and "auto" not in l
+                and "unasked" in l and "curl" in l]
+        self.assertEqual(len(rows), 5)                   # rows are capped; TOP UNASKED lists the hosts
+        for l in text.splitlines():
+            self.assertLessEqual(len(l), 100, l)
         for l in rows:
             self.assertLessEqual(len(l), 100, l)
             self.assertRegex(l, r"curl https://\S")
@@ -924,7 +927,7 @@ class TestReportFixes(unittest.TestCase):
         self.assertNotIn("UNASKED", text)
         f.add_tool("p", "Bash", {"command": "curl https://c.io/1"}, TS, "auto")
         text = self.out(f)
-        self.assertEqual((text.count("UNASKED"), text.count("UNKNOWN")), (1, 1))
+        self.assertEqual((text.count("  UNASKED  "), text.count("UNKNOWN")), (1, 1))
 
     def test_singular(self):
         f = af.Fleet()

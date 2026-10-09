@@ -23,8 +23,8 @@ and prints a report, across **Claude Code** and **Codex** together.
 - **Every command the agent ran**, audited for the risky shapes: `rm -rf`,
   piped installers, credential reads, egress to somewhere new.
 - **What it downloaded, and whether anyone asked.** Packages installed, repos
-  cloned, URLs fetched — each marked asked, unasked, or unknown — and, with
-  `--network-strict`, a finding for every unasked download from a source you
+  cloned, URLs fetched — each marked asked, unasked, or unknown (see them with
+  `actualis --network`) — and, with `--network-strict`, a finding for every unasked download from a source you
   have not trusted.
 - **What happened while a credential was live.** Give it one fingerprint and
   it reconstructs the incident: the exposure window, every command that ran
@@ -194,6 +194,7 @@ python3 actualis.py --agent codex    # one agent only (claude | codex | copilot 
 | `--reason TEXT` | why that suppression is correct, recorded for review |
 | `--suppressions` | list current suppressions and where they are read from |
 | `--fail-on LEVEL` | exit 3 if any unsuppressed finding is at or above `critical`, `high` or `any`. For gating a pipeline |
+| `--network` | print only the NETWORK section, with the IOC block when `--ioc` is given. `--network --json` emits only the `network` object (no `schema_version`). Not with `--share`, `--card`, `--bash`, `--coach`, `--aisvs`, `--diff`, `--replay`, `--watch` or `--mcp` |
 | `--network-trust HOST[/PATH],...` | trusted download sources for `--network-strict` (repeatable). Also read from `./.actualis-network-trust`, one per line; the report prints that file's path and sha256 because the agent can write it |
 | `--network-strict` | make every unasked download from an untrusted source a medium finding, so `--fail-on any` and the suppressions file apply |
 | `--ioc FILE` | match every download the transcript shows against a known-bad list: the actualis-ioc line format or OSV JSON/JSONL (repeatable). A match is a high finding, an undecidable one medium. Read only when named; see [docs/ioc.md](docs/ioc.md) |

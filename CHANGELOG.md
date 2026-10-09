@@ -71,6 +71,11 @@ Each of these is listed in full below.
 
 ### Added
 
+- **`--network`** prints only the NETWORK section (with the IOC block when
+  `--ioc` is given), and `--network --json` emits only the `network` object. The
+  full report gets a one-line `network` summary in FLEET when downloads exist,
+  and NETWORK gains a TOP UNASKED block: the ten hosts with the most unasked
+  downloads. Its UNASKED and UNKNOWN rows are capped at 5.
 - **`secrets[].distinct_values`** in `--json` and in the MCP `exposed_secrets`
   tool: how many different values were seen under the id in this run. The
   text report says "N distinct values" when it is more than 1.
