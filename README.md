@@ -24,8 +24,10 @@ and prints a report, across **Claude Code** and **Codex** together.
   piped installers, credential reads, egress to somewhere new.
 - **What it downloaded, and whether anyone asked.** Packages installed, repos
   cloned, URLs fetched — each marked asked, unasked, or unknown (see them with
-  `actualis --network`) — and, with `--network-strict`, a finding for every unasked download from a source you
-  have not trusted.
+  `actualis --network`), with the agent's stated reason, the prompt it was
+  answering and the transcript line behind it. Narrow the view with `--host`,
+  `--package`, `--session` and `--unasked` — and, with `--network-strict`, a
+  finding for every unasked download from a source you have not trusted.
 - **What happened while a credential was live.** Give it one fingerprint and
   it reconstructs the incident: the exposure window, every command that ran
   inside it, and the subset worth actually reading. A four-day window holds
@@ -197,6 +199,11 @@ python3 actualis.py --agent codex    # one agent only (claude | codex | copilot 
 | `--network` | print only the NETWORK section, with the IOC block when `--ioc` is given. `--network --json` emits only the `network` object (no `schema_version`). Not with `--share`, `--card`, `--bash`, `--coach`, `--aisvs`, `--diff`, `--replay`, `--watch` or `--mcp` |
 | `--network-trust HOST[/PATH],...` | trusted download sources for `--network-strict` (repeatable). Also read from `./.actualis-network-trust`, one per line; the report prints that file's path and sha256 because the agent can write it |
 | `--network-strict` | make every unasked download from an untrusted source a medium finding, so `--fail-on any` and the suppressions file apply |
+| `--host HOST` | with `--network`: only downloads from HOST or a subdomain of it. The view then lists every matching item, newest first, with when, approval and mode, the command, the agent's `why`, the prompt, and a `trace` line naming the transcript file and line |
+| `--package NAME` | with `--network`: only installs of exactly this package (npm case-sensitive, pypi by PEP 503) |
+| `--session ID` | with `--network`: only sessions whose id starts with ID |
+| `--unasked` | with `--network`: only downloads that ran without asking. The four filters combine with each other, `--project` and `--days`; totals are of the filtered set |
+| `--with-prompts` | with `--json`: fill `network.items[].prompt` (redacted, 160 characters); otherwise it is `null` |
 | `--ioc FILE` | match every download the transcript shows against a known-bad list: the actualis-ioc line format or OSV JSON/JSONL (repeatable). A match is a high finding, an undecidable one medium. Read only when named; see [docs/ioc.md](docs/ioc.md) |
 | `--explain [TOPIC]` | how a number is computed, what it assumes, how to check it |
 | `--replay ID` | incident report for one credential: what ran while it was live, graded by proximity |

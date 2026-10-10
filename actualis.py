@@ -400,6 +400,62 @@ BASH_RULES: list[Rule] = [
 
 COMPILED_RULES = [(sev, cat, re.compile(pat, re.IGNORECASE)) for sev, cat, pat in BASH_RULES]
 
+# One entry per BASH_RULES row, in the same order: lowercase literals of which
+# at least one must occur in a line for that rule to be able to match it. A
+# line holding none of them skips the regex. Written by hand from each rule,
+# never derived by parsing it, and each literal is a run the regex requires
+# contiguously (no \s inside one). None means the rule always runs.
+# re.IGNORECASE matches exactly four non-ASCII characters to ASCII letters
+# (U+0130 and U+0131 to i, U+017F to s, U+212A to k); _fold_lower maps them
+# before lowering, so no match is skipped. Checked against the unfiltered path
+# by tests/test_audit_prefilter.py.
+RULE_PREFILTERS: list[tuple[str, ...] | None] = [
+    ("rm",),                                            # rm -rf
+    ("mkfs", "fdisk", "diskutil"),
+    ("of=/dev/",),                                      # dd ... of=/dev/
+    ("truncate",),
+    ("-delete",),                                       # find ... -delete
+    ("sudo",),
+    ("su",),                                            # su -
+    ("777",),                                           # chmod 777
+    ("chown",),
+    ("curl", "wget"),                                   # ... | sh
+    ("curl", "wget"),                                   # ... | python
+    ("npx",),
+    ("pip",),
+    (".env", "id_rsa", "id_dsa", ".pem", ".p12", "credentials", ".netrc", ".npmrc", ".pypirc"),
+    ("find-generic-password", "find-internet-password"),
+    ("env",),                                           # printenv | env
+    ("aws_secret_access_key", "anthropic_api_key", "openai_api_key", "github_token"),
+    ("auth",),                                          # gh auth token
+    ("curl",),                                          # curl -d / --data / -F / -T
+    ("scp", "rsync"),
+    ("push",),                                          # git push --force
+    ("filter-branch", "filter-repo"),
+    ("--hard",),                                        # git reset --hard
+    ("clean",),
+    ("checkout",),
+    ("publish",),                                       # npm publish
+    ("twine", "cargo", "gem"),
+    ("kubectl", "helm"),
+    ("terraform",),
+    ("deploy",),
+    ("--delete",),                                      # aws s3 rm|sync --delete
+    ("drop", "truncate"),
+    ("delete",),                                        # DELETE FROM
+    ("psql", "mysql", "mongosh"),
+    ("history",),
+    ("histfile", "histsize=0"),
+]
+
+_ASCII_FOLD = str.maketrans({"\u0130": "i", "\u0131": "i", "\u017f": "s", "\u212a": "k"})
+
+
+def _fold_lower(text: str) -> str:
+    """Lowercase text for the prefilters, with the characters re.IGNORECASE
+    matches to an ASCII letter mapped to that letter first."""
+    return text.lower() if text.isascii() else text.translate(_ASCII_FOLD).lower()
+
 SEVERITY_ORDER = {"high": 0, "med": 1}
 
 
@@ -446,6 +502,19 @@ UNREADABLE_SHAPES = (
                 r"(?=[^\n]*(?:\b(?:urllib|requests|fetch|http\.client|socket)|LWP)\b)")),
 )
 
+# Lowercase literals per UNREADABLE_SHAPES row, as RULE_PREFILTERS is per rule.
+SHAPE_PREFILTERS: list[tuple[str, ...] | None] = [
+    ("$",),                                             # runs a variable
+    ("eval",),
+    ("curl", "wget"),
+    (".sh", ".bash", ".zsh", ".py", ".rb", ".pl"),      # runs a local script
+    ("source", "."),
+    ("-c",),                                            # shell -c with a variable
+    ("$'",),                                            # ANSI-C quoting
+    ("$(", "`"),                                        # pipes a substitution to a shell
+    ("urllib", "requests", "fetch", "http.client", "socket", "lwp"),
+]
+
 
 class AuditConfigId(ValueError):
     """--suppress was given the id of the audit-config finding."""
@@ -471,6 +540,14 @@ AUDIT_CONFIG_ID = flag_id("high", ["audit-config"], "audit-config")
 def unreadable_shapes(cmd: str) -> list[str]:
     """Which parts of this command the transcript does not actually contain."""
     text = cmd[:MAX_SCAN_TOTAL]
+    low = _fold_lower(text)
+    return [name for (name, rx), lits in zip(UNREADABLE_SHAPES, SHAPE_PREFILTERS)
+            if (lits is None or any(x in low for x in lits)) and rx.search(text)]
+
+
+def _unreadable_shapes_unfiltered(cmd: str) -> list[str]:
+    """unreadable_shapes with no prefilter: the reference the tests compare against."""
+    text = cmd[:MAX_SCAN_TOTAL]
     return [name for name, rx in UNREADABLE_SHAPES if rx.search(text)]
 
 
@@ -485,6 +562,23 @@ def audit_command(cmd: str) -> list[tuple[str, str, str]]:
     # line break. Scanning is therefore per line, and the whole-command retry
     # this used to do was both redundant and the entire cost: it doubled the
     # work on the slowest possible input.
+    lines = [ln[:MAX_SCAN_LINE] for ln in (cmd.splitlines() or [cmd])[:MAX_SCAN_LINES]]
+    lows = [_fold_lower(ln) for ln in lines]
+    whole = "\n".join(lows)
+    out: list[tuple[str, str, str]] = []
+    for (sev, cat, rx), lits in zip(COMPILED_RULES, RULE_PREFILTERS):
+        if lits is not None and not any(x in whole for x in lits):
+            continue                         # no line can hold one: skip every line
+        for ln, low in zip(lines, lows):
+            if (lits is None or any(x in low for x in lits)) and rx.search(ln):
+                out.append((sev, cat, clean(ln.strip())))
+                break
+    return out
+
+
+def _audit_command_unfiltered(cmd: str) -> list[tuple[str, str, str]]:
+    """audit_command with every rule run on every line: the reference the
+    prefilter is tested against."""
     lines = [ln[:MAX_SCAN_LINE] for ln in (cmd.splitlines() or [cmd])[:MAX_SCAN_LINES]]
     out: list[tuple[str, str, str]] = []
     for sev, cat, rx in COMPILED_RULES:
@@ -2704,19 +2798,92 @@ def apply_network_policy(fleet: "Fleet", trust: list[tuple[str, str]], strict: b
         })
 
 
+def network_filter(fleet: "Fleet", host: str | None = None, package: str | None = None,
+                   session: str | None = None, unasked: bool = False) -> None:
+    """Keep only the items every given filter matches, before --network-strict
+    and --ioc run, so totals, hosts, packages, findings and matches are all of
+    the filtered set. host: a suffix on a label boundary, as trust matches
+    (host/path also works). package: the exact name, compared as the IOC
+    matcher compares it (npm exactly, pypi by PEP 503). session: a prefix."""
+    trust = parse_trust([host], "--host") if host else []
+
+    def keep(i: dict) -> bool:
+        if trust and not network_trusted(i, trust):
+            return False
+        if package is not None:
+            eco = i.get("ecosystem") or ""
+            if not i.get("package") or _ioc_norm_name(eco, i["package"]) != _ioc_norm_name(eco, package):
+                return False
+        if session is not None and not (i.get("session") or "").startswith(session):
+            return False
+        return not unasked or i.get("approval") == "unasked"
+
+    fleet.network = [i for i in fleet.network if keep(i)]
+    fleet._net_by_call = {}              # positions are stale; every outcome is already applied
+
+
 NETWORK_ITEM_KEYS = ("kind", "program", "host", "host_inferred", "url", "dest", "source",
                      "ecosystem", "package", "version", "pinned", "exec", "dynamic", "alias",
-                     "failed", "approval", "trusted", "agent", "project", "session", "call_id", "ts", "ioc")
+                     "failed", "approval", "trusted", "agent", "project", "session", "call_id", "ts", "ioc",
+                     "mode", "why", "prompt", "transcript")
+
+# why and prompt: what the assistant said before a call, and what the person
+# last asked. Both are kept short, redacted and cleaned when they are read.
+NET_CONTEXT_MAX = 160
+NET_COMMAND_MAX = 200                # the text view's command line, after redaction
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+# Text that wraps harness output or instructions, not the person's own words.
+_NOT_A_PROMPT = ("<command-name>", "<command-message>", "<command-args>", "<local-command-",
+                 "<system-reminder>", "<user-prompt-submit-hook>", "<bash-stdout>", "<bash-stderr>",
+                 "<environment_context>", "<user_instructions>", "Caveat: The messages below",
+                 "[Request interrupted")
 
 
-def _net_public(i: dict, raw: bool = False) -> dict:
+def _net_context(text: str | None, last_sentence: bool = False) -> str | None:
+    """One line of at most NET_CONTEXT_MAX characters, cut on a word boundary:
+    the last sentence of `text`, or its start. Control characters go before
+    redaction (one inside a token would hide it from the patterns) and again
+    after; whitespace, newlines included, collapses to single spaces."""
+    if not text:
+        return None
+    t = " ".join(clean(text).split())
+    if last_sentence:
+        t = _SENTENCE_END.split(t)[-1]
+    end = t.find(" ", 4 * NET_CONTEXT_MAX)  # bounded work; never cuts inside a token
+    if end > 0:
+        t = t[:end]
+    t = " ".join(clean(redact(t)).split())
+    return clip(t, NET_CONTEXT_MAX) or None
+
+
+def _prompt_source(content: object) -> str | None:
+    """The person's own words in a user message, raw, or None when it holds
+    none: a tool result, an image, a slash-command or local-command wrapper,
+    a system reminder or an agent's injected context."""
+    if isinstance(content, str):
+        texts = [content]
+    elif isinstance(content, list):
+        texts = [b["text"] for b in content if isinstance(b, dict)
+                 and b.get("type") in ("text", "input_text") and isinstance(b.get("text"), str)]
+    else:
+        return None
+    kept = [t for t in texts if t.strip() and not t.lstrip().startswith(_NOT_A_PROMPT)]
+    return " ".join(kept) or None
+
+
+def _net_public(i: dict, raw: bool = False, prompts: bool = False) -> dict:
     """An item as --json shows it: NETWORK_ITEM_KEYS, with url, dest and
-    source redacted unless raw."""
-    out = {k: i[k] for k in NETWORK_ITEM_KEYS}
+    source redacted unless raw. prompt is null unless --with-prompts; why and
+    prompt were redacted when read, so --no-redact does not reveal them."""
+    out = {k: i.get(k) for k in NETWORK_ITEM_KEYS}
     if not raw:
         for k in ("url", "dest", "source", "package", "version", "alias"):
             if out[k]:
                 out[k] = redact(out[k])
+    if not prompts:
+        out["prompt"] = None
+    if out["transcript"]:
+        out["transcript"] = dict(out["transcript"])
     return out
 
 
@@ -2770,7 +2937,7 @@ def network_json(fleet: "Fleet", raw: bool = False) -> dict:
         "packages": [{**p, "name": p["name"] if raw else redact(p["name"]),
                       "versions": sorted(p["versions"] if raw else {redact(v) for v in p["versions"]})}
                      for _, p in sorted(packages.items(), key=lambda kv: (-kv[1]["count"], kv[0]))],
-        "items": [_net_public(i, raw) for i in order[:NETWORK_ITEMS_CAP]],
+        "items": [_net_public(i, raw, fleet.with_prompts) for i in order[:NETWORK_ITEMS_CAP]],
         "items_truncated": len(items) > NETWORK_ITEMS_CAP,
         "strict": fleet.network_strict,
         "trust": list(fleet.network_trust),
@@ -3996,7 +4163,7 @@ def ioc_json(fleet: "Fleet", raw: bool = False) -> dict:
             "refs": sorted({e.ref for e in r["entries"] if e.ref})[:IOC_REFS_CAP],
             "labels": sorted({e.label for e in r["entries"] if e.label})[:IOC_REFS_CAP],
             "entry": _ioc_entry_json(r["entries"][0]),
-            "item": _net_public(r["item"], raw),
+            "item": _net_public(r["item"], raw, fleet.with_prompts),
         })
     return {"enabled": True, "sources": sources, "totals": totals, "matches": matches,
             "matches_truncated": len(rows) > NETWORK_ITEMS_CAP}
@@ -4452,7 +4619,23 @@ def copilot_session_cost(usage: dict, model: str) -> float:
 
 
 class Fleet:
-    def __init__(self) -> None:
+    def __init__(self, network_only: bool = False) -> None:
+        # --network with nothing that reads findings: the shell-audit rules,
+        # the unreadable count, the audit-config tripwire and the secret
+        # ranking are skipped, since nothing they produce is shown. The
+        # network inventory, strict findings and --ioc matches are the same.
+        self.network_only = network_only
+        # --with-prompts: network.items[].prompt in --json. The text view shows it.
+        self.with_prompts = False
+        # Per transcript file, for network items: the person's last real
+        # message (raw), the text blocks of the assistant message being read,
+        # and where in the file the current record is.
+        self._prompt: str | None = None
+        self._why_id: object = None
+        self._why_prior: list[str] = []
+        self._src_root = ""
+        self._src_file = ""
+        self._src_line: int | None = None
         self.messages = 0
         self.cost_by_agent: dict[str, float] = defaultdict(float)
         self.units_by_agent: Counter = Counter()
@@ -4780,10 +4963,10 @@ class Fleet:
                    project_filter: str | None) -> None:
         for root in roots:
             for f in sorted(root.rglob("rollout-*.jsonl")):
-                self._scan_codex_file(f, since, project_filter)
+                self._scan_codex_file(f, since, project_filter, root)
 
     def _scan_codex_file(self, path: Path, since: datetime | None,
-                         project_filter: str | None) -> None:
+                         project_filter: str | None, root: Path | None = None) -> None:
         try:
             st = path.stat()
         except OSError:
@@ -4798,11 +4981,17 @@ class Fleet:
         best: dict | None = None
         best_total = -1
         last_ts: datetime | None = None
-        pending: list[tuple[str, datetime | None, str | None]] = []
+        # (command, ts, mode, why, prompt, line)
+        pending: list[tuple[str, datetime | None, str | None, str | None, str | None, int]] = []
+        # why: the latest assistant message or reasoning summary text, until the
+        # next call's output or user message. prompt: the latest user message.
+        why: str | None = None
+        prompt: str | None = None
+        self._start_file(path, root)
 
         try:
             with path.open("r", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
+                for n, line in enumerate(fh, 1):
                     try:
                         rec = json.loads(line)
                     except (json.JSONDecodeError, ValueError):
@@ -4814,6 +5003,31 @@ class Fleet:
                     if not isinstance(payload, dict):
                         continue
                     kind = rec.get("type")
+                    ptype = payload.get("type")
+
+                    if kind == "event_msg" and ptype == "user_message":
+                        said = _prompt_source(payload.get("message"))
+                        if said:
+                            prompt, why = said, None
+                    elif kind == "response_item" and ptype == "message":
+                        blocks = payload.get("content")
+                        if payload.get("role") == "user":
+                            said = _prompt_source(blocks)
+                            if said:
+                                prompt, why = said, None
+                        elif payload.get("role") == "assistant" and isinstance(blocks, list):
+                            said = " ".join(b["text"] for b in blocks if isinstance(b, dict)
+                                            and b.get("type") == "output_text"
+                                            and isinstance(b.get("text"), str))
+                            why = said or why
+                    elif kind == "response_item" and ptype == "reasoning":
+                        summary = payload.get("summary")
+                        if isinstance(summary, list):
+                            said = " ".join(b["text"] for b in summary if isinstance(b, dict)
+                                            and isinstance(b.get("text"), str))
+                            why = said or why
+                    elif kind == "response_item" and ptype == "function_call_output":
+                        why = None
 
                     if kind == "session_meta":
                         cwd = payload.get("cwd") or cwd
@@ -4847,7 +5061,7 @@ class Fleet:
                             continue
                         cmd = args.get("command")
                         if cmd:
-                            pending.append((cmd, ts, policy))
+                            pending.append((cmd, ts, policy, why, prompt, n))
                             cwd = args.get("workdir") or cwd
         except OSError:
             return
@@ -4858,11 +5072,13 @@ class Fleet:
         if project_filter and project_filter.lower() not in project.lower():
             return
 
-        for cmd, ts, mode in pending:
+        for cmd, ts, mode, why, prompt, n in pending:
             # Normalise Codex's shell_command onto the same "Bash" tool name the
             # Claude Code path uses, so the audit is one cross-agent view.
+            self._src_line = n
             self.add_tool(project, "Bash", {"command": cmd}, ts, mode,
-                          session=session, agent="codex")
+                          session=session, agent="codex", why=why, prompt=prompt,
+                          where=self._where())
 
         if best:
             self.add_codex_session(project, model or "unknown", best, last_ts)
@@ -4871,10 +5087,10 @@ class Fleet:
                      project_filter: str | None) -> None:
         for root in roots:
             for f in sorted(root.glob("*/events.jsonl")):
-                self._scan_copilot_file(f, since, project_filter)
+                self._scan_copilot_file(f, since, project_filter, root)
 
     def _scan_copilot_file(self, path: Path, since: datetime | None,
-                           project_filter: str | None) -> None:
+                           project_filter: str | None, root: Path | None = None) -> None:
         """One Copilot CLI session. Two passes over memory, one over disk:
         whether a command was prompted is only known once every
         permission.requested in the session has been seen."""
@@ -4890,14 +5106,18 @@ class Fleet:
         cwd = branch = None
         shutdown: dict | None = None
         shutdown_ts: datetime | None = None
-        calls: list[tuple[str, str, str, datetime | None, dict]] = []   # (id, tool, command, ts, args)
+        # (id, tool, command, ts, args, why, prompt, line)
+        calls: list[tuple[str, str, str, datetime | None, dict, str | None, str | None, int]] = []
+        why: str | None = None          # the latest assistant.message text, until a tool completes
+        prompt: str | None = None       # the latest user.message
+        self._start_file(path, root if root is not None else path.parent.parent)
         prompted: set[str] = set()
         prompted_any: set[str] = set()
         refusals: list[tuple[str, str, datetime | None]] = []     # (kind, id, ts)
         subagents: list[tuple[dict, datetime | None]] = []
         try:
             with path.open("r", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
+                for n, line in enumerate(fh, 1):
                     try:
                         rec = json.loads(line)
                     except (json.JSONDecodeError, ValueError):
@@ -4909,6 +5129,15 @@ class Fleet:
                         continue
                     kind = rec.get("type")
                     ts = parse_ts(rec.get("timestamp"))
+                    if kind == "user.message":
+                        said = _prompt_source(data.get("content"))
+                        if said:
+                            prompt, why = said, None
+                    elif kind == "assistant.message":
+                        said = data.get("content")
+                        why = said if isinstance(said, str) and said.strip() else why
+                    elif kind == "tool.execution_complete":
+                        why = None
                     if kind in ("session.start", "session.context_changed"):
                         ctx = data.get("context") if kind == "session.start" else data
                         if isinstance(ctx, dict):
@@ -4919,7 +5148,7 @@ class Fleet:
                         cmd = args.get("command") if isinstance(args, dict) else None
                         cmd = cmd if name == "bash" and isinstance(cmd, str) else ""
                         calls.append((str(data.get("toolCallId") or ""), name, cmd, ts,
-                                      args if isinstance(args, dict) else {}))
+                                      args if isinstance(args, dict) else {}, why, prompt, n))
                     elif kind == "permission.requested":
                         req = data.get("permissionRequest")
                         if isinstance(req, dict) and req.get("toolCallId"):
@@ -4950,16 +5179,18 @@ class Fleet:
         active = False
         joined: dict[str, tuple[str, str]] = {}
         sid = path.parent.name
-        for call_id, name, cmd, ts, targs in calls:
+        for call_id, name, cmd, ts, targs, why, prompt, n in calls:
             if not in_window(ts):
                 continue
             active = True
+            self._src_line = n
+            detail = {"why": why, "prompt": prompt, "where": self._where()}
             if cmd:
                 mode = "copilot:prompted" if call_id in prompted else "copilot:auto"
                 self.permission_modes[mode] += 1
                 # Normalised onto "Bash", as Codex is, so the audit is one view.
                 self.add_tool(project, "Bash", {"command": cmd}, ts, mode,
-                              session=sid, call_id=call_id, agent="copilot")
+                              session=sid, call_id=call_id, agent="copilot", **detail)
                 if call_id:
                     joined[call_id] = ("Bash", cmd[:MAX_SCAN_LINE])
             else:
@@ -4967,7 +5198,7 @@ class Fleet:
                 # counts nothing else for a non-Bash tool.
                 net_mode = "copilot:prompted" if call_id in prompted_any else "copilot:auto"
                 self.add_tool(project, name, targs, ts, net_mode,
-                              session=sid, call_id=call_id, agent="copilot")
+                              session=sid, call_id=call_id, agent="copilot", **detail)
                 if call_id:
                     joined[call_id] = (name, "")
         for kind, call_id, ts in refusals:
@@ -5081,7 +5312,9 @@ class Fleet:
 
     def add_tool(self, project: str, name: str, tool_input: dict, ts: datetime | None,
                  mode: str | None = None, *, session: str | None = None,
-                 call_id: str | None = None, agent: str | None = None) -> None:
+                 call_id: str | None = None, agent: str | None = None,
+                 why: str | None = None, prompt: str | None = None,
+                 where: dict | None = None) -> None:
         if call_id:
             who = agent or ("codex" if (mode or "").startswith("codex:")
                             else "copilot" if (mode or "").startswith("copilot:") else "claude")
@@ -5094,8 +5327,10 @@ class Fleet:
         name = clean(name)[:48] or "?"
         self.tools[name] += 1
         self._net_remote_exec = ""
-        self._add_network(project, name, tool_input or {}, ts, mode, session, call_id, agent)
-        self._audit_config_write(project, name, tool_input or {}, ts)
+        self._add_network(project, name, tool_input or {}, ts, mode, session, call_id, agent,
+                          (why, prompt, where))
+        if not self.network_only:
+            self._audit_config_write(project, name, tool_input or {}, ts)
         if name != "Bash":
             return
         cmd = (tool_input or {}).get("command") or ""
@@ -5103,6 +5338,8 @@ class Fleet:
             return
         self.bash_total += 1
         self.bash_by_project[project] += 1
+        if self.network_only:
+            return
         self.bash_categories[command_category(cmd)] += 1
         if ts:
             day = ts.date().isoformat()
@@ -5274,11 +5511,29 @@ class Fleet:
             # Sorted: which copy of a repeated message is kept decides its day,
             # branch and ticket, so the order must not be the filesystem's.
             for f in sorted(d.glob("*.jsonl")):
-                self._scan_file(f, project, since)
+                self._scan_file(f, project, since, d.parent)
         if progress:
             print("\r" + " " * 72 + "\r", end="", file=sys.stderr, flush=True)
 
-    def _scan_file(self, path: Path, project: str, since: datetime | None) -> None:
+    def _start_file(self, path: Path, root: Path | None) -> None:
+        """Reset the per-file state network items read: mode, prompt, the
+        assistant text being collected, and the file's path under its root."""
+        self._mode = None
+        self._prompt = None
+        self._why_id, self._why_prior = None, []
+        root = root if root is not None else path.parent
+        self._src_root = str(root)
+        try:
+            self._src_file = path.relative_to(root).as_posix()
+        except ValueError:
+            self._src_file = path.name
+        self._src_line = None
+
+    def _where(self) -> dict:
+        return {"root": self._src_root, "file": self._src_file, "line": self._src_line}
+
+    def _scan_file(self, path: Path, project: str, since: datetime | None,
+                   root: Path | None = None) -> None:
         try:
             st = path.stat()
             size = st.st_size
@@ -5294,20 +5549,24 @@ class Fleet:
         # tool_use_id -> (tool name, command). Scoped to this file: a refusal
         # always answers a tool call in the same session, so nothing needs to
         # survive across files and memory stays bounded on a large fleet.
-        self._mode = None
+        self._start_file(path, root)
         calls: dict[str, tuple[str, str]] = {}
         try:
             with path.open("r", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
+                for n, line in enumerate(fh, 1):
                     # Cheap prefilter: skip lines that cannot contribute to any
                     # counter. Must include the permission fields, which live on
                     # records that carry neither usage nor tool_use.
                     counts = not ('"usage"' not in line and '"tool_use"' not in line
                                   and '"permissionMode"' not in line
                                   and '"toolDenialKind"' not in line)
+                    # A user message with no tool result may be the prompt a
+                    # network item shows; it moves no counter.
+                    said = not counts and ('"type":"user"' in line or '"type": "user"' in line) \
+                        and '"tool_result"' not in line
                     # A line admitted only for its error result feeds the
                     # network inventory alone, so no existing counter moves.
-                    if not counts and '"is_error":true' not in line \
+                    if not counts and not said and '"is_error":true' not in line \
                             and '"is_error": true' not in line:
                         continue
                     try:
@@ -5316,10 +5575,12 @@ class Fleet:
                         continue
                     if not isinstance(rec, dict):
                         continue
+                    self._src_line = n
 
                     if counts:
                         self._ingest_claude(rec, project, since, calls)
                     else:
+                        self._claude_context(rec)
                         ts = parse_ts(rec.get("timestamp"))
                         if not (since and ts and ts < since):
                             self._network_results(rec)
@@ -5385,6 +5646,7 @@ class Fleet:
             # Stays in force for the tool calls that follow it, even when this
             # record is itself older than the window.
             self._mode = str(mode)
+        whys = self._claude_context(rec)        # likewise: a prompt outlives the window
         if since and ts and ts < since:
             return
         self._network_results(rec)
@@ -5422,21 +5684,57 @@ class Fleet:
 
         content = msg.get("content")
         if isinstance(content, list):
-            for block in content:
+            for k, block in enumerate(content):
                 if isinstance(block, dict) and block.get("type") == "tool_use":
                     self.add_tool(project, block.get("name") or "?",
                                   block.get("input") or {}, ts, self._mode,
                                   session=rec.get("sessionId"), call_id=block.get("id"),
-                                  agent="claude")
+                                  agent="claude", why=whys.get(k), prompt=self._prompt,
+                                  where=self._where())
                     if block.get("id"):
                         calls[block["id"]] = (
                             block.get("name") or "?",
                             ((block.get("input") or {}).get("command") or "")
                             [:MAX_SCAN_LINE])
 
+    def _claude_context(self, rec: dict) -> dict[int, str]:
+        """Note a real user prompt, and collect an assistant message's text.
+
+        Claude Code writes one record per content block, all under the same
+        message id, so the text before a tool_use may sit in earlier records.
+        Returns, for each tool_use block in this record, the raw text that came
+        before it in its message. A meta, compact-summary or sidechain user
+        record is never the person's prompt."""
+        msg = rec.get("message")
+        if not isinstance(msg, dict):
+            return {}
+        content = msg.get("content")
+        kind = rec.get("type")
+        if kind == "user":
+            if not (rec.get("isMeta") or rec.get("isCompactSummary") or rec.get("isSidechain")):
+                said = _prompt_source(content)
+                if said:
+                    self._prompt = said
+            return {}
+        if kind != "assistant" or not isinstance(content, list):
+            return {}
+        mid = msg.get("id")
+        if not mid or mid != self._why_id:
+            self._why_id, self._why_prior = mid, []
+        whys: dict[int, str] = {}
+        for k, b in enumerate(content):
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text" and isinstance(b.get("text"), str):
+                if b["text"] not in self._why_prior:     # a re-emitted record adds nothing
+                    self._why_prior.append(b["text"])
+            elif b.get("type") == "tool_use" and self._why_prior:
+                whys[k] = " ".join(self._why_prior)
+        return whys
+
     def _add_network(self, project: str, name: str, tool_input: dict, ts: datetime | None,
                      mode: str | None, session: str | None, call_id: str | None,
-                     agent: str | None) -> None:
+                     agent: str | None, context: tuple = (None, None, None)) -> None:
         if name == "Bash":
             cmd = tool_input.get("command")
             if not isinstance(cmd, str) or not cmd:
@@ -5463,6 +5761,23 @@ class Fleet:
         if not agent:
             agent = ("codex" if (mode or "").startswith("codex:")
                      else "copilot" if (mode or "").startswith("copilot:") else "claude")
+        # Worked out only for a call that reached the network: redaction is the cost.
+        why_raw, prompt_raw, where = context
+        why, prompt = _net_context(why_raw, last_sentence=True), _net_context(prompt_raw)
+        # What the text view prints as `command`: cleaned and on one line here,
+        # redacted when printed (unless --no-redact), never in --json.
+        if name == "Bash":
+            command = " ".join(clean(tool_input.get("command") or "").split())
+        else:
+            target = tool_input.get("url")
+            command = clean(f"{name} {target}" if isinstance(target, str) else name)
+            command = " ".join(command.split())
+        cut = command.find(" ", 4 * NET_COMMAND_MAX)
+        command = command[:cut] if cut > 0 else command[:MAX_SCAN_LINE]
+        where = ({"root": clean(str(where.get("root") or "")),
+                  "file": clean(str(where.get("file") or "")).replace("\n", " "),
+                  "line": where.get("line") if isinstance(where.get("line"), int) else None}
+                 if isinstance(where, dict) else None)
         for item in found:
             for k, v in item.items():           # transcript text must not reach a terminal
                 if isinstance(v, str):
@@ -5471,7 +5786,10 @@ class Fleet:
                         session=clean(str(session))[:80] if session else None,
                         call_id=clean(str(call_id))[:120] if call_id else None,
                         ts=ts.isoformat() if ts else None,
-                        failed=False if agent == "claude" else None, trusted=False, ioc=None)
+                        failed=False if agent == "claude" else None, trusted=False, ioc=None,
+                        mode=clean(str(mode))[:48] or None if mode else None,
+                        why=why, prompt=prompt, transcript=dict(where) if where else None,
+                        _command=command)
             if call_id:
                 self._net_by_call.setdefault(f"{agent}:{call_id}", []).append(len(self.network))
             self.network.append(item)
@@ -5533,7 +5851,7 @@ class Fleet:
             return
         if not isinstance(records, list):
             return
-        self._mode = None
+        self._start_file(path, path.parent)     # one JSON array: no line numbers
         calls: dict[str, tuple[str, str]] = {}
         for rec in records:
             if isinstance(rec, dict):
@@ -6897,10 +7215,36 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "crates, cargo add is pinned only with =1.2.3 (x@1.2.3 is a caret",
             "requirement) and cargo install --version 1.2.3 is exact.",
             "",
-            "To find the exact transcript record behind an item:",
+            "Each item carries detail, all redacted and cleaned when read:",
+            "  mode        the permission-mode key approval was judged from",
+            "  why         the assistant's own words before the call, last sentence,",
+            "              at most 160 characters",
+            "  prompt      the person's last real message before the turn, at most",
+            "              160 characters. The text view shows it; --json emits it",
+            "              only with --with-prompts, otherwise null",
+            "  transcript  root, file (relative to root) and 1-based line of the",
+            "              record that made the call",
+            "What each agent provides:",
+            "  Claude Code  why: text blocks of the same assistant message before the",
+            "               tool_use. prompt: the last user message that is not a tool",
+            "               result, meta record, slash-command or local-command",
+            "               wrapper, or system reminder.",
+            "  Codex        why: the latest assistant message or reasoning summary",
+            "               before the call, cleared by a call's output. prompt: the",
+            "               latest user_message, not injected environment context.",
+            "               No call_id is recorded for Codex.",
+            "  Copilot      why: the latest assistant.message text, cleared when a",
+            "               tool completes. prompt: the latest user.message.",
+            "A field the records do not give is null.",
+            "",
+            "To see the exact transcript record behind an item:",
+            "  actualis --network --json | jq -r '.items[0].transcript'",
+            "  sed -n '<line>p' <root>/<file>",
+            "or by call id:",
             "  actualis --network --json | jq -r '.items[0] | .session, .call_id'",
             "  grep -l '<call_id>' ~/.claude/projects/*/*.jsonl",
-            "call_id is the tool call's id in the transcript (null when none).",
+            "call_id is the tool call's id in the transcript (null when none). The",
+            "text view's trace line prints the call_id, then the same path and line.",
         ],
         "verify": "actualis --json | jq '.network.totals, .network.hosts[:5]'",
     },
@@ -7753,10 +8097,119 @@ def _local_host(host: str) -> bool:
     return False
 
 
-def render_network(fleet: Fleet, c: C, top: int, raw: bool = False) -> None:
-    """NETWORK: what came in, and from where; unasked first. Rows come from
-    network_json, which is redacted unless raw; fleet.network_items is only
-    counted here, never printed."""
+NET_VIEW_WIDTH = 100
+NET_DETAIL_PER_HOST = 3
+
+
+def _net_wrap(text: str, width: int, breaks: str = " ") -> list[str]:
+    """Lines of at most `width`, broken after a character in `breaks` where one
+    falls in the last third of the line, else hard. Concatenating the lines
+    (with a space when a break was a space) gives the text back."""
+    out: list[str] = []
+    while len(text) > width:
+        cut = max(text.rfind(b, width * 2 // 3, width) for b in breaks)
+        if cut < 0:
+            out.append(text[:width])
+            text = text[width:]
+        elif text[cut] == " ":
+            out.append(text[:cut])
+            text = text[cut + 1:]
+        else:
+            out.append(text[:cut + 1])
+            text = text[cut + 1:]
+    return out + [text] if text or not out else out
+
+
+def _net_when(ts: str | None) -> str:
+    return ts[:16].replace("T", " ") if ts else "time unknown"
+
+
+def _net_what(r: dict) -> str:
+    """The program and what it fetched, as one short phrase (fields as printed)."""
+    if r["package"]:
+        what = r["package"] + (f"@{r['version']}" if r["version"] else "")
+    else:
+        what = r["url"] or r["dest"] or ""
+    return f"{r['program']} {what}".rstrip()
+
+
+def _net_command(i: dict, raw: bool) -> str:
+    cmd = i.get("_command") or ""
+    return clip(cmd if raw else redact(cmd), NET_COMMAND_MAX)
+
+
+def _net_path(t: dict | None) -> str:
+    """root/file:line, with the home directory written as ~, or "-"."""
+    if not t or not t.get("file"):
+        return "-"
+    path = str(Path(t["root"]) / t["file"]) if t.get("root") else t["file"]
+    home = str(Path.home())
+    if home not in ("", "/") and path.startswith(home + os.sep):
+        path = "~" + path[len(home):]
+    return path + (f":{t['line']}" if t.get("line") else "")
+
+
+def _net_host_hint(host: str, room: int) -> str:
+    """A --host value that fits in `room`: the host, or its shortest parent
+    suffix that does (a broader filter, never a broken one)."""
+    labels = host.split(".")
+    while len(".".join(labels)) > room and len(labels) > 2:
+        labels = labels[1:]
+    return ".".join(labels)
+
+
+def _render_network_items(fleet: "Fleet", c: "C", top: int, raw: bool,
+                          filters: list[str]) -> None:
+    """Every item the filters kept, newest first, one block each."""
+    order = sorted(fleet.network_items, key=_net_order_key, reverse=True)
+    limit = max(top, 0) * 5
+    joined = " \u00b7 ".join(filters)
+    print(f"  {c.dim}FILTER   {joined}{c.off}"[:NET_VIEW_WIDTH + len(c.dim) + len(c.off)])
+    print(f"  {c.dim}showing {num(min(limit, len(order)))} of {num(len(order))}, newest first{c.off}")
+    pad = " " * 13
+    width = NET_VIEW_WIDTH - len(pad)
+    for i in order[:limit]:
+        r = _net_public(i, raw, prompts=True)
+        kind = r["kind"] + ((", pinned" if r["pinned"] else ", unpinned") if r["kind"] == "install" else "")
+        print()
+        head = f"  {r['host'] or '(no host)'}  \u00b7  {_net_what(r)}"
+        tail = f"  ({kind})"
+        print(clip(head, NET_VIEW_WIDTH - len(tail)) + tail)
+        lead = f"{_net_when(r['ts'])}  \u00b7  {r['agent']} \u00b7 project "
+        sess = f" \u00b7 session {(r['session'] or '-')[:8]}"
+        fields = [("when", lead + clip(r["project"], max(width - len(lead) - len(sess), 8)) + sess, True)]
+        asked = f"{r['approval']} ({r['mode'] or 'mode not recorded'})"
+        asked += (" \u00b7 failed" if r["failed"] else "") + (" \u00b7 trusted" if r["trusted"] else "") \
+            + (f" \u00b7 ioc {r['ioc']}" if r["ioc"] else "")
+        fields.append(("asked", asked, True))
+        fields.append(("command", _net_command(i, raw), False))
+        if r["why"]:
+            fields.append(("why", r["why"], False))
+        if r["prompt"]:
+            fields.append(("prompt", r["prompt"], False))
+        for label, value, one_line in fields:
+            lines = [clip(value, width)] if one_line else _net_wrap(value, width)
+            print(f"    {label:<9}{lines[0]}")
+            for more in lines[1:]:
+                print(pad + more)
+        trace = f"{r['call_id'] or '-'} \u00b7 {_net_path(r['transcript'])}"
+        if len(trace) <= width:
+            print(f"    {'trace':<9}{trace}")
+        else:                                # the path whole, broken after a /, never cut
+            print(f"    {'trace':<9}{clip(r['call_id'] or '-', width)}")
+            for part in _net_wrap(_net_path(r["transcript"]), width, "/"):
+                print(pad + part)
+    if len(order) > limit:
+        print()
+        print(f"  {c.dim}\u2026 {num(len(order) - limit)} more, narrow with --days or --session{c.off}")
+
+
+def render_network(fleet: Fleet, c: C, top: int, raw: bool = False,
+                   filters: list[str] | None = None) -> None:
+    """NETWORK: what came in, and from where; unasked first. Every printed
+    field comes from network_json or _net_public, redacted unless raw, or
+    from _net_command, which redacts too. `filters`, when given, names the
+    --network filters in force and switches to one block per item."""
     n = network_json(fleet, raw)
     t = n["totals"]
     rule(c, "NETWORK")
@@ -7790,6 +8243,9 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False) -> None:
         print(f"  {c.dim}trust: {' · '.join(parts)}{c.off}")
     render_ioc(fleet, c, raw)
     items = fleet.network_items
+    if filters:
+        _render_network_items(fleet, c, top, raw, filters)
+        return
 
     eco = Counter(i["ecosystem"] for i in items if i["kind"] == "install" and i["ecosystem"])
     unpinned = sum(1 for p in n["packages"] if not p["pinned"])
@@ -7817,10 +8273,27 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False) -> None:
     n_local = sum(h["unasked"] for h in n["hosts"] if _local_host(h["host"]))
     if unasked_hosts or n_nohost or n_local:
         print(f"  {c.dim}TOP UNASKED   hosts by unasked downloads{c.off}")
-        for host, (cnt, trusted, first) in sorted(
-                unasked_hosts.items(), key=lambda kv: (-kv[1][0], kv[0]))[:min(10, top)]:
+        ranked = sorted(unasked_hosts.items(), key=lambda kv: (-kv[1][0], kv[0]))[:min(10, top)]
+        # Each ranked host's newest downloads, any approval, newest first.
+        recent: dict[str, list[dict]] = {h: [] for h, _ in ranked}
+        for i in sorted(items, key=_net_order_key, reverse=True):
+            got = recent.get(i["host"])
+            if got is not None and len(got) < NET_DETAIL_PER_HOST:
+                got.append(i)
+        for host, (cnt, trusted, first) in ranked:
             seen = "trusted" if trusted else f"first seen {first[:10] if first else '?'}"
             print(f"    {clip(host, 44):<44} {num(cnt):>7}  {c.dim}{seen}{c.off}")
+            for i in recent[host]:
+                r = _net_public(i, raw)
+                left = (f"      {_net_when(r['ts']):<16}  {clip(r['project'], 16):<16}  "
+                        f"{(r['session'] or '-')[:8]:<8}  {r['approval']:<7}  ")
+                print(left + clip(_net_what(r), NET_VIEW_WIDTH - len(left)))
+                if r["why"]:
+                    print(f"        {c.dim}why: {clip(r['why'], NET_VIEW_WIDTH - 13)}{c.off}")
+            hint = "      \u2192 actualis --network --host "
+            narrow = _net_host_hint(host, NET_VIEW_WIDTH - len(hint))
+            if len(hint + narrow) <= NET_VIEW_WIDTH:     # no hint rather than a broken one
+                print(f"{c.dim}{hint}{narrow}{c.off}")
         extra = ([f"{num(n_nohost)} with no host (git remote names, $VAR URLs)"] if n_nohost else []) \
             + ([f"{num(n_local)} local or private"] if n_local else [])
         if extra:
@@ -7845,10 +8318,10 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False) -> None:
 
 
 def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
-           network_only: bool = False) -> None:
+           network_only: bool = False, network_filters: list[str] | None = None) -> None:
     if network_only:
         # --network: the NETWORK section and the redaction note, nothing else.
-        render_network(fleet, c, top, raw)
+        render_network(fleet, c, top, raw, network_filters)
         print()
         print(f"{c.dim}  Ask how this was read:  actualis --explain network")
         if not raw:
@@ -9059,6 +9532,13 @@ JSON_SCHEMA: dict[str, str] = {
     "network.items[].session": "str|null",
     "network.items[].call_id": "str|null",
     "network.items[].ts": "str|null",
+    "network.items[].mode": "str|null",
+    "network.items[].why": "str|null",
+    "network.items[].prompt": "str|null",
+    "network.items[].transcript": "object|null",
+    "network.items[].transcript.root": "str",
+    "network.items[].transcript.file": "str",
+    "network.items[].transcript.line": "int|null",
     "network.items_truncated": "bool",
     "network.strict": "bool",
     "network.trust": "array",
@@ -9126,6 +9606,8 @@ JSON_SCHEMA: dict[str, str] = {
 # A matched item is shown exactly as network.items shows it.
 JSON_SCHEMA.update({f"network.ioc.matches[].item.{k}": JSON_SCHEMA[f"network.items[].{k}"]
                     for k in NETWORK_ITEM_KEYS})
+JSON_SCHEMA.update({f"network.ioc.matches[].item.transcript.{k}": JSON_SCHEMA[f"network.items[].transcript.{k}"]
+                    for k in ("root", "file", "line")})
 
 
 def canonical_json(payload: dict) -> str:
@@ -10466,6 +10948,17 @@ def build_parser() -> argparse.ArgumentParser:
                           "actualis-ioc line format or OSV JSON/JSONL. Repeatable. Never read unless named.")
     net.add_argument("--network-strict", action="store_true",
                      help="make every unasked download from an untrusted source a medium finding")
+    net.add_argument("--host", metavar="HOST",
+                     help="--network: only downloads from HOST or a subdomain of it")
+    net.add_argument("--package", metavar="NAME",
+                     help="--network: only installs of this exact package (npm exactly, pypi by PEP 503)")
+    net.add_argument("--session", metavar="ID",
+                     help="--network: only sessions whose id starts with ID")
+    net.add_argument("--unasked", action="store_true",
+                     help="--network: only downloads that ran without asking")
+    net.add_argument("--with-prompts", action="store_true",
+                     help="--json: include network.items[].prompt, the person's last message "
+                          "before each download (redacted, 160 characters). Null otherwise")
     ap.add_argument("--suppress", metavar="ID",
                     help="mark a finding as a false positive on this machine. "
                          "It stays counted; it leaves the actionable list.")
@@ -10487,6 +10980,21 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def network_filtered(args) -> bool:
+    """Whether any --network filter was given."""
+    return bool(network_filter_names(args))
+
+
+def network_filter_names(args) -> list[str]:
+    """The --network filters in force, as the filtered view names them."""
+    if not args.network:
+        return []
+    return ([f"host {clean(args.host)}"] if args.host else []) \
+        + ([f"package {clean(args.package)}"] if args.package is not None else []) \
+        + ([f"session {clean(args.session)}"] if args.session is not None else []) \
+        + (["unasked only"] if args.unasked else [])
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = build_parser()
     args = ap.parse_args(argv)
@@ -10505,6 +11013,17 @@ def main(argv: list[str] | None = None) -> int:
                          ("--coach", args.coach), ("--aisvs", args.aisvs)):
             if on:
                 ap.error(f"--network cannot be combined with {flag}.")
+    for flag, on in (("--host", args.host), ("--package", args.package),
+                     ("--session", args.session), ("--unasked", args.unasked)):
+        if on is not None and on is not False and not args.network:
+            ap.error(f"{flag} requires --network: it narrows the network view.")
+    if args.host:
+        try:
+            parse_trust([args.host], "--host")
+        except ValueError as exc:
+            ap.error(str(exc))
+    if args.with_prompts and not args.json:
+        ap.error("--with-prompts applies only to --json; the text view already shows prompts.")
     if args.ioc and args.card:
         ap.error("--ioc does not apply to --card; the card never shows downloads.")
     if args.ioc and (args.watch or args.mcp):
@@ -10650,7 +11169,9 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, OSError) as exc:
         ap.error(str(exc))
 
-    fleet = Fleet()
+    # --network shows only the inventory; --fail-on and --why read findings.
+    fleet = Fleet(network_only=bool(args.network and not args.fail_on and not args.why))
+    fleet.with_prompts = args.with_prompts
     progress = not args.json and sys.stderr.isatty()
 
     if args.ci_log:
@@ -10713,6 +11234,8 @@ def main(argv: list[str] | None = None) -> int:
         print(dead_end_message(fleet, args), file=sys.stderr)
         return EXIT_CANNOT_RUN
 
+    if network_filtered(args):
+        network_filter(fleet, args.host, args.package, args.session, args.unasked)
     apply_network_policy(fleet, network_trust, args.network_strict, trust_sources)
     apply_ioc(fleet, ioc)
 
@@ -10757,7 +11280,7 @@ def main(argv: list[str] | None = None) -> int:
         render_coach(coach(fleet), C(use_color()))
     else:
         render(fleet, C(use_color()), bash_only=args.bash, top=args.top, raw=args.no_redact,
-               network_only=args.network)
+               network_only=args.network, network_filters=network_filter_names(args))
 
     if args.fail_on:
         reasons = failing_findings(fleet, args.fail_on)

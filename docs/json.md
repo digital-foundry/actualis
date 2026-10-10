@@ -199,18 +199,26 @@ not parse (a script, `poetry add`, `npm exec`) gives no item.
 | `by_kind` | counts of `install`, `clone`, `fetch` and `search` items |
 | `hosts[]` | per host: `count`, `unasked`, `first_seen`, and `trusted` if any item from it matched the trust list |
 | `packages[]` | per `ecosystem` and `name`: `versions` seen, `pinned` (every install named an exact version: a full `MAJOR.MINOR.PATCH` for npm, crates and go, `==` for pypi, an `@sha256:` digest for images; for crates, `cargo add` is pinned only with `=1.2.3` and `cargo install --version 1.2.3` is exact; ranges, tags and prefixes are not pinned), `exec` (any install ran code), `count` |
-| `items[]` | one record per item (`package`, `version` and `alias` are redacted like `url` unless `--no-redact`): `kind`, `program`, `host`, `host_inferred`, `url`, `dest`, `source`, `ecosystem`, `package`, `version`, `pinned`, `exec`, `dynamic`, `alias` (the name an npm alias installs under, `x` in `x@npm:evil@1.0.0`, where `package` is `evil`; else `null`), `failed` (`null` when unknown), `approval`, `trusted`, `agent`, `project`, `session`, `call_id` (the tool call's id in the transcript, an opaque string, `null` when there is none), `ts`, `ioc` (`match`, `unresolved` or `null`; see `network.ioc`) |
+| `items[]` | one record per item (`package`, `version` and `alias` are redacted like `url` unless `--no-redact`): `kind`, `program`, `host`, `host_inferred`, `url`, `dest`, `source`, `ecosystem`, `package`, `version`, `pinned`, `exec`, `dynamic`, `alias` (the name an npm alias installs under, `x` in `x@npm:evil@1.0.0`, where `package` is `evil`; else `null`), `failed` (`null` when unknown), `approval`, `trusted`, `agent`, `project`, `session`, `call_id` (the tool call's id in the transcript, an opaque string, `null` when there is none), `ts`, `ioc` (`match`, `unresolved` or `null`; see `network.ioc`), `mode` (the permission-mode key `approval` was judged from, or `null`), `why` (the assistant's own words before the call: the last sentence, at most 160 characters, or `null`), `prompt` (the person's last real message before the turn, at most 160 characters; `null` unless `--with-prompts`), `transcript` (`root`, `file` relative to `root`, and the 1-based `line` of the record that made the call; `line` is `null` for a `--ci-log` array; `transcript` is `null` for an item not read from a file) |
 | `items_truncated` | `true` when `items` was cut at the cap |
 | `strict` | whether `--network-strict` was on |
 | `trust` | the trusted host or host-and-path entries in force |
 | `trust_sources[]` | where the trust entries came from: `source` (`flag` or `file`), `path` and `sha256` (both `null` for a flag), and `entries`. It shows whether an agent-editable file supplied the trust, so a reader can tell. `path` is absolute and not redacted, like `scanned.roots` |
 
-**Finding the record behind an item.** `session` and `call_id` name it:
+**Finding the record behind an item.** `transcript` points at it exactly,
+and `session` and `call_id` name it:
 
 ```sh
+actualis --network --json | jq -r '.items[0].transcript | "\(.line) \(.root)/\(.file)"'
+sed -n '<line>p' <root>/<file>                       # the record itself
 actualis --network --json | jq -r '.items[0] | .session, .call_id'
 grep -l '<call_id>' ~/.claude/projects/*/*.jsonl    # the transcript file(s) holding that tool call
 ```
+
+**why and prompt.** Both are redacted and stripped of control characters when
+they are read, so `--no-redact` does not reveal them. What each agent gives
+is in `actualis --explain network`; a field the records do not give is
+`null`. `--share` and `--card` never carry either.
 
 **Approval values.** `asked`: the user was prompted and approved. `unasked`:
 the agent ran it without asking, in a mode that does not prompt. `unknown`:
