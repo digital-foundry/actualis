@@ -286,5 +286,94 @@ class TestFallbacks(Charts):
             self.assertIn(path, out)
 
 
+def render(fn, *args):
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        fn(*args)
+    return buf.getvalue()
+
+
+def fleet_of(spec):
+    """spec: (command, datetime, mode) per item, all in project p."""
+    f = af.Fleet()
+    for cmd, ts, mode in spec:
+        f.add_tool("p", "Bash", {"command": cmd}, ts, mode)
+    af.apply_network_policy(f, af.parse_trust([]), strict=False)
+    return f
+
+
+class TestReviewFixes(unittest.TestCase):
+    """Edge cases from the review of the first cut (#77)."""
+
+    def test_a_far_future_date_does_not_crash_or_stall(self):
+        from datetime import datetime, timezone
+        f = fleet_of([("npm install a", datetime(2026, 10, 1, tzinfo=timezone.utc), "auto"),
+                      ("npm install b", datetime(9999, 12, 31, 12, tzinfo=timezone.utc), "auto")])
+        out = render(af.render_network, f, af.C(False), 12)
+        self.assertIn("2026-10-01 \u2192 9999-12-31", out)
+        for line in out.splitlines():
+            self.assertLessEqual(len(line), 100, line)
+
+    def test_a_chart_failure_never_takes_the_report_down(self):
+        n = {"totals": {"items": 1, "asked": 0, "unasked": 1, "unknown": 0},
+             "by_day": [{"date": "not-a-date", "items": 1, "unasked": 1},
+                        {"date": "2026-10-01", "items": 0, "unasked": 0}],
+             "by_day_undated": 0, "by_kind": {"fetch": 1}}
+        out = render(af._render_network_strip, n, af.C(False))
+        self.assertIn("charts unavailable", out)
+
+    def test_the_undated_note_is_whole_or_absent(self):
+        n = {"totals": {"items": 1234667, "asked": 0, "unasked": 0, "unknown": 1234667},
+             "by_day": [{"date": "2026-09-01", "items": 1234567, "unasked": 0},
+                        {"date": "2026-10-06", "items": 2, "unasked": 0}],
+             "by_day_undated": 98765, "by_kind": {"fetch": 1234667}}
+        out = render(af._render_network_strip, n, af.C(True))
+        day = next(l for l in out.splitlines() if "per day" in l)
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", day)
+        self.assertLessEqual(len(plain), 100, plain)
+        self.assertTrue("98,765 undated" in plain or "undated" not in plain, plain)
+        self.assertEqual(day.count("\x1b[2m"), day.count("\x1b[0m"), day)
+
+    def test_long_hosts_keep_their_registrable_end(self):
+        got = af._net_host_clip("objects.githubusercontent.com.evil.ru", 24)
+        self.assertTrue(got.startswith("\u2026") and got.endswith(".evil.ru"), got)
+        self.assertLessEqual(len(got), 24)
+        self.assertEqual(af._net_host_clip("a.io", 24), "a.io")
+        self.assertEqual(len(af._net_host_clip("x" * 60 + ".io", 24)), 24)
+        f = fleet_of([("curl -O https://objects.githubusercontent.com.evil.ru/x",
+                       af.datetime(2026, 10, 1, tzinfo=af.timezone.utc), "auto")])
+        out = render(af.render_network, f, af.C(False), 12)
+        self.assertNotIn("githubuserconte\u2026", out)
+        hosts = [l for l in out.splitlines() if l.startswith("    \u2026")]
+        self.assertTrue(hosts and all(".evil.ru " in l for l in hosts), out)   # TOP HOSTS row
+
+    def test_by_day_is_the_utc_date(self):
+        from datetime import datetime, timedelta, timezone
+        late = datetime(2026, 10, 1, 23, 30, tzinfo=timezone(timedelta(hours=-5)))
+        f = fleet_of([("curl https://a.io/x", late, "auto")])
+        n = af.network_json(f)
+        self.assertEqual([d["date"] for d in n["by_day"]], ["2026-10-02"])
+
+    def test_huge_counts_still_fit(self):
+        from datetime import datetime, timezone
+        f = fleet_of([("curl https://a.io/x", datetime(2026, 10, 1, tzinfo=timezone.utc), "auto")])
+        n = af.network_json(f)
+        n["hosts"][0].update(count=148148136, unasked=148148136)
+        with mock.patch.object(af, "network_json", lambda *a, **k: n), \
+                mock.patch.object(af, "network_reconciles", lambda n: []):
+            out = render(af.render_network, f, af.C(False), 12)
+        self.assertIn("148,148,136 / 148,148,136", out)
+        for line in out.splitlines():
+            self.assertLessEqual(len(line), 100, line)
+
+    def test_every_nonzero_share_gets_a_cell(self):
+        bar = af._net_approval_bar({"unasked": 1, "unknown": 2000000, "asked": 0}, 32)
+        self.assertEqual(len(bar), 32)
+        self.assertEqual(bar.count("\u2588"), 1)
+        bar = af._net_bar(999, 1000, 1000, 20)
+        self.assertIn("\u2591", bar)                       # the one not unasked still shows
+        self.assertEqual(af._net_bar(1000, 1000, 1000, 20), "\u2588" * 20)
+
+
 if __name__ == "__main__":
     unittest.main()
