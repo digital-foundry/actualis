@@ -95,25 +95,28 @@ class View(unittest.TestCase):
 
 
 class TestDefaultView(View):
-    def test_top_hosts_show_their_three_newest_downloads_and_a_hint(self):
+    def test_unasked_downloads_grouped_by_session_with_why_and_a_hint(self):
         out = self.run_main("--network")
         self.assert_fits(out)
         self.assert_clean(out)
         lines = out.splitlines()
-        i = next(k for k, l in enumerate(lines) if l.strip().startswith("evil.example"))
-        block = lines[i + 1:i + 6]
-        dates = [l.split()[0] + " " + l.split()[1] for l in block if re.match(r"^ {6}\d{4}-", l)]
-        self.assertEqual(dates, ["2026-10-07 15:00", "2026-10-06 09:00", "2026-10-05 09:00"])
-        self.assertIn("why: Downloading the installer script.", "\n".join(block))
-        self.assertIn("3f2a1b2c", block[0])
-        self.assertIn("unasked", block[0])
-        hint = next(l for l in lines[i:] if "→" in l)
-        self.assertEqual(hint.strip(), "→ actualis --network --host evil.example")
-        self.assertNotIn("2026-10-04 09:00", "\n".join(lines[i:lines.index(hint)]))
+        i = next(k for k, l in enumerate(lines) if l.startswith("  UNASKED, BY SESSION"))
+        head = lines[i + 1]
+        self.assertTrue(head.startswith("    2026-10-04 09:00"), head)   # the session's first unasked
+        self.assertIn("3f2a1b2c", head)
+        self.assertIn("6 downloads, 5 unasked", head)
+        rows = [l for l in lines[i + 2:i + 12] if re.match(r"^ {6}(\d\d-\d\d )?\d\d:\d\d ", l)]
+        self.assertEqual([r.split()[1] for r in rows[:3]], ["09:00"] * 3)
+        self.assertEqual([r.split()[0] for r in rows[:3]], ["10-04", "10-05", "10-06"])
+        self.assertEqual(len(rows), 5)
+        block = "\n".join(lines[i:i + 14])
+        self.assertIn("why: Downloading the installer script.", block)
+        self.assertIn("why: I will pin lodash to an exact version.", block)
+        self.assertIn("\u2192 actualis --network --session 3f2a1b2c", block)
 
-    def test_summary_and_top_unasked_are_kept(self):
+    def test_summary_and_top_hosts(self):
         out = self.run_main("--network")
-        self.assertIn("TOP UNASKED", out)
+        self.assertIn("TOP HOSTS", out)
         self.assertRegex(out, r"\d+ downloads")
 
 

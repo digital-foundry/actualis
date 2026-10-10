@@ -79,23 +79,38 @@ Each of these is listed in full below.
 
 - **`--network`** prints only the NETWORK section (with the IOC block when
   `--ioc` is given), and `--network --json` emits only the `network` object. The
-  full report gets a one-line `network` summary in FLEET when downloads exist,
-  and NETWORK gains a TOP UNASKED block: the ten hosts with the most unasked
-  downloads. Its UNASKED and UNKNOWN rows are capped at 5. Under each top host
-  it shows that host's three newest downloads (time, project, session,
-  approval, package or URL, and the agent's `why`) and the
-  `actualis --network --host <h>` command that lists them all.
+  full report gets a one-line `network` summary in FLEET when downloads exist.
+  The view reads top down, every line at most 100 columns:
+  - a chart strip: an approval bar (unasked solid, unknown medium, asked
+    light), downloads per day as a sparkline with the unasked on the same
+    scale under it (empty days blank), and the mix of kinds;
+  - TOP HOSTS, TOP PACKAGES and, with two or more projects, BY PROJECT: up to
+    ten rows each, a bar whose solid part is the unasked share, and
+    `unasked / all`;
+  - UNASKED, BY SESSION (UNKNOWN when nothing is unasked): the newest five
+    sessions, each with its first five such downloads in the order they ran,
+    the agent's `why`, and the `actualis --network --session <id>` command
+    that lists them all.
+  The charts need no colour, and an ASCII-only terminal gets ASCII (`#`, `.`,
+  `:` and `_.:-=+*`). `--explain network` names the `--json` path behind each
+  chart.
 - **`--host`, `--package`, `--session` and `--unasked`** narrow `--network`
   (text and `--json`), combinable with each other, `--project` and `--days`.
   `--host` is a suffix on a label boundary, `--package` the exact name (npm
   case-sensitive, pypi by PEP 503), `--session` a prefix. The filter runs
   before `--network-strict` and `--ioc`, so totals, findings and matches are of
-  the filtered set. Filtered, the text view prints a block per item, newest
+  the filtered set. Filtered, the text view prints the chart strip for the
+  filtered set, then a block per item under a line naming its session, newest
   first and capped at `--top` x 5: host and target, when, agent, project and
   session, approval with the mode it was judged from, the redacted command,
   `why`, the prompt, and a `trace` line (call id, file and line) that
   `sed -n '<line>p' <file>` turns into the exact record. Without `--network`
   each is a usage error.
+- **`network.by_day[]`, `network.by_day_undated`, `network.by_project[]` and
+  `network.packages[].unasked`**, the series the charts draw. They reconcile
+  with `network.totals` (dated plus undated equals all items; project sums
+  equal the item and unasked totals), and the text view says so in red when
+  they do not.
 - **`network.items[]` gains `mode`, `why`, `prompt` and `transcript`.** `mode`
   is the permission-mode key approval was judged from. `why` is the agent's
   own text before the call (last sentence, 160 characters); `prompt` is the

@@ -2920,12 +2920,28 @@ def network_json(fleet: "Fleet", raw: bool = False) -> dict:
             continue
         p = packages.setdefault((i["ecosystem"] or "", i["package"]), {
             "ecosystem": i["ecosystem"], "name": i["package"], "versions": set(),
-            "pinned": True, "exec": False, "count": 0})
+            "pinned": True, "exec": False, "count": 0, "unasked": 0})
         p["count"] += 1
+        p["unasked"] += 1 if i["approval"] == "unasked" else 0
         if i["version"]:
             p["versions"].add(i["version"])
         p["pinned"] = p["pinned"] and i["pinned"]
         p["exec"] = p["exec"] or i["exec"]
+
+    # The chart series. A date is the item's own UTC timestamp's date; an
+    # item with no timestamp is counted in by_day_undated, never guessed at.
+    days: dict[str, dict] = {}
+    projects: dict[str, dict] = {}
+    for i in items:
+        un = 1 if i["approval"] == "unasked" else 0
+        if i["ts"]:
+            d = days.setdefault(i["ts"][:10], {"date": i["ts"][:10], "items": 0, "unasked": 0})
+            d["items"] += 1
+            d["unasked"] += un
+        pr = projects.setdefault(i["project"] or "", {"project": i["project"] or "",
+                                                       "items": 0, "unasked": 0})
+        pr["items"] += 1
+        pr["unasked"] += un
 
     order = sorted(items, key=_net_order_key, reverse=True)
     return {
@@ -2934,6 +2950,9 @@ def network_json(fleet: "Fleet", raw: bool = False) -> dict:
                    "failed": sum(1 for i in items if i["failed"] is True),
                    "unparsed_segments": fleet.network_unparsed},
         "by_kind": {k: kinds.get(k, 0) for k in ("install", "clone", "fetch", "search")},
+        "by_day": [days[k] for k in sorted(days)],
+        "by_day_undated": sum(1 for i in items if not i["ts"]),
+        "by_project": sorted(projects.values(), key=lambda p: (-p["items"], p["project"])),
         "hosts": sorted(hosts.values(), key=lambda h: (-h["count"], h["host"])),
         "packages": [{**p, "name": p["name"] if raw else redact(p["name"]),
                       "versions": sorted(p["versions"] if raw else {redact(v) for v in p["versions"]})}
@@ -2976,6 +2995,21 @@ def network_reconciles(n: dict) -> list[str]:
         if i["kind"] not in ("install", "clone", "fetch", "search"):
             bad.append(f"item kind {i['kind']!r} is not install, clone, fetch or search")
             break
+    # The chart series, where present (a payload from before 0.3.0 has none).
+    if "by_day" in n:
+        dated = sum(d["items"] for d in n["by_day"])
+        if dated + n["by_day_undated"] != t["items"]:
+            bad.append(f"by_day items {dated} + undated {n['by_day_undated']} "
+                       f"!= totals.items {t['items']}")
+        if sum(d["unasked"] for d in n["by_day"]) > t["unasked"]:
+            bad.append("by_day unasked exceeds totals.unasked")
+        if any(d["unasked"] > d["items"] for d in n["by_day"]):
+            bad.append("a by_day entry has more unasked than items")
+    if "by_project" in n:
+        for key, total in (("items", t["items"]), ("unasked", t["unasked"])):
+            got = sum(p[key] for p in n["by_project"])
+            if got != total:
+                bad.append(f"by_project {key} {got} != totals.{key} {total}")
     if n["items_truncated"] != (len(items) < t["items"]):
         bad.append(f"items_truncated {n['items_truncated']} but {len(items)} of "
                    f"{t['items']} items are listed")
@@ -7250,6 +7284,23 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "  grep -l '<call_id>' ~/.claude/projects/*/*.jsonl",
             "call_id is the tool call's id in the transcript (null when none). The",
             "text view's trace line prints the call_id, then the same path and line.",
+            "",
+            "The text view's charts, and the --network --json path each one draws:",
+            "  approval bar   .totals (unasked solid, unknown medium, asked light)",
+            "  per day        .by_day, one cell per date from first to last, empty",
+            "                 dates blank; .by_day_undated counts items with no time",
+            "  unasked        .by_day[].unasked, on the per-day row's scale",
+            "  kind           .by_kind",
+            "  TOP HOSTS      .hosts, ranked by unasked, then count; local and",
+            "                 private hosts are counted on the 'plus' line",
+            "  TOP PACKAGES   .packages (count, unasked, versions, pinned, exec)",
+            "  BY PROJECT     .by_project, shown with two or more projects",
+            "  BY SESSION     .items grouped by .session; counts are of every item",
+            "A bar's solid part is the unasked share; its length is the count",
+            "against the largest row in the same chart. Any count above zero gets",
+            "at least one cell. The series reconcile with .totals; the report says",
+            "so in red when they do not.",
+            "  actualis --network --json | jq '.by_day, .by_project'",
         ],
         "verify": "actualis --json | jq '.network.totals, .network.hosts[:5]'",
     },
@@ -8023,7 +8074,12 @@ _GLYPH_FALLBACK = {
     "→": "->",
     "×": "x",      # cache multiplier
     "─": "-",      # section rule
-    "█": "#",      # bar chart
+    "█": "#",      # bar chart: the unasked share
+    "░": ".",      # bar chart: the rest
+    "▒": ":",      # approval bar: unknown
+    # Sparkline levels, lowest to highest (written as escapes: see _BLOCKS).
+    "\u2581": "_", "\u2582": ".", "\u2583": ":", "\u2584": "-",
+    "\u2585": "=", "\u2586": "+", "\u2587": "*",
 }
 _GLYPH_TABLE = str.maketrans(_GLYPH_FALLBACK)
 
@@ -8163,18 +8219,156 @@ def _net_host_hint(host: str, room: int) -> str:
     return ".".join(labels)
 
 
+NET_SPARK_MAX = 36          # cells in a sparkline; wider windows share a cell
+NET_PER_SESSION = 5         # items listed under each session
+NET_SESSIONS = 5            # sessions listed in the default view
+
+
+def _net_bar(part: int, whole: int, scale: int, width: int) -> str:
+    """`whole` drawn against `scale` (the largest whole in the chart) in
+    `width` cells, the first `part` of it solid. Anything above zero gets at
+    least one cell, so a small count is never drawn as nothing."""
+    if scale <= 0 or whole <= 0:
+        return " " * width
+    w = min(width, max(1, round(whole / scale * width)))
+    p = min(w, max(1, round(part / scale * width))) if part else 0
+    return ("\u2588" * p + "\u2591" * (w - p)).ljust(width)
+
+
+def _net_approval_bar(t: dict, width: int, c: "C | None" = None) -> str:
+    """unasked (solid), unknown (medium), asked (light), in that order, the
+    cells shared out by largest remainder so they always add up to `width`."""
+    parts = [(t["unasked"], "\u2588"), (t["unknown"], "\u2592"), (t["asked"], "\u2591")]
+    total = sum(v for v, _ in parts)
+    if not total:
+        return " " * width
+    exact = [v * width / total for v, _ in parts]
+    cells = [int(e) for e in exact]
+    for k in sorted(range(3), key=lambda k: -(exact[k] - cells[k]))[:width - sum(cells)]:
+        cells[k] += 1
+    colours = (c.yellow, c.dim, "") if c else ("", "", "")
+    off = c.off if c else ""
+    return "".join(f"{col}{g * n}{off}" if n and col else g * n
+                   for (_, g), n, col in zip(parts, cells, colours))
+
+
+def _net_calendar(by_day: list[dict]) -> list[tuple[str, int, int]]:
+    """Every date from the first to the last in by_day, empty days as zero."""
+    if not by_day:
+        return []
+    seen = {d["date"]: (d["items"], d["unasked"]) for d in by_day}
+    day = datetime.strptime(by_day[0]["date"], "%Y-%m-%d").date()
+    last = datetime.strptime(by_day[-1]["date"], "%Y-%m-%d").date()
+    out = []
+    while day <= last:
+        key = day.isoformat()
+        out.append((key, *seen.get(key, (0, 0))))
+        day += timedelta(days=1)
+    return out
+
+
+def _net_spark(values: list[int], vmax: int) -> str:
+    """One cell per value: blank for zero, else one of eight levels of vmax."""
+    return "".join(" " if not v else _BLOCKS[min(7, max(0, -(-v * 8 // vmax) - 1))]
+                   for v in values)
+
+
+def _render_network_strip(n: dict, c: "C") -> None:
+    """The chart strip: approval share, downloads per day with the unasked
+    under it on the same scale, and the mix of kinds. Every number printed is
+    in --json (totals, by_day, by_kind); see --explain network."""
+    t = n["totals"]
+    label = lambda s: f"  {s:<10}"               # noqa: E731
+    print(label("approval") + _net_approval_bar(t, 32, c)
+          + f"   unasked {num(t['unasked'])} \u00b7 unknown {num(t['unknown'])}"
+          f" \u00b7 asked {num(t['asked'])}")
+    cal = _net_calendar(n["by_day"])
+    undated = f" \u00b7 {num(n['by_day_undated'])} undated" if n["by_day_undated"] else ""
+    if not cal:
+        print(label("per day") + f"{c.dim}no timestamps{undated}{c.off}")
+    elif len(cal) == 1:
+        print(label("per day") + f"all on {cal[0][0]}{c.dim}{undated}{c.off}")
+    else:
+        step = -(-len(cal) // NET_SPARK_MAX)
+        totals = [sum(d[1] for d in cal[k:k + step]) for k in range(0, len(cal), step)]
+        unasked = [sum(d[2] for d in cal[k:k + step]) for k in range(0, len(cal), step)]
+        vmax = max(totals)
+        peak = max(cal, key=lambda d: (d[1], d[0]))
+        width = len(totals)
+        tail = (f"   {cal[0][0]} \u2192 {cal[-1][0]} \u00b7 peak {num(peak[1])} on {peak[0]}")
+        print(label("per day") + _net_spark(totals, vmax).ljust(width)
+              + clip(tail, NET_VIEW_WIDTH - 12 - width) + f"{c.dim}{undated}{c.off}"[
+                  :max(0, NET_VIEW_WIDTH - 12 - width - len(tail)) + len(c.dim) + len(c.off)])
+        note = f"   {c.dim}same scale{'' if step == 1 else f', {step} days a cell'}{c.off}"
+        print(label("unasked") + f"{c.yellow}{_net_spark(unasked, vmax).ljust(width)}{c.off}" + note)
+    kinds = sorted(((k, v) for k, v in n["by_kind"].items() if v), key=lambda kv: (-kv[1], kv[0]))
+    if kinds:
+        top_k = kinds[0][1]
+        parts = [f"{k} {num(v)} {_net_bar(v, v, top_k, 6).rstrip()}" for k, v in kinds]
+        print(clip(label("kind") + "  ".join(parts), NET_VIEW_WIDTH))
+
+
+def _render_network_sessions(fleet: "Fleet", n: dict, c: "C", top: int, raw: bool) -> None:
+    """The unasked downloads (else the unknown ones) grouped by session, so a
+    burst reads as one task: newest session first, each in the order it ran."""
+    t = n["totals"]
+    want = "unasked" if t["unasked"] else "unknown" if t["unknown"] else None
+    if not want:
+        return
+    groups: dict[str, list[dict]] = {}
+    size: Counter = Counter()
+    for i in fleet.network_items:
+        size[i["session"] or ""] += 1
+        if i["approval"] == want:
+            groups.setdefault(i["session"] or "", []).append(i)
+    for g in groups.values():
+        g.sort(key=_net_order_key)
+    order = sorted(groups, key=lambda s: (max((i["ts"] or "") for i in groups[s]), s), reverse=True)
+    shown = order[:min(max(top, 0), NET_SESSIONS)]
+    print(f"  {want.upper()}, BY SESSION   {c.dim}newest first{c.off}")
+    for sid in shown:
+        rows = [_net_public(i, raw) for i in groups[sid]]
+        one_day = len({(r["ts"] or "")[:10] for r in rows[:NET_PER_SESSION]}) == 1
+        many = size[sid]
+        print(f"    {_net_when(rows[0]['ts']):<16}  {clip(rows[0]['project'], 28):<28}  "
+              f"{(sid[:8] or '(none)'):<8}  {num(many)} download{'' if many == 1 else 's'}, "
+              f"{c.yellow}{num(len(rows))} {want}{c.off}")
+        for r in rows[:NET_PER_SESSION]:
+            ts = r["ts"] or ""
+            when = ts[11:16] if one_day else ts[5:16].replace("T", " ")
+            room = NET_VIEW_WIDTH - 6 - 11 - 2 - 2 - 24
+            what = _net_what(r)                  # cut, not clip: clip drops the URL at its space
+            what = what if len(what) <= room else what[:room - 1] + "\u2026"
+            print(f"      {when or '--:--':<11}  {what:<{room}}  "
+                  f"{c.dim}{clip(r['host'] or '-', 24)}{c.off}")
+            if r["why"]:
+                print(f"        {c.dim}why: {clip(r['why'], NET_VIEW_WIDTH - 13)}{c.off}")
+        if len(rows) > NET_PER_SESSION:
+            print(f"      {c.dim}\u2026 {num(len(rows) - NET_PER_SESSION)} more{c.off}")
+        if sid:
+            print(f"      {c.dim}\u2192 actualis --network --session {sid[:8]}{c.off}")
+    if len(order) > len(shown):
+        print(f"    {c.dim}\u2026 {num(len(order) - len(shown))} more sessions{c.off}")
+
+
 def _render_network_items(fleet: "Fleet", c: "C", top: int, raw: bool,
                           filters: list[str]) -> None:
     """Every item the filters kept, newest first, one block each."""
     order = sorted(fleet.network_items, key=_net_order_key, reverse=True)
     limit = max(top, 0) * 5
-    joined = " \u00b7 ".join(filters)
-    print(f"  {c.dim}FILTER   {joined}{c.off}"[:NET_VIEW_WIDTH + len(c.dim) + len(c.off)])
     print(f"  {c.dim}showing {num(min(limit, len(order)))} of {num(len(order))}, newest first{c.off}")
     pad = " " * 13
     width = NET_VIEW_WIDTH - len(pad)
+    per_session = Counter(i["session"] or "" for i in order)
+    last_session = None
     for i in order[:limit]:
         r = _net_public(i, raw, prompts=True)
+        if (r["session"] or "") != last_session:
+            last_session = r["session"] or ""
+            k = per_session[last_session]
+            print()
+            print(f"  session {(last_session[:8] or '(none)')} \u00b7 "
+                  f"{clip(r['project'], 48)} \u00b7 {num(k)} download{'' if k == 1 else 's'}")
         kind = r["kind"] + ((", pinned" if r["pinned"] else ", unpinned") if r["kind"] == "install" else "")
         print()
         head = f"  {r['host'] or '(no host)'}  \u00b7  {_net_what(r)}"
@@ -8229,7 +8423,8 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False,
         print(f"  {c.dim}no downloads seen{c.off}")
         render_ioc(fleet, c, raw)              # an empty inventory is still an answer to --ioc
         return
-    print(f"  {num(t['items'])} download{'' if t['items'] == 1 else 's'} · {c.yellow}{num(t['unasked'])} unasked{c.off}"
+    share = f" ({t['unasked'] * 100 // t['items']}%)" if t["unasked"] else ""
+    print(f"  {num(t['items'])} download{'' if t['items'] == 1 else 's'} · {c.yellow}{num(t['unasked'])} unasked{share}{c.off}"
           f" · {num(t['unknown'])} unknown"
           + (f" · {num(t['failed'])} failed" if t["failed"] else ""))
     if t["unknown"]:
@@ -8249,77 +8444,71 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False,
     render_ioc(fleet, c, raw)
     items = fleet.network_items
     if filters:
+        joined = " \u00b7 ".join(filters)
+        print(f"  {c.dim}FILTER   {joined}{c.off}"[:NET_VIEW_WIDTH + len(c.dim) + len(c.off)])
+    _render_network_strip(n, c)
+    if filters:
         _render_network_items(fleet, c, top, raw, filters)
         return
 
     eco = Counter(i["ecosystem"] for i in items if i["kind"] == "install" and i["ecosystem"])
     unpinned = sum(1 for p in n["packages"] if not p["pinned"])
     if eco:
-        parts = " · ".join(f"{k} {num(v)}" for k, v in sorted(eco.items(), key=lambda kv: (-kv[1], kv[0])))
-        print(f"  {'INSTALLED':<11} {parts}"
+        parts = " \u00b7 ".join(f"{k} {num(v)}" for k, v in sorted(eco.items(), key=lambda kv: (-kv[1], kv[0])))
+        print(f"  {'INSTALLED':<10}{parts}"
               + (f"   {c.dim}{num(unpinned)} unpinned package(s){c.off}" if unpinned else ""))
-
     clones = Counter(i["host"] or "(remote name)" for i in items if i["kind"] == "clone")
     if clones:
-        parts = " · ".join(f"{h} {num(v)}" for h, v in sorted(clones.items(), key=lambda kv: (-kv[1], kv[0]))[:top])
-        print(f"  {'CLONED':<11} {num(sum(clones.values()))}   {parts}")
+        parts = " \u00b7 ".join(f"{h} {num(v)}" for h, v in sorted(clones.items(), key=lambda kv: (-kv[1], kv[0]))[:top])
+        print(clip(f"  {'CLONED':<10}{num(sum(clones.values()))}   {parts}", NET_VIEW_WIDTH))
+    rows_max = min(10, max(top, 0))
 
-    fetches = [i for i in items if i["kind"] in ("fetch", "search")]
-    if fetches:
-        fhosts = {i["host"] for i in fetches if i["host"]}
-        print(f"  {'FETCHED':<11} {num(len(fetches))}   {num(len(fhosts))} host(s)")
-
-    # Counts and dates only: host names are the same ones the rows below
-    # print, and no item field is read here that network_json would redact.
-    # Only real remote hosts are ranked; the rest are counted on one line.
-    unasked_hosts = {h["host"]: (h["unasked"], h["trusted"], h["first_seen"])
-                     for h in n["hosts"] if h["unasked"] and not _local_host(h["host"])}
-    n_nohost = sum(1 for i in items if not i["host"] and i["approval"] == "unasked")
-    n_local = sum(h["unasked"] for h in n["hosts"] if _local_host(h["host"]))
-    if unasked_hosts or n_nohost or n_local:
-        print(f"  {c.dim}TOP UNASKED   hosts by unasked downloads{c.off}")
-        ranked = sorted(unasked_hosts.items(), key=lambda kv: (-kv[1][0], kv[0]))[:min(10, top)]
-        # Each ranked host's newest downloads, any approval, newest first.
-        recent: dict[str, list[dict]] = {h: [] for h, _ in ranked}
-        for i in sorted(items, key=_net_order_key, reverse=True):
-            got = recent.get(i["host"])
-            if got is not None and len(got) < NET_DETAIL_PER_HOST:
-                got.append(i)
-        for host, (cnt, trusted, first) in ranked:
-            seen = "trusted" if trusted else f"first seen {first[:10] if first else '?'}"
-            print(f"    {clip(host, 44):<44} {num(cnt):>7}  {c.dim}{seen}{c.off}")
-            for i in recent[host]:
-                r = _net_public(i, raw)
-                left = (f"      {_net_when(r['ts']):<16}  {clip(r['project'], 16):<16}  "
-                        f"{(r['session'] or '-')[:8]:<8}  {r['approval']:<7}  ")
-                print(left + clip(_net_what(r), NET_VIEW_WIDTH - len(left)))
-                if r["why"]:
-                    print(f"        {c.dim}why: {clip(r['why'], NET_VIEW_WIDTH - 13)}{c.off}")
-            hint = "      \u2192 actualis --network --host "
-            narrow = _net_host_hint(host, NET_VIEW_WIDTH - len(hint))
-            if len(hint + narrow) <= NET_VIEW_WIDTH:     # no hint rather than a broken one
-                print(f"{c.dim}{hint}{narrow}{c.off}")
+    # Real remote hosts are ranked; host-less and local ones are counted on
+    # one line, since a row reading `?  git` says nothing a reader can act on.
+    hosts = sorted((h for h in n["hosts"] if not _local_host(h["host"])),
+                   key=lambda h: (-h["unasked"], -h["count"], h["host"]))[:rows_max]
+    n_nohost = sum(1 for i in items if not i["host"])
+    n_local = sum(h["count"] for h in n["hosts"] if _local_host(h["host"]))
+    if hosts or n_nohost or n_local:
+        print()
+        print(f"  TOP HOSTS{' ' * 48}{c.dim}unasked / all{c.off}")
+        scale = max((h["count"] for h in hosts), default=0)
+        for h in hosts:
+            seen = "trusted" if h["trusted"] else f"first {(h['first_seen'] or '?')[:10]}"
+            print(f"    {clip(h['host'], 32):<32} {_net_bar(h['unasked'], h['count'], scale, 20)}"
+                  f"  {num(h['unasked']) + ' / ' + num(h['count']):>13}  {c.dim}{seen}{c.off}")
         extra = ([f"{num(n_nohost)} with no host (git remote names, $VAR URLs)"] if n_nohost else []) \
             + ([f"{num(n_local)} local or private"] if n_local else [])
         if extra:
-            print(f"    {c.dim}plus {' · '.join(extra)}{c.off}")
+            joined = " \u00b7 ".join(extra)
+            print(f"    {c.dim}plus {joined}{c.off}")
 
-    # Remote hosts only: host-less and local items are counted on the "plus"
-    # line above, so a row reading `?  git` says nothing a reader can act on.
-    rows = [i for i in n["items"] if i["approval"] in ("unasked", "unknown")
-            and i["host"] and not _local_host(i["host"])]
-    rows.sort(key=lambda i: i["approval"] != "unasked")   # stable: newest-first within each
-    last = None
-    for i in rows[:min(top, 5)]:
-        label = i["approval"].upper() if i["approval"] != last else ""
-        last = i["approval"]
-        what = i["url"] or i["package"] or ""
-        room = 32 - len(i["program"]) - 1
-        if what and len(what) > room:
-            what = what[:max(room - 1, 1)] + "\u2026"
-        target = f"{i['program']} {what}".rstrip()
-        print(f"  {label:<9}{clip(i['host'] or '?', 26):<26} {target[:32]:<32}"
-              f" {c.dim}{clip(i['project'], 10):<10} {(i['ts'] or '')[:10]} {i['approval']}{c.off}")
+    pkgs = n["packages"][:rows_max]
+    if pkgs:
+        print()
+        print(f"  TOP PACKAGES{' ' * 45}{c.dim}unasked / all{c.off}")
+        scale = max(p["count"] for p in pkgs)
+        for p in pkgs:
+            flags = ", ".join(p["versions"][:2]) or "no version"
+            flags += ("" if p["pinned"] else " \u00b7 unpinned") + (" \u00b7 exec" if p["exec"] else "")
+            left = (f"    {(p['ecosystem'] or '-'):<6} {clip(p['name'], 25):<25} "
+                    f"{_net_bar(p['unasked'], p['count'], scale, 20)}"
+                    f"  {num(p['unasked']) + ' / ' + num(p['count']):>13}  ")
+            print(left + f"{c.dim}{clip(flags, NET_VIEW_WIDTH - len(left))}{c.off}")
+
+    if len(n["by_project"]) >= 2:
+        print()
+        print(f"  BY PROJECT{' ' * 47}{c.dim}unasked / all{c.off}")
+        projects = n["by_project"][:rows_max]
+        scale = max(p["items"] for p in projects)
+        for p in projects:
+            print(f"    {clip(p['project'] or '-', 32):<32} {_net_bar(p['unasked'], p['items'], scale, 20)}"
+                  f"  {num(p['unasked']) + ' / ' + num(p['items']):>13}")
+        if len(n["by_project"]) > len(projects):
+            print(f"    {c.dim}\u2026 {num(len(n['by_project']) - len(projects))} more{c.off}")
+
+    print()
+    _render_network_sessions(fleet, n, c, top, raw)
 
 
 def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
@@ -9500,6 +9689,15 @@ JSON_SCHEMA: dict[str, str] = {
     "network.by_kind.clone": "int",
     "network.by_kind.fetch": "int",
     "network.by_kind.search": "int",
+    "network.by_day": "array",
+    "network.by_day[].date": "str",
+    "network.by_day[].items": "int",
+    "network.by_day[].unasked": "int",
+    "network.by_day_undated": "int",
+    "network.by_project": "array",
+    "network.by_project[].project": "str",
+    "network.by_project[].items": "int",
+    "network.by_project[].unasked": "int",
     "network.hosts": "array",
     "network.hosts[].host": "str",
     "network.hosts[].count": "int",
@@ -9514,6 +9712,7 @@ JSON_SCHEMA: dict[str, str] = {
     "network.packages[].pinned": "bool",
     "network.packages[].exec": "bool",
     "network.packages[].count": "int",
+    "network.packages[].unasked": "int",
     "network.items": "array",
     "network.items[].kind": "str",
     "network.items[].program": "str",
