@@ -8,12 +8,12 @@ Your coding agent writes down everything it did — every shell command, every
 token, every refused tool call — and then nothing reads it. `actualis` reads it.
 
 ```sh
-uv tool install actualis     # or: pipx install actualis
+brew install digital-foundry/tap/actualis   # or: uv tool install actualis / pipx install actualis
 actualis
 ```
 
 No account, no config file, no network. It reads files already on your disk
-and prints a report, across **Claude Code** and **Codex** together.
+and prints a report, across **Claude Code**, **Codex** and **GitHub Copilot CLI** together.
 
 **What it finds that you probably don't know:**
 
@@ -139,34 +139,55 @@ project, or more than one agent, you cannot currently answer:
 
 ## Install
 
-No dependencies beyond Python 3.9+. Either run the file directly:
+No dependencies beyond Python 3.9+. Pick one:
 
 ```sh
+brew install digital-foundry/tap/actualis   # macOS / Linux, Homebrew
+uv tool install actualis                    # any OS, from PyPI
+pipx install actualis                       # same, with pipx
+```
+
+All three install the same file PyPI serves. Upgrade with `brew upgrade actualis`,
+`uv tool upgrade actualis` or `pipx upgrade actualis`.
+
+The network view (`--network`, `--ioc`, `--network-strict`, `--network-trust`)
+arrives in 0.3.0. Until that is released, install from a checkout to get it.
+
+### From a checkout
+
+The file runs as it is, with nothing to install:
+
+```sh
+git clone https://github.com/digital-foundry/actualis && cd actualis
 python3 actualis.py
 ```
 
-Or install it as a command:
+The Makefile has shortcuts for the common steps; `make` lists them:
 
 ```sh
-uv tool install .      # or: pipx install .
-actualis
+make run ARGS="--days 30"   # run from the checkout
+make install                # install the `actualis` command (uv, else pipx)
+make test                   # the test suite
+make tray                   # build the tray app (needs Go)
 ```
 
-`uv tool install` copies the code, so re-run it with `--force` after pulling to
-pick up changes.
+`make install` re-installs with `--force`, because uv and pipx copy the code:
+without it, a re-install after `git pull` keeps the old version.
 
 ## Usage
 
+From a checkout, `python3 actualis.py` works anywhere `actualis` does.
+
 ```sh
-python3 actualis.py                  # full report
-python3 actualis.py --days 30        # last 30 days
-python3 actualis.py --bash           # shell audit only
-python3 actualis.py --coach          # findings and recommended actions only
-python3 actualis.py --watch          # live alerting on new secrets
-python3 actualis.py --project svc    # filter to matching projects
-python3 actualis.py --json           # machine-readable
-python3 actualis.py --top 25         # show more projects
-python3 actualis.py --agent codex    # one agent only (claude | codex | copilot | all)
+actualis                  # full report
+actualis --days 30        # last 30 days
+actualis --bash           # shell audit only
+actualis --coach          # findings and recommended actions only
+actualis --watch          # live alerting on new secrets
+actualis --project svc    # filter to matching projects
+actualis --json           # machine-readable
+actualis --top 25         # show more projects
+actualis --agent codex    # one agent only (claude | codex | copilot | all)
 ```
 
 ### All options
@@ -246,7 +267,7 @@ multiplier applied to each · `BY AGENT` · `BY MODEL` · `CACHE EFFICIENCY` ·
 
 | | |
 |---|---|
-| [docs/findings.md](docs/findings.md) | every coach finding `AF001`–`AF011`: what it means, when it fires, what to do |
+| [docs/findings.md](docs/findings.md) | every coach finding `AF001`–`AF013`: what it means, when it fires, what to do |
 | [docs/secrets.md](docs/secrets.md) | which credential types are detected, and what is deliberately not flagged |
 | [docs/json.md](docs/json.md) | `--json` schema |
 | [docs/ioc.md](docs/ioc.md) | `--ioc`: the known-bad list format, OSV input, verdicts and the CI recipe |
@@ -281,7 +302,7 @@ invented.
 ## The coach
 
 The report says what happened; `--coach` says what to do about it. Findings carry
-stable ids (`AF001`–`AF010`) so they can be quoted and documented, and each one
+stable ids (`AF001`–`AF013`) so they can be quoted and documented, and each one
 carries evidence, an action, and an impact estimate where one can be computed
 honestly.
 
@@ -813,8 +834,10 @@ cat ~/.claude/projects/*/*.jsonl \
 
 ## Tray app
 
+Built from source for now (Go 1.23+):
+
 ```sh
-cd tray-go && go build -ldflags "-s -w" -o actualis-tray . && ./actualis-tray
+make tray && ./tray-go/actualis-tray
 ```
 
 A **constant gauge mark with a status dot in the corner** — the pattern Docker,
