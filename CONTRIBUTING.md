@@ -139,7 +139,7 @@ would undermine the claim at its root.
 ## Running the suite
 
 ```sh
-python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests -v   # or: make test
 ```
 
 No test runner, no config, no fixtures directory.
