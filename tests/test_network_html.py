@@ -182,6 +182,21 @@ class TestWrite(unittest.TestCase):
             p = af.write_network_html("x", Path(d))
             self.assertEqual(p.stat().st_mode & 0o777, 0o600)
 
+    @unittest.skipIf(os.name == "nt", "symlinks")
+    def test_dangling_symlink_is_skipped_not_followed_or_looped(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "actualis-network.html").symlink_to(d / "missing-target")
+            p = af.write_network_html("x", d)
+            self.assertEqual(p.name, "actualis-network-2.html")
+            self.assertFalse((d / "missing-target").exists())
+
+    def test_endless_collisions_give_up(self):
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(af.os, "open", side_effect=FileExistsError):
+                with self.assertRaises(FileExistsError):
+                    af.write_network_html("x", Path(d))
+
     def test_race_takes_next_name(self):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)

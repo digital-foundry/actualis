@@ -274,3 +274,20 @@ real transcripts.
 - **Live updates:** `--watch` stays terminal only.
 - **Links out to hosts or package registries:** these were left out on
   purpose, for the CSP and no-reference rules.
+
+## 9. Amendments during planning and build (2026-10-13)
+
+- **Signature:** `render_network_html` takes no `items` argument. Items come
+  from `n["items"]`.
+- **Hosts table:** host, downloads, unasked, first seen, trusted. `unknown`
+  and `last seen` are not in `network.hosts[]`, and §3 forbids a second pass
+  over the fleet.
+- **Sessions:** the sessions table and tile come from `n["items"]`. When that
+  list is truncated they are labelled "in listed items".
+- **Naming:** a lost name race takes the next name, up to 100 tries. A
+  dangling symlink counts as taken (`os.path.lexists`), so it is never
+  followed and never loops. It still never overwrites.
+- **Imports:** `base64` and `html` join the import freeze (T-OUT-8). Neither
+  opens a socket, and `--self-check` still passes.
+- **`--out` and `--style`:** they get separate errors: "--style applies only
+  to --card." and "--out applies only to --card or --html."

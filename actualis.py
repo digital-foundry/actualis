@@ -7321,6 +7321,10 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "at least one cell. The series reconcile with .totals; the report says",
             "so in red when they do not.",
             "  actualis --network --json | jq '.by_day, .by_project'",
+            "--html writes the same report as one self-contained page",
+            "(actualis-network.html, never overwritten, readable by you only). It",
+            "loads nothing from the network and embeds the --network --json object,",
+            "with its sha256, so every number on it can be checked against --json.",
         ],
         "verify": "actualis --json | jq '.network.totals, .network.hosts[:5]'",
     },
@@ -8849,7 +8853,7 @@ def network_html_path(out_dir: Path) -> Path:
     k = 1
     while True:
         p = out_dir / (f"{NET_HTML_NAME}.html" if k == 1 else f"{NET_HTML_NAME}-{k}.html")
-        if not p.exists():
+        if not os.path.lexists(p):          # a dangling symlink is taken too
             return p
         k += 1
 
@@ -8860,13 +8864,15 @@ def write_network_html(page: str, out_dir: Path) -> Path:
     page holds commands and URLs from the user's transcripts."""
     data = page.encode("utf-8")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-    while True:
+    for _ in range(100):                     # a lost race takes the next name; bounded
         path = network_html_path(out_dir)
         try:
             fd = os.open(path, flags, 0o600)
         except FileExistsError:
             continue
         break
+    else:
+        raise FileExistsError(f"no free {NET_HTML_NAME}-N.html name after 100 tries")
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
