@@ -159,6 +159,12 @@ Each of these is listed in full below.
 
 ### Fixed
 
+- **Newer Codex sessions no longer stop the scan.** Codex 0.16x writes
+  `approval_policy` as an object (`{"granular": {...}}`). actualis records
+  it as `codex:granular`, which does not count as unattended, so downloads
+  under it show as unknown. 0.2.2 showed the raw object as the mode name.
+  Any non-text value in a transcript field is now read as empty.
+
 - **Shell, secret and network counts no longer double-count tool calls copied
   into resumed or forked sessions.** The same `tool_use` id in more than one
   transcript is counted once (`duplicate_tool_calls_skipped` in `--json`), so

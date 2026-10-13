@@ -345,6 +345,44 @@ class TestOtherAgents(unittest.TestCase):
         self.assertEqual((it["agent"], it["approval"], it["session"], it["failed"], it["package"]),
                          ("codex", "unasked", "cx-1", None, "requests"))
 
+    def _codex_run(self, policy):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "rollout-2026-10-12T10-00-00-cx-2.jsonl"
+            recs = [
+                {"timestamp": "2026-10-12T10:00:00Z", "type": "session_meta", "payload": {"id": "cx-2", "cwd": "/Users/x/proj"}},
+                {"timestamp": "2026-10-12T10:00:00Z", "type": "turn_context", "payload": {
+                    "cwd": "/Users/x/proj", "model": {"not": "a string"}, "approval_policy": policy,
+                    "sandbox_policy": {"type": "workspace-write"}}},
+                {"timestamp": "2026-10-12T10:00:01Z", "type": "response_item", "payload": {
+                    "type": "function_call", "name": "shell_command", "call_id": "c1",
+                    "arguments": json.dumps({"command": "pip install requests", "workdir": "/Users/x/proj"})}},
+            ]
+            p.write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+            f = af.Fleet()
+            f.scan_codex([Path(tmp)], None, None)
+        return f
+
+    def test_codex_granular_approval_policy_object(self):
+        # Codex 0.16x writes approval_policy as {"granular": {...flags}}, not a string.
+        f = self._codex_run({"granular": {"mcp_elicitations": True, "request_permissions": True,
+                                          "rules": False, "sandbox_approval": False,
+                                          "skill_approval": False}})
+        self.assertEqual(f.permission_modes["codex:granular"], 1)
+        [it] = f.network_items
+        self.assertEqual((it["agent"], it["approval"]), ("codex", "unknown"))
+
+    def test_codex_policy_of_any_other_shape_is_skipped(self):
+        for policy in (7, ["never"], {}, {"a": 1, "b": 2}):
+            f = self._codex_run(policy)
+            self.assertFalse([k for k in f.permission_modes if k.startswith("codex:")], policy)
+            self.assertEqual(len(f.network_items), 1)
+
+    def test_codex_policy_object_key_is_cleaned(self):
+        f = self._codex_run({"\x1b[31mnever": {}})
+        self.assertEqual([k for k in f.permission_modes if k.startswith("codex:")],
+                         ["codex:[31mnever"])           # escape byte gone, not ungated
+        self.assertEqual(f.network_items[0]["approval"], "unknown")
+
     def test_copilot_web_fetch_keeps_arguments(self):
         with tempfile.TemporaryDirectory() as tmp:
             sid = "ffffffff-0000-0000-0000-000000000001"
