@@ -293,3 +293,12 @@ real transcripts.
   to --card." and "--out applies only to --card or --html."
 - **No readable copy:** the readable `<details>` copy of the JSON is dropped. It doubled
   the file (5 MB on a large corpus). The page names the script element that holds it.
+- **Review fixes (2026-10-13):**
+  - `--fail-on` still gates with `--html`: the page is written, then the verdict decides the exit code. §1's "no new conflict rule" was wrong.
+  - `--html` is refused with modes that write no file: `--why`, `--suppress`, `--suppressions`, `--explain`, `--agents`, `--completions`, `--service` and `--self-check`.
+  - The page shows what the text view shows:
+    - the IOC block, with lists, sha256 and matches;
+    - an `ioc` column on items;
+    - a `failed` tile, with "failed" marked on the item;
+    - the red reconcile warning.
+  - Session start and order compare timestamps in UTC.

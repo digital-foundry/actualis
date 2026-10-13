@@ -218,7 +218,7 @@ class TestWrite(unittest.TestCase):
 SID = "cccc3333-0000-4000-8000-000000000003"
 
 
-class TestCli(unittest.TestCase):
+class CliFixture(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -250,6 +250,8 @@ class TestCli(unittest.TestCase):
             os.chdir(old)
         return code, out.getvalue(), err.getvalue()
 
+
+class TestCli(CliFixture):
     def test_writes_into_cwd_and_prints_path(self):
         code, out, err = self.run_main("--network", "--html")
         self.assertEqual(code, 0, err)
@@ -288,3 +290,85 @@ class TestCli(unittest.TestCase):
         code, _, err = self.run_main("--network", "--html", "--out", str(self.home / "nope"))
         self.assertEqual(code, 1)
         self.assertIn("is not a directory", err)
+
+
+class TestReviewFixes(CliFixture):
+    def _with_secret(self):
+        secret = "sk-ant-api03-" + "Q" * 40
+        recs = [{"type": "assistant", "timestamp": "2026-10-07T15:00:00Z",
+                 "permissionMode": "bypassPermissions", "sessionId": SID,
+                 "message": {"id": "m2", "role": "assistant", "usage": {"input_tokens": 1, "output_tokens": 1},
+                             "content": [{"type": "tool_use", "id": "toolu_02", "name": "Bash",
+                                          "input": {"command": f"ANTHROPIC_API_KEY={secret} npm i left-pad"}}]}}]
+        with open(self.root / "-Users-x-proj" / f"{SID}.jsonl", "a") as fh:
+            fh.write("\n".join(json.dumps(r) for r in recs) + "\n")
+
+    def test_fail_on_still_gates(self):
+        self._with_secret()
+        code, out, err = self.run_main("--network", "--html", "--fail-on", "high")
+        self.assertEqual(code, 3, err)
+        self.assertIn("FAIL at --fail-on high", err)
+        self.assertTrue(Path(out.strip()).exists())        # the page is still written
+
+    def test_modes_that_write_nothing_are_refused(self):
+        for argv in (["--why", "x"], ["--explain", "network"], ["--service", "systemd"],
+                     ["--suppressions"], ["--self-check"], ["--completions", "zsh"]):
+            with self.subTest(argv=argv):
+                code, _, err = self.run_main("--network", "--html", *argv)
+                self.assertEqual(code, 2, err)
+                self.assertIn("--html writes a file; it cannot be combined with", err)
+
+    def test_ioc_matches_are_on_the_page(self):
+        ioc = self.home / "ioc.txt"
+        ioc.write_text("npm:lodash id=REF-1 label=badlabel\n")
+        code, out, err = self.run_main("--network", "--html", "--ioc", str(ioc))
+        self.assertEqual(code, 0, err)
+        visible = Path(out.strip()).read_text().split("<h2>Data</h2>")[0]
+        self.assertIn("<h2>IOC</h2>", visible)
+        self.assertIn("REF-1", visible)
+        self.assertIn("badlabel", visible)
+        self.assertIn(">MATCH<", visible)
+
+    def test_no_ioc_section_without_the_flag(self):
+        self.assertNotIn("<h2>IOC</h2>", page())
+
+    def test_reconcile_failure_is_shown(self):
+        n = af.network_json(fleet())
+        n["totals"]["items"] += 1
+        p = af.render_network_html(n, filters=[], version="x", with_prompts=False)
+        self.assertIn("do not reconcile", p)
+
+
+class TestReviewFixesUnit(unittest.TestCase):
+    def test_session_start_compares_in_utc(self):
+        f = af.Fleet()
+        sid = "dddd4444-0000-4000-8000-000000000004"
+        f.add_tool("p", "Bash", {"command": "npm i a"},
+                   datetime(2026, 10, 7, 23, tzinfo=timezone(timedelta(hours=-5))), "auto", session=sid)
+        f.add_tool("p", "Bash", {"command": "npm i b"},
+                   datetime(2026, 10, 8, 1, tzinfo=timezone.utc), "auto", session=sid)
+        p = page(f)
+        sessions = p.split('id="t-sessions"')[1].split("</table>")[0]
+        self.assertIn("2026-10-08 01:00", sessions)          # 01:00Z is earlier than 04:00Z
+        self.assertNotIn("2026-10-08 04:00", sessions)
+
+    def test_a_bar_spanning_days_names_its_range(self):
+        f = af.Fleet()
+        f.add_tool("p", "Bash", {"command": "npm i a"}, datetime(2020, 1, 1, tzinfo=timezone.utc), "auto")
+        f.add_tool("p", "Bash", {"command": "npm i b"}, datetime(2026, 1, 1, tzinfo=timezone.utc), "auto")
+        p = page(f)
+        self.assertRegex(p, r"<title>2020-01-01 to 2020-01-\d\d: 1 downloads")
+        self.assertIn("one bar is", p)
+
+    def test_a_failed_write_leaves_no_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            real = af.os.fdopen
+
+            def broken(fd, mode):
+                fh = real(fd, mode)
+                fh.write = mock.Mock(side_effect=OSError(28, "No space left on device"))
+                return fh
+            with mock.patch.object(af.os, "fdopen", side_effect=broken):
+                with self.assertRaises(OSError):
+                    af.write_network_html("x", Path(d))
+            self.assertEqual(list(Path(d).iterdir()), [])

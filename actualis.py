@@ -8608,9 +8608,9 @@ _NET_HTML_SCRIPT = (
 
 _NET_HTML_STYLE = (
     ":root{--bg:#fbfaf7;--fg:#1d1c1a;--mut:#6b6862;--line:#e3e0d8;--un:#c99700;--uk:#a8a49b;"
-    "--as:#e8e5de;--card:#fff}"
+    "--as:#e8e5de;--card:#fff;--bad:#b42318}"
     "@media (prefers-color-scheme:dark){:root{--bg:#141413;--fg:#ecebe6;--mut:#9d9a93;"
-    "--line:#2c2b28;--un:#e6b422;--uk:#6e6b65;--as:#3a3935;--card:#1c1c1a}}"
+    "--line:#2c2b28;--un:#e6b422;--uk:#6e6b65;--as:#3a3935;--card:#1c1c1a;--bad:#ff6b5b}}"
     "*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);"
     "font:15px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}"
     "main{max-width:1100px;margin:0 auto;padding:24px 16px 64px}h1{font-size:22px;margin:0}"
@@ -8637,7 +8637,7 @@ _NET_HTML_STYLE = (
     "font-variant-numeric:tabular-nums}td{max-width:340px;overflow-wrap:anywhere}"
     ".flt{margin:6px 0;padding:4px 8px;border:1px solid var(--line);border-radius:4px;"
     "background:var(--card);color:var(--fg)}code,pre{font:12px ui-monospace,Menlo,monospace}"
-    "code{word-break:break-all}"
+    "code{word-break:break-all}.bad{color:var(--bad);font-weight:600}"
     "pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto;"
     "background:var(--card);padding:8px;border:1px solid var(--line)}")
 
@@ -8660,6 +8660,58 @@ def _net_html_when(ts: str | None) -> str:
         return dt.strftime("%Y-%m-%d %H:%M")
     except (ValueError, OverflowError):
         return ts[:16]
+
+
+def _net_utc_key(ts: str | None) -> str:
+    """A timestamp as a sortable UTC string: items keep the transcript's own
+    offset, so raw strings from two zones do not compare in time order."""
+    if not ts:
+        return ""
+    try:
+        dt = datetime.fromisoformat(ts)
+        return dt.astimezone(timezone.utc).isoformat() if dt.tzinfo is not None else ts
+    except (ValueError, OverflowError):
+        return ts
+
+
+def _net_html_ioc(j: dict) -> str:
+    """The IOC block when --ioc was given, as render_ioc prints it: totals,
+    each list with its sha256, and every match. Empty without --ioc."""
+    if not j["enabled"]:
+        return ""
+    t = j["totals"]
+    out = [f'<h2>IOC</h2><p><span class="{"bad" if t["match"] else ""}">{t["match"]:,} match</span>'
+           f' &middot; {t["unresolved"]:,} unresolved'
+           + "".join(f" &middot; {t[k]:,} {k}" for k in ("refused", "suppressed") if t[k])
+           + f' &middot; {t["items_checked"]:,} checkable downloads checked</p>']
+    out.append(_html_table("t-ioc-lists", ["list", "sha256", "format", "package entries", "host entries",
+                                           "modified during the window"], [
+        [_h(Path(src["path"]).name), _h(src["sha256"]), _h(src["format"]), src["entries"]["package"],
+         src["entries"]["host"], "yes" if src["mtime_in_window"] else "no"] for src in j["sources"]]))
+    if j["matches"]:
+        rows = []
+        for r in j["matches"]:
+            i = r["item"]
+            if r["refused"]:
+                state = "never ran"
+            elif r["suppressed"]:
+                state = "suppressed"
+            elif r["verdict"] == "match":
+                state = ""
+            else:
+                state = _IOC_REASON_TEXT.get(r["reason"], r["reason"] or "")
+            rows.append([_h("REFUSED" if r["refused"] else r["verdict"].upper()), _h(_net_what(i)),
+                         _h(", ".join(r["refs"]) or "-"), _h(", ".join(r["labels"]) or "-"),
+                         _h(i["project"] or "-"), _h(_net_html_when(i["ts"])), _h(i["approval"]),
+                         _h(state)])
+        out.append(_html_table("t-ioc", ["verdict", "what", "refs", "labels", "project", "when (UTC)",
+                                         "approval", "note"], rows))
+        if j["matches_truncated"]:
+            out.append('<p class="note">More matches than listed; --network --json --ioc has them all.</p>')
+    out.append('<p class="note">No match is not "not affected": this covers the transcripts still on '
+               "this machine in the window, and lockfile installs, scripts and postinstall hooks are "
+               "not visible. See actualis --explain ioc.</p>")
+    return "".join(out)
 
 
 def _net_html_blob(n: dict) -> str:
@@ -8765,7 +8817,8 @@ def render_network_html(n: dict, *, filters: list[str], version: str, with_promp
     for i in items:
         s = sessions.setdefault(i["session"] or "-", {"start": i["ts"] or "", "project": i["project"],
                                                       "n": 0, "u": 0})
-        s["start"] = min(s["start"], i["ts"] or s["start"])
+        if i["ts"] and (not s["start"] or _net_utc_key(i["ts"]) < _net_utc_key(s["start"])):
+            s["start"] = i["ts"]
         s["n"] += 1
         s["u"] += i["approval"] == "unasked"
     listed = " in listed items" if truncated else ""
@@ -8781,12 +8834,20 @@ def render_network_html(n: dict, *, filters: list[str], version: str, with_promp
            '<p class="meta"><b>unasked</b>: ran in a mode that never stops to ask. '
            "<b>unknown</b>: the mode could have asked; the transcript does not say. "
            "<b>asked</b>: a person approved it.</p>"]
+    try:                                   # a self-check on the numbers; never a crash
+        problems = network_reconciles(n)
+    except Exception as exc:               # noqa: BLE001
+        problems = [f"check failed: {type(exc).__name__}"]
+    if problems:
+        out.append(f'<p class="bad">Network totals do not reconcile: {_h("; ".join(problems)[:200])}. '
+                   "Do not trust these numbers.</p>")
+    out.append(_net_html_ioc(n["ioc"]))
     if not t["items"]:
         out.append("<p>No downloads were recorded"
                    + (" for these filters" if filters else "") + ".</p>")
     else:
         tiles = [(t["items"], "downloads"), (t["unasked"], f"unasked ({pct}%)"),
-                 (t["unknown"], "unknown"), (t["asked"], "asked"),
+                 (t["unknown"], "unknown"), (t["asked"], "asked"), (t["failed"], "failed"),
                  (len(n["hosts"]), "hosts"), (len(n["packages"]), "packages"),
                  (len(sessions), "sessions" + listed), (len(n["by_project"]), "projects")]
         out.append('<div class="tiles">' + "".join(
@@ -8817,16 +8878,17 @@ def render_network_html(n: dict, *, filters: list[str], version: str, with_promp
         out.append(f"<h2>Sessions{listed}</h2>" + _html_table(
             "t-sessions", ["start (UTC)", "project", "session", "downloads", "unasked"], [
                 [_h(_net_html_when(s["start"])), _h(s["project"] or "-"), _h(sid[:8]), s["n"], s["u"]]
-                for sid, s in sorted(sessions.items(), key=lambda kv: (kv[1]["start"], kv[0]),
+                for sid, s in sorted(sessions.items(), key=lambda kv: (_net_utc_key(kv[1]["start"]), kv[0]),
                                      reverse=True)]))
         cols = ["when (UTC)", "host", "what", "approval", "mode", "agent", "project", "session",
-                "why", "trace"] + (["prompt"] if with_prompts else [])
+                "why", "trace", "ioc"] + (["prompt"] if with_prompts else [])
         rows = []
         for i in items:
             row = [_h(_net_html_when(i["ts"])), _h(i["host"] or "-"), _h(_net_what(i)),
-                   _h(i["approval"]), _h(i["mode"] or "-"), _h(i["agent"] or "-"),
+                   _h(i["approval"]) + (" &middot; failed" if i["failed"] else ""), _h(i["mode"] or "-"), _h(i["agent"] or "-"),
                    _h(i["project"] or "-"), _h((i["session"] or "-")[:8]), _h(i["why"] or ""),
-                   f"{_h(i['call_id'] or '-')} &middot; {_h(_net_path(i['transcript']))}"]
+                   f"{_h(i['call_id'] or '-')} &middot; {_h(_net_path(i['transcript']))}",
+                   f'<span class="bad">{_h(i["ioc"])}</span>' if i["ioc"] else ""]
             if with_prompts:
                 row.append(_h(i["prompt"] or ""))
             rows.append(row)
@@ -11608,6 +11670,14 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--html requires --network: it writes the network report.")
     if args.html and args.json:
         ap.error("--html writes a file; it cannot also emit --json.")
+    if args.html:
+        for flag, on in (("--why", args.why), ("--suppress", args.suppress),
+                         ("--suppressions", args.suppressions),
+                         ("--explain", args.explain is not None), ("--agents", args.agents),
+                         ("--completions", args.completions), ("--service", args.service),
+                         ("--self-check", args.self_check)):
+            if on:
+                ap.error(f"--html writes a file; it cannot be combined with {flag}.")
     if args.with_prompts and not (args.json or args.html):
         ap.error("--with-prompts applies only to --json or --html; "
                  "the text view already shows prompts.")
@@ -11877,9 +11947,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.no_redact:
             print("actualis: --no-redact is on: this report may contain live secrets.",
                   file=sys.stderr)
-        return EXIT_OK
-
-    if args.json:
+    elif args.json:
         json.dump(network_json(fleet, raw=args.no_redact) if args.network
                   else to_json(fleet, raw=args.no_redact), sys.stdout, indent=2)
         print()
