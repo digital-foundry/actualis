@@ -188,27 +188,30 @@ class TestTopUnasked(unittest.TestCase):
         return f
 
     def block(self, text):
+        """TOP HOSTS rows as (host, unasked, count, rest); [] when absent."""
         lines = text.splitlines()
-        i = next(k for k, l in enumerate(lines) if "TOP UNASKED" in l)
+        i = next((k for k, l in enumerate(lines) if l.startswith("  TOP HOSTS")), None)
+        if i is None:
+            return []
         rows = []
         for l in lines[i + 1:]:
-            if not l.startswith("    "):
+            if not l.startswith("    ") or l.strip().startswith("plus "):
                 break
-            if l.startswith("      "):         # a host's recent downloads and its hint
-                continue
-            if not l.strip().startswith("plus "):
-                rows.append(l.strip())
+            m = re.match(r"^    (\S+)\s.*?\s(\d+) / (\d+)  (.*)$", l)
+            rows.append((m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)))
         return rows
 
     def test_ordering_ties_and_trust(self):
         f = self.fleet([("b.io", 3, "auto", TS2), ("a.io", 3, "auto", TS1),
                         ("trusted.io", 5, "auto", TS1), ("asked.io", 9, "default", TS1)])
         rows = self.block(self.out(f))
-        self.assertEqual([r.split()[0] for r in rows], ["trusted.io", "a.io", "b.io"])
-        self.assertEqual([r.split()[1] for r in rows], ["5", "3", "3"])
-        self.assertIn("trusted", rows[0])
-        self.assertIn("first seen 2026-10-01", rows[1])
-        self.assertIn("first seen 2026-10-03", rows[2])
+        # Most unasked first, then most downloads, then name; asked.io has
+        # none unasked, so it ranks last despite nine downloads.
+        self.assertEqual([r[0] for r in rows], ["trusted.io", "a.io", "b.io", "asked.io"])
+        self.assertEqual([(r[1], r[2]) for r in rows], [(5, 5), (3, 3), (3, 3), (0, 9)])
+        self.assertIn("trusted", rows[0][3])
+        self.assertIn("first 2026-10-01", rows[1][3])
+        self.assertIn("first 2026-10-03", rows[2][3])
 
     def test_capped_at_ten_and_by_top(self):
         f = self.fleet([(f"h{k:02}.io", 1, "auto", TS1) for k in range(15)])
@@ -232,9 +235,9 @@ class TestTopUnasked(unittest.TestCase):
         f.add_tool("p", "WebSearch", {"query": "q"}, TS1, "auto")
         text = self.out(f)
         rows = self.block(text)
-        self.assertEqual([r.split()[0] for r in rows], ["172.32.0.1", "a.io"])
+        self.assertEqual([r[0] for r in rows], ["172.32.0.1", "a.io"])
         self.assertIn(f"plus 1 with no host (git remote names, $VAR URLs) \u00b7 {3 * len(self.LOCAL)} local or private", text)
-        self.assertNotIn("(no host)", "\n".join(rows))
+        self.assertNotIn("(no host)", "\n".join(r[0] for r in rows))
         n = af.network_json(f)
         self.assertEqual(n["totals"]["items"], 2 + 3 * len(self.LOCAL) + 1)
 
@@ -252,16 +255,20 @@ class TestTopUnasked(unittest.TestCase):
         self.assertIn("plus 4 local or private", text)
         self.assertEqual(self.block(text), [])
 
-    def test_no_block_without_unasked(self):
+    def test_without_unasked_the_sessions_list_the_unknown(self):
         f = self.fleet([("a.io", 2, "default", TS1)])
-        self.assertNotIn("TOP UNASKED", self.out(f))
+        text = self.out(f)
+        self.assertIn("UNKNOWN, BY SESSION", text)
+        self.assertNotIn("UNASKED, BY SESSION", text)
 
-    def test_unasked_and_unknown_rows_capped_at_five(self):
+    def test_session_rows_capped_at_five_then_a_count(self):
         f = self.fleet([(f"h{k}.io", 1, "auto", TS1) for k in range(8)]
                        + [(f"u{k}.io", 1, "default", TS1) for k in range(8)])
         text = self.out(f)
-        self.assertEqual(len(re.findall(r" unasked$", text, re.M)), 5)
-        self.assertEqual(len(re.findall(r"\d{4}-\d\d-\d\d (?:unasked|unknown)$", text, re.M)), 5)   # one cap, newest unasked first
+        rows = re.findall(r"^      \S+\s+curl .*$", text, re.M)
+        self.assertEqual(len(rows), 5)
+        self.assertTrue(all(".io/f0" in r and re.search(r"h\d\.io", r) for r in rows), rows)
+        self.assertIn("\u2026 3 more", text)
 
     def test_rows_fit_and_nothing_raw(self):
         f = self.fleet([("a-very-long-host-name-" + "x" * 60 + ".example.com", 2, "auto", TS1)])
@@ -283,9 +290,7 @@ class TestRowsAreRemoteOnly(TestTopUnasked):
                         ("10.0.0.5", 1, "default", TS2), ("b.io", 1, "default", TS1)])
         f.add_tool("p", "WebSearch", {"query": "q"}, TS2, "auto")
         text = self.out(f)
-        rows = [l for l in text.splitlines() if re.search(r"\d{4}-\d\d-\d\d (?:unasked|unknown)$", l)]
-        self.assertEqual(len(rows), 2)
-        self.assertEqual({l.split()[1] for l in rows}, {"a.io", "b.io"}, rows)
-        self.assertNotIn("?  ", "\n".join(rows))
+        rows = self.block(text)
+        self.assertEqual({r[0] for r in rows}, {"a.io", "b.io"}, rows)
         self.assertIn("plus 1 with no host", text)
-        self.assertIn("3 local or private", text)
+        self.assertIn("4 local or private", text)        # every approval, as the ranking is

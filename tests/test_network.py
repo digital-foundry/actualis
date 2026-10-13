@@ -6,6 +6,7 @@ import io
 import json
 import sys
 import tempfile
+import re
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
@@ -857,7 +858,7 @@ class TestReport(unittest.TestCase):
         f.add_tool("proj-b", "Bash", {"command": "git clone https://github.com/o/r"}, TS, "copilot:prompted")
         text = self.out(f)
         for needle in ("NETWORK", "3 downloads", "1 unasked", "1 unknown", "INSTALLED", "CLONED",
-                       "FETCHED", "UNASKED", "raw.githubusercontent.com", "allowlist rule"):
+                       "fetch 1", "UNASKED, BY SESSION", "raw.githubusercontent.com", "allowlist rule"):
             self.assertIn(needle, text, needle)
 
     def test_report_redacts_urls(self):
@@ -943,9 +944,8 @@ class TestReportFixes(unittest.TestCase):
                        {"command": f"curl https://example-host-{k}.io/a/very/long/path/segment/{k}/more"},
                        TS, "auto")
         text = self.out(f, top=50)
-        rows = [l for l in text.splitlines() if "example-host" in l and "auto" not in l
-                and "unasked" in l and "curl" in l]
-        self.assertEqual(len(rows), 5)                   # rows are capped; TOP UNASKED lists the hosts
+        rows = [l for l in text.splitlines() if "example-host" in l and "curl https://" in l]
+        self.assertEqual(len(rows), 5)                   # per session; TOP HOSTS lists the hosts
         for l in text.splitlines():
             self.assertLessEqual(len(l), 100, l)
         for l in rows:
@@ -961,7 +961,8 @@ class TestReportFixes(unittest.TestCase):
         self.assertNotIn("UNASKED", text)
         f.add_tool("p", "Bash", {"command": "curl https://c.io/1"}, TS, "auto")
         text = self.out(f)
-        self.assertEqual((text.count("  UNASKED  "), text.count("UNKNOWN")), (1, 1))
+        # The session list shows one approval: unasked when there is any.
+        self.assertEqual((text.count("UNASKED, BY SESSION"), text.count("UNKNOWN")), (1, 0))
 
     def test_singular(self):
         f = af.Fleet()
@@ -972,7 +973,11 @@ class TestReportFixes(unittest.TestCase):
         f = af.Fleet()
         for k in range(10):
             f.add_tool("p", "Bash", {"command": f"curl https://h{k}.io/x"}, TS, "auto")
-        rows = [l for l in self.out(f, top=3).splitlines() if l.rstrip().endswith("unasked")]
+        text = self.out(f, top=3)
+        lines = text.splitlines()
+        i = lines.index(next(l for l in lines if l.startswith("  TOP HOSTS")))
+        rows = [l for l in lines[i + 1:] if l.startswith("    ")]
+        rows = rows[:next((k for k, l in enumerate(rows) if not re.match(r"^    h\d\.io", l)), len(rows))]
         self.assertEqual(len(rows), 3)
 
     def test_refused_only_fleet_is_empty(self):
