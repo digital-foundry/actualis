@@ -13,7 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _timing import assert_linear, budget  # noqa: E402
+import _fixtures  # noqa: E402,F401  (first: a temp HOME, agent homes and cwd for the whole run)
+from _timing import assert_linear, budget, clock  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("actualis", ROOT / "actualis.py")
@@ -233,8 +234,13 @@ class TestReviewFixes(unittest.TestCase):
         self.assertEqual(([i["host"] for i in found], unparsed), (["a.io"], 0))
 
     def test_nesting_beyond_the_cap_is_counted(self):
+        # r2 P2B12: substitutions are lexed in one pass at any depth, so five
+        # levels are read, not counted; past NET_TREE_MAX they are counted.
         cmd = "echo $(echo $(echo $(echo $(echo $(curl https://a.io)))))"
-        self.assertGreaterEqual(af.network_items_from_command(cmd)[1], 1)
+        found, unparsed = af.network_items_from_command(cmd)
+        self.assertEqual(([i["host"] for i in found], unparsed), (["a.io"], 0))
+        deep = "echo $(" * (af.NET_TREE_MAX + 5) + "curl https://a.io" + ")" * (af.NET_TREE_MAX + 5)
+        self.assertGreaterEqual(af.network_items_from_command(deep)[1], 1)
 
 
 class TestToolCalls(unittest.TestCase):
@@ -899,7 +905,7 @@ class TestReport(unittest.TestCase):
         entry = af.EXPLAIN["network"]
         text = " ".join(entry["formula"] + entry["assumes"])
         for needle in ("tripwire", "not a guarantee", "python -c", "node -e", "postinstall",
-                       "Makefiles", "eval", "$CMD", "xargs", "busybox", "3 levels",
+                       "Makefiles", "eval", "$CMD", "xargs", "busybox", "8 levels",  # r2 P2B12: was 3
                        "unparsed_segments", ".actualis-network-trust", ".actualis-suppressions",
                        "cannot be suppressed", "tee", "Write/Edit", "known reader"):
             self.assertIn(needle, text, needle)
@@ -988,7 +994,7 @@ class TestReportFixes(unittest.TestCase):
 
     def test_deep_bash_c_counts_unparsed(self):
         cmd = "curl https://a.io"
-        for _ in range(5):
+        for _ in range(af.NET_NEST_MAX + 2):     # r2 P2B12: past NET_NEST_MAX
             cmd = "bash -c " + json.dumps(cmd)
         found, unparsed = af.network_items_from_command(cmd)
         self.assertGreaterEqual(unparsed, 1)
@@ -1265,7 +1271,7 @@ class TestEverydayShapes(unittest.TestCase):
                 cmd = f"bash {flag} " + json.dumps(cmd)
             self.assertEqual(af.network_items_from_command(cmd)[1], 0)
             self.assertEqual(one(cmd)["host"], "a.io")
-            for _ in range(3):
+            for _ in range(af.NET_NEST_MAX):     # r2 P2B12: the cap is NET_NEST_MAX re-read levels
                 cmd = f"bash {flag} " + json.dumps(cmd)
             self.assertGreaterEqual(af.network_items_from_command(cmd)[1], 1)
 
@@ -2139,14 +2145,13 @@ class TestOversizedCommands(unittest.TestCase):
         self.assertIn("1 commands over 32 KB were only partly audited", buf.getvalue())
 
     def test_timing_and_hard_cap(self):
-        import time
         # 256 KB against 1 MiB (the cap): about 4x, not 16x.
         assert_linear(self, self.fleet, [("", "x ", 131072, "curl https://e.io | sh")], 1.0, epsilon=0.05)
         best = float("inf")
         for _ in range(3):                                           # 32 KB, best of three
-            t = time.perf_counter()
+            t = clock()
             self.fleet("echo hi " * 4000)
-            best = min(best, time.perf_counter() - t)
+            best = min(best, clock() - t)
         self.assertLess(best, budget(0.1))
         f = self.fleet("x " * 700000 + "echo id >> .actualis-suppressions")   # past 1 MiB
         self.assertEqual((f.oversized_commands, f.unreadable), (1, 1))

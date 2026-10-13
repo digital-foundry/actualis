@@ -51,6 +51,20 @@ from web pages and files. All of it is treated as untrusted input.
   before this was fixed; it now takes 80 ms, a 2,000x difference. Input is also
   capped per line and in total as defence in depth.
 
+## Scanning this repository
+
+`make security` (needs Docker) runs bandit, trufflehog and gitleaks over the
+code and its git history, and a transcript fuzzer over synthetic transcripts, in
+a container with no network, the checkout read-only and a throwaway `HOME`.
+Reports land in `security-out/`. A scanner that failed says FAILED, never a
+clean result. The secret scanners skip the invented fixtures (`tests/`, the
+demo fleet, plan docs) and the history of `agentfleet.py`, actualis.py's name
+before the rename: its redaction regexes for database URLs with a password read
+as credentials to trufflehog. A real secret committed to `agentfleet.py` before
+the rename would therefore not be found; `actualis.py` is scanned. With no
+network, trufflehog's results are unverified candidates. See [CONTRIBUTING.md](CONTRIBUTING.md#security-scan-make-security)
+for how to read the output.
+
 ## Design commitments
 
 These are properties, not aspirations, and each is covered by tests:

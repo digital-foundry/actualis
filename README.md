@@ -13,7 +13,8 @@ actualis
 ```
 
 No account, no config file, no network. It reads files already on your disk
-and prints a report, across **Claude Code**, **Codex** and **GitHub Copilot CLI** together.
+and prints a report, across **Claude Code**, **Codex**, **GitHub Copilot CLI**, **Gemini CLI**
+and **Qwen Code** together.
 
 **What it finds that you probably don't know:**
 
@@ -115,8 +116,8 @@ That grading is the point. On a real corpus a four-day exposure window contains
 7,553 commands, and counting them all produces a number nobody can act on. The
 same incident graded by proximity is **42 commands to read**.
 
-Works across Claude Code and Codex. Codex records no git branch, so those stay
-empty rather than invented.
+Works across every supported agent. Codex and Gemini CLI record no git branch,
+so those stay empty rather than invented.
 
 Every report ends with what it does **not** establish — including that absence
 of a sighting after `last_seen` is not evidence of rotation.
@@ -169,6 +170,8 @@ make run ARGS="--days 30"   # run from the checkout
 make install                # install the `actualis` command (uv, else pipx)
 make test                   # the test suite
 make tray                   # build the tray app (needs Go)
+make security               # scanners + transcript fuzzer, isolated (needs Docker)
+make security-remote        # the same scan on the build server over SSH
 ```
 
 `make install` re-installs with `--force`, because uv and pipx copy the code:
@@ -187,19 +190,19 @@ actualis --watch          # live alerting on new secrets
 actualis --project svc    # filter to matching projects
 actualis --json           # machine-readable
 actualis --top 25         # show more projects
-actualis --agent codex    # one agent only (claude | codex | copilot | all)
+actualis --agent codex    # one agent only (claude | codex | copilot | gemini | qwen | all)
 ```
 
 ### All options
 
 | flag | effect |
 |---|---|
-| `--days N` | only the last N days |
+| `--days N` | only the last N days (1 to 36500) |
 | `--project SUBSTR` | only projects whose name contains SUBSTR |
-| `--top N` | how many projects and tickets to list (default 12) |
-| `--agent {all,claude,codex,copilot}` | which agents to include (default all) |
+| `--top N` | how many projects and tickets to list, 1 or more (default 12). Only the text report reads it (with `--bash` and `--network` too); any other mode, `--json` and `--html` refuse it |
+| `--agent {all,claude,codex,copilot,gemini,qwen}` | which agents to include (default all) |
 | `--root DIR` | read one specific transcript directory instead of discovering them |
-| `--ci-log FILE` | audit a Claude Code Action execution log on a CI runner, instead of discovering transcript directories |
+| `--ci-log FILE` | audit a Claude Code Action execution log on a CI runner, instead of discovering transcript directories. The log is the only input: not with `--root`, `--project`, `--replay` or an `--agent` other than `claude`, and only the scanning modes read it (not `--watch`, `--mcp`, `--explain`, `--agents`, `--suppress`, `--suppressions`, `--self-check`, `--service` or `--completions`) |
 | `--bash` | shell audit only |
 | `--coach` | findings and actions only |
 | `--aisvs` | which OWASP AISVS controls your transcripts show are **not** holding |
@@ -210,30 +213,30 @@ actualis --agent codex    # one agent only (claude | codex | copilot | all)
 | `--json` | machine-readable ([schema](docs/json.md)) |
 | `--diff OLD.json` | compare against a saved `--json` report: what appeared, what went away, what got worse |
 | `--watch` | live monitor; alert on new secrets and risky commands |
-| `--interval SEC` | `--watch` poll interval, default 4 |
-| `--quiet` | `--watch`: notify on secrets only, not every flagged command |
+| `--interval SEC` | `--watch` poll interval, default 4. At least 0.5 and at most 3600. Only with `--watch` or `--service launchd`/`systemd` |
+| `--quiet` | `--watch`: notify on secrets only, not every flagged command. Only with `--watch` or `--service launchd`/`systemd` |
 | `--no-redact` | **do not** redact credentials from output; unsafe to share |
 | `--suppress ID` | mark a finding as a false positive on this machine (it stays counted) |
-| `--reason TEXT` | why that suppression is correct, recorded for review |
+| `--reason TEXT` | why that suppression is correct, recorded for review. Only with `--suppress`; one line, so a newline or other control character is refused |
 | `--suppressions` | list current suppressions and where they are read from |
-| `--fail-on LEVEL` | exit 3 if any unsuppressed finding is at or above `critical`, `high` or `any`. For gating a pipeline |
+| `--fail-on LEVEL` | exit 3 if any unsuppressed finding is at or above `critical`, `high` or `any`. For gating a pipeline. A mode that cannot evaluate the gate (`--diff`, `--why`, `--replay`, `--watch`, `--mcp`, `--explain`, `--agents`, `--suppress`, `--suppressions`, `--self-check`, `--service`, `--completions`) refuses it with exit 2. AF013 (rate-table age) is reported but never counted |
 | `--network` | print only the NETWORK section, with the IOC block when `--ioc` is given. `--network --json` emits only the `network` object (no `schema_version`). Not with `--share`, `--card`, `--bash`, `--coach`, `--aisvs`, `--diff`, `--replay`, `--watch` or `--mcp` |
 | `--network-trust HOST[/PATH],...` | trusted download sources for `--network-strict` (repeatable). Also read from `./.actualis-network-trust`, one per line; the report prints that file's path and sha256 because the agent can write it |
-| `--network-strict` | make every unasked download from an untrusted source a medium finding, so `--fail-on any` and the suppressions file apply |
+| `--network-strict` | make every unasked download from an untrusted source a medium finding, so `--fail-on any` and the suppressions file apply. `--coach`, `--aisvs` and `--share` never show network findings, so they take it (and `--network-trust`) only with `--fail-on`; modes that never scan refuse both |
 | `--host HOST` | with `--network`: only downloads from HOST or a subdomain of it. The view then lists every matching item, newest first, with when, approval and mode, the command, the agent's `why`, the prompt, and a `trace` line naming the transcript file and line |
 | `--package NAME` | with `--network`: only installs of exactly this package (npm case-sensitive, pypi by PEP 503) |
 | `--session ID` | with `--network`: only sessions whose id starts with ID |
 | `--unasked` | with `--network`: only downloads that ran without asking. The four filters combine with each other, `--project` and `--days`; totals are of the filtered set |
 | `--html` | with `--network`: write the report as one self-contained page, `actualis-network.html` in the current directory or `--out DIR` (never overwritten; `-2`, `-3` and so on), readable by you only. Inline charts, sortable tables, the `--network --json` object embedded with its sha256. It loads nothing from the network. Not with `--json` |
-| `--with-prompts` | with `--json` or `--html`: fill `network.items[].prompt` (redacted, 160 characters); otherwise it is `null` |
-| `--ioc FILE` | match every download the transcript shows against a known-bad list: the actualis-ioc line format or OSV JSON/JSONL (repeatable). A match is a high finding, an undecidable one medium. Read only when named; see [docs/ioc.md](docs/ioc.md) |
-| `--explain [TOPIC]` | how a number is computed, what it assumes, how to check it |
-| `--replay ID` | incident report for one credential: what ran while it was live, graded by proximity |
-| `--why AFxxx` | explain one finding against your actual numbers |
+| `--with-prompts` | with `--json` or `--html`: fill `network.items[].prompt` (redacted, 160 characters); otherwise it is `null`. Not with `--agents`, `--replay`, `--watch` or `--mcp` |
+| `--ioc FILE` | match every download the transcript shows against a known-bad list: the actualis-ioc line format or OSV JSON/JSONL (repeatable). A match is a high finding, an undecidable one medium. Read only when named; see [docs/ioc.md](docs/ioc.md). `--coach`, `--aisvs` and `--share` never show the matches, so they take `--ioc` only with `--fail-on` |
+| `--explain [TOPIC]` | how a number is computed, what it assumes, how to check it. An unknown topic is a usage error |
+| `--replay ID` | incident report for one credential: what ran while it was live, graded by proximity. Honours `--root`, `--agent`, `--days` and `--project` |
+| `--why AFxxx` | explain one finding against your actual numbers. A per-project finding (AF002, AF006) is explained for every project it fires for |
 | `--agents` | installed agent platforms and whether their binaries are validly signed |
-| `--mcp` | run as an MCP server over stdio ([below](#ask-the-agent-about-itself)) |
-| `--service KIND` | print a `launchd`, `systemd` or `newsyslog` unit for `--watch`, paths already resolved |
-| `--self-check` | verify the privacy claims on your own machine, by executing them. Honours `--root` and `--days` |
+| `--mcp` | run as an MCP server over stdio ([below](#ask-the-agent-about-itself)). Honours `--root`, `--agent`, `--days` and `--project`: every answer stays inside them (a missing `--root` is exit 2). `--no-redact` and `--top` are refused |
+| `--service KIND` | print a `launchd`, `systemd` or `newsyslog` unit for `--watch`, paths already resolved. The unit passes only `--interval` and `--quiet`, so `--root`, `--agent`, `--days`, `--project` and `--no-redact` are refused |
+| `--self-check` | verify the privacy claims on your own machine, by executing them. Honours `--root`, `--agent` (how `--root` is read, and which agents' directories are checked) and `--days`; refuses `--project` and `--no-redact` |
 | `--completions SHELL` | print a shell completion script for `bash`, `zsh` or `fish` |
 | `--version` | print version |
 
@@ -241,7 +244,8 @@ actualis --agent codex    # one agent only (claude | codex | copilot | all)
 
 The script is generated from the parser, so it never drifts from the flags this
 build actually has. `--explain`, `--why`, `--agent` and `--fail-on` complete
-their real values.
+their real values; `--card` and `--explain` may be followed straight by another flag,
+and zsh keeps offering the repeatable `--ioc` and `--network-trust`.
 
 ```sh
 # zsh — any directory on your fpath
@@ -530,7 +534,7 @@ cannot open a network connection without `socket`), hashes a sample of your
 transcripts before and after a real scan to show they are byte-identical,
 confirms no file appeared or vanished under the transcript roots, names the only
 path it can ever write to, and prints its own sha256 so you can compare it with
-the published wheel. It exits non-zero if any of that fails.
+the published wheel. It exits 4 if any of that fails (not 3, which means findings).
 
 Passing is a floor, not a guarantee, and the output says so: it proves what this
 run did, not what every run could do. The stronger check is still to watch the
@@ -543,8 +547,9 @@ no report.
 
 ## About the cost number
 
-Costs are Anthropic API list prices, verified 2026-10-08, including the cache
-multipliers that dominate agent workloads:
+Costs are provider list prices (Anthropic, OpenAI, Google; the oldest rates
+verified 2026-10-08), including the cache multipliers that dominate agent
+workloads:
 
 | | multiplier on input rate |
 |---|---|
@@ -559,9 +564,11 @@ your spend by roughly an order of magnitude.
 **If you're on a Pro or Max subscription, this is not a bill.** Your actual outlay
 is the flat subscription fee. Read the total as *what this would have cost at API
 list price*: an opportunity-cost figure, a consumption signal, and a way to see
-which project is eating your quota. Models with no published rate are priced at
-the top of the known range for their provider, and that share is reported as its
-own number so you can subtract it rather than having to trust it.
+which project is eating your quota. Claude and OpenAI models with no published
+rate are priced at the top of the known range for their provider, and that share
+is reported as its own number so you can subtract it rather than having to trust
+it. Gemini, Gemma and Qwen ids with no published rate are not estimated at all:
+their tokens are listed and their cost is $0.
 
 **One message is counted once.** A transcript repeats the same assistant record
 while a response streams — identical message id, identical usage block, a fresh
@@ -634,14 +641,38 @@ actualis --days 7 --fail-on critical
 |---|---|
 | `0` | nothing at or above the threshold |
 | `1` | could not run: no transcripts, an unreadable `--root` |
-| `2` | a command-line usage error (argparse's, not ours) |
+| `2` | a usage error: a bad flag, a flag combination the tool cannot honour, or an unusable `--ioc` or trust file |
 | `3` | findings at or above `--fail-on` |
+| `4` | `--self-check`: a check failed |
 | `130` | interrupted |
 
 Findings are **3**, not 1 and not 2. `1` already meant "could not run", and `2`
 is what argparse returns for a bad invocation — a pipeline that cannot tell *a
 credential is exposed* from *you mistyped a flag* will eventually be told to
 ignore both.
+
+A flag combination the tool cannot honour is a usage error (`2`), never silently
+dropped: `--fail-on` with a mode that never evaluates the gate, `--json` with a
+mode that has no JSON form (`--share`, `--coach`, `--aisvs`, `--bash`, `--why`,
+`--explain`, `--suppress`, `--suppressions`, `--self-check`, `--service`,
+`--completions`, `--watch`, `--mcp`), `--network` or `--ioc` with a mode that never
+reads them, `--with-prompts`, `--out`, `--style`, `--reason`, `--quiet`, `--interval`
+or `--top` where they do nothing, a scope flag (`--root`, `--agent`, `--days`,
+`--project`, `--no-redact`) given to a mode that would not apply it (`--explain`,
+`--agents`, `--completions`, `--suppress` and `--suppressions` take none; `--watch`
+takes no `--days` or `--project`; the summary views take no `--no-redact`), and
+`--ci-log` with a mode that does not scan. The modes are exclusive: `--diff`, `--why`, `--replay`,
+`--watch`, `--mcp`, `--explain`, `--agents`, `--suppress`, `--suppressions`,
+`--self-check`, `--service`, `--completions`, `--card`, `--share`, `--coach`, `--aisvs`
+and `--bash` take one per run, and two are refused with a message naming both. So is
+a malformed `--suppress` id, an unknown `--why` id or `--explain` topic, and a
+`--days`, `--top` or `--interval` out of range.
+
+The verdict is decided before the report is written, so a reader that closes
+the pipe early (`| head`, or `2>&1 | head -1`, which closes stderr mid-verdict)
+still gets exit `3` from a failing gate. AF013 (the
+rate table's age) depends on today's date, not on your transcripts, so it is
+never counted toward `--fail-on`.
 
 The verdict goes to **stderr**, so `--json` on stdout stays byte-identical and a
 pipeline can capture the report and the outcome separately:
@@ -674,7 +705,7 @@ The action's inputs:
 | input | default | meaning |
 |---|---|---|
 | `execution-file` | required | path to the Claude Code Action's execution log; pass the upstream step's `execution_file` output |
-| `fail-on` | `critical` | fail the job at or above this level: `critical`, `high` or `any`; `none` reports without gating (a run that could not complete still prints a `::warning::`) |
+| `fail-on` | `critical` | fail the job at or above this level: `critical`, `high` or `any`; `none` reports without gating (a run that could not complete still prints a `::warning::`). Case does not matter; any other value fails the job |
 | `network-strict` | `false` | `"true"` makes every unasked download from a source not trusted a medium finding, which `fail-on: any` then fails on |
 | `network-trust` | empty | comma-separated trusted download sources, host or host/path (for example `npmjs.org,github.com/your-org`); added to `.actualis-network-trust` |
 | `ioc` | empty | paths to known-bad lists (actualis-ioc lines or OSV), one per line, each passed as `--ioc`. Fetch them in a step after the agent step, outside the workspace (for example `$RUNNER_TEMP`). Matches are `high`, so set `fail-on: high` to gate on them; with the default `critical` the action prints a warning |
@@ -687,7 +718,8 @@ The action's outputs are available whether or not the gate fires:
 | output | meaning |
 |---|---|
 | `exit-code` | `0` clean, `3` findings at or above `fail-on`, `1` could not run, `2` usage error (for example a bad `network-trust` entry) |
-| `findings` | coach findings plus unsuppressed credentials |
+| `findings` | coach findings plus unsuppressed credentials; flagged shell commands and IOC hits, which can also fail the gate, are not in it |
+| `gate-reasons` | how many reasons the `fail-on` gate fired on, each a group such as "2 high-severity shell command(s) flagged" (`0` when it passed or `fail-on` is `none`); branch on this, not `findings`, to follow the gate |
 | `ioc-matches` | unsuppressed `--ioc` matches (`network.ioc.matches[]` rows with verdict `match`, not refused); `0` without `ioc` |
 
 `--ci-log` reads that documented output rather than guessing at `~/.claude` on
@@ -725,7 +757,10 @@ actualis --suppressions
 Suppressions are a plain text file — greppable, diffable, reviewable in a pull
 request, and editable by hand six months later by someone who did not write it.
 Read from `$XDG_CONFIG_HOME/actualis/suppressions` and from
-`./.actualis-suppressions`, so a team can commit a shared list.
+`./.actualis-suppressions`, so a team can commit a shared list. One id per
+line, then the reason after a space or tab; ids are read case-insensitively. A
+line whose id is not an eight-hex-character id from this tool cannot match
+anything: it is not loaded, and `--suppressions` lists it as ignored.
 
 **A suppression never removes a finding from the count.** It is held back from
 the actionable list, and it still appears in `--json` with `suppressed: true` and
@@ -764,6 +799,8 @@ sitting in plaintext in your transcripts. Rotate anything live.
 | **Claude Code** | yes | `~/.claude/projects/**/*.jsonl` |
 | **Codex** | yes | `$CODEX_HOME/sessions/**/rollout-*.jsonl` |
 | **GitHub Copilot CLI** | yes | `$COPILOT_HOME/session-state/*/events.jsonl` (default `~/.copilot`). A person declining a prompt is recorded as `denied-interactively-by-user`. |
+| **Gemini CLI** | yes | `$GEMINI_CLI_HOME/.gemini/tmp/<project>/chats/` (`GEMINI_CLI_HOME` replaces the home directory; default `~/.gemini`, plus `~/.cache/.gemini` where a macOS sandbox run writes). All three layouts: the legacy single `.json` per session, and JSONL with `$set` and `$rewindTo` lines; `$patch` lines (0.64 preview) are skipped and counted under `unsupported_records`. Subagent transcripts under `chats/<parent session>/` are read. The project is the real path from `.project_root` or `projects.json`, else the directory's slug. **Gemini CLI records no approval and no approval mode**, so every Gemini call's approval is `unknown`; a call a person declined (`User denied execution.`) or a policy blocked (`Tool execution denied by policy.`) is counted as a refusal. A tool call a later rewind removed still ran: it is audited, and counted as rewound. |
+| **Qwen Code** | yes | `$QWEN_RUNTIME_DIR/projects/<project>/chats/<session>.jsonl`, else `$QWEN_HOME` (the `.qwen` directory itself; default `~/.qwen`). Every record carries its real `cwd` and `gitBranch`. The approval mode is recorded per turn and on every change: `yolo` and `auto` count as unasked; `default`, `plan` and `auto-edit` (which still asks before a shell command) as unknown. |
 | Cursor | **no** | Nothing to read. All `composerData` records are empty shells: `conversationMap {}`, `usageData {}`. The `ai_code_hashes` and `conversation_summaries` tables have zero rows. Content is server-side. |
 | Windsurf | **no** | `globalStorage` holds config and auth only. No conversation or usage store. Server-side. |
 | Cline, Aider | not yet | Both write local files. Untested, likely feasible. |
@@ -785,6 +822,14 @@ if handled like the other:
 - Codex's `total_token_usage` is **cumulative** across a session and its
   `token_count` events repeat, so the session total is the final value, never a sum.
 - **Copilot CLI** reports `inputTokens` *including* both cache reads and cache writes, for every provider, and writes one final per-model total at `session.shutdown`.
+- **Gemini CLI and Qwen Code** report the prompt *including* its cached part (`input`
+  / `promptTokenCount`), and thinking tokens separately, billed at the output rate.
+  Gemini CLI re-appends a whole message each time it changes, so only the last copy
+  of each message id is counted. Pro models above 200,000 prompt tokens are priced at
+  Google's long-prompt rate, and dated price changes apply by message date. A model
+  Google does not price (`gemini-3-pro-preview`, `gemini-3.5-flash`) and every Qwen
+  model shows its tokens with **no cost**, never a guessed one; Gemini cost is an
+  API-equivalent figure, since a free-tier session cannot be told apart.
 
 ## Limitations
 - **Reporting only.** It observes; it does not enforce. Claude Code's own
@@ -854,7 +899,10 @@ See [tray-go/README.md](tray-go/README.md).
 ## Running it in the background
 
 `--watch` tails the transcripts and raises a native notification when an agent
-runs a command carrying a new credential. To keep it running without a terminal,
+runs a command carrying a new credential. It reads every supported agent; for
+Gemini CLI it tails the JSONL sessions (a legacy `.json` session is rewritten
+whole, never appended) and alerts once per tool call even though Gemini re-appends
+a message each time it changes. To keep it running without a terminal,
 generate a unit for your service manager. The paths are resolved on the machine
 that will run it, so there is nothing to substitute:
 

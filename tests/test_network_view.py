@@ -16,6 +16,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _fixtures  # noqa: E402,F401  (first: a temp HOME, agent homes and cwd for the whole run)
+
 ROOT = Path(__file__).resolve().parent.parent
 if "actualis" in sys.modules:
     af = sys.modules["actualis"]
@@ -185,8 +188,7 @@ class TestFilteredView(View):
         self.assert_fits(out)
 
     def test_capped_at_top_times_five(self):
-        out = self.run_main("--network", "--session", "3f2a", "--top", "0")
-        self.assertEqual(self.blocks(out), [])
+        # --top 0 is a usage error now (review r2 P2D7); 1 is the smallest cap.
         out = self.run_main("--network", "--session", "3f2a", "--top", "1")
         self.assertEqual(len(self.blocks(out)), 5)
         self.assertIn("… 1 more, narrow with --days or --session", out)

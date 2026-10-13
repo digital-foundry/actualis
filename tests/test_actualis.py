@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _fixtures  # noqa: E402,F401  (first: a temp HOME, agent homes and cwd for the whole run)
 from _timing import assert_linear  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -483,7 +484,8 @@ class TestCoach(unittest.TestCase):
     def test_silent_on_an_unremarkable_fleet(self):
         f = af.Fleet()
         f.add_usage("p", "claude-opus-5", {"output_tokens": 1000}, None)
-        self.assertEqual(af.coach(f), [])
+        with _fixtures.fresh_prices(af):           # AF013 is about the date, not this fleet
+            self.assertEqual(af.coach(f), [])
 
     def test_critical_secret_raises_af004(self):
         f = af.Fleet()
@@ -1654,7 +1656,8 @@ class TestRateProvenance(unittest.TestCase):
 
     def test_the_tier_order_runs_best_to_worst(self):
         self.assertEqual(af.RATE_TIERS,
-                         (af.VENDOR, af.VENDOR_DOC, af.AGGREGATOR, af.FAMILY, af.DEFAULT))
+                         (af.VENDOR, af.VENDOR_DOC, af.AGGREGATOR, af.FAMILY, af.DEFAULT,
+                          af.UNPRICED))
 
     def test_resolution_falls_back_in_order(self):
         cases = [
@@ -2083,7 +2086,8 @@ class TestCorrectnessFindings(unittest.TestCase):
         f.duplicate_usage_records = 1
         original = af.PRICING_VERIFIED
         try:
-            self.assertNotIn("AF013", [x.id for x in af.coach(f)])
+            with _fixtures.fresh_prices(af):
+                self.assertNotIn("AF013", [x.id for x in af.coach(f)])
             af.PRICING_VERIFIED = "2026-01-01"
             found = [x for x in af.coach(f) if x.id == "AF013"]
             self.assertTrue(found)
@@ -2346,7 +2350,8 @@ class TestUnreadableCommands(unittest.TestCase):
                    datetime(2026, 8, 1, tzinfo=timezone.utc))
         self.assertEqual(f.unreadable, 1)
         self.assertEqual(f.flags, [])                 # not flagged
-        self.assertEqual([x.id for x in af.coach(f)], [])   # not a finding
+        with _fixtures.fresh_prices(af):
+            self.assertEqual([x.id for x in af.coach(f)], [])   # not a finding
 
     def test_the_share_reaches_json(self):
         f = af.Fleet()

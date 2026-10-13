@@ -48,7 +48,7 @@ classifiers = [
 dependencies = []
 
 [project.scripts]
-actualis = "actualis:main"
+actualis = "actualis:_cli"
 
 [project.urls]
 Homepage = "https://actualis.app"
@@ -59,4 +59,9 @@ Issues = "https://github.com/digital-foundry/actualis/issues"
 include = ["actualis.py"]
 
 [tool.hatch.build.targets.sdist]
-include = ["actualis.py", "README.md", "LICENSE", "tests/"]
+# tests/ read these too (the action, the workflows, the docs, tools/), so an
+# sdist without them fails its own suite for a packager who runs it.
+include = ["actualis.py", "README.md", "LICENSE", "CHANGELOG.md", "CONTRIBUTING.md",
+           "SECURITY.md", "TRADEMARKS.md", "tests/",
+           "action.yml", ".github/workflows/", "docs/", "tools/", "Makefile",
+           "pyproject.toml"]

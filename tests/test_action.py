@@ -15,6 +15,9 @@ import sys
 import unittest
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _fixtures  # noqa: E402,F401  (first: a temp HOME, agent homes and cwd for the whole run)
+
 ROOT = Path(__file__).resolve().parent.parent
 FILES = [ROOT / "action.yml", *sorted((ROOT / ".github" / "workflows").glob("*.yml"))]
 OPEN = re.compile(r"\$\{\{")

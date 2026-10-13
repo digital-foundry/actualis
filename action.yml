@@ -22,6 +22,7 @@ inputs:
     description: >-
       Fail the job when any unsuppressed finding is at or above this level:
       `critical`, `high`, or `any`. Set to `none` to report without gating.
+      Case does not matter; any other value fails the job as a usage error.
     required: false
     default: "critical"
 
@@ -78,8 +79,11 @@ outputs:
     description: "0 clean, 3 findings at or above fail-on, 1 could not run, 2 a usage error (a bad network-trust entry, say)."
     value: ${{ steps.audit.outputs.exit-code }}
   findings:
-    description: "Number of unsuppressed findings, or empty if the scan could not run."
+    description: "Coach findings plus unsuppressed credentials, or empty if the scan could not run. It does not count flagged shell commands or IOC hits, which can also fail the gate: branch on gate-reasons for that."
     value: ${{ steps.audit.outputs.findings }}
+  gate-reasons:
+    description: "Number of reasons the fail-on gate fired on (each a group, e.g. \"2 high-severity shell command(s) flagged\"); 0 when it passed or fail-on is none, empty if the scan could not run."
+    value: ${{ steps.audit.outputs.gate-reasons }}
   ioc-matches:
     description: "Number of unsuppressed --ioc matches (not refused), or empty if the scan could not run."
     value: ${{ steps.audit.outputs.ioc-matches }}
@@ -130,6 +134,14 @@ runs:
 
         work="${RUNNER_TEMP:-.}"
 
+        # GitHub's expression != is case-insensitive and bash's is not, so
+        # "None" used to skip the Gate step and then run as a usage error that
+        # only warned. Lowercase once (tr: macOS runners ship bash 3.2, no
+        # ${x,,}), and decide here whether the Gate step runs.
+        FAIL_ON="$(printf '%s' "${FAIL_ON}" | tr '[:upper:]' '[:lower:]')"
+        gate=true
+        [ "${FAIL_ON}" = "none" ] && gate=false
+
         args=(--ci-log "${EXECUTION_FILE}")
         [ "${FAIL_ON}" != "none" ] && args+=(--fail-on "${FAIL_ON}")
 
@@ -169,9 +181,30 @@ runs:
         # Coach findings plus unsuppressed credentials. Suppressed ones are
         # excluded here for the same reason they do not fail the build: a
         # recorded, reasoned decision should not keep showing up as a number.
-        findings=$(python3 -c "import json; d=json.load(open('${work}/report.json')); print(len(d.get('coach', [])) + len([s for s in d.get('secrets', []) if not s.get('suppressed')]))" 2>/dev/null || echo "")
+        # The path goes in as an argument, never spliced into Python source:
+        # on Windows RUNNER_TEMP is D:\a\_temp, and "\a" in a literal is BEL.
+        findings=$(python3 - "${work}/report.json" 2>/dev/null <<'PY' || echo ""
+        import json, sys
+        d = json.load(open(sys.argv[1], encoding='utf-8'))
+        print(len(d.get('coach', [])) + len([s for s in d.get('secrets', []) if not s.get('suppressed')]))
+        PY
+        )
         # Unsuppressed --ioc matches. A separate output: findings keeps its meaning.
-        ioc_matches=$(python3 -c "import json; d=json.load(open('${work}/report.json')); m=d.get('network', {}).get('ioc', {}).get('matches', []); print(len([r for r in m if r.get('verdict') == 'match' and not r.get('refused') and not r.get('suppressed')]))" 2>/dev/null || echo "")
+        ioc_matches=$(python3 - "${work}/report.json" 2>/dev/null <<'PY' || echo ""
+        import json, sys
+        d = json.load(open(sys.argv[1], encoding='utf-8'))
+        m = d.get('network', {}).get('ioc', {}).get('matches', [])
+        print(len([r for r in m if r.get('verdict') == 'match' and not r.get('refused') and not r.get('suppressed')]))
+        PY
+        )
+        # What the gate itself fired on: the "  - reason" lines under the FAIL
+        # verdict, from the same function that set the exit code. findings
+        # misses flagged commands and IOC hits, which fail the gate too.
+        case "${rc}" in
+          3) gate_reasons=$(awk '/^actualis: FAIL at --fail-on/ {f=1; next} f && /^  - / {n++} END {print n+0}' "${work}/verdict.txt") ;;
+          0) gate_reasons=0 ;;
+          *) gate_reasons="" ;;
+        esac
 
         # With fail-on: none there is no Gate step, so a run that could not
         # complete (1) or was refused as a usage error (2) would otherwise be green.
@@ -182,14 +215,22 @@ runs:
         echo "exit-code=${rc}" >> "$GITHUB_OUTPUT"
         echo "findings=${findings}" >> "$GITHUB_OUTPUT"
         echo "ioc-matches=${ioc_matches}" >> "$GITHUB_OUTPUT"
+        echo "gate-reasons=${gate_reasons}" >> "$GITHUB_OUTPUT"
+        echo "gate=${gate}" >> "$GITHUB_OUTPUT"
 
         if [ "${SUMMARY}" = "true" ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+          # The fence is longer than any run of backticks in the report, so
+          # transcript text holding ``` cannot close it and render the lines
+          # after it as live Markdown (headings, links, image beacons).
+          longest=$(awk '{ while (match($0, /`+/)) { if (RLENGTH > m) m = RLENGTH; $0 = substr($0, RSTART + RLENGTH) } } END { print m + 0 }' "${work}/report.txt")
+          fence='```'
+          while [ "${#fence}" -le "${longest}" ]; do fence="${fence}\`"; done
           {
             echo "## Actualis — what the agent actually did"
             echo
-            echo '```'
+            echo "${fence}"
             cat "${work}/report.txt"
-            echo '```'
+            echo "${fence}"
             echo
             sed 's/^/> /' "${work}/verdict.txt"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -202,11 +243,12 @@ runs:
         exit 0
 
     - name: Gate
-      if: ${{ inputs.fail-on != 'none' }}
+      # Decided in the audit step, after lowercasing fail-on there.
+      if: ${{ steps.audit.outputs.gate == 'true' }}
       shell: bash
       env:
         RC: ${{ steps.audit.outputs.exit-code }}
-        FINDINGS: ${{ steps.audit.outputs.findings }}
+        REASONS: ${{ steps.audit.outputs.gate-reasons }}
       run: |
         set -uo pipefail
         if [ "${RC}" = "0" ]; then
@@ -214,7 +256,7 @@ runs:
           exit 0
         fi
         if [ "${RC}" = "3" ]; then
-          echo "::error::actualis found ${FINDINGS} finding(s) at or above the threshold."
+          echo "::error::actualis failed the gate on ${REASONS:-?} reason(s) at or above the threshold (listed in the log above)."
           exit 1
         fi
         # 1 could not run, 2 a usage error. Neither is a clean pass, and

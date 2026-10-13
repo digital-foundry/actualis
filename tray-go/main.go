@@ -19,6 +19,7 @@
 package main
 
 import (
+	"context"
 	_ "embed"
 	"encoding/json"
 	"fmt"
@@ -179,15 +180,33 @@ type report struct {
 	flaggedHigh  int
 	unsupPct     float64
 	hasUnsup     bool
+	unmoded      int // shell commands with no recorded mode: approval unknown
 	invisPct     float64
 	netItems     int
 	netUnasked   int
 	findings     []finding
 	err          string
 	at           time.Time
+	days         int // the window this report covers, which render labels it with
 }
 
 type finding struct{ ID, Title, Severity string }
+
+// unsupLabel is the tray's supervision line, "" when there is nothing to say.
+// When some commands have no recorded mode the share says what it covers and
+// names them, as actualis --share does, instead of reading as the whole fleet.
+func unsupLabel(r report) string {
+	switch {
+	case r.hasUnsup && r.unmoded > 0:
+		return fmt.Sprintf("%.0f%% of turns with a recorded mode ran unsupervised  ·  %s commands had none",
+			r.unsupPct, comma(r.unmoded))
+	case r.hasUnsup:
+		return fmt.Sprintf("%.0f%% ran unsupervised", r.unsupPct)
+	case r.unmoded > 0:
+		return fmt.Sprintf("%s shell commands had no recorded permission mode", comma(r.unmoded))
+	}
+	return ""
+}
 
 // findBinary resolves the CLI without a login shell's PATH, which a
 // desktop-launched process does not inherit.
@@ -210,18 +229,68 @@ func findBinary() string {
 	return ""
 }
 
+// scanTimeout bounds one CLI run. A hung actualis (a stuck network home, a
+// huge transcript) must not leave the tray "loading" for good.
+const scanTimeout = 5 * time.Minute
+
+// isUngatedMode mirrors the CLI's is_ungated_mode, its single definition of a
+// permission mode that does not stop for approval. Keep the two in step.
+func isUngatedMode(key string) bool {
+	k := strings.ToLower(key)
+	return strings.Contains(k, "auto") || strings.Contains(k, "bypass") || strings.Contains(k, "yolo") ||
+		key == "codex:never"
+}
+
+// flaggedHigh is the CLI's "flagged N high": one per command, suppressed
+// flags left out. bash.flagged.high carries it from the CLI; an older CLI
+// lacks it, so count bash.flags[] the same way. Never sum flag_counts: it
+// counts per category and includes suppressed flags.
+func flaggedHigh(bash map[string]any) int {
+	if fl, ok := bash["flagged"].(map[string]any); ok {
+		if n, ok := fl["high"].(float64); ok {
+			return int(n)
+		}
+	}
+	n := 0
+	if flags, ok := bash["flags"].([]any); ok {
+		for _, f := range flags {
+			m, _ := f.(map[string]any)
+			if sup, _ := m["suppressed"].(bool); sup {
+				continue
+			}
+			if m["severity"] == "high" {
+				n++
+			}
+		}
+	}
+	return n
+}
+
 func fetch(days int) report {
-	r := report{at: time.Now()}
+	r := report{at: time.Now(), days: days}
 	bin := findBinary()
 	if bin == "" {
 		r.err = "actualis not found on PATH"
 		return r
 	}
-	out, err := exec.Command(bin, "--json", "--days", strconv.Itoa(days)).Output()
+	ctx, cancel := context.WithTimeout(context.Background(), scanTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, bin, "--json", "--days", strconv.Itoa(days)).Output()
+	if ctx.Err() == context.DeadlineExceeded {
+		r.err = fmt.Sprintf("actualis did not finish within %s", scanTimeout)
+		return r
+	}
 	if err != nil {
 		r.err = "could not run actualis: " + err.Error()
 		return r
 	}
+	return parseReport(out, days)
+}
+
+// parseReport reads `actualis --json` output. Split from fetch so it can be
+// tested without a CLI on PATH.
+func parseReport(out []byte, days int) report {
+	r := report{at: time.Now(), days: days}
 	var root map[string]any
 	if err := json.Unmarshal(out, &root); err != nil {
 		r.err = "actualis returned no usable JSON"
@@ -246,6 +315,11 @@ func fetch(days int) report {
 	if secrets, ok := root["secrets"].([]any); ok {
 		for _, s := range secrets {
 			m, _ := s.(map[string]any)
+			// secrets[] lists suppressed entries too. The CLI's gate and the
+			// action leave them out; a reasoned suppression must clear the badge.
+			if sup, _ := m["suppressed"].(bool); sup {
+				continue
+			}
 			switch m["priority"] {
 			case "critical":
 				r.critical++
@@ -262,23 +336,32 @@ func fetch(days int) report {
 		if v, ok := bash["total"].(float64); ok {
 			r.shell = int(v)
 		}
-		if fc, ok := bash["flag_counts"].(map[string]any); ok {
-			for k, v := range fc {
-				if strings.HasPrefix(k, "high:") {
-					if n, ok := v.(float64); ok {
-						r.flaggedHigh += int(n)
-					}
-				}
-			}
-		}
+		r.flaggedHigh = flaggedHigh(bash)
 	}
-	if modes, ok := root["permission_modes"].(map[string]any); ok && len(modes) > 0 {
+	// The CLI computes the unsupervised share once (unsupervised_pct, added
+	// after 0.3.0). Read it rather than re-derive it: a second copy of the
+	// maths already drifted once. null means no permission mode was recorded.
+	// unsupervised_pct covers only turns with a recorded mode; the CLI names
+	// the commands that have none (every Gemini CLI one), and so must we.
+	if v, ok := root["unmoded_commands"].(float64); ok && v > 0 {
+		r.unmoded = int(v)
+	}
+	if v, present := root["unsupervised_pct"]; present {
+		if pct, ok := v.(float64); ok {
+			r.unsupPct, r.hasUnsup = pct, true
+		}
+	} else if modes, ok := root["permission_modes"].(map[string]any); ok && len(modes) > 0 {
+		// Fallback for an older CLI: the same maths as its recorded_turns and
+		// ungated_modes. A Codex `sandbox:` key sits beside every approval
+		// policy and is not a turn of its own.
 		var total, auto float64
 		for k, v := range modes {
+			if strings.HasPrefix(k, "sandbox:") {
+				continue
+			}
 			n, _ := v.(float64)
 			total += n
-			lk := strings.ToLower(k)
-			if strings.Contains(lk, "auto") || strings.Contains(lk, "bypass") {
+			if isUngatedMode(k) {
 				auto += n
 			}
 		}
@@ -313,7 +396,9 @@ func shareText() string {
 	if bin == "" {
 		return "actualis not found"
 	}
-	cmd := exec.Command(bin, "--share")
+	ctx, cancel := context.WithTimeout(context.Background(), scanTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "--share")
 	cmd.Env = append(os.Environ(), "NO_COLOR=1")
 	out, err := cmd.Output()
 	if err != nil {
@@ -325,12 +410,14 @@ func shareText() string {
 // ---------------------------------------------------------------- ui
 
 type ui struct {
-	mu      sync.Mutex
-	rep     report
-	days    int
-	loading bool
-	seen    map[string]bool // critical fingerprints already announced
-	primed  bool            // first scan must not fire a flood of alerts
+	mu         sync.Mutex
+	rep        report
+	days       int
+	loading    bool
+	pending    bool            // the window changed while a scan ran: scan again after it
+	seen       map[string]bool // critical fingerprints already announced
+	primed     bool            // first scan must not fire a flood of alerts
+	primedDays int             // the window the baseline in seen was taken over
 
 	mHeader, mSub, mCost, mShell, mUnsup, mInvis *systray.MenuItem
 	mNet, mNetReport                             *systray.MenuItem
@@ -372,16 +459,34 @@ func notify(title, body string) {
 	case "linux":
 		_ = exec.Command("notify-send", "-u", "critical", title, body).Run()
 	case "windows":
-		// The text goes through the environment and is referenced by name. Go's
-		// %q escapes quotes and backslashes but not $ or backtick, and
-		// PowerShell evaluates $(...) inside a double-quoted string, so
-		// formatting the text into the command would hand it execution. Not
-		// reachable from transcript content today; one call site away from it.
-		cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive",
-			"-Command", "Write-Output $Env:ACTUALIS_TRAY_NOTIFY")
-		cmd.Env = append(os.Environ(), "ACTUALIS_TRAY_NOTIFY="+title+": "+body)
-		_ = cmd.Run()
+		_ = windowsNotifyCmd(title, body).Run()
 	}
+}
+
+// windowsToastScript shows a toast through the WinRT notification API, which
+// ships with Windows 10 and later (no module to install). It is a constant:
+// the text goes through the environment and is referenced by name. Go's %q
+// escapes quotes and backslashes but not $ or backtick, and PowerShell
+// evaluates $(...) inside a double-quoted string, so formatting the text into
+// the command would hand it execution. CreateTextNode takes the text as data.
+// The app id is PowerShell's own, registered on every install, because a toast
+// from an unregistered id is silently dropped. Not run on Windows in CI.
+const windowsToastScript = `$ErrorActionPreference = 'Stop'
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+$t = [Windows.UI.Notifications.ToastTemplateType]::ToastText02
+$x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent($t)
+$n = $x.GetElementsByTagName('text')
+$n.Item(0).AppendChild($x.CreateTextNode($Env:ACTUALIS_TRAY_NOTIFY_TITLE)) > $null
+$n.Item(1).AppendChild($x.CreateTextNode($Env:ACTUALIS_TRAY_NOTIFY_BODY)) > $null
+$id = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($id).Show([Windows.UI.Notifications.ToastNotification]::new($x))`
+
+func windowsNotifyCmd(title, body string) *exec.Cmd {
+	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive",
+		"-Command", windowsToastScript)
+	cmd.Env = append(os.Environ(),
+		"ACTUALIS_TRAY_NOTIFY_TITLE="+title, "ACTUALIS_TRAY_NOTIFY_BODY="+body)
+	return cmd
 }
 
 // flash draws attention when something new appears. Three beats is noticeable
@@ -500,12 +605,14 @@ func addDisabled(s string) *systray.MenuItem {
 func (u *ui) loop() {
 	tick := time.NewTicker(10 * time.Minute)
 	defer tick.Stop()
+	// Scans run off this loop: a scan takes as long as the history is big, and
+	// Quit, Copy and the rest must answer while it runs.
 	for {
 		select {
 		case <-tick.C:
-			u.refresh()
+			go u.refresh()
 		case <-u.mRefresh.ClickedCh:
-			u.refresh()
+			go u.refresh()
 		case <-u.mCopy.ClickedCh:
 			go copyToClipboard(shareText())
 		case <-u.mReport.ClickedCh:
@@ -544,12 +651,15 @@ func (u *ui) setDays(d int) {
 		}
 	}
 	u.mu.Unlock()
-	u.refresh()
+	go u.refresh()
 }
 
 func (u *ui) refresh() {
 	u.mu.Lock()
 	if u.loading {
+		// A scan is in flight. If it is for an older window, scan again when it
+		// lands, rather than wait for the next tick.
+		u.pending = true
 		u.mu.Unlock()
 		return
 	}
@@ -561,21 +671,15 @@ func (u *ui) refresh() {
 
 	u.mu.Lock()
 	u.rep, u.loading = r, false
-	fresh := []string{}
-	for fp := range r.fingerprints {
-		if !u.seen[fp] {
-			u.seen[fp] = true
-			if u.primed {
-				fresh = append(fresh, fp)
-			}
-		}
-	}
-	// The first scan establishes a baseline. Announcing a month of history on
-	// launch would train the user to ignore the notification permanently.
-	u.primed = true
+	fresh := u.absorb(r)
+	again := u.pending || r.days != u.days
+	u.pending = false
 	u.mu.Unlock()
 
 	u.render()
+	if again {
+		go u.refresh()
+	}
 	if len(fresh) > 0 {
 		notify("actualis: new credential exposed",
 			fmt.Sprintf("%d new critical credential(s) in your agent history", len(fresh)))
@@ -583,9 +687,37 @@ func (u *ui) refresh() {
 	}
 }
 
+// absorb records a report's critical fingerprints and returns the ones worth
+// announcing. Called with u.mu held.
+//
+// The first scan establishes a baseline. Announcing a month of history on
+// launch would train the user to ignore the notification permanently. A scan
+// over a different window re-baselines the same way: widening 7 days to 90
+// brings older exposures into view, and they are not new.
+func (u *ui) absorb(r report) []string {
+	if r.err != "" {
+		return nil
+	}
+	announce := u.primed && r.days == u.primedDays
+	fresh := []string{}
+	for fp := range r.fingerprints {
+		if !u.seen[fp] {
+			u.seen[fp] = true
+			if announce {
+				fresh = append(fresh, fp)
+			}
+		}
+	}
+	u.primed, u.primedDays = true, r.days
+	return fresh
+}
+
 func (u *ui) render() {
 	u.mu.Lock()
-	r, days := u.rep, u.days
+	// The report's own window, not the one selected now: a scan that started
+	// before the window changed covers the old one.
+	r := u.rep
+	days := r.days
 	u.mu.Unlock()
 
 	if r.err != "" {
@@ -619,8 +751,8 @@ func (u *ui) render() {
 	show(u.mCost, fmt.Sprintf("$%.2f  ·  last %d days, at list price", r.cost, days))
 	show(u.mShell, fmt.Sprintf("%s shell commands  ·  %d flagged",
 		comma(r.shell), r.flaggedHigh))
-	if r.hasUnsup {
-		show(u.mUnsup, fmt.Sprintf("%.0f%% ran unsupervised", r.unsupPct))
+	if label := unsupLabel(r); label != "" {
+		show(u.mUnsup, label)
 	} else {
 		u.mUnsup.Hide()
 	}

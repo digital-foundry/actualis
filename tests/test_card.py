@@ -13,6 +13,9 @@ import zlib
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _fixtures  # noqa: E402,F401  (first: a temp HOME, agent homes and cwd for the whole run)
+
 ROOT = Path(__file__).resolve().parent.parent
 if "actualis" in sys.modules:
     af = sys.modules["actualis"]
@@ -104,7 +107,7 @@ class TestPerCommandSupervision(unittest.TestCase):
 
     def test_share_uses_the_same_definition(self):
         f = af.Fleet()
-        f.add_tool("p", "Bash", {"command": "ls"}, self.TS)
+        f.add_tool("p", "Bash", {"command": "ls"}, self.TS, "codex:never")   # moded (R3G2)
         f.permission_modes.update({"codex:never": 1, "default": 1})
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -186,7 +189,7 @@ class TestCardModel(unittest.TestCase):
         self.assertEqual(m["label"], "ACTUALIS · LAST 5 DAYS")
         self.assertEqual([s[1] for s in m["stats"]], ["commands", "refused", "agents"])
         self.assertEqual(m["stats"][0][0], "20")
-        self.assertEqual([b[0] for b in m["bars"]], ["auto", "you", "refused"])
+        self.assertEqual([b[0] for b in m["bars"]], ["auto", "gated", "refused"])
         self.assertEqual(m["series"], [75.0] * 5)
         self.assertTrue(m["trend"])
         self.assertTrue(m["share"].startswith("75% of my coding agents' shell commands"))

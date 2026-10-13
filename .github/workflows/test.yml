@@ -24,9 +24,13 @@ concurrency:
 
 jobs:
   test:
-    # Real runs finish in about 30 seconds. The GitHub default is 360 minutes,
-    # so a wedged runner burns six hours per job before anything notices — and
-    # a stuck job does not fail, it just sits there holding up the release.
+    # The suite takes about 1.5 minutes on a dev Mac (Python 3.9 and 3.15,
+    # measured 2026-10-13, ~1475 tests); the hosted runners are 1.2-2.3x slower
+    # and Windows spawns subprocesses slowly, so expect 2-4 minutes per job.
+    # 10 minutes leaves 2.5x over the slowest; do not tighten it from a fast
+    # Linux run. The GitHub default is 360 minutes, so a wedged runner burns
+    # six hours per job before anything notices — and a stuck job does not
+    # fail, it just sits there holding up the release.
     timeout-minutes: 10
     strategy:
       fail-fast: false

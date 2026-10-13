@@ -20,7 +20,7 @@ names is one secret carrying both names.
 | Stripe key | critical | `sk_live_…`, `rk_live_…` |
 | AWS access key | critical | `AKIA…`, `ASIA…` |
 | Anthropic key | critical | `sk-ant-…` |
-| OpenAI key | critical | `sk-…` (non-Anthropic) |
+| OpenAI key | critical | `sk-…-…` (non-Anthropic), and the classic `sk-` + 40 or more alphanumerics |
 | JWT / service key | critical | `eyJ….…` |
 | GitHub PAT | high | `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_` |
 | Google API key | high | `AIza…` |
@@ -30,6 +30,25 @@ names is one secret carrying both names.
 | DigitalOcean | high | `dop_v1_…` |
 | HuggingFace | high | `hf_…` |
 | **Supabase PAT** | critical | `sbp_` + 40 alphanumerics. Full account authority |
+| npm token | high | `npm_` + 36 alphanumerics |
+| Shopify token | high | `shpat_` + 32 hex |
+| Linear API key | high | `lin_api_…` |
+| Google OAuth token | high | `ya29.…` |
+| private key | critical | the body of a PEM `-----BEGIN … PRIVATE KEY-----` block or an armored PGP `-----BEGIN PGP PRIVATE KEY BLOCK-----` block, also as a `KEY=` or JSON value |
+
+Everything in this table is also masked in every output, the JWT including its
+signature, so a credential that is counted is never printed.
+
+A prefix is read at the start of a word, or right after an SGR colour code
+written into the command (`echo -e "\033[1mghp_…"`, `printf '\e[32mghp_…'`),
+whose final `m` touches the prefix, or right after any other escape written
+into it: a backslash escape (`printf 'x\nghp_…'`, `\t`, `\x20`, `\040`,
+`\u0020`), an escape sequence with any final byte (`\e[2K`, `\033[H`,
+`\e[38:2:…m`, `\e(B`, which `tput sgr0` prints), or what is left of a raw one
+(`[2K`). A prefix glued to a preceding letter or
+`_` is not read: `thighs_and_calves_workout` holds `ghs_…` and
+`disk-io-performance_monitoring` holds `sk-io-…`, so reading them would report
+identifiers as keys.
 
 ## Recognised by shape
 
@@ -37,8 +56,13 @@ names is one secret carrying both names.
 `critical`; loopback (`127.0.0.1`, `localhost`, `0.0.0.0`, `::1`,
 `host.docker.internal`) is `low`, because rotating a dev password is busywork.
 
-**Named assignments** — `NAME=value` where the name contains `SECRET`, `TOKEN`,
-`PASSWORD`, `APIKEY`, `API_KEY`, `ACCESS_KEY`, or `PRIVATE_KEY`. Escalated to
+**Named assignments** — `NAME=value` (also `NAME: value`, a quoted JSON key,
+`{"password": "…"}`, and the same JSON with escaped quotes inside a
+double-quoted argument, `curl -d "{\"password\":\"…\"}"`) where the name
+contains `SECRET`, `TOKEN`, `PASSWORD`, `APIKEY`, `API_KEY`, `ACCESS_KEY`,
+`PRIVATE_KEY` or `AUTH` (so `Authorization: <value>` with no scheme word is
+read too). An SGR colour code between the `=` and the value
+(`TOKEN=\e[1m…`) does not hide it. Escalated to
 `critical` when the name also mentions stripe, aws, service_role, private_key,
 master, root, prod, payment, or billing — a variable called
 `STRIPE_SECRET_KEY` is critical whatever its value looks like.
@@ -50,7 +74,41 @@ master, root, prod, payment, or billing — a variable called
 part of `user:PASS` stays readable; only the password is masked. A `uid:gid`
 pair, a shell reference and a placeholder are left alone, and the generic
 `-p` (`mysql -pPASS`, `sshpass -p`) is not read: `-p` means other things in
-other programs.
+other programs. Also read as options: `aws configure set
+aws_secret_access_key VALUE` (and `aws_session_token`, with or without a
+`profile.` prefix) and `gh secret set NAME --body VALUE` (or `-b`).
+
+Any long option named for a credential is read the same way, with the value
+after a space or `=`: `--token`, `--api-key`, `--apikey`, `--client-secret`,
+`--access-token`, `--auth-token`, `--api-token`, `--secret`, `--secret-key`,
+`--password` and `--passphrase`, and any other option ending in one of those
+words (`--bot-token`, `--http-password`). Values shorter than 6 characters,
+values starting with `-`, a flag that only names a credential (`--no-password`,
+`--ask-password`), `--token-file` and the other options that name a file, and a
+BuildKit secret mount (`docker build --secret id=…,src=…`) are not read. A
+`.netrc` line written by a command, `machine HOST login USER password PASS` or
+`default login USER password PASS`, is read too (also through `printf
+'machine h\nlogin u\npassword …'`); its id is taken from the host and user.
+
+**The whole value is masked**, however long: an unquoted value to the next
+blank or quote (an AWS session token of 1,000 characters is masked to its last
+character), and a quoted one, spaces and all, to its closing quote on the line
+(`--passphrase 'correct horse battery'`, `--api-key "…"`, `$'…'`, and
+`NAME='…'`). A private key's body runs to its END line, or to the end of the
+command when there is none.
+
+**Cookies** — every `NAME=VALUE` pair of a `Cookie:` or `Set-Cookie:` header
+(`curl -H 'Cookie: theme=dark; sid=…'`, or a JSON `"Cookie": "…"`) and of
+curl's `-b`/`--cookie` value (`-b 'theme=dark; sid=…'`, `-bsid=…`) is read on
+its own (`high`, kind `cookie`). A pair is masked and counted when its name
+sounds like a credential (`sid`, `session`, `token`, `auth`, `jwt`, `csrf`,
+`xsrf`, `secret`, `pass`, `key`, `cred`, `bearer`, `access`, `refresh`,
+`login`, `remember`, `sig`) and its value has 6 or more characters, when its
+value has a credential's shape (a known prefix, a JWT), or when its value is
+opaque (16 or more characters mixing letters and digits). `theme=dark` stays
+readable. A header with no pair is one value. `-b FILE`, a cookie jar, is not
+a secret and is left alone. The id is taken from the program and the cookie
+name.
 
 These ids are **not** `sha256(value)[:8]`. A person chose the password, so a
 hash of it published in a report, a CI log or a committed
@@ -73,6 +131,8 @@ release, since any of them may be a short, person-chosen password:
 | an scp-style `user:password@host:` password | `user@host` |
 | a password-less URL or scp userinfo longer than 20 characters | the host |
 | an `Authorization:` header value with no recognised prefix | the program and the scheme word (`Bearer`, `Basic`, `token`) |
+| a value passed to a credential-named option (`--token`, `--api-key`, `--client-secret`, …) | the program, the option and the user |
+| a cookie value | the program and the cookie or header name |
 
 Credentials counted before that release keep their value-based ids: tokens
 recognised by prefix, URL passwords of 6 characters or more, and named secrets
@@ -142,7 +202,13 @@ numbers, and anything already redacted.
 
 Command text is treated as hostile. Control characters are stripped before
 anything is printed or written to JSON, and every pattern uses bounded
-quantifiers so a pathological command cannot hang the scan. See
+quantifiers so a pathological command cannot hang the scan.
+
+Detection and masking run on the text with those characters already removed.
+An ESC, a zero-width space, a soft hyphen or any other stripped character
+inside a token (`ghp_\u200b…`) therefore cannot split it past the rules: the
+token is masked and counted as the token it shows as, in the text report,
+`--json`, `--html` and MCP alike. See
 [SECURITY.md](../SECURITY.md#hardening).
 
 ## What it cannot see

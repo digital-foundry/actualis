@@ -5,7 +5,9 @@ on:
     branches: [main]
     paths: ["tray-go/**", ".github/workflows/tray*.yml"]
   pull_request:
-    paths: ["tray-go/**"]
+    # tray-build.yml is what release.yml builds the shipped binaries with, so a
+    # PR that edits it is tested before it merges, not first on a tag.
+    paths: ["tray-go/**", ".github/workflows/tray*.yml"]
   workflow_dispatch:
 
 permissions:
