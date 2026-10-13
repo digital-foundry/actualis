@@ -163,3 +163,110 @@ class TestPage(unittest.TestCase):
 
     def test_filters_named(self):
         self.assertIn("host h1.example", page(filters=["host h1.example"]))
+
+
+class TestWrite(unittest.TestCase):
+    def test_never_overwrites_and_numbers(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "actualis-network.html").write_text("keep")
+            (d / "actualis-network-2.html").write_text("keep2")
+            p = af.write_network_html("<p>x</p>", d)
+            self.assertEqual(p.name, "actualis-network-3.html")
+            self.assertEqual((d / "actualis-network.html").read_text(), "keep")
+            self.assertEqual(p.read_text(), "<p>x</p>")
+
+    @unittest.skipIf(os.name == "nt", "POSIX file modes")
+    def test_mode_0600(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = af.write_network_html("x", Path(d))
+            self.assertEqual(p.stat().st_mode & 0o777, 0o600)
+
+    def test_race_takes_next_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            real = af.network_html_path
+            def racing(out_dir):
+                p = real(out_dir)
+                if p.name == "actualis-network.html":
+                    p.write_text("other writer")
+                return p
+            with mock.patch.object(af, "network_html_path", side_effect=racing):
+                p = af.write_network_html("mine", d)
+            self.assertEqual((d / "actualis-network.html").read_text(), "other writer")
+            self.assertEqual(p.read_text(), "mine")
+
+
+SID = "cccc3333-0000-4000-8000-000000000003"
+
+
+class TestCli(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        base = Path(self._tmp.name)
+        self.root = base / "projects"
+        (self.root / "-Users-x-proj").mkdir(parents=True)
+        recs = [{"type": "assistant", "timestamp": "2026-10-07T14:22:00Z",
+                 "permissionMode": "bypassPermissions", "sessionId": SID,
+                 "message": {"id": "m1", "role": "assistant", "usage": {"input_tokens": 1, "output_tokens": 1},
+                             "content": [{"type": "tool_use", "id": "toolu_01", "name": "Bash",
+                                          "input": {"command": "npm i lodash@4.17.21"}}]}}]
+        (self.root / "-Users-x-proj" / f"{SID}.jsonl").write_text(
+            "\n".join(json.dumps(r) for r in recs) + "\n")
+        self.home = base / "home"
+        self.home.mkdir()
+
+    def run_main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        env = {"HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / ".config"), "NO_COLOR": "1"}
+        old = os.getcwd()
+        os.chdir(self.home)
+        try:
+            with mock.patch.dict(os.environ, env), redirect_stdout(out), redirect_stderr(err):
+                try:
+                    code = af.main([*argv, "--root", str(self.root), "--days", "3650"])
+                except SystemExit as exc:
+                    code = exc.code
+        finally:
+            os.chdir(old)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_writes_into_cwd_and_prints_path(self):
+        code, out, err = self.run_main("--network", "--html")
+        self.assertEqual(code, 0, err)
+        p = Path(out.strip())
+        self.assertEqual(p.resolve(), (self.home / "actualis-network.html").resolve())
+        self.assertIn("lodash", p.read_text())
+
+    def test_out_dir_and_embedded_equals_json(self):
+        d = self.home / "reports"
+        d.mkdir()
+        code, out, _ = self.run_main("--network", "--html", "--out", str(d))
+        self.assertEqual(code, 0)
+        page_text = Path(out.strip()).read_text()
+        blob = [s[1] for s in parse(page_text).scripts if s[0] == "application/json"][0]
+        _, js, _ = self.run_main("--network", "--json")
+        self.assertEqual(json.loads(blob), json.loads(js))
+
+    def test_argument_errors(self):
+        for argv, msg in ((["--html"], "--html requires --network"),
+                          (["--network", "--html", "--json"], "--html writes a file")):
+            code, _, err = self.run_main(*argv)
+            self.assertEqual(code, 2)
+            self.assertIn(msg, err)
+        code, _, err = self.run_main("--network", "--html", "--with-prompts")
+        self.assertEqual(code, 0, err)
+
+    def test_out_rules(self):
+        code, _, err = self.run_main("--network", "--out", str(self.home))
+        self.assertEqual(code, 2)
+        self.assertIn("--out applies only to --card or --html", err)
+        code, _, err = self.run_main("--style", "terminal")
+        self.assertEqual(code, 2)
+        self.assertIn("--style applies only to --card", err)
+
+    def test_missing_dir(self):
+        code, _, err = self.run_main("--network", "--html", "--out", str(self.home / "nope"))
+        self.assertEqual(code, 1)
+        self.assertIn("is not a directory", err)

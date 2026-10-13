@@ -8844,6 +8844,41 @@ def render_network_html(n: dict, *, filters: list[str], version: str, with_promp
     return "".join(out)
 
 
+def network_html_path(out_dir: Path) -> Path:
+    """The first actualis-network[-N].html that does not exist yet."""
+    k = 1
+    while True:
+        p = out_dir / (f"{NET_HTML_NAME}.html" if k == 1 else f"{NET_HTML_NAME}-{k}.html")
+        if not p.exists():
+            return p
+        k += 1
+
+
+def write_network_html(page: str, out_dir: Path) -> Path:
+    """Write the page, never over an existing file: O_EXCL makes that hold
+    even under a race, and a lost race takes the next name. 0600 because the
+    page holds commands and URLs from the user's transcripts."""
+    data = page.encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    while True:
+        path = network_html_path(out_dir)
+        try:
+            fd = os.open(path, flags, 0o600)
+        except FileExistsError:
+            continue
+        break
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+    except BaseException:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    return path
+
+
 def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
            network_only: bool = False, network_filters: list[str] | None = None) -> None:
     if network_only:
@@ -11457,7 +11492,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--style", choices=CARD_STYLES, default="hero",
                     help="--card layout: hero (default) or terminal")
     ap.add_argument("--out", metavar="DIR",
-                    help="--card: directory to write into (default: current directory)")
+                    help="--card or --html: directory to write into (default: current directory)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--watch", action="store_true",
                     help="live monitor: alert on new secrets and risky commands")
@@ -11493,8 +11528,11 @@ def build_parser() -> argparse.ArgumentParser:
                      help="--network: only sessions whose id starts with ID")
     net.add_argument("--unasked", action="store_true",
                      help="--network: only downloads that ran without asking")
+    net.add_argument("--html", action="store_true",
+                     help="--network: write the report as one self-contained HTML page "
+                          "(actualis-network.html, never overwritten; see --out)")
     net.add_argument("--with-prompts", action="store_true",
-                     help="--json: include network.items[].prompt, the person's last message "
+                     help="--json or --html: include network.items[].prompt, the person's last message "
                           "before each download (redacted, 160 characters). Null otherwise")
     ap.add_argument("--suppress", metavar="ID",
                     help="mark a finding as a false positive on this machine. "
@@ -11559,8 +11597,13 @@ def main(argv: list[str] | None = None) -> int:
             parse_trust([args.host], "--host")
         except ValueError as exc:
             ap.error(str(exc))
-    if args.with_prompts and not args.json:
-        ap.error("--with-prompts applies only to --json; the text view already shows prompts.")
+    if args.html and not args.network:
+        ap.error("--html requires --network: it writes the network report.")
+    if args.html and args.json:
+        ap.error("--html writes a file; it cannot also emit --json.")
+    if args.with_prompts and not (args.json or args.html):
+        ap.error("--with-prompts applies only to --json or --html; "
+                 "the text view already shows prompts.")
     if args.ioc and args.card:
         ap.error("--ioc does not apply to --card; the card never shows downloads.")
     if args.ioc and (args.watch or args.mcp):
@@ -11584,6 +11627,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"actualis: {card_dir} is not a directory.\n"
                   "  --out takes the directory the card is written into.", file=sys.stderr)
             return EXIT_CANNOT_RUN
+    if args.html:
+        html_dir = Path(args.out).expanduser() if args.out else Path.cwd()
+        if not html_dir.is_dir():
+            print(f"actualis: {html_dir} is not a directory.\n"
+                  "  --out takes the directory the report is written into.", file=sys.stderr)
+            return EXIT_CANNOT_RUN
     if args.service:
         # Unit to stdout, instructions to stderr: `> file` must yield a file
         # that works, and still tell the user what to do with it.
@@ -11606,8 +11655,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.diff and args.json:
         ap.error("--diff renders a comparison; it cannot also emit --json. "
                  "Save this run with --json, then diff the two files.")
-    if not args.card and (args.style != "hero" or args.out):
-        ap.error("--style and --out apply only to --card.")
+    if not args.card and args.style != "hero":
+        ap.error("--style applies only to --card.")
+    if args.out and not (args.card or args.html):
+        ap.error("--out applies only to --card or --html.")
 
     since = None
     if args.days:
@@ -11803,6 +11854,22 @@ def main(argv: list[str] | None = None) -> int:
                   file=sys.stderr)
             return EXIT_CANNOT_RUN
         print(f"  {svg}\n  {png}\n\n  {model['share']}")
+        return EXIT_OK
+
+    if args.html:
+        page = render_network_html(network_json(fleet, raw=args.no_redact),
+                                   filters=network_filter_names(args), version=__version__,
+                                   with_prompts=args.with_prompts)
+        try:
+            path = write_network_html(page, html_dir)
+        except OSError as exc:
+            print(f"actualis: cannot write the report to {html_dir}: {exc.strerror or exc}",
+                  file=sys.stderr)
+            return EXIT_CANNOT_RUN
+        print(path)
+        if args.no_redact:
+            print("actualis: --no-redact is on: this report may contain live secrets.",
+                  file=sys.stderr)
         return EXIT_OK
 
     if args.json:
