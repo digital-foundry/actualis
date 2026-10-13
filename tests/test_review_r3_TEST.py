@@ -82,6 +82,15 @@ class TestHermeticSuite(unittest.TestCase):
         missing = sorted(n for n in sources if not isolated(n))
         self.assertEqual(missing, [], "add `import _fixtures` at the top of these modules")
 
+    def test_no_module_relies_on_add_module_cleanup(self):
+        """Python 3.9.6 (Apple's /usr/bin/python3) runs addModuleCleanup
+        callbacks only when the module also defines tearDownModule; an env
+        patch undone that way leaks into every later module there."""
+        offenders = sorted(p.name for p in TESTS.glob("test_*.py")
+                           if "addModuleCleanup(" in p.read_text(encoding="utf-8")
+                           and p.name != Path(__file__).name)
+        self.assertEqual(offenders, [], "undo module-level patches in tearDownModule")
+
     def test_a_read_under_the_real_home_is_refused_and_recorded(self):
         probe = os.path.join(fx.REAL_HOME, ".actualis-isolation-probe-does-not-exist")
         before = list(fx.LEAKS)

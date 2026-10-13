@@ -27,11 +27,19 @@ TS = "2026-10-10T00:00:00Z"
 _HOME = tempfile.mkdtemp()
 
 
+# A module-level tearDownModule, not unittest.addModuleCleanup: Python 3.9.6
+# (Apple's /usr/bin/python3) runs module cleanups only when the module defines
+# tearDownModule, so the patched HOME leaked into every later module.
+_ENV_PATCH = mock.patch.dict(os.environ, {"HOME": _HOME, "CODEX_HOME": _HOME + "/cx",
+                                          "COPILOT_HOME": _HOME + "/cp"})
+
+
 def setUpModule():
-    p = mock.patch.dict(os.environ, {"HOME": _HOME, "CODEX_HOME": _HOME + "/cx",
-                                     "COPILOT_HOME": _HOME + "/cp"})
-    p.start()
-    unittest.addModuleCleanup(p.stop)
+    _ENV_PATCH.start()
+
+
+def tearDownModule():
+    _ENV_PATCH.stop()
 
 
 def _write(dirpath: Path, name: str, lines) -> None:

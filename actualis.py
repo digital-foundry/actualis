@@ -17659,6 +17659,20 @@ def _gate_verdict() -> int:
     return code
 
 
+def _reader_gone(exc: BaseException) -> bool:
+    """True when `exc` is a write to a std stream whose reader has gone.
+
+    POSIX reports that as EPIPE (BrokenPipeError). Windows reports a write or
+    flush to a pipe with no reader as EINVAL (errno 22) instead: only there,
+    and only for an error that names no file (a bad path is EINVAL on Windows
+    too, and carries its filename), is it treated the same way.
+    """
+    if isinstance(exc, BrokenPipeError):
+        return True
+    return (sys.platform == "win32" and isinstance(exc, OSError)
+            and exc.errno == 22 and exc.filename is None)
+
+
 def _silence_fd(stream) -> None:
     """Point a stream's descriptor at the null device once its reader has gone.
 
@@ -17694,7 +17708,9 @@ def _cli(argv: list[str] | None = None) -> int:
         sys.stdout.flush()
     except KeyboardInterrupt:
         return 130
-    except BrokenPipeError:
+    except OSError as exc:
+        if not _reader_gone(exc):
+            raise
         # `actualis | head` is not an error, but it must not turn a failing
         # gate into exit 0 either: the verdict was decided before the output.
         # Only the stream whose reader has gone is silenced, so a closed

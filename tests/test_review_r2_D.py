@@ -379,7 +379,9 @@ class TestP2D12Completions(unittest.TestCase):
         self.assertRegex(z, r"'\*--network-trust=")
         self.assertNotIn("'--ioc=", z)
 
-    @unittest.skipUnless(shutil.which("bash"), "needs bash")
+    # On a Windows runner `bash` is System32's WSL launcher (no distro installed:
+    # it prints a UTF-16 notice), not a POSIX bash the completion is written for.
+    @unittest.skipIf(sys.platform == "win32" or not shutil.which("bash"), "needs POSIX bash")
     def test_bash_offers_flags_after_an_optional_value_flag(self):
         script = af.completion_script("bash")
         with tempfile.TemporaryDirectory() as td:

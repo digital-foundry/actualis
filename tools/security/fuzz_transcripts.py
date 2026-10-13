@@ -282,10 +282,15 @@ def mutate_bytes(rng, path: Path):
 
 def case_env(dirs: dict) -> dict:
     # Built from scratch: no CLAUDE_CONFIG_DIR or XDG_* leaks in from the host.
-    return {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(dirs["home"]),
-            "CODEX_HOME": str(dirs["codex"]), "COPILOT_HOME": str(dirs["copilot"]),
-            "GEMINI_CLI_HOME": str(dirs["gemini"]), "QWEN_HOME": str(dirs["qwen"]),
-            "NO_COLOR": "1", "LANG": "C.UTF-8"}
+    # USERPROFILE too: on Windows, Python 3.8+ finds the home there, not in HOME.
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(dirs["home"]),
+           "USERPROFILE": str(dirs["home"]),
+           "CODEX_HOME": str(dirs["codex"]), "COPILOT_HOME": str(dirs["copilot"]),
+           "GEMINI_CLI_HOME": str(dirs["gemini"]), "QWEN_HOME": str(dirs["qwen"]),
+           "NO_COLOR": "1", "LANG": "C.UTF-8"}
+    if os.name == "nt" and os.environ.get("SYSTEMROOT"):
+        env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]    # a Windows interpreter needs it
+    return env
 
 
 def check_seed(work: Path, dirs: dict):

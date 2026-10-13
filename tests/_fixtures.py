@@ -72,10 +72,15 @@ def _isolate_process():
     def norm(p):
         return os.path.normcase(os.path.abspath(p))
     real = norm(REAL_HOME)
-    # Under the real home, only the code under test and the interpreter may be read.
+    # Under the real home, only the code under test and the interpreter may be
+    # read. The interpreter includes its bytecode cache when that lives outside
+    # the source tree: Apple's /usr/bin/python3 (3.9.6) sets sys.pycache_prefix
+    # to ~/Library/Caches/com.apple.python and reads and writes every .pyc there.
+    pycache = getattr(sys, "pycache_prefix", None)
     allowed = tuple(sorted({norm(p) + os.sep for p in
                             (repo, sys.prefix, sys.base_prefix, sys.exec_prefix,
-                             tempfile.gettempdir(), *(p for p in sys.path if p))
+                             tempfile.gettempdir(), *(p for p in sys.path if p),
+                             *((pycache,) if pycache else ()))
                             if norm(p) != real}))
     real_prefix = real + os.sep
     project_file = norm(os.path.join(orig_cwd, ".actualis-suppressions"))

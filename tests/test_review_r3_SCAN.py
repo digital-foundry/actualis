@@ -9,6 +9,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -620,6 +621,9 @@ class TestR3E1LineBreaks(Tmp):
 class TestR3E1ActionFence(unittest.TestCase):
     """The job summary's code fence is longer than any backtick run in the report."""
 
+    # action.yml's snippet is bash. On a Windows runner `bash` on PATH is
+    # System32's WSL launcher, which has no distro and runs nothing.
+    @unittest.skipIf(sys.platform == "win32" or not shutil.which("bash"), "needs POSIX bash")
     def test_fence_outgrows_the_report(self):
         text = (ROOT / "action.yml").read_text(encoding="utf-8")
         start = text.index("longest=$(awk")

@@ -118,8 +118,12 @@ class TestJsonCarriesTrayNumbers(unittest.TestCase):
             home.mkdir()
             (d / "rollout-2026-10-01T10-00-00-cx-1.jsonl").write_text(
                 "\n".join(json.dumps(r) for r in recs) + "\n")
+            # USERPROFILE: Windows' Python finds the home there, not in HOME.
             env = {"PATH": os.environ.get("PATH", ""), "HOME": str(home),
+                   "USERPROFILE": str(home),
                    "CODEX_HOME": str(codex), "COPILOT_HOME": str(Path(td) / "copilot")}
+            if os.name == "nt" and os.environ.get("SYSTEMROOT"):
+                env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
             run = lambda *a: subprocess.run([sys.executable, str(ROOT / "actualis.py"),
                                              "--days", "3650", *a], capture_output=True,
                                             text=True, env=env, cwd=td, timeout=120)

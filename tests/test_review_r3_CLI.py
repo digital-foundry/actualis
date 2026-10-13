@@ -81,6 +81,55 @@ class TestR3D1GateBehindClosedStderr(_Env):
         self.assertEqual(af._PENDING_GATE, [])
 
 
+class _WindowsClosedPipe(io.StringIO):
+    """A stream as Windows reports a pipe with no reader: EINVAL, not EPIPE."""
+
+    def write(self, s):
+        raise OSError(22, "Invalid argument")
+
+    def flush(self):
+        raise OSError(22, "Invalid argument")
+
+
+class TestWindowsClosedPipeIsEinval(_Env):
+    """Windows reports a write to a closed pipe as OSError(EINVAL); the gate
+    code must survive it there just as it survives EPIPE on POSIX."""
+
+    def test_reader_gone_only_for_epipe_or_windows_einval_without_a_file(self):
+        self.assertTrue(af._reader_gone(BrokenPipeError(32, "Broken pipe")))
+        with mock.patch.object(af.sys, "platform", "win32"):
+            self.assertTrue(af._reader_gone(OSError(22, "Invalid argument")))
+            # A bad path is EINVAL on Windows too, and it names the file.
+            self.assertFalse(af._reader_gone(OSError(22, "Invalid argument", "a:b")))
+            self.assertFalse(af._reader_gone(OSError(13, "Permission denied")))
+            self.assertFalse(af._reader_gone(ValueError("x")))
+        for platform in ("linux", "darwin"):
+            with mock.patch.object(af.sys, "platform", platform):
+                self.assertFalse(af._reader_gone(OSError(22, "Invalid argument")))
+
+    def _cli(self, platform, *argv):
+        err = io.StringIO()
+        with mock.patch.object(af.sys, "platform", platform), \
+                mock.patch.object(sys, "stdout", _WindowsClosedPipe()), \
+                mock.patch.object(af, "_silence_stdout", lambda: None), \
+                contextlib.redirect_stderr(err):
+            code = af._cli(["--root", str(self.state), "--agent", "copilot", *argv])
+        return code, err.getvalue()
+
+    def test_gate_code_survives_einval_on_windows(self):
+        for argv, want in ((("--json", "--fail-on", "critical"), af.EXIT_FINDINGS),
+                           (("--fail-on", "critical"), af.EXIT_FINDINGS),
+                           (("--json",), af.EXIT_OK)):
+            with self.subTest(argv=argv):
+                code, err = self._cli("win32", *argv)
+                self.assertEqual(code, want, err)
+                self.assertNotIn("Traceback", err)
+
+    def test_einval_is_not_swallowed_on_posix(self):
+        with self.assertRaises(OSError):
+            self._cli("linux", "--json")
+
+
 # --- R3D2, R3D3, R3D4: never silently drop a flag (rows added, R4/R14) --------
 
 REFUSED = [
