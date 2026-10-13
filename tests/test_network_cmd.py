@@ -141,7 +141,7 @@ class TestNetworkFlag(Cli):
         self.assertIn("actualis --network", af.EXPLAIN["network"]["measures"].splitlines()[0])
         self.assertIn("actualis --network", (ROOT / "README.md").read_text(encoding="utf-8"))
         text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        section = text[text.index("## 0.3.0 (unreleased)"):text.index("## 0.2.2")]
+        section = text[text.index("## 0.3.0 ("):text.index("## 0.2.2")]
         self.assertIn("`--network`", section)
 
 
