@@ -25,7 +25,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
+import html as _html
 import json
 import os
 import re
@@ -8576,6 +8578,270 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False,
 
     print()
     _render_network_sessions(fleet, n, c, top, raw)
+
+
+# --------------------------------------------------------------------------
+# --network --html: the network view as one self-contained page. Pure: the
+# page is a function of network_json and the flags, so the same input gives
+# the same bytes. Everything from a transcript goes through _h().
+
+NET_HTML_NAME = "actualis-network"
+NET_HTML_DAY_CELLS = 120        # bars in the per-day chart; wider spans share a bar
+NET_HTML_RANK_ROWS = 15
+
+_NET_HTML_SCRIPT = (
+    "document.querySelectorAll('th').forEach(function(th){th.addEventListener('click',function(){"
+    "var tb=th.closest('table').tBodies[0],k=+th.dataset.k,d=th.dataset.d==='1'?-1:1;"
+    "th.dataset.d=d===1?'1':'0';var rows=Array.prototype.slice.call(tb.rows);"
+    "rows.sort(function(a,b){var x=a.cells[k].textContent,y=b.cells[k].textContent,"
+    "nx=parseFloat(x.replace(/,/g,'')),ny=parseFloat(y.replace(/,/g,''));"
+    "return(!isNaN(nx)&&!isNaN(ny)&&/^[\\d,.]+$/.test(x)&&/^[\\d,.]+$/.test(y)?nx-ny:x.localeCompare(y))*d;});"
+    "rows.forEach(function(r){tb.appendChild(r);});});});"
+    "document.querySelectorAll('input.flt').forEach(function(i){i.hidden=false;"
+    "i.addEventListener('input',function(){var q=i.value.toLowerCase();"
+    "Array.prototype.forEach.call(document.getElementById(i.dataset.t).tBodies[0].rows,"
+    "function(r){r.hidden=!!q&&r.textContent.toLowerCase().indexOf(q)<0;});});});")
+
+_NET_HTML_STYLE = (
+    ":root{--bg:#fbfaf7;--fg:#1d1c1a;--mut:#6b6862;--line:#e3e0d8;--un:#c99700;--uk:#a8a49b;"
+    "--as:#e8e5de;--card:#fff}"
+    "@media (prefers-color-scheme:dark){:root{--bg:#141413;--fg:#ecebe6;--mut:#9d9a93;"
+    "--line:#2c2b28;--un:#e6b422;--uk:#6e6b65;--as:#3a3935;--card:#1c1c1a}}"
+    "*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);"
+    "font:15px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}"
+    "main{max-width:1100px;margin:0 auto;padding:24px 16px 64px}h1{font-size:22px;margin:0}"
+    "h2{font-size:16px;margin:32px 0 8px;border-bottom:1px solid var(--line);padding-bottom:4px}"
+    "h3{font-size:14px;margin:16px 0 6px;color:var(--mut)}.meta,.note{color:var(--mut);font-size:13px}"
+    ".tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-top:16px}"
+    ".tile{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:10px}"
+    ".tile b{display:block;font-size:22px;font-variant-numeric:tabular-nums}"
+    ".tile span{color:var(--mut);font-size:12px}svg{width:100%;height:auto;display:block}"
+    ".b-unasked{fill:var(--un)}.b-unknown{fill:var(--uk)}.b-asked{fill:var(--as)}"
+    ".b-other{fill:var(--uk);opacity:.45}.ax{font-size:11px;fill:var(--mut)}.axis{stroke:var(--line)}"
+    ".lg{display:inline-block;width:10px;height:10px;margin:0 4px 0 12px;border-radius:2px}"
+    ".lg.b-unasked{background:var(--un)}.lg.b-unknown{background:var(--uk)}"
+    ".lg.b-asked{background:var(--as)}.lg.b-other{background:var(--uk);opacity:.45}"
+    ".cols{display:grid;grid-template-columns:1fr 1fr;gap:24px}"
+    "@media(max-width:720px){.cols{grid-template-columns:1fr}}"
+    ".rk{display:grid;grid-template-columns:minmax(0,40%) 1fr auto;gap:8px;align-items:center;"
+    "font-size:13px;margin:3px 0}.rk svg{height:10px}.rl{overflow-wrap:anywhere}"
+    ".rn{font-variant-numeric:tabular-nums;color:var(--mut)}"
+    ".tw{overflow-x:auto;border:1px solid var(--line);border-radius:6px}"
+    "table{border-collapse:collapse;width:100%;font-size:13px}"
+    "th,td{padding:5px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}"
+    "th{cursor:pointer;background:var(--card);white-space:nowrap}td.n{text-align:right;"
+    "font-variant-numeric:tabular-nums}td{max-width:340px;overflow-wrap:anywhere}"
+    ".flt{margin:6px 0;padding:4px 8px;border:1px solid var(--line);border-radius:4px;"
+    "background:var(--card);color:var(--fg)}code,pre{font:12px ui-monospace,Menlo,monospace}"
+    "pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto;"
+    "background:var(--card);padding:8px;border:1px solid var(--line)}")
+
+
+def _h(s: object) -> str:
+    """Any value as HTML text or attribute: cleaned, then escaped."""
+    if s is None:
+        return ""
+    return _html.escape(clean(s) if isinstance(s, str) else str(s), quote=True)
+
+
+def _net_html_when(ts: str | None) -> str:
+    """An item timestamp as YYYY-MM-DD HH:MM in UTC."""
+    if not ts:
+        return "-"
+    try:
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except (ValueError, OverflowError):
+        return ts[:16]
+
+
+def _net_html_blob(n: dict) -> str:
+    """The JSON as embedded: sorted, compact, ASCII, and with < > & escaped so
+    no value can close the script element. Still valid JSON for the same object."""
+    s = json.dumps(n, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return s.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+
+
+def _svg_day_bars(by_day: list[dict], undated: int) -> str:
+    if not by_day:
+        return '<p class="note">No dated downloads.</p>'
+    totals, unasked, step = _net_buckets(by_day, NET_HTML_DAY_CELLS)
+    first = datetime.strptime(by_day[0]["date"], "%Y-%m-%d").date()
+    last = datetime.strptime(by_day[-1]["date"], "%Y-%m-%d").date()
+    vmax = max(totals) or 1
+    w, h, pad = 1000, 160, 4
+    bw = (w - 2 * pad) / len(totals)
+    out = [f'<svg viewBox="0 0 {w} {h + 24}" role="img" aria-label="Downloads per day">']
+    for k, (items, un) in enumerate(zip(totals, unasked)):
+        if not items:
+            continue
+        start = first + timedelta(days=k * step)
+        end = last if (last - start).days < step - 1 else start + timedelta(days=step - 1)
+        when = start.isoformat() if start == end else f"{start.isoformat()} to {end.isoformat()}"
+        x, hi, hu = pad + k * bw, h * items / vmax, h * un / vmax
+        out.append(f'<g><title>{when}: {items:,} downloads, {un:,} unasked</title>'
+                   f'<rect class="b-other" x="{x:.1f}" y="{h - hi:.1f}" width="{bw * 0.8:.1f}" '
+                   f'height="{hi - hu:.1f}"/><rect class="b-unasked" x="{x:.1f}" y="{h - hu:.1f}" '
+                   f'width="{bw * 0.8:.1f}" height="{hu:.1f}"/></g>')
+    out.append(f'<line class="axis" x1="{pad}" y1="{h}" x2="{w - pad}" y2="{h}"/>'
+               f'<text class="ax" x="{pad}" y="{h + 18}">{first.isoformat()}</text>'
+               f'<text class="ax" x="{w - pad}" y="{h + 18}" text-anchor="end">{last.isoformat()}</text>'
+               "</svg>")
+    out.append('<p class="note"><span class="lg b-unasked"></span>unasked'
+               '<span class="lg b-other"></span>unknown or asked'
+               + (f" &middot; one bar is {step} days" if step > 1 else "") + "</p>")
+    if undated:
+        out.append(f'<p class="note">{undated:,} downloads have no date and are not in this chart.</p>')
+    return "".join(out)
+
+
+def _svg_approval_bar(t: dict) -> str:
+    parts = [("unasked", t["unasked"], "b-unasked"), ("unknown", t["unknown"], "b-unknown"),
+             ("asked", t["asked"], "b-asked")]
+    total = sum(v for _, v, _ in parts) or 1
+    cells = _net_shares([v for _, v, _ in parts], 1000)
+    out, x = ['<svg viewBox="0 0 1000 34" role="img" aria-label="Approval">'], 0
+    for (name, v, cls), wd in zip(parts, cells):
+        if wd:
+            out.append(f'<rect class="{cls}" x="{x}" y="0" width="{wd}" height="34">'
+                       f'<title>{name}: {v:,} ({v * 100 // total}%)</title></rect>')
+        x += wd
+    out.append("</svg><p class=\"note\">")
+    out.append("".join(f'<span class="lg {cls}"></span>{name} {v:,}' for name, v, cls in parts))
+    return "".join(out) + "</p>"
+
+
+def _svg_rank_bars(title: str, rows: list[tuple[str, int, int]]) -> str:
+    """Rows of (label, unasked, total), drawn as total with unasked over it."""
+    if not rows:
+        return ""
+    vmax = max(whole for _, _, whole in rows) or 1
+    out = [f"<h3>{title}</h3><div class=\"ranks\">"]
+    for label, part, whole in rows:
+        out.append(f'<div class="rk"><span class="rl">{_h(label)}</span>'
+                   f'<svg viewBox="0 0 100 10" preserveAspectRatio="none" role="img" '
+                   f'aria-label="{_h(label)}"><title>{_h(label)}: {part:,} unasked of {whole:,}</title>'
+                   f'<rect class="b-other" width="{100 * whole / vmax:.2f}" height="10"/>'
+                   f'<rect class="b-unasked" width="{100 * part / vmax:.2f}" height="10"/></svg>'
+                   f'<span class="rn">{part:,} / {whole:,}</span></div>')
+    return "".join(out) + "</div>"
+
+
+def _html_table(tid: str, cols: list[str], rows: list[list]) -> str:
+    """A table whose int cells are right-aligned and comma-grouped. The filter
+    box is hidden until the script shows it, so with scripts off it is absent."""
+    head = "".join(f'<th data-k="{k}">{_h(c)}</th>' for k, c in enumerate(cols))
+    body = []
+    for r in rows:
+        cells = "".join(f'<td class="n">{v:,}</td>' if isinstance(v, int) and not isinstance(v, bool)
+                        else f"<td>{v}</td>" for v in r)
+        body.append(f"<tr>{cells}</tr>")
+    return (f'<input class="flt" data-t="{tid}" placeholder="filter" aria-label="filter" hidden>'
+            f'<div class="tw"><table id="{tid}"><thead><tr>{head}</tr></thead>'
+            f'<tbody>{"".join(body)}</tbody></table></div>')
+
+
+def render_network_html(n: dict, *, filters: list[str], version: str, with_prompts: bool) -> str:
+    """The --network --html page. Every number on it is read from `n`, the
+    object --network --json prints, which is also embedded verbatim."""
+    t = n["totals"]
+    items = n["items"]
+    truncated = len(items) < t["items"]
+    blob = _net_html_blob(n)
+    digest = hashlib.sha256(blob.encode("ascii")).hexdigest()
+    sh = base64.b64encode(hashlib.sha256(_NET_HTML_SCRIPT.encode("ascii")).digest()).decode()
+    csp = (f"default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-{sh}'; "
+           "img-src data:; base-uri 'none'; form-action 'none'")
+    window = (f"{n['by_day'][0]['date']} to {n['by_day'][-1]['date']} UTC"
+              if n["by_day"] else "no dated downloads")
+    sessions: dict = {}
+    for i in items:
+        s = sessions.setdefault(i["session"] or "-", {"start": i["ts"] or "", "project": i["project"],
+                                                      "n": 0, "u": 0})
+        s["start"] = min(s["start"], i["ts"] or s["start"])
+        s["n"] += 1
+        s["u"] += i["approval"] == "unasked"
+    listed = " in listed items" if truncated else ""
+    pct = t["unasked"] * 100 // t["items"] if t["items"] else 0
+
+    out = ['<!doctype html><html lang="en"><head><meta charset="utf-8">'
+           '<meta name="viewport" content="width=device-width,initial-scale=1">'
+           f'<meta http-equiv="Content-Security-Policy" content="{csp}">'
+           f"<title>actualis network report</title><style>{_NET_HTML_STYLE}</style></head>"
+           "<body><main><h1>actualis network report</h1>"
+           f'<p class="meta">actualis {_h(version)} &middot; {_h(window)} &middot; filters: '
+           f'{_h(", ".join(filters)) if filters else "none"}</p>'
+           '<p class="meta"><b>unasked</b>: ran in a mode that never stops to ask. '
+           "<b>unknown</b>: the mode could have asked; the transcript does not say. "
+           "<b>asked</b>: a person approved it.</p>"]
+    if not t["items"]:
+        out.append("<p>No downloads were recorded"
+                   + (" for these filters" if filters else "") + ".</p>")
+    else:
+        tiles = [(t["items"], "downloads"), (t["unasked"], f"unasked ({pct}%)"),
+                 (t["unknown"], "unknown"), (t["asked"], "asked"),
+                 (len(n["hosts"]), "hosts"), (len(n["packages"]), "packages"),
+                 (len(sessions), "sessions" + listed), (len(n["by_project"]), "projects")]
+        out.append('<div class="tiles">' + "".join(
+            f'<div class="tile"><b>{v:,}</b><span>{_h(label)}</span></div>' for v, label in tiles)
+            + "</div>")
+        out.append("<h2>Downloads per day</h2>" + _svg_day_bars(n["by_day"], n["by_day_undated"]))
+        out.append("<h2>Approval</h2>" + _svg_approval_bar(t))
+        hosts = [(h["host"], h["unasked"], h["count"]) for h in n["hosts"][:NET_HTML_RANK_ROWS]]
+        pkgs = [(f"{p['ecosystem']} {p['name']}", p["unasked"], p["count"])
+                for p in n["packages"][:NET_HTML_RANK_ROWS]]
+        out.append('<div class="cols"><div>' + _svg_rank_bars("Top hosts (unasked / total)", hosts)
+                   + "</div><div>" + _svg_rank_bars("Top packages (unasked / total)", pkgs)
+                   + "</div></div>")
+        if len(n["by_project"]) > 1:
+            out.append(_svg_rank_bars("By project (unasked / total)", [
+                (p["project"] or "-", p["unasked"], p["items"])
+                for p in n["by_project"][:NET_HTML_RANK_ROWS]]))
+        out.append("<h2>Hosts</h2>" + _html_table("t-hosts", ["host", "downloads", "unasked",
+                                                             "first seen (UTC)", "trusted"], [
+            [_h(h["host"]), h["count"], h["unasked"], _h(_net_html_when(h["first_seen"])),
+             "yes" if h["trusted"] else "no"] for h in n["hosts"]]))
+        out.append("<h2>Packages</h2>" + _html_table("t-packages", ["ecosystem", "name", "versions",
+                                                                   "pinned", "downloads", "unasked"], [
+            [_h(p["ecosystem"]), _h(p["name"]), _h(", ".join(p["versions"])) or "-",
+             "yes" if p["pinned"] else "no", p["count"], p["unasked"]] for p in n["packages"]]))
+        out.append("<h2>Projects</h2>" + _html_table("t-projects", ["project", "downloads", "unasked"], [
+            [_h(p["project"] or "-"), p["items"], p["unasked"]] for p in n["by_project"]]))
+        out.append(f"<h2>Sessions{listed}</h2>" + _html_table(
+            "t-sessions", ["start (UTC)", "project", "session", "downloads", "unasked"], [
+                [_h(_net_html_when(s["start"])), _h(s["project"] or "-"), _h(sid[:8]), s["n"], s["u"]]
+                for sid, s in sorted(sessions.items(), key=lambda kv: (kv[1]["start"], kv[0]),
+                                     reverse=True)]))
+        cols = ["when (UTC)", "host", "what", "approval", "mode", "agent", "project", "session",
+                "why", "trace"] + (["prompt"] if with_prompts else [])
+        rows = []
+        for i in items:
+            row = [_h(_net_html_when(i["ts"])), _h(i["host"] or "-"), _h(_net_what(i)),
+                   _h(i["approval"]), _h(i["mode"] or "-"), _h(i["agent"] or "-"),
+                   _h(i["project"] or "-"), _h((i["session"] or "-")[:8]), _h(i["why"] or ""),
+                   f"{_h(i['call_id'] or '-')} &middot; {_h(_net_path(i['transcript']))}"]
+            if with_prompts:
+                row.append(_h(i["prompt"] or ""))
+            rows.append(row)
+        out.append("<h2>Every download</h2>" + _html_table("t-items", cols, rows))
+        if truncated:
+            out.append(f'<p class="note">{t["items"] - len(items):,} more not listed; '
+                       "narrow with --days or --session.</p>")
+    check = ("actualis --network --json SAME-FLAGS | python3 -c 'import json,re,sys; "
+             "p=open(sys.argv[1]).read(); print(json.loads(re.search(r\"actualis-network\\\">"
+             "(.*?)</script>\", p, re.S).group(1)) == json.load(sys.stdin))' REPORT.html")
+    out.append("<h2>Data</h2>"
+               '<p class="meta">Every number above is read from the object '
+               "<code>actualis --network --json</code> prints for the same flags, embedded below. "
+               f"sha256 of the embedded text: <code>{digest}</code></p>"
+               f'<p class="meta">Check it (prints True):</p><pre>{_h(check)}</pre>'
+               f'<details><summary>embedded JSON</summary><pre>{_h(json.dumps(n, indent=1, sort_keys=True))}'
+               "</pre></details>"
+               f'<script type="application/json" id="actualis-network">{blob}</script>'
+               f"<script>{_NET_HTML_SCRIPT}</script></main></body></html>\n")
+    return "".join(out)
 
 
 def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
