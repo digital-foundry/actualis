@@ -132,6 +132,9 @@ class TestPage(unittest.TestCase):
             self.assertNotRegex(ref, r"^(https?:|//)")
         self.assertNotRegex(p, r"url\(\s*['\"]?(https?:|//)")
 
+    def test_items_embedded_once(self):
+        self.assertEqual(page().count("toolu_003"), 2)     # the items table and the JSON
+
     def test_deterministic(self):
         self.assertEqual(page(), page())
 

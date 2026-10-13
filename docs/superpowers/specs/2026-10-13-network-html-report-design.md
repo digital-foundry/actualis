@@ -291,3 +291,5 @@ real transcripts.
   opens a socket, and `--self-check` still passes.
 - **`--out` and `--style`:** they get separate errors: "--style applies only
   to --card." and "--out applies only to --card or --html."
+- **No readable copy:** the readable `<details>` copy of the JSON is dropped. It doubled
+  the file (5 MB on a large corpus). The page names the script element that holds it.

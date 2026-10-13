@@ -8842,8 +8842,8 @@ def render_network_html(n: dict, *, filters: list[str], version: str, with_promp
                "<code>actualis --network --json</code> prints for the same flags, embedded below. "
                f"sha256 of the embedded text: <code>{digest}</code></p>"
                f'<p class="meta">Check it (prints True):</p><pre>{_h(check)}</pre>'
-               f'<details><summary>embedded JSON</summary><pre>{_h(json.dumps(n, indent=1, sort_keys=True))}'
-               "</pre></details>"
+               '<p class="meta">The object is in this page\'s source, in '
+               '<code>&lt;script id="actualis-network"&gt;</code>.</p>'
                f'<script type="application/json" id="actualis-network">{blob}</script>'
                f"<script>{_NET_HTML_SCRIPT}</script></main></body></html>\n")
     return "".join(out)
