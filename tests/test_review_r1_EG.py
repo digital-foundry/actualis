@@ -463,7 +463,9 @@ class TestWorkflowsG17G18(unittest.TestCase):
         self.assertIn("HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}", text)
         self.assertIn("version: ${{ steps.ver.outputs.version }}", text)
         self.assertIn('[ "$got" = "$WANT_VERSION" ]', text)
-        self.assertIn("ref: ${{ github.event.workflow_run.head_sha || github.sha }}", text)
+        # Never check out the triggering run's ref and run its local action
+        # (CodeQL actions/cache-poisoning); the released package is pinned instead.
+        self.assertNotIn("workflow_run.head_sha", text.replace("head_sha:", ""))
         # Untrusted event fields reach run: only through env:.
         for block in re.findall(r"run: \|\n((?:          .*\n|\n)+)", text):
             self.assertNotIn("${{ github.event", block)
