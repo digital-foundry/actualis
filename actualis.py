@@ -1073,8 +1073,9 @@ def clean(text: str | None) -> str:
     """Strip control characters from untrusted text.
 
     Tab and newline survive. Carriage return does not: see _STRIPPED_RANGES.
+    A non-string (a transcript field can hold any JSON value) is empty.
     """
-    if not text:
+    if not text or not isinstance(text, str):
         return ""
     return _CONTROL.sub("", text.replace("\t", " "))
 
@@ -5037,7 +5038,11 @@ class Fleet:
                         # Harness-written, but a tampered file reaches the terminal
                         # through these as surely as through a command: clean them.
                         model = clean(payload.get("model"))[:48] or model
-                        pol = clean(payload.get("approval_policy"))[:48]
+                        pol = payload.get("approval_policy")
+                        # Newer Codex writes {"granular": {...flags}}: keep the kind.
+                        if isinstance(pol, dict) and len(pol) == 1:
+                            pol = next(iter(pol))
+                        pol = clean(pol)[:48]
                         if pol:
                             policy = f"codex:{pol}"
                             self.permission_modes[policy] += 1
