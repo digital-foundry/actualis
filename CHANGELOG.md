@@ -77,6 +77,12 @@ Each of these is listed in full below.
 
 ### Added
 
+- **`--network --html`** writes the network report as one offline page:
+  inline SVG charts, sortable tables, every item with its trace, and the
+  `--network --json` object embedded with its sha256. It never overwrites
+  (`actualis-network-2.html`, …), is readable by you only, and a content
+  security policy blocks every fetch. `--out` now applies to `--card` or
+  `--html`, and `--with-prompts` to `--json` or `--html`.
 - **`--network`** prints only the NETWORK section (with the IOC block when
   `--ioc` is given), and `--network --json` emits only the `network` object. The
   full report gets a one-line `network` summary in FLEET when downloads exist.

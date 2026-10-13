@@ -186,6 +186,9 @@ and a countersignature, which is separate work.
 
 ## network
 
+`actualis --network --html` embeds this same object, for the same flags, in the
+page's `<script type="application/json" id="actualis-network">` element.
+
 Every download, clone, install and web fetch the transcripts show and actualis
 can read, recorded from shell commands and web tools. A shape the inventory does
 not parse (a script, `poetry add`, `npm exec`) gives no item.

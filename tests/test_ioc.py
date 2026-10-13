@@ -1319,8 +1319,8 @@ class TestDocsAndSelfCheck(unittest.TestCase):
     def test_imports_are_unchanged(self):                               # T-OUT-8
         src = (ROOT / "actualis.py").read_text(encoding="utf-8")
         self.assertEqual(sorted(set(af.imports_in(src))),
-                         ["__future__", "argparse", "collections", "datetime", "hashlib", "json", "os",
-                          "pathlib", "re", "shutil", "struct", "subprocess", "sys", "time", "typing", "zlib"])
+                         ["__future__", "argparse", "base64", "collections", "datetime", "hashlib",
+                          "html", "json", "os", "pathlib", "re", "shutil", "struct", "subprocess", "sys", "time", "typing", "zlib"])
         # --self-check itself runs end to end in test_actualis (TestLegacyTerminalEncoding).
 
     def test_docs(self):

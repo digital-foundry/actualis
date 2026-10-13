@@ -25,7 +25,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
+import html as _html
 import json
 import os
 import re
@@ -7319,6 +7321,10 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "at least one cell. The series reconcile with .totals; the report says",
             "so in red when they do not.",
             "  actualis --network --json | jq '.by_day, .by_project'",
+            "--html writes the same report as one self-contained page",
+            "(actualis-network.html, never overwritten, readable by you only). It",
+            "loads nothing from the network and embeds the --network --json object,",
+            "with its sha256, so every number on it can be checked against --json.",
         ],
         "verify": "actualis --json | jq '.network.totals, .network.hosts[:5]'",
     },
@@ -8252,21 +8258,32 @@ def _net_bar(part: int, whole: int, scale: int, width: int) -> str:
     return ("\u2588" * p + "\u2591" * (w - p)).ljust(width)
 
 
+def _net_shares(values: list[int], width: int) -> list[int]:
+    """`width` cells shared among `values` by largest remainder, so they add
+    up to `width`; a value above zero always gets a cell, taken from the
+    largest share. The terminal approval bar and the HTML charts both use it,
+    so the two cannot disagree on proportions."""
+    total = sum(values)
+    if not total or width <= 0:
+        return [0] * len(values)
+    exact = [v * width / total for v in values]
+    cells = [int(e) for e in exact]
+    for k in sorted(range(len(values)), key=lambda k: -(exact[k] - cells[k]))[:width - sum(cells)]:
+        cells[k] += 1
+    for k in range(len(values)):
+        if values[k] and not cells[k]:
+            cells[k] = 1
+            cells[max(range(len(values)), key=lambda j: cells[j])] -= 1
+    return cells
+
+
 def _net_approval_bar(t: dict, width: int, c: "C | None" = None) -> str:
     """unasked (solid), unknown (medium), asked (light), in that order, the
-    cells shared out by largest remainder so they always add up to `width`."""
+    cells shared out by _net_shares so they always add up to `width`."""
     parts = [(t["unasked"], "\u2588"), (t["unknown"], "\u2592"), (t["asked"], "\u2591")]
-    total = sum(v for v, _ in parts)
-    if not total:
+    if not sum(v for v, _ in parts):
         return " " * width
-    exact = [v * width / total for v, _ in parts]
-    cells = [int(e) for e in exact]
-    for k in sorted(range(3), key=lambda k: -(exact[k] - cells[k]))[:width - sum(cells)]:
-        cells[k] += 1
-    for k in range(3):                        # a share above zero always gets a cell
-        if parts[k][0] and not cells[k]:
-            cells[k] = 1
-            cells[max(range(3), key=lambda j: cells[j])] -= 1
+    cells = _net_shares([v for v, _ in parts], width)
     colours = (c.yellow, c.dim, "") if c else ("", "", "")
     off = c.off if c else ""
     return "".join(f"{col}{g * n}{off}" if n and col else g * n
@@ -8565,6 +8582,370 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False,
 
     print()
     _render_network_sessions(fleet, n, c, top, raw)
+
+
+# --------------------------------------------------------------------------
+# --network --html: the network view as one self-contained page. Pure: the
+# page is a function of network_json and the flags, so the same input gives
+# the same bytes. Everything from a transcript goes through _h().
+
+NET_HTML_NAME = "actualis-network"
+NET_HTML_DAY_CELLS = 120        # bars in the per-day chart; wider spans share a bar
+NET_HTML_RANK_ROWS = 15
+
+_NET_HTML_SCRIPT = (
+    "document.querySelectorAll('th').forEach(function(th){th.addEventListener('click',function(){"
+    "var tb=th.closest('table').tBodies[0],k=+th.dataset.k,d=th.dataset.d==='1'?-1:1;"
+    "th.dataset.d=d===1?'1':'0';var rows=Array.prototype.slice.call(tb.rows);"
+    "rows.sort(function(a,b){var x=a.cells[k].textContent,y=b.cells[k].textContent,"
+    "nx=parseFloat(x.replace(/,/g,'')),ny=parseFloat(y.replace(/,/g,''));"
+    "return(!isNaN(nx)&&!isNaN(ny)&&/^[\\d,.]+$/.test(x)&&/^[\\d,.]+$/.test(y)?nx-ny:x.localeCompare(y))*d;});"
+    "rows.forEach(function(r){tb.appendChild(r);});});});"
+    "document.querySelectorAll('input.flt').forEach(function(i){i.hidden=false;"
+    "i.addEventListener('input',function(){var q=i.value.toLowerCase();"
+    "Array.prototype.forEach.call(document.getElementById(i.dataset.t).tBodies[0].rows,"
+    "function(r){r.hidden=!!q&&r.textContent.toLowerCase().indexOf(q)<0;});});});")
+
+_NET_HTML_STYLE = (
+    ":root{--bg:#fbfaf7;--fg:#1d1c1a;--mut:#6b6862;--line:#e3e0d8;--un:#c99700;--uk:#a8a49b;"
+    "--as:#e8e5de;--card:#fff;--bad:#b42318}"
+    "@media (prefers-color-scheme:dark){:root{--bg:#141413;--fg:#ecebe6;--mut:#9d9a93;"
+    "--line:#2c2b28;--un:#e6b422;--uk:#6e6b65;--as:#3a3935;--card:#1c1c1a;--bad:#ff6b5b}}"
+    "*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);"
+    "font:15px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}"
+    "main{max-width:1100px;margin:0 auto;padding:24px 16px 64px}h1{font-size:22px;margin:0}"
+    "h2{font-size:16px;margin:32px 0 8px;border-bottom:1px solid var(--line);padding-bottom:4px}"
+    "h3{font-size:14px;margin:16px 0 6px;color:var(--mut)}.meta,.note{color:var(--mut);font-size:13px}"
+    ".tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-top:16px}"
+    ".tile{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:10px}"
+    ".tile b{display:block;font-size:22px;font-variant-numeric:tabular-nums}"
+    ".tile span{color:var(--mut);font-size:12px}svg{width:100%;height:auto;display:block}"
+    ".b-unasked{fill:var(--un)}.b-unknown{fill:var(--uk)}.b-asked{fill:var(--as)}"
+    ".b-other{fill:var(--uk);opacity:.45}.ax{font-size:11px;fill:var(--mut)}.axis{stroke:var(--line)}"
+    ".lg{display:inline-block;width:10px;height:10px;margin:0 4px 0 12px;border-radius:2px}"
+    ".lg.b-unasked{background:var(--un)}.lg.b-unknown{background:var(--uk)}"
+    ".lg.b-asked{background:var(--as)}.lg.b-other{background:var(--uk);opacity:.45}"
+    ".cols{display:grid;grid-template-columns:1fr 1fr;gap:24px}"
+    "@media(max-width:720px){.cols{grid-template-columns:1fr}}"
+    ".rk{display:grid;grid-template-columns:minmax(0,40%) 1fr auto;gap:8px;align-items:center;"
+    "font-size:13px;margin:3px 0}.rk svg{height:10px}.rl{overflow-wrap:anywhere}"
+    ".rn{font-variant-numeric:tabular-nums;color:var(--mut)}"
+    ".tw{overflow-x:auto;border:1px solid var(--line);border-radius:6px}"
+    "table{border-collapse:collapse;width:100%;font-size:13px}"
+    "th,td{padding:5px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}"
+    "th{cursor:pointer;background:var(--card);white-space:nowrap}td.n{text-align:right;"
+    "font-variant-numeric:tabular-nums}td{max-width:340px;overflow-wrap:anywhere}"
+    ".flt{margin:6px 0;padding:4px 8px;border:1px solid var(--line);border-radius:4px;"
+    "background:var(--card);color:var(--fg)}code,pre{font:12px ui-monospace,Menlo,monospace}"
+    "code{word-break:break-all}.bad{color:var(--bad);font-weight:600}"
+    "pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto;"
+    "background:var(--card);padding:8px;border:1px solid var(--line)}")
+
+
+def _h(s: object) -> str:
+    """Any value as HTML text or attribute: cleaned, then escaped."""
+    if s is None:
+        return ""
+    return _html.escape(clean(s) if isinstance(s, str) else str(s), quote=True)
+
+
+def _net_html_when(ts: str | None) -> str:
+    """An item timestamp as YYYY-MM-DD HH:MM in UTC."""
+    if not ts:
+        return "-"
+    try:
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except (ValueError, OverflowError):
+        return ts[:16]
+
+
+def _net_utc_key(ts: str | None) -> str:
+    """A timestamp as a sortable UTC string: items keep the transcript's own
+    offset, so raw strings from two zones do not compare in time order."""
+    if not ts:
+        return ""
+    try:
+        dt = datetime.fromisoformat(ts)
+        return dt.astimezone(timezone.utc).isoformat() if dt.tzinfo is not None else ts
+    except (ValueError, OverflowError):
+        return ts
+
+
+def _net_html_ioc(j: dict) -> str:
+    """The IOC block when --ioc was given, as render_ioc prints it: totals,
+    each list with its sha256, and every match. Empty without --ioc."""
+    if not j["enabled"]:
+        return ""
+    t = j["totals"]
+    out = [f'<h2>IOC</h2><p><span class="{"bad" if t["match"] else ""}">{t["match"]:,} match</span>'
+           f' &middot; {t["unresolved"]:,} unresolved'
+           + "".join(f" &middot; {t[k]:,} {k}" for k in ("refused", "suppressed") if t[k])
+           + f' &middot; {t["items_checked"]:,} checkable downloads checked</p>']
+    out.append(_html_table("t-ioc-lists", ["list", "sha256", "format", "package entries", "host entries",
+                                           "modified during the window"], [
+        [_h(Path(src["path"]).name), _h(src["sha256"]), _h(src["format"]), src["entries"]["package"],
+         src["entries"]["host"], "yes" if src["mtime_in_window"] else "no"] for src in j["sources"]]))
+    if j["matches"]:
+        rows = []
+        for r in j["matches"]:
+            i = r["item"]
+            if r["refused"]:
+                state = "never ran"
+            elif r["suppressed"]:
+                state = "suppressed"
+            elif r["verdict"] == "match":
+                state = ""
+            else:
+                state = _IOC_REASON_TEXT.get(r["reason"], r["reason"] or "")
+            rows.append([_h("REFUSED" if r["refused"] else r["verdict"].upper()), _h(_net_what(i)),
+                         _h(", ".join(r["refs"]) or "-"), _h(", ".join(r["labels"]) or "-"),
+                         _h(i["project"] or "-"), _h(_net_html_when(i["ts"])), _h(i["approval"]),
+                         _h(state)])
+        out.append(_html_table("t-ioc", ["verdict", "what", "refs", "labels", "project", "when (UTC)",
+                                         "approval", "note"], rows))
+        if j["matches_truncated"]:
+            out.append('<p class="note">More matches than listed; --network --json --ioc has them all.</p>')
+    out.append('<p class="note">No match is not "not affected": this covers the transcripts still on '
+               "this machine in the window, and lockfile installs, scripts and postinstall hooks are "
+               "not visible. See actualis --explain ioc.</p>")
+    return "".join(out)
+
+
+def _net_html_blob(n: dict) -> str:
+    """The JSON as embedded: sorted, compact, ASCII, and with < > & escaped so
+    no value can close the script element. Still valid JSON for the same object."""
+    s = json.dumps(n, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return s.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+
+
+def _svg_day_bars(by_day: list[dict], undated: int) -> str:
+    if not by_day:
+        return '<p class="note">No dated downloads.</p>'
+    totals, unasked, step = _net_buckets(by_day, NET_HTML_DAY_CELLS)
+    first = datetime.strptime(by_day[0]["date"], "%Y-%m-%d").date()
+    last = datetime.strptime(by_day[-1]["date"], "%Y-%m-%d").date()
+    vmax = max(totals) or 1
+    w, h, pad = 1000, 160, 4
+    bw = (w - 2 * pad) / len(totals)
+    out = [f'<svg viewBox="0 0 {w} {h + 24}" role="img" aria-label="Downloads per day">']
+    for k, (items, un) in enumerate(zip(totals, unasked)):
+        if not items:
+            continue
+        start = first + timedelta(days=k * step)
+        end = last if (last - start).days < step - 1 else start + timedelta(days=step - 1)
+        when = start.isoformat() if start == end else f"{start.isoformat()} to {end.isoformat()}"
+        x, hi, hu = pad + k * bw, h * items / vmax, h * un / vmax
+        out.append(f'<g><title>{when}: {items:,} downloads, {un:,} unasked</title>'
+                   f'<rect class="b-other" x="{x:.1f}" y="{h - hi:.1f}" width="{bw * 0.8:.1f}" '
+                   f'height="{hi - hu:.1f}"/><rect class="b-unasked" x="{x:.1f}" y="{h - hu:.1f}" '
+                   f'width="{bw * 0.8:.1f}" height="{hu:.1f}"/></g>')
+    out.append(f'<line class="axis" x1="{pad}" y1="{h}" x2="{w - pad}" y2="{h}"/>'
+               f'<text class="ax" x="{pad}" y="{h + 18}">{first.isoformat()}</text>'
+               f'<text class="ax" x="{w - pad}" y="{h + 18}" text-anchor="end">{last.isoformat()}</text>'
+               "</svg>")
+    out.append('<p class="note"><span class="lg b-unasked"></span>unasked'
+               '<span class="lg b-other"></span>unknown or asked'
+               + (f" &middot; one bar is {step} days" if step > 1 else "") + "</p>")
+    if undated:
+        out.append(f'<p class="note">{undated:,} downloads have no date and are not in this chart.</p>')
+    return "".join(out)
+
+
+def _svg_approval_bar(t: dict) -> str:
+    parts = [("unasked", t["unasked"], "b-unasked"), ("unknown", t["unknown"], "b-unknown"),
+             ("asked", t["asked"], "b-asked")]
+    total = sum(v for _, v, _ in parts) or 1
+    cells = _net_shares([v for _, v, _ in parts], 1000)
+    out, x = ['<svg viewBox="0 0 1000 34" role="img" aria-label="Approval">'], 0
+    for (name, v, cls), wd in zip(parts, cells):
+        if wd:
+            out.append(f'<rect class="{cls}" x="{x}" y="0" width="{wd}" height="34">'
+                       f'<title>{name}: {v:,} ({v * 100 // total}%)</title></rect>')
+        x += wd
+    out.append("</svg><p class=\"note\">")
+    out.append("".join(f'<span class="lg {cls}"></span>{name} {v:,}' for name, v, cls in parts))
+    return "".join(out) + "</p>"
+
+
+def _svg_rank_bars(title: str, rows: list[tuple[str, int, int]]) -> str:
+    """Rows of (label, unasked, total), drawn as total with unasked over it."""
+    if not rows:
+        return ""
+    vmax = max(whole for _, _, whole in rows) or 1
+    out = [f"<h3>{title}</h3><div class=\"ranks\">"]
+    for label, part, whole in rows:
+        out.append(f'<div class="rk"><span class="rl">{_h(label)}</span>'
+                   f'<svg viewBox="0 0 100 10" preserveAspectRatio="none" role="img" '
+                   f'aria-label="{_h(label)}"><title>{_h(label)}: {part:,} unasked of {whole:,}</title>'
+                   f'<rect class="b-other" width="{100 * whole / vmax:.2f}" height="10"/>'
+                   f'<rect class="b-unasked" width="{100 * part / vmax:.2f}" height="10"/></svg>'
+                   f'<span class="rn">{part:,} / {whole:,}</span></div>')
+    return "".join(out) + "</div>"
+
+
+def _html_table(tid: str, cols: list[str], rows: list[list]) -> str:
+    """A table whose int cells are right-aligned and comma-grouped. The filter
+    box is hidden until the script shows it, so with scripts off it is absent."""
+    head = "".join(f'<th data-k="{k}">{_h(c)}</th>' for k, c in enumerate(cols))
+    body = []
+    for r in rows:
+        cells = "".join(f'<td class="n">{v:,}</td>' if isinstance(v, int) and not isinstance(v, bool)
+                        else f"<td>{v}</td>" for v in r)
+        body.append(f"<tr>{cells}</tr>")
+    return (f'<input class="flt" data-t="{tid}" placeholder="filter" aria-label="filter" hidden>'
+            f'<div class="tw"><table id="{tid}"><thead><tr>{head}</tr></thead>'
+            f'<tbody>{"".join(body)}</tbody></table></div>')
+
+
+def render_network_html(n: dict, *, filters: list[str], version: str, with_prompts: bool) -> str:
+    """The --network --html page. Every number on it is read from `n`, the
+    object --network --json prints, which is also embedded verbatim."""
+    t = n["totals"]
+    items = n["items"]
+    truncated = len(items) < t["items"]
+    blob = _net_html_blob(n)
+    digest = hashlib.sha256(blob.encode("ascii")).hexdigest()
+    sh = base64.b64encode(hashlib.sha256(_NET_HTML_SCRIPT.encode("ascii")).digest()).decode()
+    csp = (f"default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-{sh}'; "
+           "img-src data:; base-uri 'none'; form-action 'none'")
+    window = (f"{n['by_day'][0]['date']} to {n['by_day'][-1]['date']} UTC"
+              if n["by_day"] else "no dated downloads")
+    sessions: dict = {}
+    for i in items:
+        s = sessions.setdefault(i["session"] or "-", {"start": i["ts"] or "", "project": i["project"],
+                                                      "n": 0, "u": 0})
+        if i["ts"] and (not s["start"] or _net_utc_key(i["ts"]) < _net_utc_key(s["start"])):
+            s["start"] = i["ts"]
+        s["n"] += 1
+        s["u"] += i["approval"] == "unasked"
+    listed = " in listed items" if truncated else ""
+    pct = t["unasked"] * 100 // t["items"] if t["items"] else 0
+
+    out = ['<!doctype html><html lang="en"><head><meta charset="utf-8">'
+           '<meta name="viewport" content="width=device-width,initial-scale=1">'
+           f'<meta http-equiv="Content-Security-Policy" content="{csp}">'
+           f"<title>actualis network report</title><style>{_NET_HTML_STYLE}</style></head>"
+           "<body><main><h1>actualis network report</h1>"
+           f'<p class="meta">actualis {_h(version)} &middot; {_h(window)} &middot; filters: '
+           f'{_h(", ".join(filters)) if filters else "none"}</p>'
+           '<p class="meta"><b>unasked</b>: ran in a mode that never stops to ask. '
+           "<b>unknown</b>: the mode could have asked; the transcript does not say. "
+           "<b>asked</b>: a person approved it.</p>"]
+    try:                                   # a self-check on the numbers; never a crash
+        problems = network_reconciles(n)
+    except Exception as exc:               # noqa: BLE001
+        problems = [f"check failed: {type(exc).__name__}"]
+    if problems:
+        out.append(f'<p class="bad">Network totals do not reconcile: {_h("; ".join(problems)[:200])}. '
+                   "Do not trust these numbers.</p>")
+    out.append(_net_html_ioc(n["ioc"]))
+    if not t["items"]:
+        out.append("<p>No downloads were recorded"
+                   + (" for these filters" if filters else "") + ".</p>")
+    else:
+        tiles = [(t["items"], "downloads"), (t["unasked"], f"unasked ({pct}%)"),
+                 (t["unknown"], "unknown"), (t["asked"], "asked"), (t["failed"], "failed"),
+                 (len(n["hosts"]), "hosts"), (len(n["packages"]), "packages"),
+                 (len(sessions), "sessions" + listed), (len(n["by_project"]), "projects")]
+        out.append('<div class="tiles">' + "".join(
+            f'<div class="tile"><b>{v:,}</b><span>{_h(label)}</span></div>' for v, label in tiles)
+            + "</div>")
+        out.append("<h2>Downloads per day</h2>" + _svg_day_bars(n["by_day"], n["by_day_undated"]))
+        out.append("<h2>Approval</h2>" + _svg_approval_bar(t))
+        hosts = [(h["host"], h["unasked"], h["count"]) for h in n["hosts"][:NET_HTML_RANK_ROWS]]
+        pkgs = [(f"{p['ecosystem']} {p['name']}", p["unasked"], p["count"])
+                for p in n["packages"][:NET_HTML_RANK_ROWS]]
+        out.append('<div class="cols"><div>' + _svg_rank_bars("Top hosts (unasked / total)", hosts)
+                   + "</div><div>" + _svg_rank_bars("Top packages (unasked / total)", pkgs)
+                   + "</div></div>")
+        if len(n["by_project"]) > 1:
+            out.append(_svg_rank_bars("By project (unasked / total)", [
+                (p["project"] or "-", p["unasked"], p["items"])
+                for p in n["by_project"][:NET_HTML_RANK_ROWS]]))
+        out.append("<h2>Hosts</h2>" + _html_table("t-hosts", ["host", "downloads", "unasked",
+                                                             "first seen (UTC)", "trusted"], [
+            [_h(h["host"]), h["count"], h["unasked"], _h(_net_html_when(h["first_seen"])),
+             "yes" if h["trusted"] else "no"] for h in n["hosts"]]))
+        out.append("<h2>Packages</h2>" + _html_table("t-packages", ["ecosystem", "name", "versions",
+                                                                   "pinned", "downloads", "unasked"], [
+            [_h(p["ecosystem"]), _h(p["name"]), _h(", ".join(p["versions"])) or "-",
+             "yes" if p["pinned"] else "no", p["count"], p["unasked"]] for p in n["packages"]]))
+        out.append("<h2>Projects</h2>" + _html_table("t-projects", ["project", "downloads", "unasked"], [
+            [_h(p["project"] or "-"), p["items"], p["unasked"]] for p in n["by_project"]]))
+        out.append(f"<h2>Sessions{listed}</h2>" + _html_table(
+            "t-sessions", ["start (UTC)", "project", "session", "downloads", "unasked"], [
+                [_h(_net_html_when(s["start"])), _h(s["project"] or "-"), _h(sid[:8]), s["n"], s["u"]]
+                for sid, s in sorted(sessions.items(), key=lambda kv: (_net_utc_key(kv[1]["start"]), kv[0]),
+                                     reverse=True)]))
+        cols = ["when (UTC)", "host", "what", "approval", "mode", "agent", "project", "session",
+                "why", "trace", "ioc"] + (["prompt"] if with_prompts else [])
+        rows = []
+        for i in items:
+            row = [_h(_net_html_when(i["ts"])), _h(i["host"] or "-"), _h(_net_what(i)),
+                   _h(i["approval"]) + (" &middot; failed" if i["failed"] else ""), _h(i["mode"] or "-"), _h(i["agent"] or "-"),
+                   _h(i["project"] or "-"), _h((i["session"] or "-")[:8]), _h(i["why"] or ""),
+                   f"{_h(i['call_id'] or '-')} &middot; {_h(_net_path(i['transcript']))}",
+                   f'<span class="bad">{_h(i["ioc"])}</span>' if i["ioc"] else ""]
+            if with_prompts:
+                row.append(_h(i["prompt"] or ""))
+            rows.append(row)
+        out.append("<h2>Every download</h2>" + _html_table("t-items", cols, rows))
+        if truncated:
+            out.append(f'<p class="note">{t["items"] - len(items):,} more not listed; '
+                       "narrow with --days or --session.</p>")
+    check = ("actualis --network --json SAME-FLAGS | python3 -c 'import json,re,sys; "
+             "p=open(sys.argv[1]).read(); print(json.loads(re.search(r\"actualis-network\\\">"
+             "(.*?)</script>\", p, re.S).group(1)) == json.load(sys.stdin))' REPORT.html")
+    out.append("<h2>Data</h2>"
+               '<p class="meta">Every number above is read from the object '
+               "<code>actualis --network --json</code> prints for the same flags, embedded below. "
+               f"sha256 of the embedded text: <code>{digest}</code></p>"
+               f'<p class="meta">Check it (prints True):</p><pre>{_h(check)}</pre>'
+               '<p class="meta">The object is in this page\'s source, in '
+               '<code>&lt;script id="actualis-network"&gt;</code>.</p>'
+               f'<script type="application/json" id="actualis-network">{blob}</script>'
+               f"<script>{_NET_HTML_SCRIPT}</script></main></body></html>\n")
+    return "".join(out)
+
+
+def network_html_path(out_dir: Path) -> Path:
+    """The first actualis-network[-N].html that does not exist yet."""
+    k = 1
+    while True:
+        p = out_dir / (f"{NET_HTML_NAME}.html" if k == 1 else f"{NET_HTML_NAME}-{k}.html")
+        if not os.path.lexists(p):          # a dangling symlink is taken too
+            return p
+        k += 1
+
+
+def write_network_html(page: str, out_dir: Path) -> Path:
+    """Write the page, never over an existing file: O_EXCL makes that hold
+    even under a race, and a lost race takes the next name. 0600 because the
+    page holds commands and URLs from the user's transcripts."""
+    data = page.encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    for _ in range(100):                     # a lost race takes the next name; bounded
+        path = network_html_path(out_dir)
+        try:
+            fd = os.open(path, flags, 0o600)
+        except FileExistsError:
+            continue
+        break
+    else:
+        raise FileExistsError(f"no free {NET_HTML_NAME}-N.html name after 100 tries")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+    except BaseException:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    return path
 
 
 def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
@@ -11180,7 +11561,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--style", choices=CARD_STYLES, default="hero",
                     help="--card layout: hero (default) or terminal")
     ap.add_argument("--out", metavar="DIR",
-                    help="--card: directory to write into (default: current directory)")
+                    help="--card or --html: directory to write into (default: current directory)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--watch", action="store_true",
                     help="live monitor: alert on new secrets and risky commands")
@@ -11216,8 +11597,11 @@ def build_parser() -> argparse.ArgumentParser:
                      help="--network: only sessions whose id starts with ID")
     net.add_argument("--unasked", action="store_true",
                      help="--network: only downloads that ran without asking")
+    net.add_argument("--html", action="store_true",
+                     help="--network: write the report as one self-contained HTML page "
+                          "(actualis-network.html, never overwritten; see --out)")
     net.add_argument("--with-prompts", action="store_true",
-                     help="--json: include network.items[].prompt, the person's last message "
+                     help="--json or --html: include network.items[].prompt, the person's last message "
                           "before each download (redacted, 160 characters). Null otherwise")
     ap.add_argument("--suppress", metavar="ID",
                     help="mark a finding as a false positive on this machine. "
@@ -11282,8 +11666,21 @@ def main(argv: list[str] | None = None) -> int:
             parse_trust([args.host], "--host")
         except ValueError as exc:
             ap.error(str(exc))
-    if args.with_prompts and not args.json:
-        ap.error("--with-prompts applies only to --json; the text view already shows prompts.")
+    if args.html and not args.network:
+        ap.error("--html requires --network: it writes the network report.")
+    if args.html and args.json:
+        ap.error("--html writes a file; it cannot also emit --json.")
+    if args.html:
+        for flag, on in (("--why", args.why), ("--suppress", args.suppress),
+                         ("--suppressions", args.suppressions),
+                         ("--explain", args.explain is not None), ("--agents", args.agents),
+                         ("--completions", args.completions), ("--service", args.service),
+                         ("--self-check", args.self_check)):
+            if on:
+                ap.error(f"--html writes a file; it cannot be combined with {flag}.")
+    if args.with_prompts and not (args.json or args.html):
+        ap.error("--with-prompts applies only to --json or --html; "
+                 "the text view already shows prompts.")
     if args.ioc and args.card:
         ap.error("--ioc does not apply to --card; the card never shows downloads.")
     if args.ioc and (args.watch or args.mcp):
@@ -11307,6 +11704,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"actualis: {card_dir} is not a directory.\n"
                   "  --out takes the directory the card is written into.", file=sys.stderr)
             return EXIT_CANNOT_RUN
+    if args.html:
+        html_dir = Path(args.out).expanduser() if args.out else Path.cwd()
+        if not html_dir.is_dir():
+            print(f"actualis: {html_dir} is not a directory.\n"
+                  "  --out takes the directory the report is written into.", file=sys.stderr)
+            return EXIT_CANNOT_RUN
     if args.service:
         # Unit to stdout, instructions to stderr: `> file` must yield a file
         # that works, and still tell the user what to do with it.
@@ -11329,8 +11732,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.diff and args.json:
         ap.error("--diff renders a comparison; it cannot also emit --json. "
                  "Save this run with --json, then diff the two files.")
-    if not args.card and (args.style != "hero" or args.out):
-        ap.error("--style and --out apply only to --card.")
+    if not args.card and args.style != "hero":
+        ap.error("--style applies only to --card.")
+    if args.out and not (args.card or args.html):
+        ap.error("--out applies only to --card or --html.")
 
     since = None
     if args.days:
@@ -11528,7 +11933,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {svg}\n  {png}\n\n  {model['share']}")
         return EXIT_OK
 
-    if args.json:
+    if args.html:
+        page = render_network_html(network_json(fleet, raw=args.no_redact),
+                                   filters=network_filter_names(args), version=__version__,
+                                   with_prompts=args.with_prompts)
+        try:
+            path = write_network_html(page, html_dir)
+        except OSError as exc:
+            print(f"actualis: cannot write the report to {html_dir}: {exc.strerror or exc}",
+                  file=sys.stderr)
+            return EXIT_CANNOT_RUN
+        print(path)
+        if args.no_redact:
+            print("actualis: --no-redact is on: this report may contain live secrets.",
+                  file=sys.stderr)
+    elif args.json:
         json.dump(network_json(fleet, raw=args.no_redact) if args.network
                   else to_json(fleet, raw=args.no_redact), sys.stdout, indent=2)
         print()

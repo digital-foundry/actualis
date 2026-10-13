@@ -206,7 +206,7 @@ actualis --agent codex    # one agent only (claude | codex | copilot | all)
 | `--share` | postable summary with nothing identifying in it |
 | `--card [MODE]` | write a shareable 1200×630 SVG and PNG: `supervision` (default), `cost` or `volume`. Nothing identifying is on it, and it never overwrites |
 | `--style STYLE` | `--card` layout: `hero` (default) or `terminal` |
-| `--out DIR` | `--card`: the directory to write into (default: the current directory) |
+| `--out DIR` | `--card` or `--html`: the directory to write into (default: the current directory) |
 | `--json` | machine-readable ([schema](docs/json.md)) |
 | `--diff OLD.json` | compare against a saved `--json` report: what appeared, what went away, what got worse |
 | `--watch` | live monitor; alert on new secrets and risky commands |
@@ -224,7 +224,8 @@ actualis --agent codex    # one agent only (claude | codex | copilot | all)
 | `--package NAME` | with `--network`: only installs of exactly this package (npm case-sensitive, pypi by PEP 503) |
 | `--session ID` | with `--network`: only sessions whose id starts with ID |
 | `--unasked` | with `--network`: only downloads that ran without asking. The four filters combine with each other, `--project` and `--days`; totals are of the filtered set |
-| `--with-prompts` | with `--json`: fill `network.items[].prompt` (redacted, 160 characters); otherwise it is `null` |
+| `--html` | with `--network`: write the report as one self-contained page, `actualis-network.html` in the current directory or `--out DIR` (never overwritten; `-2`, `-3` and so on), readable by you only. Inline charts, sortable tables, the `--network --json` object embedded with its sha256. It loads nothing from the network. Not with `--json` |
+| `--with-prompts` | with `--json` or `--html`: fill `network.items[].prompt` (redacted, 160 characters); otherwise it is `null` |
 | `--ioc FILE` | match every download the transcript shows against a known-bad list: the actualis-ioc line format or OSV JSON/JSONL (repeatable). A match is a high finding, an undecidable one medium. Read only when named; see [docs/ioc.md](docs/ioc.md) |
 | `--explain [TOPIC]` | how a number is computed, what it assumes, how to check it |
 | `--replay ID` | incident report for one credential: what ran while it was live, graded by proximity |
