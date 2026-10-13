@@ -1343,7 +1343,8 @@ class TestVersion(unittest.TestCase):
     def test_version_is_0_3_0_everywhere(self):
         self.assertEqual(af.__version__, "0.3.0")
         self.assertIn('version = "0.3.0"', (ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-        self.assertIn("## 0.3.0 (unreleased)", (ROOT / "CHANGELOG.md").read_text(encoding="utf-8"))
+        self.assertRegex((ROOT / "CHANGELOG.md").read_text(encoding="utf-8"),
+                         r"(?m)^## 0\.3\.0 \((unreleased|\d{4}-\d\d-\d\d)\)$")
 
 
 class TestChangelog(unittest.TestCase):
@@ -1352,7 +1353,7 @@ class TestChangelog(unittest.TestCase):
 
     def test_unreleased_lists_what_changes_a_gate(self):
         text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        unreleased = text[text.index("## 0.3.0 (unreleased)"):text.index("## 0.2.2")]
+        unreleased = text[text.index("## 0.3.0 ("):text.index("## 0.2.2")]
         for needle in ("bash <(curl", "source <(", 'sh -c "$(curl', "cu''rl", "|& sh", "later stage",
                        "--fail-on high", "exit 3", "location", "covers more than one value",
                        "distinct_values", "exposed_secrets", "unreadable_commands", "ANSI-C",
