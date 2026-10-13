@@ -8252,21 +8252,32 @@ def _net_bar(part: int, whole: int, scale: int, width: int) -> str:
     return ("\u2588" * p + "\u2591" * (w - p)).ljust(width)
 
 
+def _net_shares(values: list[int], width: int) -> list[int]:
+    """`width` cells shared among `values` by largest remainder, so they add
+    up to `width`; a value above zero always gets a cell, taken from the
+    largest share. The terminal approval bar and the HTML charts both use it,
+    so the two cannot disagree on proportions."""
+    total = sum(values)
+    if not total or width <= 0:
+        return [0] * len(values)
+    exact = [v * width / total for v in values]
+    cells = [int(e) for e in exact]
+    for k in sorted(range(len(values)), key=lambda k: -(exact[k] - cells[k]))[:width - sum(cells)]:
+        cells[k] += 1
+    for k in range(len(values)):
+        if values[k] and not cells[k]:
+            cells[k] = 1
+            cells[max(range(len(values)), key=lambda j: cells[j])] -= 1
+    return cells
+
+
 def _net_approval_bar(t: dict, width: int, c: "C | None" = None) -> str:
     """unasked (solid), unknown (medium), asked (light), in that order, the
-    cells shared out by largest remainder so they always add up to `width`."""
+    cells shared out by _net_shares so they always add up to `width`."""
     parts = [(t["unasked"], "\u2588"), (t["unknown"], "\u2592"), (t["asked"], "\u2591")]
-    total = sum(v for v, _ in parts)
-    if not total:
+    if not sum(v for v, _ in parts):
         return " " * width
-    exact = [v * width / total for v, _ in parts]
-    cells = [int(e) for e in exact]
-    for k in sorted(range(3), key=lambda k: -(exact[k] - cells[k]))[:width - sum(cells)]:
-        cells[k] += 1
-    for k in range(3):                        # a share above zero always gets a cell
-        if parts[k][0] and not cells[k]:
-            cells[k] = 1
-            cells[max(range(3), key=lambda j: cells[j])] -= 1
+    cells = _net_shares([v for v, _ in parts], width)
     colours = (c.yellow, c.dim, "") if c else ("", "", "")
     off = c.off if c else ""
     return "".join(f"{col}{g * n}{off}" if n and col else g * n
