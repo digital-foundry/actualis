@@ -54,8 +54,9 @@ jobs:
           # Standard library only. 'typing' is stdlib and carries no runtime
           # cost worth avoiding; it is here because Rate is a NamedTuple.
           # struct and zlib write the --card PNG without an imaging library.
-          allowed = {'__future__','argparse','collections','contextlib','datetime',
-                     'hashlib','importlib','io','json','os','pathlib','re',
+          # base64 and html build the --network --html page (CSP hash, escaping).
+          allowed = {'__future__','argparse','base64','collections','contextlib','datetime',
+                     'hashlib','html','importlib','io','json','os','pathlib','re',
                      'shutil','struct','subprocess','sys','time','typing',
                      'unittest','zlib'}
           tree = ast.parse(open('actualis.py').read())
