@@ -8637,6 +8637,7 @@ _NET_HTML_STYLE = (
     "font-variant-numeric:tabular-nums}td{max-width:340px;overflow-wrap:anywhere}"
     ".flt{margin:6px 0;padding:4px 8px;border:1px solid var(--line);border-radius:4px;"
     "background:var(--card);color:var(--fg)}code,pre{font:12px ui-monospace,Menlo,monospace}"
+    "code{word-break:break-all}"
     "pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto;"
     "background:var(--card);padding:8px;border:1px solid var(--line)}")
 
