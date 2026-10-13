@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 (unreleased)
+## 0.3.0 (2026-10-13)
 
 ### Upgrading from 0.2.2: what can change a gate
 
