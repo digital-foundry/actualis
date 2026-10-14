@@ -20,7 +20,7 @@ git config --global --add safe.directory /src
 # The container has no network, so trufflehog cannot verify anything against a
 # provider: a verified-only scan would always print 0 and read as clean. Report the
 # unverified candidates instead, outside the same fixture allowlist gitleaks
-# uses (trufflehog-exclude.txt mirrors gitleaks.toml's paths).
+# uses (trufflehog-exclude.txt mirrors the root .gitleaks.toml's paths).
 rc=0
 trufflehog git file:///src --no-update --no-verification --json \
   --exclude-paths /src/tools/security/trufflehog-exclude.txt \
@@ -37,7 +37,7 @@ else
   tail -n 20 "$OUT/trufflehog.err" || true
 fi
 rc=0
-gitleaks git /src --config /src/tools/security/gitleaks.toml --no-banner --redact --report-path "$OUT/gitleaks.json" \
+gitleaks git /src --config /src/.gitleaks.toml --no-banner --redact --report-path "$OUT/gitleaks.json" \
   > /dev/null 2> "$OUT/gitleaks.err" || rc=$?
 case "$rc" in
   0) echo "gitleaks: no leaks" ;;

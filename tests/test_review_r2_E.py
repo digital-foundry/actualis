@@ -163,7 +163,7 @@ class TestTrufflehogOffline(unittest.TestCase):
         self.assertIn("--exclude-paths /src/tools/security/trufflehog-exclude.txt", sh)
         self.assertNotIn("verified secrets:", sh)
         excl = [l for l in _text("tools/security/trufflehog-exclude.txt").splitlines() if l]
-        toml = _text("tools/security/gitleaks.toml")
+        toml = _text(".gitleaks.toml")
         allow = re.findall(r"'''(.*?)'''", toml)
         self.assertEqual(sorted(excl), sorted(allow))
         for path, excluded in (("tests/test_x.py", True), ("tools/make-demo-fleet.py", True),

@@ -193,7 +193,7 @@ console summary:
   never a clean result; its stderr is printed below the line.
 - gitleaks and trufflehog skip the files whose job is to hold invented
   credential shapes: `tests/`, `tools/make-demo-fleet.py` and
-  `docs/superpowers/plans/` (`tools/security/gitleaks.toml`,
+  `docs/superpowers/plans/` (`.gitleaks.toml`,
   `tools/security/trufflehog-exclude.txt`). They also skip `agentfleet.py`,
   actualis.py's name before the rename, so every revision of it in the history
   goes unscanned. The reason: it holds the redaction regexes for database URLs

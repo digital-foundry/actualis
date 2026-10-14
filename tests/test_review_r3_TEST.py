@@ -227,7 +227,7 @@ class TestScannerExclusionsAreDocumented(unittest.TestCase):
     """R3E8: whatever the secret scanners skip, SECURITY.md and CONTRIBUTING.md say so."""
 
     def test_agentfleet_history_is_documented(self):
-        gitleaks = (ROOT / "tools" / "security" / "gitleaks.toml").read_text(encoding="utf-8")
+        gitleaks = (ROOT / ".gitleaks.toml").read_text(encoding="utf-8")
         truffle = (ROOT / "tools" / "security" / "trufflehog-exclude.txt").read_text(encoding="utf-8")
         if "agentfleet" not in gitleaks + truffle:
             self.skipTest("agentfleet.py is no longer excluded")
