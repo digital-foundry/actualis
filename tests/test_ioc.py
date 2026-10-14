@@ -18,7 +18,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _timing import budget  # noqa: E402
+import _fixtures  # noqa: E402,F401  (first: a temp HOME, agent homes and cwd for the whole run)
+from _timing import budget, clock  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 if "actualis" in sys.modules:
@@ -665,14 +666,14 @@ unit = 1 if sys.platform == "darwin" else 1024
 def rss():
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit if resource else None
 base = rss()
-t = time.perf_counter()
+t = time.process_time()
 err = None
 try:
     ioc = af.load_ioc(sys.argv[3:])
     info = {"entries": ioc.total, "sources": ioc.sources}
 except ValueError as exc:
     err, info = str(exc), None
-dt = time.perf_counter() - t
+dt = time.process_time() - t
 peak = rss()
 print(json.dumps({"dt": dt, "mb": (peak - base) / 1e6 if resource else None, "err": err, "info": info}))
 """
@@ -782,9 +783,9 @@ class TestLoaderCaps(IocFiles, unittest.TestCase):
         for k in range(2_000):
             f.add_tool("p", "Bash", {"command": "npm i x@2.0.0"}, TS, "auto")
         ioc = self.load(lines)
-        t = time.perf_counter()
+        t = clock()
         af.apply_ioc(f, ioc)
-        self.assertLess(time.perf_counter() - t, budget(2.0))
+        self.assertLess(clock() - t, budget(2.0))
         self.assertEqual(f.ioc_totals["clean_name_matches"], 2_000)
 
 
@@ -921,9 +922,9 @@ class TestRegexTiming(unittest.TestCase):
             for b in self.bodies():
                 data = b.encode() if isinstance(p.pattern, bytes) else b
                 for fn in (p.fullmatch, p.search, p.match):
-                    t = time.perf_counter()
+                    t = clock()
                     fn(data)
-                    self.assertLess(time.perf_counter() - t, budget(0.1), (name, fn.__name__, b[:16]))
+                    self.assertLess(clock() - t, budget(0.1), (name, fn.__name__, b[:16]))
 
     def test_every_scanner(self):
         scanners = [af._ioc_semver_key, af._ioc_pep440_key, lambda v: af._ioc_url_name(
@@ -932,20 +933,20 @@ class TestRegexTiming(unittest.TestCase):
                     lambda v: af._ioc_valid_name("go", v)]
         for k, fn in enumerate(scanners):
             for b in self.bodies():
-                t = time.perf_counter()
+                t = clock()
                 try:
                     fn(b)
                 except af._IocError:
                     pass
-                self.assertLess(time.perf_counter() - t, budget(0.1), (k, b[:16]))
+                self.assertLess(clock() - t, budget(0.1), (k, b[:16]))
         for spec in self.bodies():
             for eco in ("npm", "pypi", "oci"):
-                t = time.perf_counter()
+                t = clock()
                 try:
                     af._ioc_parse_spec(eco, spec)
                 except af._IocError:
                     pass
-                self.assertLess(time.perf_counter() - t, budget(0.1), (eco, spec[:16]))
+                self.assertLess(clock() - t, budget(0.1), (eco, spec[:16]))
 
 
 class TestFailClosed(FleetCase, unittest.TestCase):
@@ -1260,8 +1261,9 @@ class TestCli(IocFiles, unittest.TestCase):
             self.assertEqual(code, 2, extra)
             self.assertIn(needle, err)
         broken = self.write("npm:a@^1\n", "broken.txt")
-        self.assertEqual(self.main("--explain", "cache", "--ioc", broken)[0], 0)
-        self.assertEqual(self.main("--suppressions", "--ioc", broken)[0], 0)
+        # Modes that never read the list refuse it (review r1 F8), whatever it holds.
+        self.assertEqual(self.main("--explain", "cache", "--ioc", broken)[0], 2)
+        self.assertEqual(self.main("--suppressions", "--ioc", broken)[0], 2)
 
     def test_cwd_file_is_ignored(self):                                 # T-CLI-3
         (self.cwd / ".actualis-ioc").write_text("npm:evil\nhost:evil.io\n")
@@ -1366,7 +1368,7 @@ class TestChangelog(unittest.TestCase):
 
 class TestPerformance(FleetCase, unittest.TestCase):                    # T-PERF-1
     """Section 11 budgets: 2 s to load 100k entries and 1 s to match 10k items
-    on the dev Mac; the loose CI ceilings are 10 s and 5 s."""
+    on the dev Mac; the loose CI ceilings are budget(): 24 s and 12 s."""
     CI = bool(os.environ.get("CI"))
 
     def test_load_100k_lines_and_osv(self):
@@ -1377,9 +1379,9 @@ class TestPerformance(FleetCase, unittest.TestCase):                    # T-PERF
               '{"fixed":"1.2.%d"}]}]}],"summary":"' + "x" * 900 + '"}\n'
         osv_path = self.write("".join(rec % (i, i, i) for i in range(100_000)), "mal.jsonl")
         for p in (path, osv_path):
-            t = time.perf_counter()
+            t = clock()
             ioc = af.load_ioc([p])
-            dt = time.perf_counter() - t
+            dt = clock() - t
             self.assertEqual(ioc.total, 100_000)
             self.assertLess(dt, budget(2.0), (p, dt))
 
@@ -1391,19 +1393,19 @@ class TestPerformance(FleetCase, unittest.TestCase):                    # T-PERF
         for i in range(10_000):
             f.add_tool("p", "Bash", {"command": f"npm i pkg-{i}@1.0.{i % 5} && curl https://a.h{i}.evil.example/x"},
                        TS, "auto")
-        t = time.perf_counter()
+        t = clock()
         af.apply_ioc(f, ioc)
-        dt = time.perf_counter() - t
+        dt = clock() - t
         self.assertEqual(sum(1 for r in f.ioc_rows if r["reason"] == "host"), 10_000)
         self.assertLess(dt, budget(1.0), dt)
 
     def test_pathological_lines(self):
         for ch in "@.":
             path = self.write("npm:" + ch * ((1 << 20) - 8) + "\n", "p.txt")
-            t = time.perf_counter()
+            t = clock()
             with self.assertRaises(ValueError):
                 af.load_ioc([path])
-            self.assertLess(time.perf_counter() - t, budget(0.05))
+            self.assertLess(clock() - t, budget(0.05))
 
 
 class TestErrorMessagesAreClean(IocFiles, unittest.TestCase):

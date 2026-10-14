@@ -143,3 +143,67 @@ python3 -m unittest discover -s tests -v   # or: make test
 ```
 
 No test runner, no config, no fixtures directory.
+
+The suite is hermetic. Every test module starts with `import _fixtures`, which
+points `HOME`, every agent's home, `XDG_CONFIG_HOME` and the working directory
+at temp directories for the whole run. An audit hook then refuses, and fails the
+run for, any read under your real home outside the repo and the Python install,
+so your own transcripts and suppressions can never change a result. A new test
+module needs that import (a test checks). Timing checks go through
+`tests/_timing.py`: `clock()` for the measurement (CPU time, so a busy machine
+does not count), `assert_linear` for a growth check, and `budget()` for any
+ceiling within 20x of the measured time.
+
+## Security scan (`make security`)
+
+```sh
+make security                       # or: make security FUZZ_ITERATIONS=1000
+make security-remote                # the same scan on the build server (SECURITY_HOST=mac-mini)
+```
+
+`make security-remote` runs it on the build server over SSH instead of here.
+It runs outside GitHub Actions on purpose: this repo is public, and the build
+server's runners do not take public repositories, because a fork's pull request
+could otherwise run code on them. It sends a git bundle of `HEAD` (committed
+work only), runs the same container under the build user's home directory (the
+only place its Docker shares with containers), and copies `security-out/` back.
+
+It needs Docker. It builds a Kali image from `tools/security/Dockerfile` and runs
+`tools/security/run.sh` in it:
+
+- **bandit**: static analysis of `actualis.py` and `tools/`. B404/B603/B607
+  (subprocess use) are skipped: actualis only runs fixed argv lists.
+- **trufflehog** and **gitleaks**: secrets anywhere in the git history.
+- **the transcript fuzzer** (`tools/security/fuzz_transcripts.py`): mutates a
+  synthetic Claude Code, Codex and Copilot fleet and runs actualis over it in
+  several modes, looking for tracebacks, crashes, hangs and invalid `--json`.
+
+The container is isolated: no network (`--network none`), the checkout mounted
+read-only, a read-only root filesystem, a throwaway `HOME` under a tmpfs, and
+your uid. It cannot see this machine's transcripts.
+
+Reports land in `security-out/`: `bandit.txt`, `trufflehog.json` and
+`gitleaks.json` (the two secret scanners' stderr beside them as `.err`), and
+`fuzz/`, with one `case-NNNN/` directory per failing case: the mutated
+transcripts plus `FAILURE.txt`, the command that failed and its error. The
+fuzzer prints its `--seed`; rerun with it to repeat a run. How to read the
+console summary:
+
+- A line saying a scanner **FAILED** means it did not run properly. That is
+  never a clean result; its stderr is printed below the line.
+- gitleaks and trufflehog skip the files whose job is to hold invented
+  credential shapes: `tests/`, `tools/make-demo-fleet.py` and
+  `docs/superpowers/plans/` (`.gitleaks.toml`,
+  `tools/security/trufflehog-exclude.txt`). They also skip `agentfleet.py`,
+  actualis.py's name before the rename, so every revision of it in the history
+  goes unscanned. The reason: it holds the redaction regexes for database URLs
+  with a password (a `postgres://` URL with a user and password), which trufflehog's Postgres
+  detector reads as credentials. The cost: a real secret committed to
+  `agentfleet.py` before the rename would not be found. `actualis.py` is still
+  scanned. Anything they report is outside those paths and worth a look.
+- With no network, trufflehog cannot check a candidate against its provider,
+  so it reports **unverified** candidates. A count above zero is a list to
+  review, not proof of a live secret; "no candidates" means it found none.
+
+The fuzzer also runs natively, with the same isolation of `HOME`:
+`python3 tools/security/fuzz_transcripts.py --iterations 300 --out /tmp/fuzz`.

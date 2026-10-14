@@ -99,8 +99,13 @@ VENDOR_DOC = "vendor-doc"    # provider docs, changelog or blog, not the price l
 AGGREGATOR = "aggregator"    # a third party that tracks prices
 FAMILY = "family"            # inferred from a sibling model in the same family
 DEFAULT = "default"          # the catch-all ceiling, used when nothing else fits
+# No price at all: a model whose vendor publishes none (gemini-3.5-flash, every
+# Qwen model). Its tokens are counted and its cost is not: zero is added, the
+# model is listed as unpriced, and nothing is guessed. Last, below DEFAULT,
+# because a ceiling is at least a bound and this is not even that.
+UNPRICED = "unpriced"
 
-RATE_TIERS = (VENDOR, VENDOR_DOC, AGGREGATOR, FAMILY, DEFAULT)
+RATE_TIERS = (VENDOR, VENDOR_DOC, AGGREGATOR, FAMILY, DEFAULT, UNPRICED)
 
 # How far a rate can drift out of date before the report stops presenting it
 # without comment. Model prices move on the order of months, so a table older
@@ -111,6 +116,7 @@ PRICING_STALE_DAYS = 90
 RATE_SOURCES = {
     "anthropic": "https://platform.claude.com/docs/en/about-claude/pricing",
     "openai": "https://developers.openai.com/api/docs/pricing",
+    "google": "https://ai.google.dev/gemini-api/docs/pricing",
     AGGREGATOR: "https://pricepertoken.com",
 }
 
@@ -129,9 +135,12 @@ class Rate(NamedTuple):
     # Cache reads cost this multiple of the input rate. 0.10 unless the model's
     # row says otherwise, so a cheaper read is a property of the model.
     cache_read: float = CACHE_READ_MULT
-    # Haiku 5.5 reprices a whole message once its prompt exceeds
-    # LONG_PROMPT_TOKENS. Applied by Fleet.add_usage only.
+    # A row with long_prompt reprices a whole message once its prompt exceeds
+    # long_prompt_tokens. Applied by Fleet.add_usage and Fleet.add_model_usage.
     long_prompt: "Rate | None" = None
+    # The prompt size above which long_prompt applies, per row, on every cost
+    # path. Haiku 5.5 switches at 100,000; Gemini Pro models at 200,000.
+    long_prompt_tokens: int = 100_000
 
     @property
     def confident(self) -> bool:
@@ -160,11 +169,18 @@ PRICING: dict[str, Rate] = {
     "claude-opus-4-1":    Rate(15.0, 75.0, "anthropic", VENDOR,
                                "retired, still billable on Bedrock and GCP",
                                retired=True),
+    # Claude Opus 4 and Sonnet 4 launched at these prices (2025-05-22). Both are
+    # retired; the rows exist so their dated ids price as themselves rather than
+    # as the newest sibling.
+    "claude-opus-4":      Rate(15.0, 75.0, "anthropic", VENDOR, "retired", retired=True),
     "claude-sonnet-5":    Rate(2.0, 10.0, "anthropic", VENDOR),
     "claude-sonnet-4-6":  Rate(3.0, 15.0, "anthropic", VENDOR),
     "claude-sonnet-4-5":  Rate(3.0, 15.0, "anthropic", VENDOR),
+    "claude-sonnet-4":    Rate(3.0, 15.0, "anthropic", VENDOR, "retired", retired=True),
     "claude-haiku-4-5":   Rate(1.0, 5.0, "anthropic", VENDOR),
-    "claude-haiku-3-5":   Rate(0.80, 4.0, "anthropic", VENDOR),
+    # Keyed as the API names it (claude-3-5-haiku-20241022); the 3.x ids put
+    # the version before the family word.
+    "claude-3-5-haiku":   Rate(0.80, 4.0, "anthropic", VENDOR),
 
     "gpt-5.2":            Rate(1.75, 14.0, "openai", VENDOR),
     "gpt-5.3-codex":      Rate(1.75, 14.0, "openai", VENDOR),
@@ -172,7 +188,54 @@ PRICING: dict[str, Rate] = {
     # for gpt-5.2 and gpt-5.3-codex, which is corroboration and not confirmation.
     "gpt-5.2-codex":      Rate(1.75, 14.0, "openai", AGGREGATOR,
                                "pricepertoken.com, 2026-08-22; no vendor line exists"),
+
+    # Google Gemini API, Standard paid tier, USD per 1M tokens.
+    # Source: https://ai.google.dev/gemini-api/docs/pricing ("Last updated
+    # 2026-10-13 UTC", fetched 2026-10-13). Output is "including thinking
+    # tokens", so thoughts are billed at the output rate. Cached input is a
+    # tenth of input on every row but gemini-4-argon (a twentieth). Pro models
+    # reprice the whole message when its prompt exceeds 200,000 tokens.
+    # Context-cache storage is billed per hour and is not in any transcript.
+    # Rows that change price on a date are in PRICE_CHANGES below.
+    # Not priced on that page, so absent here and reported unpriced:
+    # gemini-3-pro-preview, gemini-3.5-flash, gemini-3-flash, gemini-3.7-flash.
+    "gemini-2.5-pro":     Rate(1.25, 10.0, "google", VENDOR, cache_read=0.10,
+                               long_prompt=Rate(2.50, 15.0, "google", VENDOR, cache_read=0.10),
+                               long_prompt_tokens=200_000),
+    "gemini-3.1-pro-preview": Rate(2.0, 12.0, "google", VENDOR, cache_read=0.10,
+                                   long_prompt=Rate(4.0, 18.0, "google", VENDOR, cache_read=0.10),
+                                   long_prompt_tokens=200_000),
+    "gemini-3.1-pro-preview-customtools": Rate(
+        2.0, 12.0, "google", VENDOR, cache_read=0.10,
+        long_prompt=Rate(4.0, 18.0, "google", VENDOR, cache_read=0.10),
+        long_prompt_tokens=200_000),
+    # Text, image and video input; audio input is $1.00 and not modelled.
+    "gemini-2.5-flash":   Rate(0.30, 2.50, "google", VENDOR, cache_read=0.10),
+    "gemini-2.5-flash-lite": Rate(0.10, 0.40, "google", VENDOR, cache_read=0.10),
+    "gemini-3-flash-preview": Rate(0.50, 3.0, "google", VENDOR, cache_read=0.10),
+    "gemini-3.1-flash-lite": Rate(0.25, 1.50, "google", VENDOR, cache_read=0.10),
+    "gemini-3.5-flash-lite": Rate(0.30, 2.50, "google", VENDOR, cache_read=0.10),
+    "gemini-3.6-flash":   Rate(0.75, 3.75, "google", VENDOR, cache_read=0.10),
+    "gemini-3.8-flash":   Rate(0.75, 3.75, "google", VENDOR, cache_read=0.10),
+    "gemini-4-argon":     Rate(2.0, 10.0, "google", VENDOR, cache_read=0.05),
 }
+
+# Published price changes, applied by the date of the message they price
+# (UTC): model -> ((first day of the new price, new rate), ...), oldest first.
+# A record with no timestamp is priced at the PRICING row, the price in force
+# when the table was last checked. Same source as the Gemini rows above.
+PRICE_CHANGES: dict[str, tuple] = {
+    # "$0.75 through 2026-12-31, then $1.50" (input; output and cache alike).
+    "gemini-3.6-flash": ((date(2027, 1, 1), Rate(1.50, 7.50, "google", VENDOR, cache_read=0.10)),),
+    "gemini-3.8-flash": ((date(2027, 1, 1), Rate(1.50, 7.50, "google", VENDOR, cache_read=0.10)),),
+    # "$2.00 through 2026-11-30, then $4.00".
+    "gemini-4-argon":   ((date(2026, 12, 1), Rate(4.0, 20.0, "google", VENDOR, cache_read=0.05)),),
+}
+
+# Model families whose vendor publishes no price for an id missing from the
+# table: Google's unpriced Gemini ids, Gemma, and Qwen. Never priced by family
+# or ceiling (a Claude ceiling on a Flash model would overstate it 10-30x).
+_NO_PRICE_FAMILIES = re.compile(r"^(?:gemini|gemma|qwen|qwq)", re.I)
 
 # Model ids are versioned, so a new release lands in a family whose prices are
 # already known. Matching the family is a far better guess than the global
@@ -231,16 +294,21 @@ def _family_rate(model: str) -> Rate | None:
         if not m:
             continue
         family = m.group(0)
+        # A dated id (claude-haiku-4-5-20251001) is that model, not a new one.
+        # Retired rows count here: a dated id of a retired model is that model,
+        # and pricing it as the newest sibling understates history 3-5x.
+        dated = [k for k in PRICING
+                 if k.startswith(family) and re.fullmatch(re.escape(k) + r"-\d{8}", model)]
+        if dated:
+            # That model's own row, with that row's own source: the id names
+            # it exactly, so nothing about the price is inferred.
+            name = max(dated, key=len)
+            best = PRICING[name]
+            return best._replace(note=f"dated id; priced as {name}")
         siblings = {k: r for k, r in PRICING.items()
                     if k.startswith(family) and not r.retired}
         if not siblings:
             continue
-        # A dated id (claude-haiku-4-5-20251001) is that model, not a new one.
-        dated = [k for k in siblings if re.fullmatch(re.escape(k) + r"-\d{8}", model)]
-        if dated:
-            name = max(dated, key=len)
-            best = siblings[name]
-            return best._replace(tier=FAMILY, note=f"dated id; priced as {name}")
         # Newest generation in the family, not the dearest sibling: the highest
         # version number wins, and on a tie the more expensive one.
         def newest(kv: tuple[str, Rate]) -> tuple:
@@ -251,6 +319,44 @@ def _family_rate(model: str) -> Rate | None:
                              note=f"not in the table; priced as {name}, the newest "
                                   f"known {family} model")
     return None
+
+
+# A date (`-20250514`, Vertex's `@20250514`) or Anthropic's `-0` alias suffix
+# names a model already in the table, not a new one.
+_MODEL_ID_SUFFIX = re.compile(r"(?:-\d{8}|@\d{8}|-0)$")
+
+
+def _base_model_id(model: str) -> str:
+    """The table key a dated or `-0` id stands for: claude-opus-4-0 is
+    claude-opus-4, claude-sonnet-4@20250514 is claude-sonnet-4."""
+    for _ in range(2):                       # claude-opus-4-0-20250514
+        model = _MODEL_ID_SUFFIX.sub("", model)
+    return model
+
+
+def unpriced_rate(model: str) -> Rate:
+    """A model with no published price: zero, tier UNPRICED. Its tokens still
+    count; its cost is unknown and is never filled in with a guess."""
+    m = (model or "").lower()
+    provider = ("google" if m.startswith(("gemini", "gemma"))
+                else "alibaba" if m.startswith(("qwen", "qwq")) else "unknown")
+    return Rate(0.0, 0.0, provider, UNPRICED,
+                "no published rate for this model; tokens shown, cost not counted")
+
+
+def rate_at(model: str, when: datetime | None) -> Rate:
+    """rate_for, with PRICE_CHANGES applied for the UTC date of `when`."""
+    r = rate_for(model)
+    changes = PRICE_CHANGES.get(model) or PRICE_CHANGES.get(_base_model_id(model))
+    if changes and when is not None:
+        try:
+            day = when.astimezone(timezone.utc).date() if when.tzinfo else when.date()
+        except (OverflowError, ValueError):
+            return r
+        for start, new in changes:
+            if day >= start:
+                r = new
+    return r
 
 
 def rate_for(model: str) -> Rate:
@@ -264,6 +370,14 @@ def rate_for(model: str) -> Rate:
     hit = PRICING.get(model)
     if hit:
         return hit
+    base = _base_model_id(model)
+    if base != model and base in PRICING:
+        # The id names that exact model, so it keeps the row's own tier: a
+        # dated Sonnet is priced from Anthropic's list, not inferred.
+        kind = "dated id" if re.search(r"[-@]\d{8}$", model) else "alias id"
+        return PRICING[base]._replace(note=f"{kind}; priced as {base}")
+    if _NO_PRICE_FAMILIES.match(model):
+        return unpriced_rate(model)
     fam = _family_rate(model)
     if fam:
         return fam
@@ -278,11 +392,10 @@ def rate_for(model: str) -> Rate:
 def rates_for(model: str, when: datetime | None) -> tuple[float, float, str, bool, str]:
     """Back-compatible shape: (input, output, provider, is_known, tier).
 
-    `when` is retained for rates that vary by date. None are date-dependent
-    today; the parameter stays so a future scheduled change does not require
-    every caller to be touched again.
+    `when` prices a model by the date of the message: PRICE_CHANGES holds
+    the rates that change on a date.
     """
-    r = rate_for(model)
+    r = rate_at(model, when)
     # Known means the price has a source (price list, vendor docs, aggregator).
     # Only family inference and the default ceiling are estimates.
     return (r.input, r.output, r.provider, r.tier in (VENDOR, VENDOR_DOC, AGGREGATOR), r.tier)
@@ -334,15 +447,32 @@ Rule = tuple[str, str, str]  # (severity, category, regex)
 
 BASH_RULES: list[Rule] = [
     # --- destructive filesystem ---
-    ("high", "destructive",      r"\brm\s+(-[a-zA-Z]*[rR][a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*[rR])\b"),
+    # Combined (-rf, -fr) or split (-r -f, --recursive --force) flags, after up
+    # to 8 other options. Every repeat is bounded, so the scan stays linear.
+    # A cluster may hold other letters too (-rfv, -frd, -r -fv); each lookahead
+    # is bounded, so a long run of letters is scanned a bounded number of times.
+    ("high", "destructive",      r"\brm\s+(?:-\S{1,64}\s+){0,8}?"
+                                 r"(-(?=[a-z]{0,63}r)(?=[a-z]{0,63}f)[a-z]{2,64}"
+                                 r"|(?:-(?=[a-z]{0,63}r)[a-z]{1,64}|--recursive)\s+(?:-\S{1,64}\s+){0,8}?"
+                                 r"(?:-(?=[a-z]{0,63}f)[a-z]{1,64}|--force)"
+                                 r"|(?:-(?=[a-z]{0,63}f)[a-z]{1,64}|--force)\s+(?:-\S{1,64}\s+){0,8}?"
+                                 r"(?:-(?=[a-z]{0,63}r)[a-z]{1,64}|--recursive))\b"),
     ("high", "destructive",      r"\b(mkfs|fdisk|diskutil\s+erase)\b"),
-    ("high", "destructive",      r"\bdd\s+.*\bof=/dev/"),
+    # `dd ... of=/dev/`: anchored at the line start, the prefix runs to the
+    # FIRST `dd`, so a line of many `dd` words is scanned once, not once per word
+    # (`\bdd\s+.*\bof=/dev/` was O(n^2) per line). Same matches.
+    ("high", "destructive",      r"^(?:(?!\bdd\s)[^\n])*\bdd\s[^\n]*\bof=/dev/"),
     ("med",  "destructive",      r"\btruncate\s+-s\s*0\b"),
-    ("med",  "destructive",      r"\bfind\b.*-delete\b"),
+    # Anchored like the dd rule: the prefix runs to the FIRST find, so a line of
+    # many `find` words is scanned once (`\bfind\b.*-delete` was O(n^2)).
+    ("med",  "destructive",      r"^(?:(?!\bfind\b)[^\n])*\bfind\b[^\n]*-delete\b"),
 
     # --- privilege escalation ---
-    ("high", "privilege",        r"(^|[;&|]\s*)sudo\b"),
-    ("high", "privilege",        r"(^|[;&|]\s*)su\s+-"),
+    # Only where sudo / su is the program run (after a separator, a keyword
+    # such as then/do, an assignment or a wrapper): decided in code by
+    # _at_command_start, so `apt install sudo` and `echo sudo` stay quiet.
+    ("high", "privilege",        r"\bsudo\b"),
+    ("high", "privilege",        r"\bsu\s+-"),
     ("med",  "privilege",        r"\bchmod\s+(-R\s+)?0?777\b"),
     ("med",  "privilege",        r"\bchown\s+-R\s+root\b"),
 
@@ -358,7 +488,7 @@ BASH_RULES: list[Rule] = [
 
     # --- credential and secret access ---
     ("high", "credentials",      r"(cat|less|more|head|tail|strings|cp|scp|base64)\b[^|;\n]{0,512}"
-                                 r"(\.env(\.[a-z]+)?|id_[rd]sa|\.pem|\.p12|credentials|\.netrc|\.npmrc|\.pypirc)\b"),
+                                 r"(\.env(\.[a-z]+)?|id_(?:rsa|dsa|ecdsa|ed25519)|\.pem|\.p12|credentials|\.netrc|\.npmrc|\.pypirc)\b"),
     ("high", "credentials",      r"\bsecurity\s+find-(generic|internet)-password\b"),
     ("med",  "credentials",      r"\b(printenv|env)\b\s*(\||$)"),
     ("med",  "credentials",      r"\b(AWS_SECRET_ACCESS_KEY|ANTHROPIC_API_KEY|OPENAI_API_KEY|GITHUB_TOKEN)\s*="),
@@ -366,22 +496,25 @@ BASH_RULES: list[Rule] = [
 
     # --- data egress ---
     # Case-sensitive on the flags: curl -D (dump headers) is not curl -d (send body).
-    # Skipped entirely when the command only talks to loopback.
-    ("high", "egress",           r"(?!.*(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\]))"
-                                 r"\bcurl\b[^|;\n]{0,512}\s(?-i:-d|--data|--data-raw|--data-binary|-F|--form|-T|--upload-file)\b"),
-    ("med",  "egress",           r"\b(scp|rsync)\b[^|;\n]{0,512}\s[^\s]+@[^\s]+:"),
+    # Skipped when every destination of that curl is loopback: decided in code
+    # by _curl_to_loopback_only, not by a lookahead, because "localhost" in a
+    # header or a query string is not where the data goes.
+    ("high", "egress",           r"\bcurl\b[^|;\n]{0,512}\s(?-i:-d|--data|--data-raw|--data-binary|-F|--form|-T|--upload-file|--json)\b"),
+    # Decided in code, linearly (_scp_egress_hits); the pattern says what it matches.
+    ("med",  "egress",           r"\b(scp|rsync)\b[^|;\n]{0,512}\s[^\s@]+@[^\s@:]+:"),
 
     # --- git danger ---
     ("high", "git",              r"\bgit\s+push\b[^|;\n]{0,512}\s(--force|-f)\b"),
     ("high", "git",              r"\bgit\s+(filter-branch|filter-repo)\b"),
     ("med",  "git",              r"\bgit\s+reset\s+--hard\b"),
     ("med",  "git",              r"\bgit\s+clean\s+-[a-zA-Z]*f"),
-    ("med",  "git",              r"\bgit\s+checkout\s+(main|master|prod\w*)\b.*\s--\s"),
+    ("med",  "git",              r"^(?:(?!\bgit\s+checkout\s+(?:main|master|prod\w*)\b)[^\n])*"
+                                 r"\bgit\s+checkout\s+(main|master|prod\w*)\b[^\n]*\s--\s"),
 
     # --- publish and deploy ---
     ("high", "publish",          r"\b(npm|pnpm|yarn)\s+publish\b"),
     ("high", "publish",          r"\b(twine\s+upload|cargo\s+publish|gem\s+push)\b"),
-    ("high", "publish",          r"\b(kubectl|helm)\b.*\b(delete|destroy)\b"),
+    ("high", "publish",          r"^(?:(?!\b(?:kubectl|helm)\b)[^\n])*\b(kubectl|helm)\b[^\n]*\b(delete|destroy)\b"),
     ("high", "publish",          r"\bterraform\s+(apply|destroy)\b(?!.*-plan)"),
     ("med",  "publish",          r"\b(vercel|netlify|fly|wrangler)\s+deploy\b"),
     ("high", "publish",          r"\baws\s+s3\s+(rm|sync)\b[^|;\n]{0,512}--delete\b"),
@@ -425,7 +558,7 @@ RULE_PREFILTERS: list[tuple[str, ...] | None] = [
     ("curl", "wget"),                                   # ... | python
     ("npx",),
     ("pip",),
-    (".env", "id_rsa", "id_dsa", ".pem", ".p12", "credentials", ".netrc", ".npmrc", ".pypirc"),
+    (".env", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", ".pem", ".p12", "credentials", ".netrc", ".npmrc", ".pypirc"),
     ("find-generic-password", "find-internet-password"),
     ("env",),                                           # printenv | env
     ("aws_secret_access_key", "anthropic_api_key", "openai_api_key", "github_token"),
@@ -449,6 +582,28 @@ RULE_PREFILTERS: list[tuple[str, ...] | None] = [
     ("history",),
     ("histfile", "histsize=0"),
 ]
+
+# A second, cheaper gate for the rules whose regex is costly on a long line of
+# their start word (`curl ` x 200,000 cost ~2 s): a lowercase literal of which
+# at least one MUST also occur in the line, because the regex requires it
+# (curl … | sh needs a `|`; curl -d needs `-d`, `-f`, `-t` or `--json` in some
+# spelling). Keyed by the rule's pattern; never derived by parsing it.
+_RULE_REQUIRES_BY_PATTERN: dict[str, tuple[str, ...]] = {
+    r"\b(curl|wget)\b[^|;\n]{0,512}\|\s*(sudo\s+)?(ba|z|k)?sh\b": ("|",),
+    r"\b(curl|wget)\b[^|;\n]{0,512}\|\s*(sudo\s+)?(python3?|node|perl|ruby)\b"
+    r"(?!\s+-(?:c|e|m|p)\b)": ("|",),
+    r"\bcurl\b[^|;\n]{0,512}\s(?-i:-d|--data|--data-raw|--data-binary|-F|--form|-T|--upload-file|--json)\b":
+        ("-d", "-f", "-t", "--json"),
+    r"\b(scp|rsync)\b[^|;\n]{0,512}\s[^\s@]+@[^\s@:]+:": ("@",),
+    r"\bgit\s+push\b[^|;\n]{0,512}\s(--force|-f)\b": ("-f",),
+    r"\b(psql|mysql|mongosh)\b[^|;\n]{0,512}-c\b": ("-c",),
+    r"\bpip\s+install\b[^|;\n]{0,512}\bhttps?://": ("http",),
+}
+RULE_REQUIRES: list[tuple[str, ...] | None] = [_RULE_REQUIRES_BY_PATTERN.get(p) for _s, _c, p in BASH_RULES]
+# Rules anchored at the line start (`^…`) are linear on a whole line of any
+# length and are run on whole lines; the rest are bounded and read a long line
+# in overlapping MAX_SCAN_LINE pieces.
+_WHOLE_LINE_RULES = frozenset(i for i, (_s, _c, p) in enumerate(BASH_RULES) if p.startswith("^"))
 
 _ASCII_FOLD = str.maketrans({"\u0130": "i", "\u0131": "i", "\u017f": "s", "\u212a": "k"})
 
@@ -479,15 +634,17 @@ SEVERITY_ORDER = {"high": 0, "med": 1}
 # see.
 # --------------------------------------------------------------------------
 
+# One `\s*` after the separator, never two: `[|&;(]\s*)\s*` splits a whitespace
+# run in O(n^2) ways before the next token fails (13 s on one 32 KB command).
 UNREADABLE_SHAPES = (
-    ("runs a variable", re.compile(r"(?:^|[|&;(]\s*)\s*[\"']?\$[A-Za-z_{]")),
+    ("runs a variable", re.compile(r"(?:^|[|&;(])\s*[\"']?\$[A-Za-z_{]")),
     ("eval", re.compile(r"\beval\b")),
     ("pipes a download to a shell",
      re.compile(r"\b(?:curl|wget)\b[^|]*\|\s*(?:sudo\s+)?(?:ba|z|k|)sh\b")),
     ("runs a local script",
-     re.compile(r"(?:^|[|&;]\s*)\s*\.?/[\w./-]+\.(?:sh|bash|zsh|py|rb|pl)\b")),
+     re.compile(r"(?:^|[|&;])\s*\.?/[\w./-]+\.(?:sh|bash|zsh|py|rb|pl)\b")),
     ("sources a file",
-     re.compile(r"(?:^|[|&;]\s*)\s*(?:source|\.)\s+[\w./$~-]+")),
+     re.compile(r"(?:^|[|&;])\s*(?:source|\.)\s+[\w./$~-]+")),
     ("shell -c with a variable", re.compile(r"\b(?:ba|z|)sh\s+-c\s+[\"']?\$")),
     # Shapes that hide a download from every rule above. Each is
     # linear: a start is a literal token and every repeat is bounded or cannot
@@ -553,6 +710,210 @@ def _unreadable_shapes_unfiltered(cmd: str) -> list[str]:
     return [name for name, rx in UNREADABLE_SHAPES if rx.search(text)]
 
 
+# The curl egress rule, whose loopback exemption is decided in code.
+_CURL_EGRESS_RULE = next(i for i, (_s, c, p) in enumerate(BASH_RULES)
+                         if c == "egress" and p.startswith(r"\bcurl"))
+_CURL_WORD = re.compile(r"\bcurl\b", re.IGNORECASE)
+_CURL_SEGMENT_END = re.compile(r"[|;\n]|&&|\bcurl\b", re.IGNORECASE)
+# Options the egress check must not mistake for a destination, beyond the ones
+# the network view already knows take a value.
+_CURL_EGRESS_VALUE = frozenset("--json --data-ascii --form-string -U --proxy-user --connect-to "
+                               "-Y -y -z -C --oauth2-bearer".split())
+_CURL_REROUTE = frozenset("--resolve --connect-to --preproxy --doh-url --socks4 --socks4a "
+                          "--socks5 --socks5-hostname".split())
+_BARE_HOST = re.compile(r"^(?:[^@/\s]+@)?(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(?::\d{1,5})?(?:[/?#]\S*)?$")
+
+
+def _curl_to_loopback_only(segment: str) -> bool:
+    """True when every destination of one curl invocation (its URLs, bare
+    hosts, --url and --proxy) is loopback. "localhost" in a header, a referer or
+    a query string is not a destination. An unknown host ($VAR) is not
+    provably loopback, and neither is an invocation with no destination."""
+    toks = _net_tokens(segment)
+    if toks and _net_base(toks[0]).lower() == "curl":
+        toks = toks[1:]
+    # These send the request somewhere other than the host the URL names
+    # (`--resolve localhost:443:203.0.113.9`), so the URL proves nothing.
+    if any(t.split("=", 1)[0] in _CURL_REROUTE for t in toks):
+        return False
+    pos, opts = _net_positionals(toks, _CURL_VALUE | _CURL_EGRESS_VALUE)
+    hosts: list[str] = []
+    for d in pos + [opts[k] for k in ("--url", "-x", "--proxy") if opts.get(k)]:
+        if "$" in d or "`" in d:
+            return False
+        if "://" in d:
+            h = url_host(d)
+            if h is None:
+                return False
+            hosts.append(h)
+            continue
+        m = _BARE_HOST.match(d)
+        if m and ("." in m.group(1) or m.group(1).lower() == "localhost" or m.group(1).startswith("[")):
+            hosts.append(m.group(1).lower())
+    return bool(hosts) and all(_LOCAL_HOST.match(h) for h in hosts)
+
+
+_SUDO_RULE = next(i for i, (_s, _c, p) in enumerate(BASH_RULES) if p == r"\bsudo\b")
+_SU_RULE = next(i for i, (_s, _c, p) in enumerate(BASH_RULES) if p == r"\bsu\s+-")
+# Words that may stand before the program of a command: shell keywords and the
+# wrappers that run the command after them.
+_COMMAND_LEAD_WORDS = frozenset({"then", "do", "else", "elif", "if", "while", "until", "!", "{", "(",
+                                 "time", "nohup", "exec", "command", "builtin", "env", "nice", "xargs",
+                                 "timeout", "coproc", "setsid", "doas", "stdbuf", "caffeinate", "watch"})
+_COMMAND_SEPARATORS = ";&|({`\n"
+_PATH_DIR_TAIL = re.compile(r"[\w.+-]*(?:/[\w.+-]*)*/$")
+
+
+def _at_command_start(ln: str, start: int) -> bool:
+    """Whether the word at ln[start] is the program of a command: what comes
+    before it, back to the last separator, is only keywords, wrappers (with
+    their flags), assignments, or a shell's `-c "` / `eval "`. Bounded to 256
+    characters back; a run longer than that with no separator counts as a
+    command start, so padding cannot hide one."""
+    lo = max(0, start - 256)
+    before = ln[lo:start]
+    if before.endswith("/"):
+        # `/usr/bin/sudo`: the directory is part of the program word (R3C1).
+        m = _PATH_DIR_TAIL.search(before)
+        before = before[:m.start()] if m else before
+    cut = max(before.rfind(c) for c in _COMMAND_SEPARATORS)
+    if cut < 0 and lo > 0:
+        return True                          # cannot see the start: fail closed
+    words = before[cut + 1:].split()
+    if words and words[-1] in ('"', "'"):
+        # `bash -c "sudo …"`, `eval 'sudo …'`: the string is a command.
+        return len(words) > 1 and (_net_shell_c(words[-2]) or words[-2].lower() == "eval")
+    if before[-1:] in ('"', "'"):
+        return False                         # `echo "sudo …"`: text
+    for w in words:
+        if (_net_base(w).lower() not in _COMMAND_LEAD_WORDS and not _NET_ASSIGN.match(w)
+                and not w.startswith("-") and not w.isdigit()):
+            return False
+    return True
+
+
+# The scp/rsync egress rule. Its regex retried the target after every start
+# word and every `@` (8.8 s on 1 MiB of `scp N @@@@…`), so it is decided here:
+# each target `user@host:` once, then the nearest scp/rsync word before it.
+_SCP_EGRESS_RULE = next(i for i, (_s, c, p) in enumerate(BASH_RULES)
+                        if c == "egress" and p.startswith(r"\b(scp"))
+_SCP_WORD = re.compile(r"\b(?:scp|rsync)\b", re.IGNORECASE)
+_SCP_TARGET = re.compile(r"(?<=\s)[^\s@]+@[^\s@:]+:")
+
+
+def _scp_egress_hits(ln: str) -> bool:
+    """What the egress pattern matches, in linear time: a target
+    `user@host:` after a blank, with an scp/rsync word at most 512 characters
+    before that blank and no `|`, `;` or newline between."""
+    words = [m.end() for m in _SCP_WORD.finditer(ln)]
+    if not words:
+        return False
+    w = 0
+    for t in _SCP_TARGET.finditer(ln):
+        blank = t.start() - 1
+        while w < len(words) and words[w] <= blank:
+            w += 1
+        if w == 0:
+            continue
+        end = words[w - 1]                   # the last scp/rsync word ending before the blank
+        if blank - end <= 512 and ln.find("|", end, blank) < 0 and ln.find(";", end, blank) < 0:
+            return True
+    return False
+
+
+def _rule_hits(i: int, rx: "re.Pattern[str]", ln: str) -> bool:
+    if i == _SUDO_RULE or i == _SU_RULE:
+        return any(_at_command_start(ln, m.start()) for m in rx.finditer(ln))
+    if i == _SCP_EGRESS_RULE:
+        return _scp_egress_hits(ln)
+    if i != _CURL_EGRESS_RULE:
+        return rx.search(ln) is not None
+    # Each curl is judged on its own arguments: a loopback curl does not hide a
+    # second curl on the same line. Segments end at the next curl, so the
+    # tokenising is linear in the line.
+    for w in _CURL_WORD.finditer(ln):
+        if rx.match(ln, w.start()):
+            rest = ln[w.end():]
+            cut = _CURL_SEGMENT_END.search(rest)
+            if not _curl_to_loopback_only(ln[w.start():w.end() + (cut.start() if cut else len(rest))]):
+                return True
+    return False
+
+
+# Characters str.splitlines() breaks on but bash does not: inside a word they
+# are ordinary characters. For the rules they are blanks, so `cat \r ~/.ssh/id_rsa`
+# (cat still prints the key) reads like `cat   ~/.ssh/id_rsa`.
+_AUDIT_BLANKS = re.compile("[\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
+# Quoting, escapes and substitutions: only then can the commands the shared
+# lexer reads differ from the raw lines.
+_AUDIT_NEEDS_LEX = re.compile(r"['\"\\$`]|\{[^\s{}]*?(?:,|\.\.)")     # or a brace expansion
+
+
+def _audit_lines(cmd: str) -> tuple[list[str], list[str]]:
+    """What the rules read: (pieces, wholes).
+
+    Every line of the command up to MAX_SCAN_HARD, split on \n only (as bash
+    splits), plus the commands the shared lexer reads that the raw lines do not
+    show (dequoted words, `bash -c` strings, eval, here-strings and heredocs fed
+    to a shell, substitution bodies), so the audit and the network inventory
+    agree on what the commands are. Nothing is skipped: a line longer than
+    MAX_SCAN_LINE is read in pieces overlapping by SCAN_OVERLAP (more than the
+    512 every bounded rule spans) for the bounded rules, and whole for the
+    anchored ones. Past MAX_SCAN_HARD the Fleet reports the command oversized."""
+    text = cmd[:MAX_SCAN_HARD]
+    if "\r" in text:
+        text = text.replace("\r\n", "\n")
+    if not text.isascii() or _AUDIT_BLANKS.search(text):
+        text = _AUDIT_BLANKS.sub(" ", text)
+    lines = text.split("\n")
+    shown: dict[str, str] = {}
+    if _AUDIT_NEEDS_LEX.search(text):
+        raw = set(lines)
+        for ln, as_written in _shell_walk(cmd[:MAX_SCAN_HARD])[3]:
+            ln = _AUDIT_BLANKS.sub(" ", ln)
+            if ln not in raw:
+                lines.append(ln)
+                shown.setdefault(ln, as_written)
+    pieces: list[str] = []
+    wholes: list[str] = []
+    seen: set[str] = set()
+    step = MAX_SCAN_LINE - SCAN_OVERLAP
+    for ln in lines:
+        if ln in seen:
+            continue
+        seen.add(ln)
+        wholes.append(ln)
+        if len(ln) <= MAX_SCAN_LINE:
+            pieces.append(ln)
+            continue
+        k = 0
+        while True:
+            pieces.append(ln[k:k + MAX_SCAN_LINE])
+            if ln in shown:
+                shown.setdefault(pieces[-1], shown[ln])
+            if k + MAX_SCAN_LINE >= len(ln):
+                break
+            k += step
+    _AUDIT_SHOWN.clear()
+    _AUDIT_SHOWN.update(shown)
+    return pieces or [""], wholes or [""]
+
+
+# Evidence for a line the lexer derived: the command as written, not dequoted.
+# Set by the last _audit_lines call and read straight after it.
+_AUDIT_SHOWN: dict[str, str] = {}
+
+
+def _audit_evidence(i: int, rx: "re.Pattern[str]", ln: str) -> str:
+    if ln in _AUDIT_SHOWN:
+        ln = _AUDIT_SHOWN[ln][:MAX_SCAN_LINE]
+    if len(ln) > MAX_SCAN_LINE:              # a whole long line: the part up to the match
+        m = rx.search(ln)
+        end = m.end() if m else MAX_SCAN_LINE
+        ln = ln[max(0, end - MAX_SCAN_LINE):end]
+    return clean(ln.strip())
+
+
 def audit_command(cmd: str) -> list[tuple[str, str, str]]:
     """Return [(severity, category, matching_line)] for every rule that fires.
 
@@ -561,19 +922,27 @@ def audit_command(cmd: str) -> list[tuple[str, str, str]]:
     actually triggered it.
     """
     # Every rule's character classes exclude \n, so no rule can match across a
-    # line break. Scanning is therefore per line, and the whole-command retry
-    # this used to do was both redundant and the entire cost: it doubled the
-    # work on the slowest possible input.
-    lines = [ln[:MAX_SCAN_LINE] for ln in (cmd.splitlines() or [cmd])[:MAX_SCAN_LINES]]
-    lows = [_fold_lower(ln) for ln in lines]
+    # line break. Scanning is therefore per line (see _audit_lines).
+    pieces, wholes = _audit_lines(cmd)
+    lows = [_fold_lower(ln) for ln in pieces]
     whole = "\n".join(lows)
+    whole_lows: list[str] | None = None
     out: list[tuple[str, str, str]] = []
-    for (sev, cat, rx), lits in zip(COMPILED_RULES, RULE_PREFILTERS):
+    for i, ((sev, cat, rx), lits, req) in enumerate(zip(COMPILED_RULES, RULE_PREFILTERS, RULE_REQUIRES)):
         if lits is not None and not any(x in whole for x in lits):
             continue                         # no line can hold one: skip every line
-        for ln, low in zip(lines, lows):
-            if (lits is None or any(x in low for x in lits)) and rx.search(ln):
-                out.append((sev, cat, clean(ln.strip())))
+        if req is not None and not any(x in whole for x in req):
+            continue
+        if i in _WHOLE_LINE_RULES:
+            if whole_lows is None:
+                whole_lows = [_fold_lower(ln) for ln in wholes]
+            lines, lls = wholes, whole_lows
+        else:
+            lines, lls = pieces, lows
+        for ln, low in zip(lines, lls):
+            if ((lits is None or any(x in low for x in lits))
+                    and (req is None or any(x in low for x in req)) and _rule_hits(i, rx, ln)):
+                out.append((sev, cat, _audit_evidence(i, rx, ln)))
                 break
     return out
 
@@ -581,12 +950,12 @@ def audit_command(cmd: str) -> list[tuple[str, str, str]]:
 def _audit_command_unfiltered(cmd: str) -> list[tuple[str, str, str]]:
     """audit_command with every rule run on every line: the reference the
     prefilter is tested against."""
-    lines = [ln[:MAX_SCAN_LINE] for ln in (cmd.splitlines() or [cmd])[:MAX_SCAN_LINES]]
+    pieces, wholes = _audit_lines(cmd)
     out: list[tuple[str, str, str]] = []
-    for sev, cat, rx in COMPILED_RULES:
-        for ln in lines:
-            if rx.search(ln):
-                out.append((sev, cat, clean(ln.strip())))
+    for i, (sev, cat, rx) in enumerate(COMPILED_RULES):
+        for ln in (wholes if i in _WHOLE_LINE_RULES else pieces):
+            if _rule_hits(i, rx, ln):
+                out.append((sev, cat, _audit_evidence(i, rx, ln)))
                 break
     return out
 
@@ -601,7 +970,7 @@ def _audit_command_unfiltered(cmd: str) -> list[tuple[str, str, str]]:
 
 # Known credential prefixes, longest-first so the more specific ones win.
 _TOKEN_PREFIXES = [
-    "github_pat_", "sk-ant-api", "sk-ant-", "dop_v1_", "glpat-", "xoxb-", "xoxp-",
+    "github_pat_", "sk-ant-api", "sk-ant-", "dop_v1_", "glpat-", "xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-",
     "shpat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "vcp_", "npm_", "sk-", "pk-",
     "AKIA", "ASIA", "AIza", "ya29.", "hf_", "lin_api_", "rk_live_", "sk_live_",
     "sbp_",
@@ -625,6 +994,21 @@ _SECRET_NAME_WORDS = (
 # PATH, PATTERN, PATCH. Both are matched only on a word boundary.
 _SHORT_SECRET_WORDS = r"(?<![A-Za-z])(?:KEYS?|PAT)(?![A-Za-z])"
 
+# A prefixed token starts on a word boundary, or right after the `m` that ends
+# an SGR colour code (`\033[1m`, `\e[32m`, `\x1b[0;31m`, and the `31m` clean()
+# leaves of a raw C1 CSI one). The `m` touches the prefix, so `\b` alone missed
+# `printf '\e[32mghp_…'` and printed the token. The rules keep their plain `\b`
+# (an alternation there makes every scan about three times slower); when
+# _SGR_TOUCH finds such an `m` before a letter, the same rules run again
+# anchored after it (_AFTER_SGR). Fixed-width lookbehind: constant work.
+_AFTER_SGR = r"(?<=[\[0-9;]m)"
+_SGR_TOUCH = re.compile(r"[\[0-9;]m(?=[A-Za-z])")
+# An SGR colour code written into a command before a value, `TOKEN=\e[1;4m…`:
+# literal (`\033[`, `\e[`, `\x1b[`, `\u001b[`) or what clean() leaves of a raw one.
+_SGR_TEXT = r"(?:(?:\\(?:033|[eE]|x1[bB]|u001[bB]))?\[[0-9;]{0,16}m)"
+
+# A backslash may escape each quote around a name or value: a JSON body
+# inside a double-quoted argument, `curl -d "{\"password\":\"…\"}"`.
 _SECRET_PATTERNS = [
     # KEY=value / KEY: value for anything that smells like a secret
     # Same name list as classification, by construction. A value masked here
@@ -632,9 +1016,21 @@ _SECRET_PATTERNS = [
     re.compile(
         r"(?i)\b([A-Z0-9_]{0,40}(?:" + _SECRET_NAME_WORDS +
         r"|" + _SHORT_SECRET_WORDS + r")[A-Z0-9_]{0,40})"
-        r"(\s*[=:]\s*)(['\"]?)"
-        r"(?!(?:Bearer|Basic|Digest|Token|None|null|true|false)\b)"
-        r"([^\s'\";|&]{6,})"
+        # A closing quote may sit between the name and the separator: a JSON
+        # body, {"password":"…"}, names its secrets that way.
+        r"(\\?['\"]?\s*[=:]\s*)(\\?(?:\$(?=['\"]))?['\"]?" + _SGR_TEXT + r"?)"
+        # A PEM header is left to the PEM pass, which has already masked the body.
+        r"(?!(?:Bearer|Basic|Digest|Token|None|null|true|false)\b|-----BEGIN )"
+        # Inside quotes `;`, `|`, `&` and spaces belong to the value
+        # (DB_PASSWORD='Xy7;kQ2#mN9p'), so a quoted value runs to its closing
+        # quote, never across a line, however long (_kv_hits widens the bounded
+        # match to it). With no closing quote on the line it is read as an
+        # unquoted value. An escaped quote's value stops before the backslash
+        # of its closing \".
+        r"((?<=')[^'\n]{6,256}"
+        r"|(?<=\\\")[^\"\\\n]{6,256}"
+        r"|(?<=\")[^\"\n]{6,256}"
+        r"|[^\s'\";|&]{6,})"
     ),
     # bare tokens by known prefix
     re.compile(r"\b(" + "|".join(re.escape(p) for p in _TOKEN_PREFIXES) + r")([A-Za-z0-9_\-]{8,})"),
@@ -646,6 +1042,75 @@ _SECRET_PATTERNS = [
 
 
 _MASKED = "<redacted"
+
+_KV_NO_SQ = re.compile(r"[^'\n]*")
+_KV_NO_DQ = re.compile(r'[^"\n]*')
+_KV_NO_DQ_BS = re.compile(r'[^"\\\n]*')
+_KV_ANSI_C = re.compile(r"(?:[^'\\\n]|\\.)*")
+_KV_UNQUOTED = re.compile(r"[^\s'\";|&]*")
+
+
+def _kv_value_end(text: str, s: int, e: int, opening: str) -> int:
+    """Where a KEY=value value that starts at `s` ends: a quoted one at its
+    closing quote on the line, else (no closing quote) where an unquoted value
+    would; an unquoted one where the rule's match ended."""
+    if opening.endswith("$'"):
+        k = _KV_ANSI_C.match(text, s).end()
+        if text.startswith("'", k):
+            return k
+    elif opening.endswith("\\\""):
+        k = _KV_NO_DQ_BS.match(text, s).end()
+        if text.startswith('\\"', k):
+            return k
+        k = _KV_NO_DQ.match(text, s).end()
+        if text.startswith('"', k):
+            return k
+    elif opening.endswith('"'):
+        k = _KV_NO_DQ.match(text, s).end()
+        if text.startswith('"', k):
+            return k
+    elif opening.endswith("'"):
+        k = _KV_NO_SQ.match(text, s).end()
+        if text.startswith("'", k):
+            return k
+    else:
+        return e
+    return _KV_UNQUOTED.match(text, s).end()
+
+
+def _kv_cookie_header(m: "re.Match") -> bool:
+    """A Cookie header (`Cookie: a=1; sid=…`): its pairs are _cookie_hits' to read."""
+    return m.group(1).lower() == "cookie" and ":" in m.group(2)
+
+
+def _kv_hits(text: str):
+    """(match, start, end) of each KEY=value value, widened to the whole value
+    (_kv_value_end); a Cookie header is skipped (see _cookie_hits). Each
+    search resumes past the value, so the scan stays linear: a quoted value's
+    scan stops at the next quote of its kind, which ends any later start's."""
+    rx = _SECRET_PATTERNS[0]
+    pos, n = 0, len(text)
+    while pos <= n:
+        m = rx.search(text, pos)
+        if m is None:
+            return
+        if _kv_cookie_header(m):
+            pos = m.start(4)
+            continue
+        s, e = m.span(4)
+        e = _kv_value_end(text, s, e, m.group(3))
+        if e - s >= 6:
+            yield m, s, e
+        pos = max(e, m.start() + 1)
+
+# A PEM private-key block, or an armored PGP one (`gpg --export-secret-keys
+# --armor` writes `PRIVATE KEY BLOCK`). The body runs to the END line or,
+# unterminated, to the end of the text: no length cap leaves a tail of the key
+# printed. A greedy tempered scan from a literal start with nothing after it
+# never backtracks, and a match consumes every later header it runs over:
+# linear. Fewer than 16 body characters is a placeholder.
+_PEM_PRIVATE_KEY = re.compile(r"(-----BEGIN [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----)"
+                              r"((?:(?!-----END )[\s\S]){16,})")
 
 
 _SHELL_REF = re.compile(r"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$")
@@ -693,24 +1158,85 @@ _SCP_USERINFO = re.compile(r"(?<![^\s'\"=])([^\s@:/'\"=]+(?::[^\s@/'\"]{0,256})?
 # token behind (?<!\S), so there is one start per option, and every class is
 # bounded and cannot run into the next start: linear on any input. Only the
 # credential is masked; the user part of user:password stays readable.
+# A value's class is bounded so the scan stays linear, and the mask then takes
+# the WHOLE value (_option_hits): an unquoted one to the next blank or quote,
+# however long (an AWS session token runs to 1,000 characters), and a quoted
+# one, spaces and all, to its closing quote on the line ('…', "…", $'…').
+# Group 3 is the opening quote.
+_OPT_QUOTE = r"(\$['\"]|['\"]|)"
 #   curl -u/--user/-U/--proxy-user user:PASS, with a space, `=` or nothing.
 #   `//` after the colon is a URL (`pip install -U git+https://…`), not a password.
-_OPT_USERPASS = re.compile(r"(?<!\S)(-u|-U|--user|--proxy-user)(=|\s+)?(['\"]?)"
+_OPT_USERPASS = re.compile(r"(?<!\S)(-u|-U|--user|--proxy-user)(=|\s+)?" + _OPT_QUOTE +
                            r"([^\s:'\"]{1,128}:)(?!//)([^\s'\"]{1,256})")
 #   wget --password / --http-password / --ftp-password / --proxy-password PASS,
 #   and docker login --password PASS, with a space or `=`.
-_OPT_PASSWORD = re.compile(r"(?<!\S)(--(?:http-|ftp-|proxy-)?password)(\s+|=)(['\"]?)(?!-)([^\s'\"]{1,256})")
+_OPT_PASSWORD = re.compile(r"(?<!\S)(--(?:http-|ftp-|proxy-)?password)(\s+|=)" + _OPT_QUOTE +
+                           r"(?!-)([^\s'\"]{1,256})")
 #   docker login -p PASS. Only for `docker login`: -p is a port, a parent flag
 #   or a profile everywhere else (mkdir -p, ssh -p 22), and mysql -pPASS and
 #   sshpass -p are deliberately left for a program-aware follow-up.
-_OPT_DOCKER_LOGIN_P = re.compile(r"(?<!\S)(docker\s+login\b[^\n;|&]{0,512}?\s-p)(\s+|=)?(['\"]?)"
+_OPT_DOCKER_LOGIN_P = re.compile(r"(?<!\S)(docker\s+login\b[^\n;|&]{0,512}?\s-p)(\s+|=)?" + _OPT_QUOTE +
                                  r"(?!-)([^\s'\"]{1,256})")
+#   aws configure set [profile.]aws_secret_access_key|aws_session_token VALUE
+_OPT_AWS_CONFIGURE = re.compile(r"(?<!\S)(aws\s+configure\s+set\s+(?:[\w-]{1,64}\.)?"
+                                r"(?:aws_secret_access_key|aws_session_token))(\s+)" + _OPT_QUOTE +
+                                r"(?!-)([^\s'\"]{1,256})", re.IGNORECASE)
+#   gh secret set NAME [options] --body|-b VALUE
+_OPT_GH_SECRET_BODY = re.compile(r"(?<!\S)(gh\s+secret\s+set\b[^\n;|&]{0,512}?\s(?:-b|--body))"
+                                 r"(\s+|=)" + _OPT_QUOTE + r"(?!-)([^\s'\"]{1,256})")
+#   Any long option named for a credential, VALUE after a space or `=`:
+#   --token, --api-key, --apikey, --client-secret, --access-token, --auth-token,
+#   --secret, --secret-key, --password, --passphrase. Not a flag that only names
+#   one (--no-password, --ask-password), and not a BuildKit secret mount
+#   (docker build --secret id=x,src=y), which names a file.
+_OPT_CREDENTIAL_FLAG = re.compile(
+    r"(?<!\S)(--(?!(?:no|ask|prompt|skip|show|print|require|use|with|without|read)-)[a-z0-9-]{0,40}?"
+    r"(?:token|secret|secret-key|api-key|apikey|password|passwd|passphrase))(\s+|=)" + _OPT_QUOTE +
+    # Quoted, a value may hold spaces (a passphrase): its first six characters
+    # are read up to any quote, and _option_hits widens it to the closing one.
+    r"(?!-)(?!(?:id|src|source|env|type|target|required)=)((?<=['\"])[^'\"\n]{6,256}|[^\s'\"]{6,256})",
+    re.IGNORECASE)
+#   curl -b/--cookie NAME=VALUE[; NAME=VALUE…], with a space, `=` or nothing
+#   (`-bsid=…`). Without `=` the value is a cookie file. Every pair is read
+#   by _cookie_hits, as in a Cookie header.
+_OPT_CURL_COOKIE = re.compile(r"(?<!\S)(curl\b[^\n;|&]{0,512}?\s(?:-b|--cookie))(\s+|=)?" + _OPT_QUOTE)
+#   A .netrc entry written by a command: machine HOST login USER password PASS.
+_OPT_NETRC = re.compile(r"(?<![^\s'\"])((?:machine\s+[^\s'\"]{1,255}|default)\s+login\s+[^\s'\"]{1,255}\s+password)(\s+)"
+                        + _OPT_QUOTE +
+                        r"(?!-)([^\s'\"]{1,256})")
 # (rule, credential group). The same table drives redact() and classify_secrets().
-_OPTION_SECRETS = ((_OPT_USERPASS, 5), (_OPT_PASSWORD, 4), (_OPT_DOCKER_LOGIN_P, 4))
+_OPTION_SECRETS = ((_OPT_USERPASS, 5), (_OPT_PASSWORD, 4), (_OPT_DOCKER_LOGIN_P, 4),
+                   (_OPT_AWS_CONFIGURE, 4), (_OPT_GH_SECRET_BODY, 4),
+                   (_OPT_CREDENTIAL_FLAG, 4), (_OPT_NETRC, 4))
+
+# The rest of a value from its first character: to the closing quote on the
+# line for each opening quote (a backslash escapes inside "…" and $'…'), to the
+# next blank or quote unquoted. One class per scan: linear.
+_VALUE_REST = {"'": re.compile(r"[^'\n]*"), '"': re.compile(r'(?:[^"\\\n]|\\.)*'),
+               "$'": re.compile(r"(?:[^'\\\n]|\\.)*"), '$"': re.compile(r'(?:[^"\\\n]|\\.)*'),
+               "": re.compile(r"[^\s'\"]*")}
+
+
+def _option_hits(rx: "re.Pattern[str]", group: int, text: str):
+    """(match, start, end) of each credential an option rule finds in `text`,
+    the span widened to the whole value (see _OPT_QUOTE). The next search
+    starts past the widened value, so every character is read a bounded
+    number of times."""
+    pos, n = 0, len(text)
+    while pos <= n:
+        m = rx.search(text, pos)
+        if m is None:
+            return
+        s, e = m.span(group)
+        e = max(e, _VALUE_REST.get(m.group(3), _VALUE_REST[""]).match(text, s).end())
+        yield m, s, e
+        pos = max(e, m.start() + 1)
 # Every command passes through both detectors, and almost none holds any of
 # these. One search decides whether the option rules (and, in classification,
 # the header rule) need to run at all.
-_OPTION_HINT = re.compile(r"(?i)authorization|(?<!\S)-u|--(?:user|proxy-user|(?:http-|ftp-|proxy-)?password)|docker")
+_OPTION_HINT = re.compile(r"(?i)authorization|(?<!\S)-u|--(?:user|proxy-user|(?:http-|ftp-|proxy-)?password)|docker"
+                          r"|aws\s+configure|gh\s+secret|--[a-z0-9-]{0,40}?(?:token|secret|key|pass)|curl|machine"
+                          r"|default\s+login")
 
 
 # The user an option password belongs to, when the segment names one apart
@@ -797,6 +1323,18 @@ class _SecretLocations:
         start, end = self.segment(m.start())
         if rx is _OPT_DOCKER_LOGIN_P:
             program, option = "docker", "-p"
+        elif rx is _OPT_AWS_CONFIGURE:
+            program, option = "aws", m.group(1).split()[-1].lower()
+        elif rx is _OPT_GH_SECRET_BODY:
+            name = m.group(1).split()[3] if len(m.group(1).split()) > 3 else ""
+            program, option = "gh", f"secret:{name}"
+        elif rx is _OPT_CREDENTIAL_FLAG:
+            program, option = self.program(m.start()), m.group(1).lower()
+        elif rx is _OPT_NETRC:
+            words = m.group(1).split()
+            if words[0] == "default":            # `default login USER password …`
+                return self.make(f"netrc:default:{words[2]}")
+            return self.make(f"netrc:{words[1].lower()}:{words[3]}")
         else:
             program, option = self.program(m.start()), m.group(1)
         option = _OPT_SYNONYMS.get(option, option)
@@ -896,13 +1434,115 @@ def _option_secret(value: str) -> bool:
     return not (_looks_like_placeholder(value) or is_vendor_example(value))
 
 
-def _option_mask(group: int, where: "_SecretLocations | None" = None):
-    def sub(m: "re.Match") -> str:
-        v = m.group(group)
-        if not _option_secret(v) or (where is not None and _userpass_exempt(where, m)):
-            return m.group(0)
-        return m.group(0)[:m.start(group) - m.start(0)] + _mask(v) + m.group(0)[m.end(group) - m.start(0):]
-    return sub
+def _mask_spans(text: str, spans: "list[tuple[int, int]]", mask=None) -> str:
+    """`text` with each (start, end) span, in order and not overlapping, masked."""
+    if not spans:
+        return text
+    mask = mask or _mask_value
+    out: list[str] = []
+    at = 0
+    for s, e in spans:
+        if s < at:
+            continue
+        out += [text[at:s], mask(text[s:e])]
+        at = e
+    out.append(text[at:])
+    return "".join(out)
+
+
+def _option_sub(rx: "re.Pattern[str]", group: int, text: str,
+                where: "_SecretLocations | None" = None) -> str:
+    """Mask every credential an option rule finds, each value whole."""
+    return _mask_spans(text, [(s, e) for m, s, e in _option_hits(rx, group, text)
+                              if _option_secret(text[s:e])
+                              and not (where is not None and _userpass_exempt(where, m))])
+
+
+# A Cookie header (`-H 'Cookie: a=1; sid=…'`, `Set-Cookie:`, JSON "Cookie": "…")
+# names several NAME=VALUE pairs. Each pair is read on its own (_cookie_hits):
+# a value is masked, and counted as a cookie, when its name sounds like a
+# credential (sid, session, token, auth, jwt, csrf…) and it has 6 or more
+# characters, when it has a credential's shape (a known prefix, a JWT), or when
+# it is opaque (16 or more characters mixing letters and digits). `theme=dark`
+# stays readable. The header name stands alone (`XCookie:` is a variable,
+# read by the KEY=value rule), exactly as that rule's name group would read it.
+_COOKIE_HEADER = re.compile(r"(?i)(?<![A-Za-z0-9_])cookie(\\?['\"]?\s*:\s*)(\\?['\"]?)")
+_COOKIE_HINT = re.compile(r"(?i)cookie|(?<!\S)-b")
+_COOKIE_REGION = re.compile(r"[^'\"\n\\]*")
+_COOKIE_CRED_NAME = re.compile(r"(?i)sess|sid|tok|auth|jwt|[cx]srf|secret|pass|key|cred|bearer|access|refresh"
+                               r"|login|remember|sig")
+_COOKIE_OPAQUE = re.compile(r"[A-Za-z0-9_\-.%+/=:]{16,}")
+
+
+def _cookie_secret(name: str, value: str) -> bool:
+    if not value or _MASKED in value or not _option_secret(value):
+        return False
+    if len(value) >= 6 and _COOKIE_CRED_NAME.search(name):
+        return True
+    if _COOKIE_OPAQUE.fullmatch(value) and any(c.isdigit() for c in value) \
+            and any(c.isalpha() for c in value):
+        return True
+    return bool(_SECRET_PATTERNS[1].search(value)
+                or any(rx.search(value) for rx in _COOKIE_SHAPES))
+
+
+def _cookie_pairs(text: str, s: int, e: int):
+    """(NAME, value start, value end) of each NAME=VALUE pair in text[s:e],
+    split on `;`. A value ends at a blank. One pass."""
+    i = s
+    while i < e:
+        j = text.find(";", i, e)
+        j = e if j < 0 else j
+        k = text.find("=", i, j)
+        if k > i:
+            name = text[i:k].strip()
+            ve = _COOKIE_VALUE.match(text, k + 1, j).end()
+            if name:
+                yield name, k + 1, ve
+        i = j + 1
+
+
+_COOKIE_VALUE = re.compile(r"[^\s;]*")
+
+
+def _cookie_hits(text: str):
+    """(NAME, start, end, at) of every cookie value that is a credential (see
+    _COOKIE_HEADER), in a Cookie header or a curl -b/--cookie value; `at` is
+    where the header or option starts. A header holding no NAME=VALUE pair is
+    one value, NAME "COOKIE". Linear: each search resumes past what it read."""
+    if not _COOKIE_HINT.search(text):
+        return []
+    hits: list[tuple[str, int, int, int]] = []
+    pos = 0
+    while True:
+        m = _COOKIE_HEADER.search(text, pos)
+        if m is None:
+            break
+        s = m.end()
+        e = _COOKIE_REGION.match(text, s).end()
+        while e > s and text[e - 1] in " \t":
+            e -= 1
+        pairs = list(_cookie_pairs(text, s, e))
+        if pairs:
+            hits += [(n, a, b, m.start()) for n, a, b in pairs if _cookie_secret(n, text[a:b])]
+        elif e - s >= 6 and _option_secret(text[s:e]) and _MASKED not in text[s:e]:
+            hits.append(("COOKIE", s, e, m.start()))
+        pos = max(e, m.end(), m.start() + 1)
+    pos = 0
+    while "curl" in text:
+        m = _OPT_CURL_COOKIE.search(text, pos)
+        if m is None:
+            break
+        q, s = m.group(3), m.end()
+        e = (_VALUE_REST[q] if q else _SECRET_UNQUOTED_REST).match(text, s).end()
+        hits += [(n, a, b, m.start()) for n, a, b in _cookie_pairs(text, s, e)
+                 if _cookie_secret(n, text[a:b])]
+        pos = max(e, m.start() + 1)
+    hits.sort(key=lambda h: h[1])
+    return hits
+
+
+_SECRET_UNQUOTED_REST = re.compile(r"[^\s'\";|&]*")
 
 
 def _scp_mask(m: "re.Match") -> str:
@@ -912,10 +1552,24 @@ def _scp_mask(m: "re.Match") -> str:
     return m.group(0)
 
 
+def _unhide(text: str) -> str:
+    """The text a reader sees: raw SGR codes and every character clean() strips
+    removed. Redaction and classification both work on this, so ESC, a
+    zero-width space or a soft hyphen inside a token cannot split it past the
+    rules and then vanish from the output, leaving the token whole."""
+    if "\x1b" in text or "\x9b" in text:
+        text = _RAW_SGR.sub("", text)
+    return _CONTROL.sub("", text)
+
+
 def redact(text: str) -> str:
-    """Remove credential material from a command string. Idempotent."""
+    """Remove credential material from a command string. Idempotent.
+
+    Characters clean() strips are stripped here first (see _unhide), so the
+    output never holds them; tab and newline survive."""
     if not text:
         return text
+    text = _unhide(text)
     truncated = False
     if text.endswith(TRUNCATED_MARK):        # idempotent: strip our own marker first
         text, truncated = text[:-len(TRUNCATED_MARK)], True
@@ -926,19 +1580,141 @@ def redact(text: str) -> str:
 
 
 def _redact_scanned(out: str) -> str:
-    # Order matters: the Authorization header rule must run before the generic
-    # KEY=value rule, or "AUTH" in "Authorization:" makes it eat the scheme word.
+    # Order matters. A pass must never mask the anchor a later pass needs: the
+    # PEM pass runs first, because its body spans spaces and newlines that end
+    # every other value class. Run later, `PRIVATE_KEY="-----BEGIN …` lost only
+    # the word `-----BEGIN` to the KEY=value pass, and with it the header the PEM
+    # pass anchors on, so the whole key body printed.
+    if "PRIVATE KEY" in out:
+        out = _PEM_PRIVATE_KEY.sub(_pem_mask, out)
+    # The Authorization header rule must run before the generic KEY=value rule,
+    # or "AUTH" in "Authorization:" makes it eat the scheme word.
     out = _SECRET_PATTERNS[2].sub(lambda m: f"{m.group(1)}{_mask(m.group(2))}", out)
+    # Each credential pair of a Cookie header or curl -b, before the KEY=value
+    # rule (which leaves the header to this pass).
+    out = _mask_spans(out, [(a, b) for _n, a, b, _at in _cookie_hits(out)], _mask)
     if _OPTION_HINT.search(out):
         for rx, group in _OPTION_SECRETS:
             where = _SecretLocations(out) if rx is _OPT_USERPASS and rx.search(out) else None
-            out = rx.sub(_option_mask(group, where), out)
-    out = _SECRET_PATTERNS[3].sub(lambda m: f"{m.group(1)}{_mask(m.group(2))}{m.group(3)}", out)
-    out = _SECRET_PATTERNS[0].sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{_mask(m.group(4))}", out)
-    out = _SECRET_PATTERNS[1].sub(lambda m: f"{m.group(1)}{_mask(m.group(2))}", out)
+            out = _option_sub(rx, group, out, where)
+    # A marker's own `:` (`https://ghp_…<redacted:33-48>@h`) is not a URL
+    # password, and the four characters a mask shows (`sk-ant-api03-T…<redacted`)
+    # are not a fresh token: re-masking either broke idempotence.
+    out = _SECRET_PATTERNS[3].sub(lambda m: m.group(0) if _MASKED in m.group(1)
+                                  else f"{m.group(1)}{_mask(m.group(2))}{m.group(3)}", out)
+    out = _mask_spans(out, [(s, e) for _m, s, e in _kv_hits(out)])
+    sgr = _SGR_TOUCH.search(out) is not None
+    for rx in (_SECRET_PATTERNS[1], _SGR_PREFIX) if sgr else (_SECRET_PATTERNS[1],):
+        out = rx.sub(lambda m: m.group(0) if m.string.startswith("…" + _MASKED, m.end())
+                     else f"{m.group(1)}{_mask(m.group(2))}", out)
+    # Everything classify_secrets() reports by type is masked too, so the two
+    # can never drift (a JWT, xoxa-/xoxr-/xoxs- once printed in full).
+    for rx in _REDACT_SECRET_TYPES + (_SGR_REDACT_SECRET_TYPES if sgr else ()):
+        out = rx.sub(lambda m: _mask(m.group(0)), out)
+    if _ESCAPE_TOUCH.search(out):
+        out = _redact_after_escapes(out)
     out = _URL_USERINFO.sub(lambda m: f"{m.group(1)}{_mask(m.group(2))}@", out)
     out = _SCP_USERINFO.sub(_scp_mask, out)
+    if ":" in out and "@" in out:
+        out = _mask_spans(out, [(s, e) for s, e, _u, _h in _scp_long_hits(out)], _mask)
     return out
+
+
+# An escape written into a command and glued to the token after it: a
+# backslash escape (`\n`, `\t`, `\x20`, `\040`, `\u0020`), an escape sequence
+# of any final byte (`\e[2K`, `\033[H`, `\x1b[38:2:1:2:3m`, `\e(B`), or what
+# clean() leaves of a raw CSI (`[2K`). Its last character is a letter or digit,
+# so `\b` finds no word boundary before the token (`printf 'x\nghp_…'`). The
+# prefix rules then run again over a view of the text with each such escape
+# blanked (_escape_view): same length, so a match's span is the token's span in
+# the text. One linear pass to blank, then the usual linear rules.
+_ESCAPE_SEQ = (r"(?:(?:\\(?:033|[eE]|x1[bB]|u001[bB]))?\[[0-9;:?<=>]{0,32}[ -/]{0,4}[@-~]"
+               r"|\\(?:033|[eE]|x1[bB]|u001[bB])[()*+][0-9A-Za-z]"
+               r"|\\(?:x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|[0-7]{1,3}|[abefnrtvE]))")
+_ESCAPE_TOUCH = re.compile(_ESCAPE_SEQ + r"(?=[A-Za-z])")
+
+
+def _escape_view(text: str) -> str:
+    return _ESCAPE_TOUCH.sub(lambda m: " " * len(m.group(0)), text)
+
+
+def _redact_after_escapes(out: str) -> str:
+    """The prefix rules, the shape rules and the netrc rule once more, over
+    _escape_view(out), masking what they find in `out`."""
+    view = _escape_view(out)
+    spans = [(m.start(2), m.end(2)) for m in _SECRET_PATTERNS[1].finditer(view)
+             if _MASKED not in out[m.start(2):m.end(2)] and not out.startswith("…" + _MASKED, m.end())]
+    out = _mask_spans(out, spans, _mask)
+    view = _escape_view(out)
+    spans = sorted(m.span(0) for rx in _ESCAPE_SECRET_TYPES for m in rx.finditer(view)
+                   if _MASKED not in out[m.start(0):m.end(0)])
+    out = _mask_spans(out, spans, _mask)
+    if "password" in out:
+        view = _escape_view(out)
+        out = _mask_spans(out, [(s, e) for _m, s, e in _option_hits(_OPT_NETRC, 4, view)
+                                if _option_secret(out[s:e])])
+    return out
+
+
+# scp-style userinfo whose password is longer than _SCP_USERINFO reads (256):
+# the bounded match is widened to the value's end and kept only when `@HOST:`
+# follows. Each search resumes past the widened value: linear.
+_SCP_LONG = re.compile(r"(?<![^\s'\"=])([^\s@:/'\"=]{1,256}:[^\s@/'\"]{256})(?=[^\s@/'\"])")
+_SCP_LONG_REST = re.compile(r"[^\s@/'\"]*")
+_SCP_HOST = re.compile(r"@([A-Za-z0-9.-]+):")
+
+
+def _scp_long_hits(text: str):
+    """(start, end, user, host) of each over-long scp `user:password@host:`."""
+    pos, n = 0, len(text)
+    while pos < n:
+        m = _SCP_LONG.search(text, pos)
+        if m is None:
+            return
+        e = _SCP_LONG_REST.match(text, m.end()).end()
+        h = _SCP_HOST.match(text, e)
+        if h and _MASKED not in text[m.start():e]:
+            yield m.start(), e, text[m.start():text.find(":", m.start())], h.group(1)
+        pos = max(e, m.start() + 1)
+
+
+def _mask_value(v: str) -> str:
+    """_mask for a KEY=value value that may already hold markers from an
+    earlier pass (`TOKEN=s3cr3t,postgres://u:<redacted>@h,more`). The text
+    around each marker is masked, keeping a URL's `scheme://user:` before it and
+    its `@host/path` after it; _mask alone would skip the whole value, and
+    masking only the text before the first marker printed everything after it
+    (`DSN=postgres://u:<redacted>@h/x,API_KEY=…`)."""
+    out: list[str] = []
+    while True:
+        i = v.find(_MASKED)
+        if i < 0:
+            if v:
+                out.append(_mask(v))
+            return "".join(out)
+        head = v[:i]
+        if head and not (len(head) == 5 and head.endswith("…")):    # our own prefix display
+            url = re.search(r"[a-z][a-z0-9+.\-]{0,20}://[^\s:/@]{0,128}:?$", head)
+            secret = head[:url.start()] if url else head
+            if secret:
+                out.append(_mask(secret))
+                head = head[len(secret):]
+        out.append(head)
+        j = v.find(">", i)
+        if j < 0:
+            out.append(v[i:])
+            return "".join(out)
+        # The marker, then the host and path of the URL it sits in.
+        keep = re.match(r">(?:@[A-Za-z0-9.\-\[\]:]{0,255})?(?:/[^,;&=?#\s]{0,256})?", v[j:j + 520])
+        out.append(v[i:j] + keep.group(0))
+        v = v[j + keep.end():]
+
+
+def _pem_mask(m: "re.Match") -> str:
+    body = m.group(2).strip()
+    while body.startswith("\\n"):             # a JSON string's escaped newline
+        body = body[2:].lstrip()
+    return f"{m.group(1)}\n{_mask(body)}\n" if _MASKED not in body else m.group(0)
 
 
 def contains_secret(text: str) -> bool:
@@ -950,7 +1726,7 @@ def contains_secret(text: str) -> bool:
     """
     if not text:
         return False
-    head = text[:MAX_SCAN_TOTAL]
+    head = _unhide(text[:MAX_SCAN_HARD])[:MAX_SCAN_TOTAL]
     return redact(head) != head
 
 
@@ -970,6 +1746,7 @@ _TAKES_PATH_ARG = {"cd", "pushd", "popd"}
 # the CONDITION and `cat` is the work. Reporting `[` as the most-run program is
 # technically true and useless.
 _CONDITION_WORDS = {"[", "[[", "]", "]]", "test"}
+_SUDO_VALUE_FLAGS = frozenset({"-u", "-g", "-C", "-D", "-h", "-p", "-U", "-r", "-t"})
 _FUNCTION_DEF = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\(\)$")
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 # `2>/dev/null`, `>out`, `>>log`, `2>&1`, `<in` — a redirection is never the
@@ -1005,6 +1782,8 @@ _ASSIGN_SUBST = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=[\"']?(?:\$\(|`)([A-Za-z0-9
 #   2060-2064  word joiner and invisible operators
 #   2066-2069  bidi isolates
 #   feff       zero-width no-break space (BOM)
+#   fe00-fe0f, e0100-e01ef  variation selectors (an emoji loses only its
+#              presentation hint)
 # Built from a named table rather than one opaque class, so a reader can audit
 # what is stripped and why without decoding hex ranges -- and so that adding a
 # range later requires stating a reason.
@@ -1017,6 +1796,19 @@ _STRIPPED_RANGES = (
     (0x2060, 0x2064, "word joiner and the invisible operators"),
     (0x2066, 0x2069, "bidi isolates"),
     (0xFEFF, 0xFEFF, "zero-width no-break space, the BOM"),
+    (0x00AD, 0x00AD, "soft hyphen: invisible, splits a token"),
+    (0x034F, 0x034F, "combining grapheme joiner: invisible"),
+    (0x061C, 0x061C, "Arabic letter mark, a bidi control like LRM and RLM"),
+    (0x115F, 0x1160, "Hangul choseong and jungseong fillers: blank"),
+    (0x180E, 0x180E, "Mongolian vowel separator: invisible"),
+    (0x3164, 0x3164, "Hangul filler: blank"),
+    (0xFFA0, 0xFFA0, "halfwidth Hangul filler: blank"),
+    (0xFFF9, 0xFFFB, "interlinear annotation controls"),
+    (0xD800, 0xDFFF, "lone UTF-16 surrogates (JSON \\ud800): no encoder accepts them, "
+                     "so one crashed every writer"),
+    (0xE0000, 0xE007F, "Unicode tag characters: invisible, carry hidden ASCII text"),
+    (0xFE00, 0xFE0F, "variation selectors: invisible, 256 of them carry hidden bytes"),
+    (0xE0100, 0xE01EF, "variation selectors supplement: the rest of those 256"),
 )
 
 # Tab (0x09) and newline (0x0A) are the only whitespace controls that survive.
@@ -1025,8 +1817,11 @@ _STRIPPED_RANGES = (
 # the hiding this module exists to prevent, and is why it is not treated as a
 # harmless newline.
 _CONTROL = re.compile(
-    "[" + "".join(f"\\u{lo:04x}-\\u{hi:04x}" for lo, hi, _why in _STRIPPED_RANGES) + "]"
+    "[" + "".join(f"\\U{lo:08x}-\\U{hi:08x}" for lo, hi, _why in _STRIPPED_RANGES) + "]"
 )
+# A raw SGR colour code (ESC [ or C1 CSI, then digits, then m). Redaction drops
+# it whole rather than leaving `[1m` against the token that follows.
+_RAW_SGR = re.compile(r"(?:\x1b\[|\x9b)[0-9;]{0,16}m")
 
 # Bound the work any single command can cause. audit_command runs ~40 patterns
 # with wide character classes; a 140,000-character line took 164 seconds before
@@ -1052,7 +1847,7 @@ def _redacted_excerpt(text: str, start: int, end: int) -> str:
     window = text[max(lo - 4096, 0):lo]
     sep = max((window.rfind(c) for c in ";|&\n"), default=-1)
     lo = max(lo - 4096, 0) + sep + 1 if sep >= 0 else lo
-    return clean(redact(text[lo:min(end + 120, lo + MAX_SCAN_TOTAL)]).strip()[-240:])
+    return redact(clean(text[lo:min(end + 120, lo + MAX_SCAN_TOTAL)])).strip()[-240:]
 
 
 def scan_windows(cmd: str) -> list[str]:
@@ -1100,10 +1895,16 @@ TRUNK_BRANCHES = {"main", "master", "develop", "dev", "trunk", "release"}
 # tracker prefixes must be matched before the Jira-style project-key rule.
 _TRACKER_WORDS = r"issue|issues|gh|pr|bug|ticket|task|story|card"
 
+# A Jira project key is uppercase. Matched case-insensitively, every word
+# before a version number was a ticket (renovate/node-18.x was NODE-18), so
+# only the branch prefix and the tracker words ignore case.
 _TICKET_PATTERNS = [
     re.compile(rf"^(?:[a-z]+/)?(?:{_TRACKER_WORDS})[-_]?(\d{{1,6}})\b", re.I),
-    re.compile(rf"^[a-z]+/(?!(?:{_TRACKER_WORDS})\b)([A-Z][A-Z0-9]+-\d+)", re.I),
-    re.compile(rf"^(?!(?:{_TRACKER_WORDS})\b)([A-Z][A-Z0-9]+-\d+)", re.I),
+    # A CVE id is one ticket, not project CVE's ticket 2024 for every CVE of a
+    # year (hotfix/CVE-2024-1234 was CVE-2024).
+    re.compile(r"^(?:[a-z]+/)?(CVE-\d{4}-\d{4,7})\b", re.I),
+    re.compile(rf"^(?i:[a-z]+)/(?!(?i:{_TRACKER_WORDS})\b)([A-Z][A-Z0-9]+-\d+)"),
+    re.compile(rf"^(?!(?i:{_TRACKER_WORDS})\b)([A-Z][A-Z0-9]+-\d+)"),
     re.compile(r"^[a-z]+/(\d{1,6})\b", re.I),            # feat/412-slug
     re.compile(r"^(\d{2,6})-"),                           # 412-slug
 ]
@@ -1164,7 +1965,41 @@ SECRET_TYPES: list[tuple[str, str, "re.Pattern[str]"]] = [
     # shape, sbp_ followed by exactly 40 alphanumerics. A Supabase personal
     # access token carries full account authority, so critical rather than high.
     ("critical", "Supabase PAT",     re.compile(r"\bsbp_([A-Za-z0-9]{40})")),
+    # Shapes redaction already masked by prefix but nothing counted, so they
+    # never reached the rotation list or --fail-on. The classic OpenAI key has
+    # no second hyphen; the lookahead keeps sk-proj-… to the row above.
+    ("critical", "OpenAI key",       re.compile(r"\bsk-(?!ant-)([A-Za-z0-9]{40,})(?![A-Za-z0-9_\-])")),
+    ("high",     "npm token",        re.compile(r"\bnpm_([A-Za-z0-9]{36})")),
+    ("high",     "Shopify token",    re.compile(r"\bshpat_([a-fA-F0-9]{32})")),
+    ("high",     "Linear API key",   re.compile(r"\blin_api_([A-Za-z0-9]{32,})")),
+    ("high",     "Google OAuth token", re.compile(r"\bya29\.([A-Za-z0-9_\-]{20,})")),
+    # The body of a PEM private key, to the END line.
+    ("critical", "private key",      _PEM_PRIVATE_KEY),
 ]
+
+# A cookie value with one of these shapes is a credential whatever its name.
+_COOKIE_SHAPES = tuple(rx for _prio, kind, rx in SECRET_TYPES if kind != "private key")
+
+# What redaction masks for each row: the match, and for a JWT its signature
+# too (the row stops at the payload, which is what its id is taken from).
+_REDACT_SECRET_TYPES = tuple(
+    re.compile(rx.pattern + r"(?:\.[A-Za-z0-9_\-]+)?") if kind == "JWT / service key" else rx
+    for _prio, kind, rx in SECRET_TYPES)
+
+# The same rules anchored right after an SGR colour code's `m` (_AFTER_SGR),
+# for classification and for redaction. Run only when _SGR_TOUCH finds one.
+def _after_sgr(rx: "re.Pattern[str]") -> "re.Pattern[str]":
+    return re.compile(_AFTER_SGR + rx.pattern[2:])
+
+
+_SGR_PREFIX = _after_sgr(_SECRET_PATTERNS[1])
+# The rules _redact_after_escapes and classify_secrets run over _escape_view.
+_ESCAPE_SECRET_TYPES = tuple(rx for rx in _REDACT_SECRET_TYPES if rx.pattern.startswith(r"\b"))
+_ESCAPE_CLASSIFY_TYPES = tuple(t for t in SECRET_TYPES if t[2].pattern.startswith(r"\b"))
+_SGR_SECRET_TYPES = tuple((prio, kind, _after_sgr(rx)) for prio, kind, rx in SECRET_TYPES
+                          if rx.pattern.startswith(r"\b"))
+_SGR_REDACT_SECRET_TYPES = tuple(_after_sgr(rx) for rx in _REDACT_SECRET_TYPES
+                                 if rx.pattern.startswith(r"\b"))
 
 # Considered and REJECTED, 2026-08-26, with the measurement rather than a guess:
 #
@@ -1187,7 +2022,9 @@ _LOCAL_HOST = re.compile(r"^(127\.0\.0\.1|localhost|0\.0\.0\.0|\[?::1\]?|host\.d
 _NAMED_SECRET = re.compile(
     r"\b([A-Za-z0-9_]{0,40}(?:" + _SECRET_NAME_WORDS + r"|" + _SHORT_SECRET_WORDS + r")"
     r"[A-Za-z0-9_]{0,40})"
-    r"\s*[=:]\s*['\"]?([A-Za-z0-9_\-\.]{12,})", re.IGNORECASE)
+    # Quotes may be backslash-escaped (JSON inside a double-quoted argument),
+    # and an SGR colour code may sit before the value (`TOKEN=\e[1m…`).
+    r"\\?['\"]?\s*[=:]\s*\\?['\"]?" + _SGR_TEXT + r"?([A-Za-z0-9_\-\.]{12,})", re.IGNORECASE)
 
 # These are column names, metric names, and already-encrypted columns. They
 # match the "sounds like a secret" pattern and are not secrets.
@@ -1227,7 +2064,8 @@ _NOT_SECRET_NAMES = re.compile(
     # A trigger word that is only the START of a longer, ordinary word.
     # AUTHOR matched because it begins with AUTH -- the same class of defect as
     # KEY matching inside FORKEY.
-    r"|author[a-z_]*|[a-z_]*_author[a-z_]*"
+    # Not AUTHORIZATION, the header that carries a credential.
+    r"|author(?!i[sz]ation)[a-z_]*|[a-z_]*_author(?!i[sz]ation)[a-z_]*"
     r"|cookie(?:less|count|jar|name|path|domain|banner|consent)[a-z_]*"
     # An identifier is not a credential. AUTH_PROVIDER_ID, _SESSION_ID.
     r"|[a-z_]*(?:secret|token|session|auth|key|cookie|credential)s?_ids?"
@@ -1321,6 +2159,7 @@ def _looks_like_placeholder(v: str) -> bool:
 
 
 _PASSWORD_NAME = re.compile(r"(?i)PASS(?:WORD|WD|PHRASE)")
+_COOKIE_NAME = re.compile(r"(?i)COOKIE")
 
 
 # A variable named STRIPE_SECRET_KEY is critical whether or not its value
@@ -1343,7 +2182,9 @@ def classify_secrets(cmd: str, value_digests: dict[str, set[str]] | None = None
     different passwords one id stands for. The caller keeps those digests in
     memory only and never emits them.
     """
-    cmd = cmd[:MAX_SCAN_TOTAL]
+    # The same text redact() masks: stripped characters out first, so a token
+    # split by one is counted as the token it shows as.
+    cmd = _unhide(cmd[:MAX_SCAN_HARD])[:MAX_SCAN_TOTAL]
     out: list[tuple[str, str, str]] = []
     seen: set[str] = set()
     # Characters of the values the c596778 detectors (prefixes, URL passwords
@@ -1369,9 +2210,17 @@ def classify_secrets(cmd: str, value_digests: dict[str, set[str]] | None = None
         seen.add(fp)
         out.append((priority, kind, fp))
 
-    for priority, kind, rx in SECRET_TYPES:
+    types = SECRET_TYPES + list(_SGR_SECRET_TYPES) if _SGR_TOUCH.search(cmd) else SECRET_TYPES
+    for priority, kind, rx in types:
         for m in rx.finditer(cmd):
             add(priority, kind, m.group(0), span=m.span(0))
+    # A token glued to an escape (`printf 'x\nghp_…'`): the rules again over
+    # the text with the escapes blanked, as redact() masks it.
+    view = _escape_view(cmd) if _ESCAPE_TOUCH.search(cmd) else None
+    if view is not None:
+        for priority, kind, rx in _ESCAPE_CLASSIFY_TYPES:
+            for m in rx.finditer(view):
+                add(priority, kind, m.group(0), span=m.span(0))
 
     for m in _URL_CRED.finditer(cmd):
         scheme, _user, pw, host = m.groups()
@@ -1382,6 +2231,8 @@ def classify_secrets(cmd: str, value_digests: dict[str, set[str]] | None = None
 
     for m in _NAMED_SECRET.finditer(cmd):
         name, value = m.group(1), m.group(2)
+        if name.lower() == "cookie" and ":" in cmd[m.end(1):m.start(2)]:
+            continue                             # a Cookie header: _cookie_hits reads its pairs
         # Template placeholders arrive wrapped -- __X__, {{X}}, %X% -- and the
         # decoration is not part of the name. Strip it so a single exclusion
         # covers every spelling instead of one per template syntax.
@@ -1396,12 +2247,17 @@ def classify_secrets(cmd: str, value_digests: dict[str, set[str]] | None = None
 
     # Every form redact() masks is counted here too, through the
     # same compiled rules, so the rotation list and the masking cannot drift.
+    for name, a, b, at in _cookie_hits(cmd):
+        add("high", "cookie", cmd[a:b], where.make(f"cookie:{where.program(at)}:{name.upper()}"), (a, b))
     if _OPTION_HINT.search(cmd):
         for rx, group in _OPTION_SECRETS:
-            for m in rx.finditer(cmd):
+            for m, a, b in _option_hits(rx, group, cmd):
                 if rx is _OPT_USERPASS and _userpass_exempt(where, m):
                     continue
-                add("high", "password option", m.group(group), where.option(m, rx), m.span(group))
+                add("high", "password option", cmd[a:b], where.option(m, rx), (a, b))
+        if view is not None and "password" in view:
+            for m, a, b in _option_hits(_OPT_NETRC, 4, view):
+                add("high", "password option", cmd[a:b], where.option(m, _OPT_NETRC), (a, b))
         for m in _SECRET_PATTERNS[2].finditer(cmd):
             scheme = m.group(1).split(":", 1)[1].split()[0].lower()
             add("high", "Authorization header", m.group(2),
@@ -1409,11 +2265,19 @@ def classify_secrets(cmd: str, value_digests: dict[str, set[str]] | None = None
     # A password is short. _NAMED_SECRET wants 12 characters, which suits a
     # token; PGPASSWORD=hunter2pass was masked and never counted.
     if _PASSWORD_NAME.search(cmd):
-        for m in _SECRET_PATTERNS[0].finditer(cmd):
+        for m, a, b in _kv_hits(cmd):
             name = m.group(1)
             if _PASSWORD_NAME.search(name) and not _NOT_SECRET_NAMES.match(name.strip("_{}%$<>")):
-                add(_priority_for_name(name), clean(name.upper())[:48], m.group(4),
-                    where.make(f"name:{name.upper()}:{where.program(m.start())}"), m.span(4))
+                add(_priority_for_name(name), clean(name.upper())[:48], cmd[a:b],
+                    where.make(f"name:{name.upper()}:{where.program(m.start())}"), (a, b))
+    # A variable named for a cookie (`SESSION_COOKIE=…`) is masked by the
+    # KEY=value rule. A Cookie header's pairs were counted above (_cookie_hits).
+    if _COOKIE_NAME.search(cmd):
+        for m, a, b in _kv_hits(cmd):
+            name = m.group(1)
+            if _COOKIE_NAME.search(name) and not _NOT_SECRET_NAMES.match(name.strip("_{}%$<>")):
+                add("high", "cookie", cmd[a:b],
+                    where.make(f"cookie:{where.program(m.start())}:{name.upper()}"), (a, b))
     if "@" not in cmd:
         return out
     for m in _URL_USERINFO.finditer(cmd):
@@ -1436,38 +2300,11 @@ def classify_secrets(cmd: str, value_digests: dict[str, set[str]] | None = None
                 (m.end(1) - len(pw), m.end(1)))
         elif len(user) > 20:
             add("high", "scp userinfo token", user, where.make(f"scptoken:{host}"), m.span(1))
+    for a, b, user, host in _scp_long_hits(cmd):
+        add("critical", "scp password", cmd[a + len(user) + 1:b], where.make(f"scp:{user}@{host.lower()}"),
+            (a + len(user) + 1, b))
 
     return out
-
-
-_HEREDOC = re.compile(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?")
-
-
-def _without_heredocs(cmd: str) -> str:
-    """Drop heredoc bodies before looking for a program.
-
-    A heredoc carries data -- a JSON payload, a commit message, a file being
-    written. Splitting the command on newlines turned each of those lines into
-    its own candidate segment, so a bare path inside a document became "the
-    program" on 121 real commands. The `cat <<EOF` line itself is kept; only
-    the body between it and its terminator is removed.
-    """
-    if "<<" not in cmd:
-        return cmd
-    out, lines = [], cmd.splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        out.append(line)
-        m = _HEREDOC.search(line)
-        i += 1
-        if not m:
-            continue
-        terminator = m.group(1)
-        while i < len(lines) and lines[i].strip() != terminator:
-            i += 1
-        i += 1                      # skip the terminator itself
-    return "\n".join(out)
 
 
 def _shell_tokens(segment: str) -> list[str]:
@@ -1515,22 +2352,32 @@ def command_head(cmd: str) -> str | None:
     # Newlines delimit segments too: a `for … \n do …` loop has no `;` at all,
     # and without splitting on them the whole loop reads as one segment starting
     # with `for`, which then reports `for` as the program.
-    for segment in re.split(r"&&|\|\||;|\||\n", _without_heredocs(cmd).strip()):
+    # Split by the shared splitter, outside quotes: `PASSWORD="abc;def" ./run`
+    # is one command whose program is ./run, never `def`.
+    for segment in _net_split(_without_heredocs(cmd).strip())[0]:
         tokens = _shell_tokens(segment)
         if not tokens:
             continue
         if tokens[0] in _HEADERS_TAKING_A_WORD_LIST:
             continue  # `for x in LIST`: the body is a later segment
-        if _CONDITION_WORDS.intersection(tokens):
+        lead = next((t for t in tokens if not (_ASSIGNMENT.match(t) or t in _BODY_KEYWORDS
+                                               or t in _PREFIX_WORDS or t in _HEADER_KEYWORDS)), None)
+        if lead in _CONDITION_WORDS:
             # `if [ -f x ]` is its own segment once split on `;`, and every
             # token in it belongs to the test rather than to the work. Skipping
-            # only the `[` returned its operand instead.
+            # only the `[` returned its operand instead. Only when the test IS
+            # the command: `npm test` runs npm.
             continue
         skip_next = False
+        after_sudo = False
         for tok in tokens:
             if skip_next:
                 skip_next = False
                 continue
+            if after_sudo and tok in _SUDO_VALUE_FLAGS:
+                skip_next = True              # `sudo -u postgres psql`: postgres is the user
+                continue
+            after_sudo = tok == "sudo" or (after_sudo and tok.startswith("-"))
             if _ASSIGNMENT.match(tok):
                 inner = _ASSIGN_SUBST.match(tok)
                 if inner:
@@ -1567,10 +2414,28 @@ def command_head(cmd: str) -> str | None:
     # Nothing in any segment looked like a program. Fall back to the first
     # token, except when it opens a comment -- a command that is only a comment
     # ran nothing, and reporting `#` as a program put it in the flag tables.
-    first = cmd.strip().split()
+    first = [t for t in cmd.strip().split() if not _ASSIGNMENT.match(t)][:1]
     if not first or first[0].startswith("#"):
         return None
     return first[0]
+
+
+# A pasted token run as a command makes the token itself the "program", and
+# program names are counted and displayed (most run, refusals by program,
+# MCP shell_audit). Anything that looks like a credential is counted under
+# this placeholder instead, so the value never reaches an output.
+CREDENTIAL_HEAD = "(credential)"
+
+
+def safe_head(head: str) -> str:
+    """A program name fit to count and display: a credential becomes CREDENTIAL_HEAD."""
+    return CREDENTIAL_HEAD if contains_secret(head) or classify_secrets(head) else head
+
+
+def display_head(cmd: str) -> str | None:
+    """command_head(), cleaned, cut to 40 and with credentials replaced."""
+    head = command_head(cmd) if cmd else None
+    return clean(safe_head(head))[:40] if head else None
 
 
 _TEST_PROGRAMS = frozenset({"pytest", "jest", "vitest", "mocha", "rspec",
@@ -1631,6 +2496,7 @@ NETWORK_REGISTRY: dict[str, str] = {
     "crates": "crates.io", "go": "proxy.golang.org", "oci": "registry-1.docker.io",
 }
 NETWORK_ITEMS_CAP = 2000
+NET_UNREADABLE_PROGRAM = "(unreadable)"     # the program of a command read only in part (R10)
 
 _NET_URL = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
 # scp-style git remote: [user@]host.tld:owner/repo
@@ -1642,20 +2508,28 @@ _NET_FULL_VERSION = re.compile(r"^=?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?$")
 _NET_GO_VERSION = re.compile(r"^v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?$")
 _OCI_HUB_HOSTS = frozenset({"docker.io", "index.docker.io", "registry-1.docker.io"})
 _NET_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_NET_PREFIX_VALUE_FLAGS = {"sudo": {"-u", "-g", "-C", "-h", "-p"}, "nice": {"-n"}, "env": {"-u", "-C"},
+_NET_PREFIX_VALUE_FLAGS = {"sudo": {"-u", "-g", "-C", "-h", "-p", "-r", "-t", "-D", "-U", "--user", "--group",
+                                    "--chdir", "--host", "--prompt", "--role", "--type", "--close-from",
+                                    "--other-user"},
+                           "nice": {"-n", "--adjustment"}, "env": {"-u", "-C", "--unset", "--chdir"},
                            "timeout": {"-s", "--signal", "-k", "--kill-after"},
-                           "stdbuf": {"-i", "-o", "-e"}, "doas": {"-u", "-C"},
+                           "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
+                           "doas": {"-u", "-C"},
                            "xargs": {"-I", "-n", "-P", "-L", "-d", "-E", "-s", "-a",
                                      "--max-args", "--max-procs", "--max-lines", "--delimiter",
-                                     "--eof", "--max-chars", "--arg-file", "--replace"}}
+                                     "--eof", "--max-chars", "--arg-file", "--replace"},
+                           "exec": {"-a"}, "caffeinate": {"-t", "-w"}, "arch": {"-arch", "-e", "-d"},
+                           "flock": {"-w", "--wait", "--timeout", "-E", "--conflict-exit-code"},
+                           "watch": {"-n", "--interval", "-q", "--equexit"}}
 # Words that run the command after them: skipped, with their own flags.
 _NET_PREFIXES = frozenset({"sudo", "env", "time", "nice", "nohup", "command", "exec",
-                           "timeout", "stdbuf", "doas", "busybox", "xargs"})
+                           "timeout", "stdbuf", "doas", "busybox", "xargs", "coproc", "setsid",
+                           "caffeinate", "arch", "flock", "watch"})
 # Shell grammar that can stand before a command in a segment: `do curl …`,
 # `if curl …`, `! curl …`, `{ curl …`. A `for x in …` header is not here: it is
 # followed by a word list, not a command, and reads as no download.
 _NET_CONTROL_WORDS = frozenset({"while", "until", "if", "then", "else", "elif", "do",
-                                "!", "{", "}", "(", ")"})
+                                "!", "{", "}", "(", ")", "esac"})
 # `-c`, and any single-dash cluster holding c: bash -lc, sh -xc, zsh -ec.
 # A letters-only check plus `"c" in t`: `-[A-Za-z]*c[A-Za-z]*` backtracks once
 # per `c` and took 3 s on a 32 KB token.
@@ -1673,7 +2547,12 @@ def _net_base(path: str) -> str:
 # extractors know (each name below is a substring of every spelling read:
 # pip covers pip3 and pipx, uv covers uvx, npm covers pnpm, bun covers bunx,
 # go covers cargo, gh is gh). Such a command skips tokenising entirely.
-_NET_MAY_DOWNLOAD = re.compile(r"['\"\\$`(]|curl|wget|git|gh|npm|npx|yarn|bun|pip|uv|brew|go|docker|podman")
+# Case-insensitive: on a case-insensitive filesystem (macOS) `CURL` is curl.
+# A `{` that may start a brace expansion (`cu{r,}l`, `h{1..3}`). The class
+# excludes `{`, so each start scans to the next one at most: linear.
+_NET_BRACE_HINT = r"\{[^\s{}]*?(?:,|\.\.)"
+_NET_MAY_DOWNLOAD = re.compile(r"['\"\\$`(]|curl|wget|git|gh|npm|npx|yarn|bun|pip|uv|brew|go|docker|podman|"
+                               + _NET_BRACE_HINT, re.I)
 
 
 def _net_shell_c(t: str) -> bool:
@@ -1683,26 +2562,181 @@ def _net_shell_c(t: str) -> bool:
 def _net_shell_c_index(tokens: list[str]) -> int:
     """Where a shell's -c (or -lc, -xc, …) is, when a command string follows; else 0."""
     return next((k for k in range(1, len(tokens) - 1) if _net_shell_c(tokens[k])), 0)
-_NET_SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
-_NET_BACKTICK = re.compile(r"`([^`]*)`")
+_NET_SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish", "ash", "mksh", "yash", "csh", "tcsh"}
 
 
-def url_host(url: str) -> str | None:
-    """Lowercased host of a URL or scp-style git remote, without user or port.
+_NET_PCT = re.compile(rb"%([0-9A-Fa-f]{2})")
+NET_HOST_MAX = 1024
+# A host after normalisation: labels of letters, digits, `-` and `_` (curl
+# accepts `_`), one optional trailing dot already dropped.
+_NET_HOST_OK = re.compile(r"[a-z0-9_-]+(?:\.[a-z0-9_-]+)*")
+_NET_IPV4_PART = re.compile(r"0[xX][0-9A-Fa-f]*|[0-9]+")
+_NET_IPV6_GROUP = re.compile(r"[0-9a-f]{1,4}")
 
-    None for anything that is not one: a remote name, a path, or a URL built
-    from a shell variable, whose host cannot be known from the transcript.
-    """
-    if not url or "$" in url or "`" in url:
+
+def _ipv4_canon(labels: list[str]) -> str | None:
+    """Dotted quad for an IPv4 address in any form inet_aton and curl accept
+    (`101058054`, `0x06060606`, `6.6.1542`, `06.06.06.06`), or None when the
+    numbers do not make one."""
+    if not 1 <= len(labels) <= 4:
         return None
+    nums = []
+    for p in labels:
+        if len(p) > 34 or not _NET_IPV4_PART.fullmatch(p):
+            return None                      # no 32-bit number is longer (and int() caps digits)
+        if p[:2].lower() == "0x":
+            nums.append(int(p[2:] or "0", 16))
+        elif len(p) > 1 and p[0] == "0":
+            if not all(c in "01234567" for c in p):
+                return None
+            nums.append(int(p, 8))
+        else:
+            nums.append(int(p))
+    if any(n > 255 for n in nums[:-1]) or nums[-1] >= 256 ** (5 - len(nums)):
+        return None
+    value = 0
+    for n in nums[:-1]:
+        value = value * 256 + n
+    value = value * 256 ** (5 - len(nums)) + nums[-1]
+    return ".".join(str((value >> s) & 255) for s in (24, 16, 8, 0))
+
+
+def _ipv6_canon(inner: str) -> str | None:
+    """`[…]` in RFC 5952 form, or the dotted quad of an IPv4-mapped address
+    (`::ffff:6.6.6.6`); None when it does not parse (a zone id included)."""
+    inner = inner.lower()
+    if "%" in inner or inner.count("::") > 1:
+        return None
+
+    def groups(text: str) -> list[int] | None:
+        out: list[int] = []
+        parts = text.split(":") if text else []
+        for k, p in enumerate(parts):
+            if "." in p and k == len(parts) - 1:
+                if not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", p) or any(int(x) > 255 for x in p.split(".")):
+                    return None
+                a, b, c, d = (int(x) for x in p.split("."))
+                out += [a * 256 + b, c * 256 + d]
+            elif _NET_IPV6_GROUP.fullmatch(p):
+                out.append(int(p, 16))
+            else:
+                return None
+        return out
+    head, sep, tail = inner.partition("::")
+    h, t = groups(head), groups(tail)
+    if h is None or t is None:
+        return None
+    if sep:
+        if len(h) + len(t) > 7:
+            return None
+        g = h + [0] * (8 - len(h) - len(t)) + t
+    elif len(h) == 8:
+        g = h
+    else:
+        return None
+    if g[:5] == [0] * 5 and g[5] == 0xFFFF:
+        return f"{g[6] >> 8}.{g[6] & 255}.{g[7] >> 8}.{g[7] & 255}"
+    best, at = 0, -1                         # the longest run of two or more zero groups
+    k = 0
+    while k < 8:
+        if g[k] == 0:
+            e = k
+            while e < 8 and g[e] == 0:
+                e += 1
+            if e - k > best and e - k >= 2:
+                best, at = e - k, k
+            k = e
+        else:
+            k += 1
+    hexes = [format(x, "x") for x in g]
+    if at < 0:
+        return "[" + ":".join(hexes) + "]"
+    return "[" + ":".join(hexes[:at]) + "::" + ":".join(hexes[at + best:]) + "]"
+
+
+_IDNA_DEVIATIONS = re.compile("[\u00df\u1e9e\u03c2\u200c\u200d]")
+
+
+def _host_canon(host: str) -> str | None:
+    """A URL's host as curl and the URL standard resolve it (ruling R15):
+    percent-decoded, IDNA-mapped, lower-cased, without a trailing dot, an IPv4
+    address in any numeric form as a dotted quad, an IPv6 address in RFC 5952
+    form (an IPv4-mapped one as its dotted quad). None when it cannot be
+    normalised with confidence: the caller marks the item unresolved."""
+    if len(host) > NET_HOST_MAX:
+        return None                          # longer than any DNS name, even percent-encoded
+    if "%" in host:
+        try:
+            host = _NET_PCT.sub(lambda m: bytes([int(m.group(1), 16)]), host.encode("utf-8")).decode("utf-8")
+        except (UnicodeError, ValueError):
+            return None
+        if "%" in host:
+            return None
+    if host.startswith("["):
+        return _ipv6_canon(host[1:-1]) if host.endswith("]") else None
+    if not host.isascii():
+        # Python's codec is IDNA 2003; curl (libidn2) and browsers use UTS 46,
+        # non-transitional. They differ on the deviation characters: 2003 maps
+        # sharp s (U+00DF) to "ss", final sigma (U+03C2) to sigma and drops the
+        # joiners (U+200C, U+200D); UTS 46 keeps them, so "stra\u00dfe.example"
+        # is xn--strae-oqa.example to curl, not strasse.example. Without a
+        # UTS 46 table, a host holding one is not normalised (fail closed:
+        # unresolved, never trusted). Capital sharp s (U+1E9E) lowercases to U+00DF.
+        if _IDNA_DEVIATIONS.search(host):
+            return None
+        try:
+            host = host.encode("idna").decode("ascii")
+        except (UnicodeError, ValueError):
+            return None
+    host = host.lower()
+    host = host[:-1] if host.endswith(".") else host
+    if not host or not _NET_HOST_OK.fullmatch(host):
+        return None
+    labels = host.split(".")
+    if _NET_IPV4_PART.fullmatch(labels[-1]):
+        return _ipv4_canon(labels)           # a numeric last label: an address or nothing
+    return host
+
+
+def _url_host_parts(url: str) -> tuple[str | None, bool]:
+    """(url_host(url), unresolved): unresolved is True when `url` is a URL
+    whose literal host could not be normalised (R15), as opposed to no host
+    at all or one built from a variable."""
+    if not url:
+        return None, False
     if _NET_URL.match(url):
         rest = re.split(r"[/?#]", url.split("://", 1)[1], maxsplit=1)[0]
         host = rest.rsplit("@", 1)[-1]
-        if host.startswith("["):             # IPv6 literal: keep the brackets, drop the port
-            return host[:host.find("]") + 1].lower() if "]" in host else None
-        return host.split(":", 1)[0].lower().removesuffix(".") or None
+        if host.startswith("["):             # IPv6 literal: the brackets, then an optional port
+            host = host[:host.find("]") + 1] if "]" in host else host
+        else:
+            host = host.split(":", 1)[0]     # a variable in the port hides nothing (R3B4)
+        if "$" in host or "`" in host or _LEX_PH in host:
+            return None, False
+        if not host:
+            return None, False
+        canon = _host_canon(host)
+        return canon, canon is None
+    if "$" in url.split(":", 1)[0] or "`" in url.split(":", 1)[0]:
+        return None, False
     m = _NET_SCP.match(url)
-    return m.group(1).lower().removesuffix(".") if m else None
+    if not m:
+        return None, False
+    canon = _host_canon(m.group(1))
+    return canon, canon is None
+
+
+def url_host(url: str) -> str | None:
+    """Normalised host of a URL or scp-style git remote, without user or port
+    (see _host_canon).
+
+    None for anything that is not one: a remote name, a path, a URL whose
+    host is built from a shell variable and cannot be known from the
+    transcript, or a host that cannot be normalised. A variable in the path,
+    query or port (`…/releases/$VER/x`, `:$PORT`) leaves the literal host
+    readable.
+    """
+    return _url_host_parts(url)[0]
 
 
 def url_path(url: str) -> str:
@@ -1723,15 +2757,27 @@ def _net_item(kind: str, program: str, **kw) -> dict:
 
 
 def _net_url_item(kind: str, program: str, url: str, **kw) -> dict:
-    host = url_host(url)
-    return _net_item(kind, program, host=host, url=url,
-                     dynamic=host is None and ("$" in url or "`" in url), **kw)
+    host, unresolved = _url_host_parts(url)
+    item = _net_item(kind, program, host=host, url=url,
+                     dynamic="$" in url or "`" in url or unresolved, **kw)
+    if unresolved:
+        item["_unresolved"] = "host-unresolved"   # a literal host not normalised (R15)
+    return item
 
 
 def _net_registry_item(program: str, ecosystem: str, name: str | None, version: str | None,
                        registry: str | None, exec_: bool = False,
                        exact: "re.Pattern" = _NET_FULL_VERSION) -> dict:
-    host = url_host(registry) if registry else None
+    host, unresolved = _url_host_parts(registry) if registry else (None, False)
+    if registry and not host:
+        # A registry is named but its host cannot be read (`--registry "$R"`, a
+        # path): not the public default. Built from a variable, it is dynamic.
+        item = _net_item("install", program, ecosystem=ecosystem, package=name, version=version,
+                         pinned=bool(version and exact.match(version)), exec=exec_,
+                         dynamic="$" in registry or "`" in registry or unresolved)
+        if unresolved:
+            item["_unresolved"] = "host-unresolved"
+        return item
     return _net_item("install", program, ecosystem=ecosystem, package=name, version=version,
                      pinned=bool(version and exact.match(version)), exec=exec_,
                      host=host or NETWORK_REGISTRY[ecosystem], host_inferred=not host)
@@ -1741,6 +2787,18 @@ def _net_lockfile(program: str, ecosystem: str, registry: str | None = None) -> 
     item = _net_registry_item(program, ecosystem, None, None, registry)
     item["pinned"] = True
     return item
+
+
+_NET_CLUSTER = re.compile(r"^-[A-Za-z]{2,}$")
+
+
+def _net_cluster_takes(a: str, takes_value: frozenset) -> bool:
+    """A single-dash cluster (`-sH`, `-fsSX`) whose last letter takes a value,
+    the next word. When an earlier letter takes one, the rest of the cluster
+    is that value (`-ofile`, `-Oout`) and nothing more is consumed."""
+    if not _NET_CLUSTER.match(a) or "-" + a[-1] not in takes_value:
+        return False
+    return not any("-" + ch in takes_value for ch in a[1:-1])
 
 
 def _net_positionals(args: list[str], takes_value: frozenset = frozenset()) -> tuple[list[str], dict]:
@@ -1762,6 +2820,10 @@ def _net_positionals(args: list[str], takes_value: frozenset = frozenset()) -> t
             if a in takes_value and i + 1 < len(args):
                 opts[a] = args[i + 1]
                 i += 1
+            elif _net_cluster_takes(a, takes_value) and i + 1 < len(args):
+                opts["-" + a[-1]] = args[i + 1]  # `-sH "X: y"`: the last letter takes the value
+                opts[a] = ""
+                i += 1
             else:
                 opts[a] = ""
         else:
@@ -1770,177 +2832,337 @@ def _net_positionals(args: list[str], takes_value: frozenset = frozenset()) -> t
     return pos, opts
 
 
-# The character loops in _net_split and _net_tokens are exact and slow. A text
-# with none of these characters splits the same way in one C-level call, which
-# is most commands. A fuzz of 200,000 random strings found no difference.
-_NET_SPLIT_SLOW = re.compile(r"['\"\\]|>\|")
-_NET_SPLIT_OPS = re.compile(r"(&&|\|\||\|&|[;|\n])")
-_NET_TOKENS_SLOW = re.compile(r"['\"\\<>&()]")
+# The character loops in _net_split and _net_tokens are exact. A text with none
+# of these characters splits the same way in one C-level call, which is most
+# commands. A fuzz of 200,000 random strings found no difference.
+_NET_SPLIT_SLOW = re.compile(r"['\"\\#$]|>\|")
+# A lone `&` (run in the background) separates commands too; `&>`, `>&` and
+# `<&` are redirections, which _net_tokens reads.
+_NET_SPLIT_OPS = re.compile(r"(&&|\|\||\|&|(?<![<>])&(?![>&])|[;|\n])")
+_NET_TOKENS_SLOW = re.compile(r"['\"\\<>&()#$]")
+_NET_TOKENS_STOP = re.compile(r"[\s'\"\\<>&()#$]")
+# The exact path jumps from one of these to the next; the text between is copied.
+_NET_SPLIT_STOP = re.compile(r"[\\'\"#$&|;\n]")
+# The rest of a double-quoted span after its opening quote, through the closing
+# one; and of an ANSI-C $'…' span after `$'`. Each alternative starts with a
+# different character, so the scan is linear.
+_NET_DQ_REST = re.compile(r'(?:[^"\\]|\\.)*"', re.S)
+_NET_ANSI_REST = re.compile(r"(?:[^'\\]|\\.)*'", re.S)
+# A `#` starts a comment only at the start of a word.
+_NET_WORD_BREAK = frozenset(" \t\n;&|()<>")
 
 
-def _net_split(text: str, seps: list[str] | None = None) -> tuple[list[str], bool]:
-    """Split on && || |& ; | and newline, outside quotes. Returns the parts and
-    whether a quote was left open (the last part is then unusable). `seps`,
-    when given, receives the operator after each part ("" after the last)."""
+def _net_split(text: str, seps: list[str] | None = None,
+               amps: list[int] | None = None) -> tuple[list[str], bool]:
+    """Split on && || |& ; | & and newline, outside quotes and comments (bash
+    rules: '…' is literal, "…" and $'…' honour a backslash, a `#` at the start
+    of a word comments out the rest of its line). Returns the parts and whether
+    a quote was left open (the last part is then unusable). `seps`, when given,
+    receives the operator after each part ("" after the last); a lone `&` is
+    given as ";", and `amps`, when given, receives the index of each part it
+    ends (run in the background: a subshell)."""
     if not _NET_SPLIT_SLOW.search(text):     # nothing quoted or escaped: one C-level split
         pieces = _NET_SPLIT_OPS.split(text)
         if seps is not None:
-            seps += ["|" if p == "|&" else p for p in pieces[1::2]] + [""]
+            seps += ["|" if p == "|&" else ";" if p == "&" else p for p in pieces[1::2]] + [""]
+        if amps is not None:
+            amps += [k for k, p in enumerate(pieces[1::2]) if p == "&"]
         return pieces[0::2], False
-    parts, buf, quote, i = [], [], "", 0
-    while i < len(text):
+    parts: list[str] = []
+    buf: list[str] = []
+    open_quote, i, n = False, 0, len(text)
+    esc_end = -1                             # just after the last escaped character
+    while i < n:
+        m = _NET_SPLIT_STOP.search(text, i)
+        if m is None:
+            buf.append(text[i:])
+            break
+        j = m.start()
+        if j > i:
+            buf.append(text[i:j])
+            i = j
         ch = text[i]
-        if ch == "\\" and quote != "'" and i + 1 < len(text):
+        if ch == "\\":
             buf.append(text[i:i + 2])        # an escaped character opens and closes nothing
             i += 2
+            esc_end = i
             continue
-        if quote:
+        if ch == "'" or ch == '"' or (ch == "$" and text.startswith("$'", i)):
+            if ch == "'":
+                k = text.find("'", i + 1)
+                end = k + 1 if k >= 0 else -1
+            else:
+                q = _NET_DQ_REST.match(text, i + 1) if ch == '"' else _NET_ANSI_REST.match(text, i + 2)
+                end = q.end() if q else -1
+            if end < 0:
+                buf.append(text[i:])
+                open_quote = True
+                break
+            buf.append(text[i:end])
+            i = end
+            continue
+        if ch == "$":
             buf.append(ch)
-            if ch == quote:
-                quote = ""
-        elif ch in "\"'":
-            quote = ch
-            buf.append(ch)
-        elif text.startswith(("&&", "||", "|&"), i):
+            i += 1
+            continue
+        if ch == "#":
+            # `a\ #b` and `a\;#b`: an escaped blank or operator is part of the word
+            if i == 0 or (i != esc_end and text[i - 1] in _NET_WORD_BREAK):
+                k = text.find("\n", i)       # a comment: to the end of its line
+                i = n if k < 0 else k
+            else:
+                buf.append(ch)
+                i += 1
+            continue
+        prev = text[i - 1] if i else ""
+        if text.startswith(("&&", "||", "|&"), i):
             parts.append("".join(buf))
             if seps is not None:
                 seps.append("|" if text.startswith("|&", i) else text[i:i + 2])   # |& pipes stderr too
             buf = []
             i += 2
             continue
-        elif ch == "|" and buf and buf[-1] == ">":
-            buf.append(ch)                   # `>|` is a clobber redirection, not a pipe
-        elif ch in ";|\n":
-            parts.append("".join(buf))
-            if seps is not None:
-                seps.append(ch)
-            buf = []
-        else:
+        if ch == "|" and prev == ">" and i != esc_end:
+            buf.append(ch)                   # `>|` is a clobber redirection, not a pipe (`\>|` is a pipe)
+        elif ch == "&" and ((prev in ("<", ">") and i != esc_end) or text.startswith("&>", i)):
             buf.append(ch)
+        else:
+            parts.append("".join(buf))       # ; | newline, or a lone `&`: the next command
+            if seps is not None:
+                seps.append(";" if ch == "&" else ch)
+            if amps is not None and ch == "&":
+                amps.append(len(parts) - 1)
+            buf = []
         i += 1
     parts.append("".join(buf))
     if seps is not None:
         seps.append("")
-    return parts, bool(quote)
+    return parts, open_quote
+
+
+class _NetArgv(list):
+    """The argv of one command, carrying the NAME=VALUE assignments written
+    before it (`npm_config_registry=… npm i x`, `GH_HOST=… gh …`): they can
+    change where the program downloads from (R3B10, R3B11). Also what its
+    wrappers do to the environment it inherits (R3F5): `env -i` or `env -`
+    clears it (`env_clear`), `env -u NAME` drops NAME (`env_unset`), and sudo
+    or doas without -E may reset it (`env_maybe`: the sudoers policy decides)."""
+    env: dict = {}
+    env_clear = False
+    env_unset: frozenset = frozenset()
+    env_maybe = False
+
+
+def _net_argv(tokens: list[str], env: dict, scope: "dict | None" = None) -> list[str]:
+    if not env and not (scope and (scope["clear"] or scope["unset"] or scope["maybe"])):
+        return tokens
+    out = _NetArgv(tokens)
+    out.env = env
+    if scope:
+        out.env_clear, out.env_unset, out.env_maybe = scope["clear"], frozenset(scope["unset"]), scope["maybe"]
+    return out
+
+
+def _net_inherit(tokens: list[str], outer: list[str]) -> list[str]:
+    """`tokens`, run by the command `outer` (`VAR=x bash -c '…'`, `env -i sh -c
+    '…'`): it inherits outer's assignments and environment changes (R3F5)."""
+    o_env = getattr(outer, "env", {})
+    o_clear, o_unset, o_maybe = (getattr(outer, "env_clear", False), getattr(outer, "env_unset", frozenset()),
+                                 getattr(outer, "env_maybe", False))
+    if not (o_env or o_clear or o_unset or o_maybe):
+        return tokens
+    out = _NetArgv(tokens)
+    out.env = {**o_env, **getattr(tokens, "env", {})}
+    out.env_clear = o_clear or getattr(tokens, "env_clear", False)
+    out.env_unset = o_unset | getattr(tokens, "env_unset", frozenset())
+    out.env_maybe = o_maybe or getattr(tokens, "env_maybe", False)
+    return out
 
 
 def _net_strip_prefixes(tokens: list[str]) -> tuple[list[str], bool]:
     """The command a segment runs, past assignments, control-flow words and
     wrappers, and whether it came through `xargs` (its arguments may then
-    arrive on stdin, out of sight)."""
-    i, via_xargs = 0, False
+    arrive on stdin, out of sight). Names are compared lower-cased (R11), a
+    wrapper by its base name (`/usr/bin/env` is env, R3C1). The assignments
+    skipped ride on the result (_NetArgv.env)."""
+    i, via_xargs, via_exec = 0, False, False
+    env: dict[str, str] = {}
+    scope: dict = {"clear": False, "unset": set(), "maybe": False}
     while i < len(tokens):
         t = tokens[i]
-        if _NET_ASSIGN.match(t) or t in _NET_CONTROL_WORDS:
+        low = t.lower()
+        if _NET_ASSIGN.match(t):
+            k, _, v = t.partition("=")
+            env[k] = v
             i += 1
             continue
-        if t in _NET_PREFIXES:
-            takes = _NET_PREFIX_VALUE_FLAGS.get(t, set())
-            via_xargs = via_xargs or t == "xargs"
+        if low in _NET_CONTROL_WORDS:
             i += 1
+            continue
+        if "/" in low:
+            low = _net_base(low)
+        if low in _NET_PREFIXES:
+            takes = _NET_PREFIX_VALUE_FLAGS.get(low, set())
+            via_xargs = via_xargs or low == "xargs"
+            i += 1
+            keep_env = False
             while i < len(tokens) and tokens[i].startswith("-") and len(tokens[i]) > 1:
-                i += 2 if tokens[i] in takes else 1
-            if t == "timeout" and i < len(tokens):
-                i += 1                       # the DURATION
+                a = tokens[i]
+                if low == "env":
+                    gone = (tokens[i + 1] if a in ("-u", "--unset") and i + 1 < len(tokens)
+                            else a[8:] if a.startswith("--unset=")
+                            else a[2:] if a.startswith("-u") and not a.startswith("--") else None)
+                    if a in ("-i", "--ignore-environment") or (
+                            not a.startswith("--") and gone is None and "i" in a and set(a[1:]) <= set("iv0")):
+                        env.clear()              # `env -i`: nothing inherited, nothing assigned before
+                        scope["clear"] = True
+                    elif gone:
+                        env.pop(gone, None)
+                        scope["unset"].add(gone)
+                elif low in ("sudo", "doas") and (a in ("-E", "--preserve-env")
+                                                  or a.startswith("--preserve-env=")):
+                    keep_env = True
+                if low == "flock" and a in ("-c", "--command"):
+                    break
+                if low == "env" and (a in ("-S", "--split-string") or a.startswith(("-S", "--split-string="))):
+                    # `env -S 'curl … | sh'`: env splits the string into the command (R3B7).
+                    if a in ("-S", "--split-string"):
+                        text, rest = (tokens[i + 1] if i + 1 < len(tokens) else ""), tokens[i + 2:]
+                    else:
+                        text, rest = a.split("=", 1)[1] if a.startswith("--") else a[2:], tokens[i + 1:]
+                    return _net_argv(["sh", "-c", " ".join([text] + rest)], env, scope), via_xargs
+                if low == "watch" and a in ("-x", "--exec"):
+                    via_exec = True
+                    i += 1
+                    break
+                i += 2 if a in takes else 1
+            if low == "env" and i < len(tokens) and tokens[i] == "-":
+                env.clear()                      # `env - CMD` is `env -i CMD`
+                scope["clear"] = True
+                i += 1
+            if low in ("sudo", "doas") and not keep_env:
+                scope["maybe"] = True            # env_reset: what reaches CMD is the policy's call
+            if low in ("timeout", "flock") and i < len(tokens):
+                i += 1                       # timeout's DURATION, flock's FILE
+            if low == "flock" and i < len(tokens) and tokens[i] in ("-c", "--command"):
+                return _net_argv(["sh", "-c"] + tokens[i + 1:], env, scope), via_xargs    # `flock F -c CMD` runs CMD with sh
+            if low == "watch" and i < len(tokens) and not via_exec:
+                # watch runs its arguments, joined, with `sh -c` (R3B7).
+                return _net_argv(["sh", "-c", " ".join(tokens[i:])], env, scope), via_xargs
             continue
         break
-    return tokens[i:], via_xargs
+    return _net_argv(tokens[i:], env, scope), via_xargs
 
 
-def _net_close_paren(text: str, start: int) -> int:
-    """Index of the ')' closing a '$(' whose body starts at `start`, or -1.
-    Parentheses inside quoted spans do not count; a backslash escapes outside
-    single quotes. One forward pass."""
-    depth, j = 1, start
-    while j < len(text):
-        ch = text[j]
-        if ch == "\\":
-            j += 2
-            continue
-        if ch in "\"'":
-            j += 1
-            while j < len(text) and text[j] != ch:
-                j += 2 if (ch == '"' and text[j] == "\\") else 1
-            if j >= len(text):
-                return -1
-        elif ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth == 0:
-                return j
-        j += 1
-    return -1
-
-
-def _net_feeds_shell(before: str, process: bool) -> bool:
-    """Whether a substitution that starts right after `before` is run by a
-    shell as code. For `$(…)`: `sh -c "$(…)"`, where the output is the
-    script. For a process substitution `<(…)`: `bash <(…)`, `source <(…)`,
-    `. <(…)`. `before` is a bounded window, so this is constant work."""
-    cut = max(before.rfind(c) for c in ";&|\n(") + 1
-    words = [w.strip("\"'") for w in before[cut:].split()]
-    words = _net_strip_prefixes([w for w in words if w])[0]
-    if not words:
-        return False
-    prog = _net_base(words[0])
-    if process:
-        return (prog in _NET_SHELLS or prog in ("source", ".")) \
-            and all(w.startswith("-") for w in words[1:])
-    return prog in _NET_SHELLS and len(words) > 1 and _net_shell_c(words[-1])
-
-
-def _net_substitutions(text: str, feeds: list[bool] | None = None) -> tuple[list[str], str]:
-    """The bodies of every $( ... ), <( ... ) and `...` in `text`, outermost
-    first (an inner one is found again when its body is read), and `text`
-    with them blanked. Parentheses are matched by depth, so `$(a $(b))` is
-    one body. `feeds`, when given, receives for each body whether a shell
-    runs its output as code (_net_feeds_shell)."""
-    bodies: list[str] = []
-    out: list[str] = []
-    i = 0
-    while i < len(text):
-        if text.startswith(("$(", "<("), i):
-            end = _net_close_paren(text, i + 2)
-            if end < 0:
-                out.append(text[i:])         # unbalanced: nothing later can balance either
-                break
-            bodies.append(text[i + 2:end])
-            if feeds is not None:
-                feeds.append(_net_feeds_shell(text[max(0, i - 256):i], text[i] == "<"))
-            out.append(" ")
-            i = end + 1
-            continue
-        out.append(text[i])
-        i += 1
-    rest = "".join(out)
-    ticks = [m.group(1) for m in _NET_BACKTICK.finditer(rest)]
-    bodies += ticks
-    if feeds is not None:
-        feeds += [False] * len(ticks)
-    return bodies, _NET_BACKTICK.sub(" ", rest)
-
-
+# `{name}>f` (bash 4.1+) allocates a file descriptor into $name: a redirection.
+_NET_FD_VAR = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}\Z")
 # Redirection operators, longest first. `>|` reaches here only from _net_split,
 # which keeps the `|` of a clobber with its `>`.
 _NET_REDIRECT_OPS = ("&>>", "&>", "<<<", "<<", "<>", "<&", "<", ">>", ">&", ">|", ">")
+_ANSI_C_ESCAPES = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r",
+                   "t": "\t", "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?"}
+_ANSI_C_STOP = re.compile(r"[\\']")
+_ANSI_C_HEX = re.compile(r"[0-9A-Fa-f]+")
+_ANSI_C_OCT = re.compile(r"[0-7]+")
 
 
-def _net_tokens(segment: str, operators: bool = False) -> list[str]:
+def _ansi_c(text: str, i: int) -> tuple[str | None, int]:
+    """Decode the ANSI-C quoted word $'…' that starts at text[i] (the `$`):
+    (its value, the index after the closing quote), or (None, -1) when it is
+    not closed. Backslash escapes as bash reads them, including \\'. Bash
+    cuts the value at the first NUL (`$'cu\\x00x'rl` is `curl`), and the
+    lexer's private-use markers are replaced, so a decoded value can never
+    forge one."""
+    out: list[str] = []
+    j, n = i + 2, len(text)
+    while True:
+        m = _ANSI_C_STOP.search(text, j)
+        if m is None:
+            return None, -1
+        out.append(text[j:m.start()])
+        j = m.start()
+        if text[j] == "'":
+            value = "".join(out)
+            if "\0" in value:
+                value = value[:value.index("\0")]
+            if not value.isascii() and _LEX_PRIVATE.search(value):
+                value = _LEX_PRIVATE.sub("\ufffd", value)
+            return value, j + 1
+        if j + 1 >= n:
+            return None, -1
+        e = text[j + 1]
+        if e in _ANSI_C_ESCAPES:
+            out.append(_ANSI_C_ESCAPES[e])
+            j += 2
+        elif e in "xuU":
+            width = {"x": 2, "u": 4, "U": 8}[e]
+            h = _ANSI_C_HEX.match(text, j + 2, min(n, j + 2 + width))
+            if h:
+                cp = int(h.group(0), 16)
+                out.append(chr(cp) if cp <= 0x10FFFF else "\ufffd")
+                j = h.end()
+            else:
+                out.append("\\" + e)
+                j += 2
+        elif e in "01234567":
+            o = _ANSI_C_OCT.match(text, j + 1, min(n, j + 4))
+            out.append(chr(int(o.group(0), 8) & 0xFF))
+            j = o.end()
+        elif e == "c" and j + 2 < n:
+            out.append(chr(ord(text[j + 2]) & 0x1F))
+            j += 3
+        else:
+            out.append("\\" + e)
+            j += 2
+
+
+def _net_tokens(segment: str, operators: bool = False,
+                redirs: "list[tuple[str, str]] | None" = None) -> list[str]:
     """Like _shell_tokens, but a backslash escapes: `\\"` is a quote character,
-    not a quote. Kept here so command_head() keeps its behaviour.
+    not a quote; $'…' is decoded (ANSI-C quoting, where \\' is a quote
+    character); a `#` that starts a word comments out the rest of its line.
+    Kept here so command_head() keeps its behaviour.
 
     With `operators`, an unquoted `(` or `)` separates words, and an unquoted redirection (`>`, `2>&1`, `&>f`, `< f`,
     `<<< w`, `>| f`, attached or not) is dropped with its target, and a word
     is cut where an unquoted `<` or `>` starts one: `https://a.io>/tmp/x`
-    is the URL `https://a.io`. A redirection is never a package or a host."""
+    is the URL `https://a.io`. A redirection is never a package or a host.
+    `redirs`, when given, receives (operator, target) for each one dropped."""
     if not _NET_TOKENS_SLOW.search(segment):  # no quote, escape or operator: plain words
         return segment.split()
     out, buf, quote, started, i = [], [], "", False, 0
     discard = False                          # the next word is a redirection target
-    while i < len(segment):
+    op = ""
+    n = len(segment)
+
+    def flush() -> None:
+        if discard:
+            if redirs is not None:
+                redirs.append((op, "".join(buf)))
+        else:
+            out.append("".join(buf))
+
+    while i < n:
+        if not quote:                        # copy a run of plain characters at once
+            m = _NET_TOKENS_STOP.search(segment, i)
+            j = m.start() if m else n
+            if j > i:
+                buf.append(segment[i:j])
+                started = True
+                i = j
+                if i >= n:
+                    break
+        elif quote == "'":
+            e = segment.find("'", i)
+            if e < 0:
+                buf.append(segment[i:])
+                break
+            buf.append(segment[i:e])
+            quote = ""
+            i = e + 1
+            continue
         ch = segment[i]
-        if ch == "\\" and quote != "'" and i + 1 < len(segment):
+        if ch == "\\" and quote != "'" and i + 1 < n:
             nxt = segment[i + 1]
             if quote == '"' and nxt not in '"\\$`':
                 buf.append(ch)
@@ -1953,64 +3175,906 @@ def _net_tokens(segment: str, operators: bool = False) -> list[str]:
                 quote = ""
             else:
                 buf.append(ch)
+        elif ch == "$" and segment.startswith("$'", i):
+            value, end = _ansi_c(segment, i)
+            if value is None:                # not closed: the rest is the word
+                buf.append(segment[i + 2:])
+                started = True
+                break
+            buf.append(value)
+            started = True
+            i = end
+            continue
         elif ch in "\"'":
             quote, started = ch, True
+        elif ch == "#" and not buf and not started and (i == 0 or segment[i - 1] in _NET_WORD_BREAK):
+            k = segment.find("\n", i)        # a comment: nothing after it on its line is a word
+            i = n if k < 0 else k
+            continue
         elif ch.isspace():
             if buf or started:
-                if not discard:
-                    out.append("".join(buf))
+                flush()
                 discard = False
                 buf, started = [], False
         elif operators and ch in "()":
-            if (buf or started) and not discard:
-                out.append("".join(buf))
             if buf or started:
+                flush()
                 discard = False
             buf, started = [], False
         elif operators and (ch in "<>" or segment.startswith("&>", i)):
-            op = next(o for o in _NET_REDIRECT_OPS if segment.startswith(o, i))
+            nop = next(o for o in _NET_REDIRECT_OPS if segment.startswith(o, i))
             word = "".join(buf)
-            if (buf or started) and not word.isdigit() and not discard:
-                out.append(word)                 # `a.io>f`: the word ends here; `2>f`: 2 is the fd
-            buf, started, discard = [], False, True
-            i += len(op)
+            if (buf or started) and not word.isdigit() and not _NET_FD_VAR.match(word):
+                flush()                      # `a.io>f`: the word ends here; `2>f`, `{fd}>f`: the fd
+            buf, started, discard, op = [], False, True, nop
+            i += len(nop)
             continue
         else:
             buf.append(ch)
             started = True
         i += 1
-    if (buf or started) and not discard:
-        out.append("".join(buf))
+    if buf or started:
+        flush()
     return out
 
 
-def _net_segments(cmd: str, depth: int = 0) -> tuple[list[tuple[list[str], bool, bool, str]], int]:
+# --- the shared shell lexer ----------------------------------------------------
+#
+# One pass over a command, as bash reads it (R9): '…' is literal; "…" and the
+# body of a heredoc whose word is unquoted expand $(…), `…` and ${…}; $'…' is
+# ANSI-C quoted; a `#` that starts a word outside quotes is a comment; `\`
+# before a newline joins lines; a heredoc opener counts only outside quotes,
+# comments and $((…)). It yields the command as plain shell code (comments and
+# heredoc bodies cut out, $'…' turned into '…') in which every substitution is
+# a placeholder word holding `$`, and the substitution bodies and heredoc
+# bodies beside it. Nesting is a stack, never recursion, so any depth costs one
+# pass; only a backtick body holding \` or \$ is read again, as bash does, at
+# most NET_NEST_MAX levels deep and charged to the budget. Arithmetic and
+# [[ … ]] text is kept out of the code (only its substitutions stay). The
+# audit (audit_command) and the network inventory both read commands through
+# it (R12).
+
+_LEX_HD = "\ue000"                           # brackets a heredoc marker in lexed code
+_LEX_PH = "\ue001"                           # brackets a substitution placeholder
+_LEX_SUB = re.compile("\\$\ue001(\\d+)\ue001")
+_LEX_HEREDOC = re.compile("\ue000(\\d+)\ue000")
+_LEX_PRIVATE = re.compile("[\ue000\ue001]")
+_LEX_STOP = {
+    "code": re.compile(r"[\\'\"`$#<>()\n]|case|esac|\[\["),
+    "dq": re.compile(r"[\\\"`$]"),
+    "hd": re.compile(r"[\\`$]"),
+    "arith": re.compile(r"[\\'\"`$()]"),
+    "barith": re.compile(r"[\\'\"`$\[\]]"),     # legacy $[ … ] arithmetic
+    "brace": re.compile(r"[\\'\"`${}]"),
+    "test": re.compile(r"[\\'\"`$\]]"),     # [[ … ]]
+}
+_LEX_CLASS = {"top": "code", "cmd": "code", "proc": "code", "tick": "code",
+              "dq": "dq", "hd": "hd", "arith": "arith", "barith": "barith",
+              "brace": "brace", "test": "test"}
+# Words after which the next word is in command position, where bash reads a
+# reserved word such as `case` or `[[` (R3A2-1); `esac` may also follow `in`.
+_LEX_CMD_WORDS = frozenset({"then", "do", "else", "elif", "if", "while", "until", "time", "{", "!"})
+_LEX_ESAC_WORDS = _LEX_CMD_WORDS | {"in"}
+# A comment inside `…` ends at the closing backtick (an escaped one does not count) or the newline.
+_LEX_TICK_COMMENT = re.compile(r"\\.|[`\n]", re.S)
+NET_NEST_MAX = 8                             # re-read levels: bash -c, eval, here-strings, heredoc code
+NET_TREE_MAX = 200                           # substitutions inside substitutions in one text
+NET_LEX_BUDGET = 2 * MAX_SCAN_HARD           # characters lexed per command, every level together
+
+
+class _LexUnit:
+    """One piece of shell code: the command text (`buf`, joined into `code`)
+    and the global ids of the substitutions directly inside it."""
+    __slots__ = ("buf", "children", "code")
+
+    def __init__(self) -> None:
+        self.buf: list[str] = []
+        self.children: list[int] = []
+        self.code = ""
+
+
+class _LexCtx:
+    """State shared by every level of one command: all substitution bodies
+    (`subs`, their kinds and whether a shell runs their output), all heredocs
+    ([body or None when unterminated, word quoted, word, `<<-`]), the heredoc
+    body spans of the outermost text, the character budget, how many backtick
+    bodies deep the lexer is reading again, and whether a limit was hit (R10)."""
+    __slots__ = ("subs", "kinds", "feeds", "heredocs", "spans", "budget", "limit", "lines", "depth", "top")
+
+    def __init__(self) -> None:
+        self.subs: list[_LexUnit] = []
+        self.kinds: list[str] = []
+        self.feeds: list[bool] = []
+        self.heredocs: list[list] = []
+        self.spans: list[tuple[int, int]] = []
+        self.budget = NET_LEX_BUDGET
+        self.limit = False
+        self.lines: list[str] = []
+        self.depth = 0
+        # The top level's scope: (for each segment, (part, "direct" | "eval" |
+        # "nested") or (None, …) when the part is not known; the parts; the
+        # operator after each; the parts a lone `&` ends). Set by _net_unit_segments.
+        self.top: tuple = ([], [], [], [])
+
+
+def _lex_prepare(text: str) -> str:
+    """\\r\\n is \\n (R9); the private-use characters the lexer marks with are
+    replaced, so transcript text can never forge a marker."""
+    if "\r" in text:
+        text = text.replace("\r\n", "\n")
+    if not text.isascii() and _LEX_PRIVATE.search(text):
+        text = _LEX_PRIVATE.sub("\ufffd", text)
+    return text
+
+
+def _shell_lex(text: str, ctx: _LexCtx, mode: str = "top", spans: bool = False) -> _LexUnit:
+    """Lex `text` (see the section comment). mode "hd" reads a heredoc body:
+    only substitutions count. With `spans`, the raw spans of heredoc bodies
+    (with their terminator lines) are recorded in ctx.spans."""
+    top = _LexUnit()
+    first_sub = len(ctx.subs)
+    # A frame: [kind, unit, paren depth, open `case`s, start, extra, pending
+    # heredocs at its start]. `extra` is, for a backtick frame, whether its body
+    # held \` or \$ (it is then read again, as bash does); for an arithmetic or
+    # [[ ]] frame, the unit its placeholder goes to.
+    stack: list[list] = [[mode, top, 0, 0, 0, None, 0]]
+    pending: list[int] = []
+    indexes: dict[tuple[bool, bool], dict[str, list[tuple[int, int]]]] = {}   # built on first use
+    seen: dict[tuple[bool, bool, str], int] = {}
+    sinks: set[int] = set()                      # ids of the units that hold arithmetic or [[ ]] text
+    last_close = -1
+    esc_end = -1                                 # the index just after the last escaped character
+    cont = "\\\n" in text
+    i, n = 0, len(text)
+
+    def push(kind: str, unit: _LexUnit, start: int, extra: object = None) -> None:
+        stack.append([kind, unit, 0, 0, start, extra, len(pending)])
+
+    def seq(k: int, s: str) -> int:
+        """The index after `s` read at text[k], skipping line continuations
+        (bash joins them before it reads an operator: `<\\ newline <EOF`), or -1."""
+        if not cont:
+            return k + len(s) if text.startswith(s, k) else -1
+        for c in s:
+            while text.startswith("\\\n", k):
+                k += 2
+            if k >= n or text[k] != c:
+                return -1
+            k += 1
+        return k
+
+    def before(k: int) -> int:
+        """k moved back over the line continuations just before it."""
+        start = stack[-1][4]
+        while cont and k - 2 >= start and text[k - 1] == "\n" and text[k - 2] == "\\" and esc_end != k - 1:
+            k -= 2
+        return k
+
+    def word_start(k: int) -> bool:
+        # An escaped blank or operator (`a\ #b`) is part of the word, not a break.
+        k = before(k)
+        return k == stack[-1][4] or (k != last_close and k != esc_end and text[k - 1] in _NET_WORD_BREAK)
+
+    def cmd_pos(k: int, words: frozenset = _LEX_CMD_WORDS) -> bool:
+        """Whether the word at k is in command position, where bash reads a
+        reserved word (`case`, `esac`, `[[`): after a separator, `(`, the frame
+        start, or a reserved word that a command follows. `echo case` is not."""
+        start = stack[-1][4]
+        j = before(k) - 1
+        while j >= start and text[j] in " \t":
+            j = before(j) - 1
+        if j < start:
+            return True
+        c = text[j]
+        if c in ";&|(\n":
+            return esc_end != j + 1
+        if c == ")":
+            return bool(stack[-1][3]) and esc_end != j + 1 and last_close != j + 1
+        w = j
+        while w > start and j - w < 5 and text[w - 1] not in _NET_WORD_BREAK:
+            w -= 1
+        return (text[w:j + 1] in words and esc_end != j + 1
+                and (w == start or text[w - 1] in _NET_WORD_BREAK))
+
+    def open_child(kind: str, unit: _LexUnit, start: int) -> None:
+        g = len(ctx.subs)
+        child = _LexUnit()
+        ctx.subs.append(child)
+        ctx.kinds.append(kind)
+        ctx.feeds.append(False)
+        unit.children.append(g)
+        unit.buf.append(f"${_LEX_PH}{g}{_LEX_PH}")
+        push(kind, child, start, False)
+
+    def open_sink(kind: str, unit: _LexUnit, start: int) -> None:
+        # Arithmetic and [[ ]] text is not commands: it goes to a unit of its
+        # own, and only its substitutions reach the code (R3A2-15). Nested in
+        # another such text, it shares that unit (extra None), so no
+        # substitution id is ever moved twice: linear at any depth.
+        if id(unit) in sinks:
+            push(kind, unit, start, None)
+            return
+        sink = _LexUnit()
+        sinks.add(id(sink))
+        push(kind, sink, start, unit)
+
+    def close_sink(fr: list, tail: str) -> None:
+        sink, parent = fr[1], fr[5]
+        if parent is None:
+            return                           # shared with the enclosing arithmetic: nothing to move
+        if sink.children:
+            parent.buf.append(" ".join(f"${_LEX_PH}{g}{_LEX_PH}" for g in sink.children) + " ")
+            parent.children.extend(sink.children)
+        parent.buf.append(tail)
+
+    def reread(unit: _LexUnit) -> None:
+        # `…` with \` or \$ inside: bash unescapes the body and parses it again.
+        body = "".join(unit.buf)
+        if ctx.depth >= NET_NEST_MAX or len(body) > ctx.budget:
+            ctx.limit = True
+            return
+        ctx.budget -= len(body)
+        ctx.depth += 1
+        try:
+            inner = _shell_lex(body, ctx)
+        finally:
+            ctx.depth -= 1
+        unit.buf = [inner.code]
+        unit.children.extend(inner.children)
+
+    def terminators(logical: bool, dash: bool) -> dict[str, list[tuple[int, int]]]:
+        """Terminator line -> [(start, end)] of the lines that read as it: the
+        whole line, as bash compares it (no blank stripped); with `dash`
+        (`<<-`) leading tabs removed; with `logical` (an unquoted word)
+        backslash-newline continuations joined first (`EO\\ newline F` is `EOF`)."""
+        key = (logical, dash)
+        idx = indexes.get(key)
+        if idx is not None:
+            return idx
+        idx = indexes[key] = {}
+        start = first = 0
+        parts: list[str] = []
+        for line in text.split("\n"):
+            end = start + len(line)
+            if logical and line.endswith("\\") and (len(line) - len(line.rstrip("\\"))) % 2:
+                parts.append(line[:-1])
+                start = end + 1
+                continue
+            if parts:
+                parts.append(line)
+                line = "".join(parts)
+                parts = []
+            if dash:
+                line = line.lstrip("\t")
+            if line:
+                idx.setdefault(line, []).append((first, end))
+            start = first = end + 1
+        return idx
+
+    def read_heredocs(pos: int, base: int) -> int:
+        # The heredocs opened on this line in this frame (or in substitutions
+        # on it that have closed): bash reads their bodies after the newline
+        # that ends the line, not at a newline inside a $( … ) on it.
+        for h in pending[base:]:
+            _body, quoted, word, dash = ctx.heredocs[h]
+            key = (not quoted, dash)
+            found = terminators(*key).get(word, ())
+            k = seen.get((*key, word), 0)
+            while k < len(found) and found[k][0] < pos:     # pos only grows: linear
+                k += 1
+            seen[(*key, word)] = k
+            if k == len(found):
+                continue                     # no terminator: its lines stay commands
+            s, e = found[k]
+            e = n if e >= n else e + 1
+            ctx.heredocs[h][0] = text[pos:max(pos, s - 1)]
+            if spans:
+                ctx.spans.append((pos, e))
+            pos = e
+        del pending[base:]
+        return pos
+
+    def heredoc_open(unit: _LexUnit, after: int) -> int:
+        j, dash = after, False
+        d = seq(j, "-")
+        if d >= 0:
+            j, dash = d, True
+        while j < n and (text[j] in " \t" or (cont and text.startswith("\\\n", j))):
+            j += 2 if text[j] == "\\" else 1
+        if j < n and text[j] == _LEX_HD:     # a marker from an earlier pass (a backtick body read again)
+            e = text.find(_LEX_HD, j + 1)
+            if e > 0:
+                unit.buf.append("<<" + text[j:e + 1] + " ")
+                return e + 1
+        word: list[str] = []
+        quoted = False
+        while j < n:
+            c = text[j]
+            if c in _NET_WORD_BREAK:
+                break
+            if c in "'\"":
+                e = text.find(c, j + 1)
+                if e < 0:
+                    word = []
+                    break
+                word.append(text[j + 1:e])
+                quoted, j = True, e + 1
+            elif c == "\\" and j + 1 < n:
+                if text[j + 1] == "\n":
+                    j += 2                   # a continuation: `<<E\ newline OF` is the unquoted EOF
+                    continue
+                word.append(text[j + 1])
+                quoted, j = True, j + 2
+            else:
+                word.append(c)
+                j += 1
+        delim = "".join(word)
+        if not delim:
+            unit.buf.append("<<")
+            return after
+        h = len(ctx.heredocs)
+        ctx.heredocs.append([None, quoted, delim, dash])
+        pending.append(h)
+        unit.buf.append(f"<<{_LEX_HD}{h}{_LEX_HD} ")
+        return j
+
+    while i < n:
+        fr = stack[-1]
+        kind, unit = fr[0], fr[1]
+        buf = unit.buf
+        cls = _LEX_CLASS[kind]
+        m = _LEX_STOP[cls].search(text, i)
+        if m is None:
+            buf.append(text[i:])
+            break
+        j = m.start()
+        if j > i:
+            buf.append(text[i:j])
+            i = j
+        ch = text[i]
+        if ch == "\\":
+            nxt = text[i + 1:i + 2]
+            if nxt == "\n":
+                i += 2                       # a continuation: the line goes on
+                continue
+            if kind == "tick" and nxt in ("`", "$", "\\"):
+                buf.append(nxt)              # inside `…`, \` \$ \\ lose their backslash
+                if nxt != "\\":
+                    fr[5] = True             # and the body is read again when it closes
+            else:
+                buf.append(text[i:i + 2])
+            i += 2
+            esc_end = i
+            continue
+        if ch == "`":
+            if kind == "tick":
+                stack.pop()
+                last_close = i + 1
+                if fr[5]:
+                    reread(unit)
+            else:
+                open_child("tick", unit, i + 1)
+            i += 1
+            continue
+        if ch == "$":
+            k = seq(i, "$((")
+            if k >= 0:
+                buf.append("$((")
+                open_sink("arith", unit, k)
+                i = k
+                continue
+            k = seq(i, "$[")
+            if k >= 0:
+                # Legacy arithmetic, like $(( )): `<<` in it is a shift, never
+                # a heredoc (`$[1<<EOF]` would otherwise hide the next lines).
+                buf.append("$[")
+                open_sink("barith", unit, k)
+                i = k
+                continue
+            k = seq(i, "$(")
+            if k >= 0:
+                open_child("cmd", unit, k)
+                i = k
+                continue
+            k = seq(i, "${")
+            if k >= 0:
+                buf.append("${")
+                push("brace", unit, k)
+                i = k
+                continue
+            k = seq(i, "$'") if cls in ("code", "brace", "test") else -1
+            if k >= 0:
+                value, end = _ansi_c(text, k - 2)
+                if value is None:
+                    buf.append(text[i:])     # not closed: an open quote, as bash would see it
+                    break
+                buf.append("'" + value.replace("'", "'\\''") + "'")
+                i = end
+                continue
+            k = seq(i, '$"') if cls in ("code", "test") else -1
+            if k >= 0:
+                buf.append('"')
+                push("dq", unit, k)
+                i = k
+                continue
+            buf.append("$")
+            i += 1
+            continue
+        if ch == '"':
+            buf.append('"')
+            if kind == "dq":
+                stack.pop()
+            else:
+                push("dq", unit, i + 1)
+            i += 1
+            continue
+        if ch == "'":
+            e = text.find("'", i + 1)
+            if e < 0:
+                buf.append(text[i:])         # not closed: an open quote
+                break
+            buf.append(text[i:e + 1])
+            i = e + 1
+            continue
+        if kind == "brace":
+            if ch == "{":
+                fr[2] += 1
+            elif fr[2]:
+                fr[2] -= 1
+            else:
+                stack.pop()
+            buf.append(ch)
+            i += 1
+            continue
+        if kind == "barith":
+            if ch == "[":
+                fr[2] += 1
+            elif fr[2]:
+                fr[2] -= 1
+            else:
+                stack.pop()
+                close_sink(fr, "]")
+                i += 1
+                continue
+            buf.append(ch)
+            i += 1
+            continue
+        if kind == "arith":
+            if ch == "(":
+                fr[2] += 1
+            elif fr[2]:
+                fr[2] -= 1
+            else:
+                stack.pop()
+                k = seq(i, "))")
+                if k >= 0:
+                    close_sink(fr, "))")
+                    i = k
+                    continue
+                # `((a); b)`: a subshell after all; the outer ( is open, and the text is code
+                parent = fr[5] or unit
+                if fr[5] is not None:
+                    parent.buf.extend(buf)
+                    parent.children.extend(unit.children)
+                    sinks.discard(id(unit))
+                stack[-1][2] += 1
+                parent.buf.append(ch)
+                i += 1
+                continue
+            buf.append(ch)
+            i += 1
+            continue
+        if kind == "test":                   # ch is "]": the end of `[[ … ]]` is a word `]]`
+            k = seq(i, "]]")
+            b = before(i)
+            if k >= 0 and (k >= n or text[k] in _NET_WORD_BREAK) and b != esc_end and text[b - 1] in " \t\n":
+                stack.pop()
+                close_sink(fr, " ]]")
+                i = k
+            else:
+                buf.append("]")
+                i += 1
+            continue
+        # code: top, $( ), <( ), >( ), ` `
+        if ch == "#":
+            if not word_start(i):
+                buf.append("#")
+                i += 1
+            elif kind == "tick":
+                # bash finds the closing backtick before it parses the body,
+                # so a comment in `…` ends there (R3A2-4).
+                c2 = _LEX_TICK_COMMENT.search(text, i)
+                while c2 is not None and c2.group()[0] == "\\":
+                    c2 = _LEX_TICK_COMMENT.search(text, c2.end())
+                i = n if c2 is None else c2.start()
+            else:
+                e = text.find("\n", i)
+                i = n if e < 0 else e
+            continue
+        if ch == "\n":
+            buf.append("\n")
+            i += 1
+            if len(pending) > fr[6]:
+                i = read_heredocs(i, fr[6])
+            continue
+        if ch == "<":
+            k = seq(i, "<<<")
+            if k >= 0:
+                buf.append("<<<")
+                i = k
+                continue
+            k = seq(i, "<<")
+            if k >= 0:
+                i = heredoc_open(unit, k)
+                continue
+            k = seq(i, "<(")
+            if k >= 0:
+                open_child("proc", unit, k)
+                i = k
+                continue
+            buf.append("<")
+            i += 1
+            continue
+        if ch == ">":
+            k = seq(i, ">(")
+            if k >= 0:
+                open_child("proc", unit, k)
+                i = k
+            else:
+                buf.append(">")
+                i += 1
+            continue
+        if ch == "(":
+            k = seq(i, "((")
+            if k >= 0 and word_start(i):
+                buf.append("((")
+                open_sink("arith", unit, k)
+                i = k
+            else:
+                fr[2] += 1
+                buf.append("(")
+                i += 1
+            continue
+        if ch == ")":
+            if fr[2]:
+                fr[2] -= 1
+                buf.append(")")
+            elif kind in ("cmd", "proc") and not fr[3]:
+                stack.pop()
+                last_close = i + 1
+            else:
+                buf.append(")")              # a `case` pattern, or a stray `)`
+            i += 1
+            continue
+        if ch == "[":
+            # `[[ … ]]` in command position is a test: nothing in it runs but
+            # its substitutions (`[[ $v =~ (a|npm i x) ]]` installs nothing).
+            if word_start(i) and (i + 2 >= n or text[i + 2] in " \t\n") and cmd_pos(i):
+                buf.append("[[")
+                open_sink("test", unit, i + 2)
+            else:
+                buf.append("[[")
+            i += 2
+            continue
+        # `case` / `esac`: a `)` inside $( case … esac ) is a pattern, not the
+        # end. Reserved only in command position: `$(echo case)` closes (R3A2-1).
+        word = text[i:i + 4]
+        if word_start(i) and (i + 4 >= n or text[i + 4] in _NET_WORD_BREAK):
+            if word == "case":
+                if cmd_pos(i):
+                    fr[3] += 1
+            elif fr[3] and cmd_pos(i, _LEX_ESAC_WORDS):
+                fr[3] -= 1
+        buf.append(word)
+        i += 4
+    for fr in stack:                         # unterminated arithmetic or [[: its text stays code
+        if fr[0] in ("arith", "barith", "test") and fr[5] is not None:
+            fr[5].buf.extend(fr[1].buf)
+            fr[5].children.extend(fr[1].children)
+    for unit in [top] + ctx.subs[first_sub:]:
+        if unit.buf:                         # a unit a nested read already joined keeps its code
+            unit.code = "".join(unit.buf)
+            unit.buf = []
+    return top
+
+
+def _without_heredocs(cmd: str) -> str:
+    """Drop heredoc bodies before looking for a program.
+
+    A heredoc carries data -- a JSON payload, a commit message, a file being
+    written. Splitting the command on newlines turned each of those lines into
+    its own candidate segment, so a bare path inside a document became "the
+    program" on 121 real commands. The `cat <<EOF` line itself is kept; only
+    the body between it and its terminator is removed. Openers are found by
+    the shared lexer, so a `<<` in quotes, a comment or $((…)) opens nothing.
+    """
+    if "<<" not in cmd:
+        return cmd
+    text = _lex_prepare(cmd[:MAX_SCAN_HARD])
+    ctx = _LexCtx()
+    _shell_lex(text, ctx, spans=True)
+    if not ctx.spans:
+        return text
+    out, at = [], 0
+    for s, e in ctx.spans:
+        out.append(text[at:s])
+        at = e
+    out.append(text[at:])
+    return "".join(out)
+
+
+_NET_FUNC_DEF = re.compile(r"^\s*(?:function\s+[^\s(){}]+(?:\s*\(\s*\))?|[A-Za-z_][\w.:-]*\s*\(\s*\))")
+# `case WORD in` at the start of a segment, and an arm's pattern `x)` / `(x)`.
+_NET_CASE_HEAD = re.compile(r"\s*case\s+\S+\s+in(?:\s+|$)")
+# A pattern word may quote or escape a blank (`*" "*)`, `'a b')`, `a\ b)`);
+# alternatives are joined by `|`. Each alternative of a word starts with a
+# different character, so the match is linear.
+_NET_CASE_WORD = r"""(?:[^()\s'"\\|]|'[^']*'|"(?:[^"\\]|\\.)*"|\\.)+"""
+_NET_CASE_PATTERN = re.compile(r"\s*\(?\s*" + _NET_CASE_WORD + r"(?:\s*\|\s*" + _NET_CASE_WORD + r")*\s*\)",
+                               re.S)
+# `coproc NAME { …; }` / `coproc NAME ( … )`: NAME names the coprocess, it is not the program.
+_NET_COPROC_NAME = re.compile(r"(\s*coproc\s+)[A-Za-z_][A-Za-z0-9_]*(?=\s*[({])")
+# Brace expansion (`cu{r,}l`, `https://{a,b}.io`, `h{1..3}`): at most this many
+# words from one word; past it the word is unresolved, never guessed.
+NET_BRACE_MAX = 16
+_NET_BRACE_SEQ = re.compile(r"(-?\d{1,6}|[A-Za-z])\.\.(-?\d{1,6}|[A-Za-z])(?:\.\.(-?\d{1,6}))?")
+_NET_FIND_EXEC = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+_NET_STDIN_FILES = frozenset({"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"})
+_NET_SHELL_VALUE_OPTS = frozenset({"-o", "+o", "-O", "+O", "--rcfile", "--init-file"})
+
+
+def _net_display(text: str) -> str:
+    """Lexed text fit to show: a substitution placeholder reads `$(…)`, a
+    heredoc marker reads `EOF`."""
+    if _LEX_PH in text:
+        text = _LEX_SUB.sub("$(…)", text)
+    if _LEX_HD in text:
+        text = _LEX_HEREDOC.sub("EOF", text)
+    return text
+
+
+def _net_shell_operand(prog: str, args: list[str], via_xargs: bool) -> tuple[str, str | None]:
+    """How a shell (or source / .) gets its code: ("stdin", None) when it reads
+    it from stdin (`bash`, `sh -s -- a`, `bash /dev/stdin`, `source /dev/stdin`,
+    `xargs bash -c`), ("script", operand) when it runs a file, ("c", None) for
+    a -c string, else ("", None)."""
+    if prog in ("source", "."):
+        if not args:
+            return "", None
+        return ("stdin", None) if args[0] in _NET_STDIN_FILES else ("script", args[0])
+    if prog not in _NET_SHELLS:
+        return "", None
+    k = 0
+    while k < len(args):
+        a = args[k]
+        if a in ("--", "-"):
+            k += a == "--"
+            break
+        if a[:1] in ("-", "+") and len(a) > 1:
+            if _net_shell_c(a):
+                return ("stdin", None) if via_xargs and k == len(args) - 1 else ("c", None)
+            if a in _NET_SHELL_VALUE_OPTS:
+                k += 2
+                continue
+            if a[0] == "-" and not a.startswith("--") and "s" in a:
+                return "stdin", None         # -s: commands from stdin, the rest are arguments
+            k += 1
+            continue
+        break
+    rest = args[k:]
+    if not rest or rest[0] in _NET_STDIN_FILES:
+        return "stdin", None
+    return "script", rest[0]
+
+
+def _net_segments(cmd: str, depth: int = 0, ctx: "_LexCtx | None" = None
+                  ) -> tuple[list[tuple[list[str], bool, bool, str]], int]:
     """Token lists for every simple command in `cmd`, nested ones included
-    ($(...), <(...), backticks, bash -lc "...", eval "..."), each with whether
-    it ran under xargs, whether its output is run by a shell, and its raw text;
-    and how many segments could not be tokenised because a quote was left
-    open or nesting went deeper than is read."""
-    out: list[tuple[list[str], bool, bool, str]] = []
+    ($(...), <(...), backticks, bash -lc "...", eval "...", heredocs and
+    here-strings fed to a shell, substitutions in an unquoted heredoc), each
+    with whether it ran under xargs, whether its output is run by a shell,
+    and its text; and how many segments could not be tokenised because a
+    quote was left open or a limit (NET_NEST_MAX, NET_TREE_MAX, NET_LEX_BUDGET)
+    was reached. A limit also sets ctx.limit, which the caller reports (R10)."""
+    if ctx is None:
+        ctx = _LexCtx()
+        cmd = _lex_prepare(cmd)
+    if len(cmd) > ctx.budget:
+        ctx.limit = True
+        return [], 1
+    ctx.budget -= len(cmd)
+    unit = _shell_lex(cmd, ctx)
+    return _net_unit_segments(unit, depth, 0, ctx)
+
+
+def _net_brace_expand(word: str) -> list[str] | None:
+    """bash brace expansion of one unquoted word, left to right: `cu{r,}l` is
+    curl cul, `h{1..3}` is h1 h2 h3. None when it would make more than
+    NET_BRACE_MAX words (or the word is too long to read). Each step is one
+    linear pass over a word of at most 512 characters."""
+    out = [word]
+    for _ in range(NET_BRACE_MAX + 1):
+        changed, nxt = False, []
+        for w in out:
+            alts = _net_brace_once(w)
+            if alts is None:
+                return None
+            changed = changed or alts != [w]
+            nxt += alts
+            if len(nxt) > NET_BRACE_MAX:
+                return None
+        out = nxt
+        if not changed:
+            return out
+    return None
+
+
+def _net_brace_once(w: str) -> list[str] | None:
+    """The words of the first expandable `{…}` group in w ([w] when none),
+    or None when there are too many or w is too long."""
+    if len(w) > 512:
+        return None
+    stack: list[int] = []
+    comma: dict[int, bool] = {}
+    pairs: list[tuple[int, int]] = []
+    for k, c in enumerate(w):
+        if c == "{":
+            stack.append(-1 if k and w[k - 1] == "$" else k)    # ${…} is a parameter, not a group
+            comma[stack[-1]] = False
+        elif c == "," and stack:
+            comma[stack[-1]] = True
+        elif c == "}" and stack:
+            p = stack.pop()
+            if p >= 0:
+                pairs.append((p, k))
+    for p, e in sorted(pairs):
+        if comma[p]:
+            alts, depth, at = [], 0, p + 1
+            for k in range(p + 1, e):
+                c = w[k]
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                elif c == "," and not depth:
+                    alts.append(w[at:k])
+                    at = k + 1
+            alts.append(w[at:e])
+        else:
+            m = _NET_BRACE_SEQ.fullmatch(w, p + 1, e)
+            if not m:
+                continue
+            a, b, step = m.group(1), m.group(2), abs(int(m.group(3) or 1)) or 1
+            if a.isalpha() != b.isalpha():
+                continue
+            lo, hi = (ord(a), ord(b)) if a.isalpha() else (int(a), int(b))
+            if abs(hi - lo) // step + 1 > NET_BRACE_MAX:
+                return None
+            vals = range(lo, hi + (1 if hi >= lo else -1), step if hi >= lo else -step)
+            width = max(len(a), len(b)) if not a.isalpha() and (a.lstrip("-")[:1] == "0" or
+                                                              b.lstrip("-")[:1] == "0") else 0
+            alts = [chr(v) if a.isalpha() else str(v).zfill(width) for v in vals]
+        return [w[:p] + x + w[e + 1:] for x in alts]
+    return [w]
+
+
+_NET_BRACE_STOP = " \t\n;&|()<>"
+
+
+def _net_braces(toks: list[str], q: str) -> tuple[list[str], bool]:
+    """Brace-expand the program word and every URL of one command, when the
+    word stands unquoted in the code (`'cu{r,}l'` is literal): (the tokens,
+    whether a word was past NET_BRACE_MAX)."""
+    st, _ = _net_strip_prefixes(toks)
+    prog = len(toks) - len(st) if st else -1
+    out: list[str] = []
+    over = False
+    for k, t in enumerate(toks):
+        if "{" in t and (k == prog or "://" in t) and _net_unquoted(t, q):
+            got = _net_brace_expand(t)
+            if got is None:
+                over = True
+                out.append(t)
+            else:
+                out += [g for g in got if g]     # `{npm,}` is npm: an empty word is dropped
+        else:
+            out.append(t)
+    return out, over
+
+
+def _net_unquoted(word: str, q: str) -> bool:
+    """Whether `word` stands as written, as a whole word, in the code q (the
+    first few places it occurs), so no quote or escape touched it."""
+    at = 0
+    for _ in range(8):
+        k = q.find(word, at)
+        if k < 0:
+            return False
+        e = k + len(word)
+        if (k == 0 or q[k - 1] in _NET_BRACE_STOP) and (e == len(q) or q[e] in _NET_BRACE_STOP):
+            return True
+        at = k + 1
+    return False
+
+
+_NET_UNIT_SLOW = re.compile(r"[\n;&|<>()'\"\\$`#\ue000\ue001]|case|function|" + _NET_BRACE_HINT)
+
+
+def _net_unit_segments(unit: _LexUnit, depth: int, nest: int, ctx: _LexCtx
+                       ) -> tuple[list[tuple[list[str], bool, bool, str]], int]:
+    """_net_segments over one lexed unit: its own commands, the heredocs and
+    strings they feed to a shell (re-read at depth + 1), and its substitution
+    bodies (already lexed: no re-read). Each unit also adds its commands, as
+    dequoted lines, to ctx.lines for the audit."""
+    code = unit.code
+    if not unit.children and not _NET_UNIT_SLOW.search(code):
+        # Plain words, one command (most substitution bodies): nothing to split.
+        tokens = code.split()
+        if not tokens:
+            return [], 0
+        st, via = _net_strip_prefixes(tokens)
+        first = _net_base(st[0]).lower() if st else ""
+        if st and first not in ("eval", "su", "find") and first not in _NET_SHELLS:
+            ctx.lines.append((" ".join(tokens), code.strip()))
+            if depth == 0 and nest == 0:
+                ctx.top = ([(0, "direct")], [code], [""], [])
+            return [(st, via, False, code)], 0
+        if not st:
+            ctx.lines.append((" ".join(tokens), code.strip()))
+            return [], 0
     unparsed = 0
-    text = _without_heredocs(cmd)
-    # The character-level pass is skipped when there is nothing for it to find.
-    feeds: list[bool] = []
-    bodies, text = (_net_substitutions(text, feeds) if "$(" in text or "`" in text or "<(" in text
-                    else ([], text))
-    if depth < 3:
-        for body, feed in zip(bodies, feeds):
-            inner, bad = _net_segments(body, depth + 1)
-            # `sh -c "$(curl …)"`, `bash <(curl …)`: what the body prints is run.
-            out += [(t, x, True, r) for t, x, _, r in inner] if feed else inner
-            unparsed += bad
-    elif bodies:
-        unparsed += 1                        # nested deeper than we read: say so
     seps: list[str] = []
-    parts, open_quote = _net_split(text, seps)
+    amps: list[int] = []
+    parts, open_quote = _net_split(code, seps, amps)
     if open_quote:
         parts = parts[:-1]
         unparsed += 1
-    stripped = [_net_strip_prefixes(_net_tokens(p, operators=True)) for p in parts]
+    top = depth == 0 and nest == 0
+    in_case = 0
+    raw_tokens: list[list[str]] = []
+    stripped: list[tuple[list[str], bool, list[tuple[str, str]]]] = []
+    for p in parts:
+        q = p
+        if in_case or "case" in q:
+            m = _NET_CASE_HEAD.match(q)
+            if m:
+                in_case += 1
+                q = q[m.end():]
+            if in_case:
+                m = _NET_CASE_PATTERN.match(q)
+                q = " " + q[m.end():] if m else q
+        if "(" in q or "function" in q:
+            q = _NET_FUNC_DEF.sub(" ", q, count=1)
+        if "coproc" in q:
+            m = _NET_COPROC_NAME.match(q)
+            q = m.group(1) + q[m.end():] if m else q
+        redirs: list[tuple[str, str]] = []
+        toks = _net_tokens(q, operators=True, redirs=redirs)
+        if "{" in q and toks:
+            toks, over = _net_braces(toks, q)
+            if over:
+                unparsed += 1                # too many words to read: unresolved, not clean (R10)
+                ctx.limit = True
+        if in_case and "esac" in toks:
+            in_case = max(0, in_case - toks.count("esac"))
+        raw_tokens.append(toks)
+        st, via = _net_strip_prefixes(toks)
+        stripped.append((st, via, redirs))
+    # The audit's view: each logical line, dequoted, joined back with its operators.
+    # (dequoted, as written), the second for evidence.
+    line: list[str] = []
+    shown: list[str] = []
+    for n, toks in enumerate(raw_tokens):
+        line.append(" ".join(toks))
+        shown.append(parts[n].strip())
+        if seps[n] in ("\n", "") or n == len(raw_tokens) - 1:
+            text = _net_display(" ".join(x for x in line if x))
+            if text:
+                ctx.lines.append((text, _net_display(" ".join(x for x in shown if x))))
+            line, shown = [], []
+        else:
+            line.append(seps[n])
+            shown.append(seps[n])
     # `curl … | sh`, `| sudo bash`, `| busybox sh`, `| tee f | sh`: a shell at
     # any later stage of the same pipeline, on the dequoted names. Worked
     # backwards once, so a long pipeline stays linear.
@@ -2019,73 +4083,532 @@ def _net_segments(cmd: str, depth: int = 0) -> tuple[list[tuple[list[str], bool,
         if seps[n] == "|":
             nxt = stripped[n + 1][0]
             downstream[n] = downstream[n + 1] or (
-                bool(nxt) and _net_base(nxt[0]) in _NET_SHELLS and not _net_shell_c_index(nxt))
-    for n, (tokens, via_xargs) in enumerate(stripped):
+                bool(nxt) and _net_base(nxt[0]).lower() in _NET_SHELLS and not _net_shell_c_index(nxt))
+    own: list[tuple[list[str], bool, bool, str]] = []
+    code_docs: list[int] = []
+    data_docs: list[int] = []
+    # At the top level only: for each of `own`, the part it came from and how
+    # (R3F5): "direct" (the part's own command), "eval" (run by eval, in this
+    # shell) or "nested" (a child shell: bash -c, su -c, trap, find -exec).
+    own_scope: list[tuple[int, str]] = []
+    doc_part: dict[int, int] = {}
+    doc_env: dict[int, list[str]] = {}
+
+    def nested(text: str, outer: "list[str] | None" = None, how: str = "nested") -> None:
+        nonlocal unparsed
+        if depth >= NET_NEST_MAX:
+            unparsed += 1                    # nested deeper than we read: say so
+            ctx.limit = True
+            return
+        inner, bad = _net_segments(text, depth + 1, ctx)
+        if outer is not None:                # `VAR=x bash -c '…'`: the child inherits VAR
+            inner = [(_net_inherit(t, outer), x, f, r) for t, x, f, r in inner]
+        own.extend(inner)
+        if top:
+            own_scope.extend((n, how) for _ in inner)
+        unparsed += bad
+
+    for n, (tokens, via_xargs, redirs) in enumerate(stripped):
+        part = parts[n]
+        marks = [int(h) for h in _LEX_HEREDOC.findall(part)
+                 if int(h) < len(ctx.heredocs)] if _LEX_HD in part else []
+        if top:
+            for h in marks:
+                doc_part[h] = n
+        if downstream[n] and _LEX_PH in part:
+            for g in _LEX_SUB.findall(part):     # `echo "$(curl …)" | sh`
+                if int(g) < len(ctx.feeds):
+                    ctx.feeds[int(g)] = True
         if not tokens:
+            data_docs += marks
             continue
-        prog = _net_base(tokens[0])
-        flag = _net_shell_c_index(tokens) if prog in _NET_SHELLS else 0
-        into_shell = downstream[n]
-        # `eval ARGS` runs its arguments joined by spaces, as `bash -c` would.
-        nested = (tokens[flag + 1] if flag else
-                  " ".join(tokens[1:]) if prog == "eval" and len(tokens) > 1 else None)
-        if nested is not None:
-            if depth >= 3:
-                unparsed += 1                # nested deeper than we read
-            else:
-                inner, bad = _net_segments(nested, depth + 1)
-                out += inner
-                unparsed += bad
+        # `eval eval … CMD` is `eval CMD`: one level, however many words.
+        evals = 0
+        outer = tokens
+        while tokens and _net_base(tokens[0]).lower() == "eval":
+            tokens, evals = tokens[1:], evals + 1
+        if evals:
+            if tokens:
+                nested(" ".join(tokens), outer, "eval")
+            data_docs += marks
+            continue
+        head = _LEX_SUB.fullmatch(tokens[0])
+        if head and int(head.group(1)) < len(ctx.feeds):
+            ctx.feeds[int(head.group(1))] = True     # `$(curl …)` as a command: its output runs
+        prog = _net_base(tokens[0]).lower()
+        if prog == "su":
+            k = next((k for k in range(1, len(tokens) - 1) if tokens[k] in ("-c", "--command")), 0)
+            if k:
+                nested(tokens[k + 1])
+                data_docs += marks
                 continue
-        out.append((tokens, via_xargs, into_shell, parts[n]))
-    return out, unparsed
+        if prog == "find":
+            k = 1
+            while k < len(tokens):
+                if tokens[k] in _NET_FIND_EXEC:
+                    e = next((e for e in range(k + 1, len(tokens)) if tokens[e] in (";", "+")), len(tokens))
+                    sub, x = _net_strip_prefixes(tokens[k + 1:e])
+                    if sub:
+                        own.append((sub, x, False, _net_display(part)))
+                        if top:
+                            own_scope.append((n, "nested"))
+                    k = e
+                k += 1
+        mode, operand = _net_shell_operand(prog, tokens[1:], via_xargs)
+        if mode == "script" and operand is not None:
+            sub = _LEX_SUB.fullmatch(operand)
+            if sub and int(sub.group(1)) < len(ctx.kinds) and ctx.kinds[int(sub.group(1))] == "proc":
+                ctx.feeds[int(sub.group(1))] = True  # `bash <(curl …)`, `source <(curl …)`
+        if mode == "stdin":
+            for op, target in redirs:
+                sub = _LEX_SUB.fullmatch(target) if op == "<" else None
+                if sub and int(sub.group(1)) < len(ctx.feeds):
+                    ctx.feeds[int(sub.group(1))] = True  # `bash < <(curl …)`
+        (code_docs if mode == "stdin" or downstream[n] else data_docs).extend(marks)
+        if mode == "stdin":
+            for h in marks:
+                doc_env[h] = tokens          # `VAR=x bash <<EOF`: the body inherits VAR
+        if mode == "stdin" or downstream[n]:
+            for op, target in redirs:
+                if op == "<<<" and target:
+                    # `bash <<< "…"`, `cat <<< "…" | sh`: the word is the script
+                    nested(target, tokens if mode == "stdin" else None)
+        if prog == "trap":
+            # `trap 'CMD' SIG…`: bash runs CMD when the signal comes. One
+            # operand, `-`, `-p` or `-l` resets or lists: no command.
+            args = tokens[2:] if tokens[1:2] == ["--"] else tokens[1:]
+            if len(args) >= 2 and not args[0].startswith("-"):
+                nested(args[0])
+        flag = _net_shell_c_index(tokens) if prog in _NET_SHELLS else 0
+        if flag:
+            nested(tokens[flag + 1], tokens)
+            continue
+        own.append((tokens, via_xargs, downstream[n], _net_display(part)))
+        if top:
+            own_scope.append((n, "direct"))
+    pre: list[tuple[list[str], bool, bool, str]] = []
+    pre_scope: list[tuple[int | None, str]] = []
+    for h in code_docs:                      # `bash <<EOF … EOF`, `cat <<EOF | sh`: the body is code
+        body = ctx.heredocs[h][0]
+        if body is None:
+            continue                         # unterminated: its lines were read as commands
+        if depth >= NET_NEST_MAX:
+            unparsed += 1
+            ctx.limit = True
+            continue
+        inner, bad = _net_segments(body, depth + 1, ctx)
+        if h in doc_env:
+            inner = [(_net_inherit(t, doc_env[h]), x, f, r) for t, x, f, r in inner]
+        pre += inner
+        if top:
+            pre_scope += [(doc_part.get(h), "nested")] * len(inner)
+        unparsed += bad
+    kids = list(unit.children)
+    for h in data_docs:                      # an unquoted data heredoc still runs its $(…) and `…`
+        body, quoted = ctx.heredocs[h][0], ctx.heredocs[h][1]
+        if body is None or quoted or ("$" not in body and "`" not in body):
+            continue
+        if len(body) > ctx.budget:
+            unparsed += 1
+            ctx.limit = True
+            continue
+        ctx.budget -= len(body)
+        kids += _shell_lex(body, ctx, mode="hd").children
+    sub_part: dict[int, int] = {}
+    if top and kids:
+        for k, p in enumerate(parts):
+            if _LEX_PH in p:
+                for g in _LEX_SUB.findall(p):
+                    sub_part.setdefault(int(g), k)
+    for g in kids:
+        if nest >= NET_TREE_MAX:
+            unparsed += 1
+            ctx.limit = True
+            continue
+        inner, bad = _net_unit_segments(ctx.subs[g], depth, nest + 1, ctx)
+        # `sh -c "$(curl …)"`, `bash <(curl …)`, `eval "$(curl …)"`: what the body prints is run.
+        pre += [(t, x, True, r) for t, x, _, r in inner] if ctx.feeds[g] else inner
+        if top:
+            pre_scope += [(sub_part.get(g), "nested")] * len(inner)
+        unparsed += bad
+    if top:
+        ctx.top = (pre_scope + own_scope, parts, seps, amps)
+    return pre + own, unparsed
 
 
+# The last command walked, for the audit and the inventory, which both read
+# every command (R12): one lexing pass serves both.
+_WALK_CACHE: list = [None, None]
+
+
+def _shell_walk(cmd: str) -> tuple[list[tuple[list[str], bool, bool, str]], int, bool, list[str], tuple]:
+    """(segments, unparsed, limit reached, the audit's dequoted lines, the top
+    level's scope: see _LexCtx.top) for one command already cut to MAX_SCAN_HARD."""
+    if _WALK_CACHE[0] is not None and _WALK_CACHE[0] == cmd:
+        return _WALK_CACHE[1]
+    ctx = _LexCtx()
+    segments, unparsed = _net_segments(_lex_prepare(cmd), 0, ctx)
+    result = (segments, unparsed, ctx.limit, ctx.lines, ctx.top)
+    _WALK_CACHE[0], _WALK_CACHE[1] = cmd, result
+    return result
+
+
+# Every option that takes a value, from `curl --help all` (8.x, plus the newer
+# --ech, --ip-tos, --knownhosts, --sigalgs, --ssl-sessions, --upload-flags,
+# --vlan-priority) and GNU `wget --help` (1.21). A value option missing here
+# leaks its argument as a positional, and `name.tld` reads as a host.
 _CURL_VALUE = frozenset(
     "-o --output -H --header -d --data --data-raw --data-binary --data-urlencode -X --request "
     "-u --user -A --user-agent -e --referer -b --cookie -c --cookie-jar -F --form -T --upload-file "
     "-w --write-out -m --max-time --connect-timeout -x --proxy --retry -r --range --cacert --cert "
-    "--key -K --config --resolve --url -E".split())
+    "--key -K --config --resolve --url -E -D --dump-header --trace --trace-ascii --stderr --json "
+    "--limit-rate --max-filesize --interface --netrc-file --capath --unix-socket --proto "
+    "--proto-redir --variable -Y --speed-limit -y --speed-time "
+    "--abstract-unix-socket --alt-svc --aws-sigv4 --cert-type --ciphers --connect-to -C --continue-at "
+    "--create-file-mode --crlfile --curves --data-ascii --delegation --dns-interface --dns-ipv4-addr "
+    "--dns-ipv6-addr --dns-servers --doh-url --ech --egd-file --engine --etag-compare --etag-save "
+    "--expect100-timeout --form-string --ftp-account --ftp-alternative-to-user --ftp-method -P "
+    "--ftp-port --ftp-ssl-ccc-mode --happy-eyeballs-timeout-ms --haproxy-clientip -h --help "
+    "--hostpubmd5 --hostpubsha256 --hsts --ip-tos --ipfs-gateway --keepalive-time --key-type "
+    "--knownhosts --krb --libcurl --local-port --login-options --mail-auth --mail-from --mail-rcpt "
+    "--max-redirs --noproxy --oauth2-bearer --output-dir --parallel-max --pass --pinnedpubkey "
+    "--preproxy --proto-default --proxy-cacert --proxy-capath --proxy-cert --proxy-cert-type "
+    "--proxy-ciphers --proxy-crlfile --proxy-header --proxy-key --proxy-key-type --proxy-pass "
+    "--proxy-pinnedpubkey --proxy-service-name --proxy-tls13-ciphers --proxy-tlsauthtype "
+    "--proxy-tlspassword --proxy-tlsuser -U --proxy-user --proxy1.0 --pubkey -Q --quote "
+    "--random-file --rate --request-target --retry-delay --retry-max-time --sasl-authzid "
+    "--service-name --sigalgs --socks4 --socks4a --socks5 --socks5-gssapi-service --socks5-hostname "
+    "--ssl-sessions -t --telnet-option --tftp-blksize -z --time-cond --tls-max --tls13-ciphers "
+    "--tlsauthtype --tlspassword --tlsuser --trace-config --upload-flags --url-query "
+    "--vlan-priority".split())
 _WGET_VALUE = frozenset("-O --output-document -P --directory-prefix -o --output-file -U --user-agent "
-                        "--header -t --tries -T --timeout -e --execute".split())
+                        "--header -t --tries -T --timeout -e --execute -i --input-file "
+                        "-a --append-output --config "
+                        "-B --base --rejected-log --report-speed --input-metalink --metalink-index "
+                        "--preferred-location --retry-on-http-error --dns-timeout --connect-timeout "
+                        "--read-timeout -w --wait --waitretry -Q --quota --bind-address "
+                        "--bind-dns-address --dns-servers --limit-rate --user --password "
+                        "--use-askpass --prefer-family --progress --local-encoding --remote-encoding "
+                        "--restrict-file-names --compression --start-pos --backups --ftp-user "
+                        "--ftp-password --http-user --http-password --proxy-user --proxy-password "
+                        "--max-redirect --referer --save-cookies --load-cookies --post-data "
+                        "--post-file --method --body-data --body-file --default-page --hsts-file "
+                        "--secure-protocol --certificate --certificate-type --private-key "
+                        "--private-key-type --ca-certificate --ca-directory --crl-file "
+                        "--pinnedpubkey --random-file --egd-file --ciphers --warc-file "
+                        "--warc-header --warc-max-size --warc-dedup --warc-tempdir --cut-dirs "
+                        "-l --level -A --accept -R --reject --accept-regex --reject-regex "
+                        "--regex-type -D --domains --exclude-domains --follow-tags --ignore-tags "
+                        "-I --include-directories -X --exclude-directories".split())
 _GIT_GLOBAL_VALUE = frozenset({"-C", "-c", "--git-dir", "--work-tree"})
+# `git clone -h` (2.47): every option that takes a value as the next word.
 _GIT_CLONE_VALUE = frozenset("--depth -b --branch -o --origin --reference --filter -c --config "
-                             "-j --jobs --template --separate-git-dir".split())
+                             "-j --jobs --template --separate-git-dir --shallow-since --shallow-exclude "
+                             "--reference-if-able --server-option --bundle-uri -u --upload-pack "
+                             "--revision --ref-format".split())
+_GIT_SUBMODULE_ADD_VALUE = frozenset({"-b", "--branch", "--name", "--reference", "--depth"})
+_GIT_LS_REMOTE_VALUE = frozenset({"--upload-pack", "-o", "--server-option", "--sort"})
 _GH_DOWNLOAD_VALUE = frozenset({"-R", "--repo", "-p", "--pattern", "-D", "--dir", "-O", "--output",
                                 "-A", "--archive"})
-_NPM_VALUE = frozenset("--registry --prefix -w --workspace --tag --cache -C --dir --filter".split())
+# Options of npm, pnpm, yarn and bun that take a value, before or after the
+# subcommand. `-w`/`--workspace` take one only for npm: for pnpm `-w` is
+# --workspace-root, a flag (R3B5), so they are in _NPM_PROG_VALUE.
+_NPM_VALUE = frozenset("--registry --prefix --tag --cache -C --dir --filter -F "
+                       "--omit --include --install-strategy --before --userconfig --globalconfig "
+                       "--loglevel --cwd --location --otp --fetch-retries --fetch-timeout "
+                       "--network-concurrency --network-timeout --modules-folder --cache-folder "
+                       "--global-folder --link-folder --mutex --use-yarnrc --proxy --https-proxy "
+                       "--save-prefix --workspace-concurrency --reporter --store-dir --virtual-store-dir "
+                       "--lockfile-dir --config-dir --cache-dir --global-dir --backend".split())
+_NPM_PROG_VALUE = {"npm": _NPM_VALUE | {"-w", "--workspace"}}
+# Every subcommand of npm, pnpm, yarn and bun that is not an install: when the
+# first word is none of these and not an install, a value option this table
+# lacks has eaten the subcommand's place, and the install is read from the
+# first install word after it (R3B6).
+_NPM_COMMANDS = frozenset("run run-script test t start stop restart exec x ci ls list ll la view v info show "
+                          "publish pack link ln uninstall remove rm r un unlink update up upgrade outdated "
+                          "audit config c set get version init create cache why explain dedupe ddp prune "
+                          "rebuild rb login logout adduser whoami owner dist-tag search s find help doctor "
+                          "fund diff query pkg root bin prefix edit explore completion shrinkwrap star "
+                          "unstar stars team token access hook org profile deprecate unpublish sbom dlx "
+                          "workspace workspaces global store env import patch patch-commit setup node "
+                          "licenses recursive outdated bunx pm build".split())
 _NPM_INSTALL = {"npm": {"i", "install", "add"}, "pnpm": {"add", "install", "i"},
                 "yarn": {"add", "install"}, "bun": {"add", "install", "i"}}
-_NPX_VALUE = frozenset({"-p", "--package", "--registry", "-c", "--call"})
+_NPX_VALUE = frozenset({"-p", "--package", "--registry", "-c", "--call", "-w", "--workspace"})
+# pip's general options (`pip --help`) and `pip install --help`, plus uv's
+# `--index`/`--default-index`, which `uv pip install` and `uv add` take.
 _PIP_VALUE = frozenset("-r --requirement -c --constraint -i --index-url --extra-index-url -t --target "
-                       "--prefix --root -e --editable -f --find-links --python -p --platform".split())
-_UVX_VALUE = frozenset({"--from", "--with", "-p", "--python", "--index-url", "-i"})
+                       "--prefix --root -e --editable -f --find-links --python -p --platform "
+                       "--proxy --retries --timeout --log --log-file --cache-dir --cert --client-cert "
+                       "--exists-action --trusted-host --src --progress-bar --keyring-provider "
+                       "--upgrade-strategy --global-option --config-settings -C --no-binary --only-binary "
+                       "--implementation --python-version --abi --report --root-user-action --use-feature "
+                       "--use-deprecated --resume-retries --group --index --default-index".split())
+_PIP_COMMANDS = frozenset("download uninstall freeze inspect list show check config search cache index "
+                          "wheel hash completion debug help lock".split())
+# `uv --help`: global options that take a value, before the subcommand.
+_UV_GLOBAL_VALUE = frozenset("--directory --project --cache-dir --config-file --color -p --python "
+                             "--python-preference --allow-insecure-host".split())
+_UVX_VALUE = frozenset({"--from", "--with", "-w", "--with-requirements", "--with-editable", "-p", "--python",
+                        "--index-url", "-i", "--index", "--default-index", "--extra-index-url",
+                        "--python-preference", "--directory", "--project", "--cache-dir", "--config-file",
+                        "--color"})
 _CARGO_VALUE = frozenset({"--version", "--vers", "--git", "--branch", "--tag", "--rev", "--path",
-                          "--registry", "--index", "-F", "--features", "--root"})
+                          "--registry", "--index", "-F", "--features", "--root",
+                          "--color", "--config", "-Z", "--manifest-path", "--target-dir", "--target",
+                          "-j", "--jobs", "--profile", "--bin", "--example", "--message-format",
+                          "--lockfile-path"})
 _GO_VALUE = frozenset({"-C", "-modfile", "-tags", "-ldflags", "-o"})
+# `docker run|create --help` (and podman's extras): every option that takes a value.
 _DOCKER_VALUE = frozenset("-v --volume -e --env -p --publish --name -w --workdir --network --entrypoint "
                           "-u --user --platform --env-file -l --label --mount -h --hostname --add-host "
-                          "--cpus -m --memory --restart --pull --log-driver --gpus".split())
+                          "--cpus -m --memory --restart --pull --log-driver --gpus "
+                          "-a --attach --annotation --blkio-weight --blkio-weight-device --cap-add "
+                          "--cap-drop --cgroup-parent --cgroupns --cidfile --cpu-period --cpu-quota "
+                          "--cpu-rt-period --cpu-rt-runtime -c --cpu-shares --cpuset-cpus --cpuset-mems "
+                          "--device --device-cgroup-rule --device-read-bps --device-read-iops "
+                          "--device-write-bps --device-write-iops --dns --dns-option --dns-opt "
+                          "--dns-search --domainname --expose --group-add --health-cmd "
+                          "--health-interval --health-retries --health-start-period "
+                          "--health-start-interval --health-timeout --ip --ip6 --ipc --isolation "
+                          "--kernel-memory --label-file --link --link-local-ip --log-opt --mac-address "
+                          "--memory-reservation --memory-swap --memory-swappiness --net --network-alias "
+                          "--net-alias --oom-score-adj --pid --pids-limit --runtime --security-opt "
+                          "--shm-size --stop-signal --stop-timeout --storage-opt --sysctl --tmpfs "
+                          "--ulimit --userns --uts --volume-driver --volumes-from --detach-keys "
+                          "--pod --arch --os --variant --authfile --creds --cert-dir --secret --uidmap "
+                          "--gidmap --tz --umask --unsetenv --cgroups --pidfile --timeout --retry "
+                          "--retry-delay --decryption-key --personality --init-path --seccomp-policy "
+                          "--sdnotify --requires --preserve-fds --hosts-file --subuidname --subgidname "
+                          "--chrootdirs --conmon-pidfile --env-merge --group-entry --passwd-entry "
+                          "--rdt-class --pod-id-file --image-volume "
+                          "--pids-limit --variant --cpu-rt-period --label-file --health-on-failure "
+                          "--health-log-destination --health-max-log-count --health-max-log-size "
+                          "--health-startup-cmd --health-startup-interval --health-startup-retries "
+                          "--health-startup-success --health-startup-timeout --uts --userns".split())
+# `docker pull`: -a is --all-tags there, which takes nothing.
+_DOCKER_PULL_VALUE = frozenset("--platform --arch --os --variant --authfile --creds --cert-dir "
+                               "--decryption-key --retry --retry-delay".split())
+# Global options, before the subcommand: `docker --context x run …`, `docker -H h pull …`.
+_DOCKER_GLOBAL_VALUE = frozenset("-c --context -H --host --config -l --log-level --tlscacert --tlscert "
+                                 "--tlskey --connection --url --identity --root --runroot "
+                                 "--storage-driver --storage-opt --cgroup-manager --events-backend "
+                                 "--hooks-dir --imagestore --module --network-cmd-path "
+                                 "--network-config-dir --runtime --tmpdir --volumepath --ssh".split())
+_NET_PEP508_URL = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?\s*@\s*(\S+://\S*)$")
 _PIP_SPEC = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)(\[[^\]]*\])?\s*(===|==|~=|>=|<=|!=|>|<)?\s*([^,;\s]*)")
 
 
+# curl and wget read a positional with no scheme as http: `curl evil.example/x`.
+# An optional `user@` first: `u@evil.example/x` is fetched from evil.example.
+_NET_BARE_HOST = re.compile(r"^(?:[^@/\s]+@)?(?:(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\.?|localhost)"
+                            r"(?::\d+)?(?:[/?#]|$)")
+# An address with no scheme (R3B2): a numeric IPv4 in any inet_aton form, or a
+# bracketed IPv6. A single number counts only with a port or path after it
+# (`101058054/x`), so a stray count is not read as a host.
+_NET_BARE_IP = re.compile(r"^(?:[^@/\s]+@)?(\[[0-9A-Fa-f:.]+\]|[0-9][0-9A-Fa-fxX]*(?:\.[0-9A-Fa-fxX]+){0,3}\.?)"
+                          r"(:\d*)?([/?#]|$)")
+
+
+def _net_bare_ip(a: str) -> bool:
+    m = _NET_BARE_IP.match(a)
+    if not m:
+        return False
+    host = m.group(1)
+    if not host.startswith("[") and "." not in host and not (m.group(2) or m.group(3)):
+        return False
+    return _host_canon(host) is not None
+
+
 def _net_is_url_arg(a: str) -> bool:
-    return "://" in a or "$" in a or "`" in a
+    return "://" in a or "$" in a or "`" in a or bool(_NET_BARE_HOST.match(a)) or _net_bare_ip(a)
+
+
+# Brace expansion (`{a,b}`, `{1..3}`, `{a..c}`) and curl's URL globs (`[a-z]`,
+# `[1-9:2]`): a word that names several hosts or packages is read as each one
+# (R3B3). Bounded: past NET_EXPAND_MAX words, or NET_EXPAND_MAX * 4 steps, the
+# word is not expanded and the item is reported unresolved (R10), as is a group
+# in a word longer than NET_EXPAND_CHARS.
+NET_EXPAND_MAX = 64
+NET_EXPAND_CHARS = 4096                      # a longer word is not expanded: unresolved if it would be
+_NET_SEQ = re.compile(r"(-?\d{1,9})\.\.(-?\d{1,9})(?:\.\.(-?\d{1,9}))?|([A-Za-z])\.\.([A-Za-z])(?:\.\.(-?\d{1,9}))?")
+_NET_CURL_RANGE = re.compile(r"(?:(\d{1,9})-(\d{1,9})|([a-z])-([a-z])|([A-Z])-([A-Z]))(?::(\d{1,9}))?")
+
+
+def _net_seq(body: str, curl_range: bool = False) -> "list[str] | None | bool":
+    """The words of a sequence `1..5`, `a..e`, `01..10..3` (or, for curl, a
+    range `1-5`, `a-e`, `1-9:2`); None when body is not one; False when it
+    names more than NET_EXPAND_MAX words."""
+    m = (_NET_CURL_RANGE if curl_range else _NET_SEQ).fullmatch(body)
+    if not m:
+        return None
+    g = m.groups()
+    step = abs(int(g[-1])) if g[-1] else 1
+    step = step or 1
+    if g[0] is not None:
+        lo, hi = int(g[0]), int(g[1])
+        width = max(len(g[0]), len(g[1])) if (g[0].lstrip("-")[:1] == "0" and len(g[0].lstrip("-")) > 1) \
+            or (g[1].lstrip("-")[:1] == "0" and len(g[1].lstrip("-")) > 1) else 0
+        if abs(hi - lo) // step + 1 > NET_EXPAND_MAX:
+            return False
+        rng = range(lo, hi + 1, step) if hi >= lo else range(lo, hi - 1, -step)
+        return [str(n).zfill(width) for n in rng]
+    a, b = (g[2], g[3]) if g[2] is not None else (g[4], g[5]) if curl_range else (g[3], g[4])
+    lo, hi = ord(a), ord(b)
+    if abs(hi - lo) // step + 1 > NET_EXPAND_MAX:
+        return False
+    rng = range(lo, hi + 1, step) if hi >= lo else range(lo, hi - 1, -step)
+    return [chr(n) for n in rng]
+
+
+def _net_group(word: str, curl: bool) -> "tuple[int, int, list[str]] | None | bool":
+    """The first group in word that expands, as (start, end, alternatives);
+    None when there is none; False when it names too many words. One pass
+    over the word (matching braces found with a stack)."""
+    stack: list[int] = []
+    close: dict[int, int] = {}
+    commas: dict[int, list[int]] = {}
+    for j, ch in enumerate(word):
+        if ch == "{" and not (j and word[j - 1] == "$"):
+            stack.append(j)
+        elif ch == "}" and stack:
+            close[stack.pop()] = j
+        elif ch == "," and stack:
+            commas.setdefault(stack[-1], []).append(j)
+    cands = sorted(close)
+    if curl:
+        k = 0
+        while True:
+            k = word.find("[", k)
+            if k < 0:
+                break
+            e = word.find("]", k)
+            if e < 0:
+                break
+            close[k] = e
+            cands.append(k)
+            k = e
+        cands.sort()
+    for i in cands:
+        j = close[i]
+        if word[i] == "[":
+            alts = _net_seq(word[i + 1:j], curl_range=True)
+            if alts is False:
+                return False
+            if alts:
+                return i, j + 1, alts
+            continue
+        if i in commas:
+            cuts = [i] + commas[i] + [j]
+            return i, j + 1, [word[a + 1:b] for a, b in zip(cuts, cuts[1:])]
+        alts = _net_seq(word[i + 1:j])
+        if alts is False:
+            return False
+        if alts:
+            return i, j + 1, alts
+    return None
+
+
+def _net_expand(word: str, curl: bool = False) -> list[str] | None:
+    """The words bash brace expansion (and, with curl, curl's URL globbing)
+    makes of `word`, in order; [word] when nothing expands; None when the
+    result would pass NET_EXPAND_MAX words."""
+    if "{" not in word and not (curl and "[" in word):
+        return [word]
+    if len(word) > NET_EXPAND_CHARS:
+        return [word] if _net_group(word, curl) is None else None
+    done: list[str] = []
+    todo = [word]
+    steps = 0
+    while todo:
+        w = todo.pop(0)
+        steps += 1
+        if steps > 4 * NET_EXPAND_MAX:
+            return None
+        g = _net_group(w, curl)
+        if g is False:
+            return None
+        if g is None:
+            done.append(w)
+            continue
+        a, b, alts = g
+        if len(done) + len(todo) + len(alts) > NET_EXPAND_MAX:
+            return None
+        todo = [w[:a] + x + w[b:] for x in alts] + todo
+    return done
+
+
+def _net_expand_items(items: list[dict]) -> list[dict]:
+    """Each item whose url or package holds a brace group, once per word it
+    expands to (R3B3). A word past the cap leaves the item unresolved."""
+    out: list[dict] = []
+    for item in items:
+        group = [item]
+        for key in ("url", "package"):
+            nxt: list[dict] = []
+            for it in group:
+                v = it.get(key)
+                words = _net_expand(v) if isinstance(v, str) and "{" in v else [v]
+                if words is None:
+                    it = dict(it, dynamic=True, _unresolved="unreadable")
+                    nxt.append(it)
+                    continue
+                if words == [v]:
+                    nxt.append(it)
+                    continue
+                for w in words:
+                    c = dict(it)
+                    c[key] = w
+                    if key == "url" and (it.get("host") is None or it.get("host") == url_host(v)):
+                        host, unresolved = _url_host_parts(w)
+                        c["host"] = host
+                        c.pop("_unresolved", None)
+                        if unresolved:
+                            c["dynamic"], c["_unresolved"] = True, "host-unresolved"
+                    nxt.append(c)
+            group = nxt
+        out += group
+    return out
+
+
+def _net_fetch_item(program: str, url: str, dest: str | None) -> dict:
+    """A curl or wget item; a URL with no scheme is the http one it fetches."""
+    if "://" not in url and not re.match(r"[^/?#]*[$`]", url):    # a literal host
+        url = "http://" + url
+    return _net_url_item("fetch", program, url, dest=dest)
 
 
 def _net_curl(args: list[str]) -> list[dict]:
     pos, opts = _net_positionals(args, _CURL_VALUE)
-    urls = [u for u in pos if _net_is_url_arg(u)] + ([opts["--url"]] if opts.get("--url") else [])
+    # Every --url counts: curl fetches each (R3B8).
+    urls = [u for u in pos if _net_is_url_arg(u)] + _net_opt_values(args, frozenset({"--url"}), _CURL_VALUE)
     dest = opts.get("-o") or opts.get("--output") or (
         "(remote name)" if "-O" in opts or "--remote-name" in opts else None)
-    return [_net_url_item("fetch", "curl", u, dest=dest) for u in urls]
+    if not urls and ("-K" in opts or "--config" in opts):
+        return [_net_item("fetch", "curl", dynamic=True)]    # the URLs are in the config file
+    globs = "-g" not in opts and "--globoff" not in opts
+    out: list[dict] = []
+    for u in urls:
+        words = _net_expand(u, curl=globs)
+        if words is None:                    # more URLs than are read: unresolved (R10)
+            out.append(dict(_net_fetch_item("curl", u, dest), host=None, dynamic=True, _unresolved="unreadable"))
+            continue
+        out += [_net_fetch_item("curl", w, dest) for w in words]
+    return out
 
 
 def _net_wget(args: list[str]) -> list[dict]:
     pos, opts = _net_positionals(args, _WGET_VALUE)
     dest = (opts.get("-O") or opts.get("--output-document") or opts.get("-P")
             or opts.get("--directory-prefix"))
-    return [_net_url_item("fetch", "wget", u, dest=dest) for u in pos if _net_is_url_arg(u)]
+    out = [_net_fetch_item("wget", u, dest) for u in pos if _net_is_url_arg(u)]
+    listed = opts.get("-i") if "-i" in opts else opts.get("--input-file")
+    if listed is not None:                   # `-i FILE`: the URLs are in the file, as with xargs
+        if "://" in listed:                  # `-i URL` fetches the list itself first
+            out.append(_net_fetch_item("wget", listed, None))
+        out.append(_net_item("fetch", "wget", dynamic=True))
+    return out
 
 
 def _net_git_sub(args: list[str]) -> tuple[str, list[str]]:
@@ -2114,15 +4637,34 @@ def _net_git_remote_names(args: list[str]) -> "list[str] | None":
     return []
 
 
+def _net_git_repo_index(pos: list[str]) -> int:
+    """Which positional of `git clone` (or `submodule add`) is the repository:
+    the first URL or scp remote, else the first (R3B9). A value option missing
+    from the table then cannot make its value the repository."""
+    return next((k for k, p in enumerate(pos) if _NET_URL.match(p) or _NET_SCP.match(p)), 0)
+
+
+_GIT_CONFIG_VALUE = frozenset({"-f", "--file", "--blob", "--type", "--default", "--comment", "--value"})
+_GIT_REMOTE_URL_KEY = re.compile(r"(?i:remote)\.(.+)\.(?i:url)")
+
+
 def _net_git_remotes(args: list[str], remotes: dict[str, str]) -> None:
     """Track, in order, the URL each remote name stands for in this session:
-    `git remote add|set-url NAME URL`, and the `origin` a `git clone URL` makes."""
+    `git remote add|set-url NAME URL`, `git config remote.NAME.url URL`, and
+    the `origin` a `git clone URL` makes."""
     sub, rest = _net_git_sub(args)
     if sub == "clone":
         pos, opts = _net_positionals(rest, _GIT_CLONE_VALUE)
         name = opts.get("-o") or opts.get("--origin") or "origin"
         if pos and (len(remotes) < NET_REMOTES_CAP or name in remotes):
-            remotes[name] = pos[0]
+            remotes[name] = pos[_net_git_repo_index(pos)]
+    elif sub == "config":
+        pos, _ = _net_positionals(rest, _GIT_CONFIG_VALUE)
+        if pos[:1] in (["set"], ["add"]):    # `git config set KEY VALUE` (git 2.46)
+            pos = pos[1:]
+        m = _GIT_REMOTE_URL_KEY.fullmatch(pos[0]) if len(pos) >= 2 else None
+        if m and (len(remotes) < NET_REMOTES_CAP or m.group(1) in remotes):
+            remotes[m.group(1)] = pos[1]
     elif sub == "remote" and rest[:1] in (["add"], ["set-url"]):
         # -t BRANCH and -m MASTER take a value; -f, --tags, --no-tags, --mirror=… do not.
         pos, _ = _net_positionals(rest[1:], _GIT_REMOTE_ADD_VALUE)
@@ -2134,15 +4676,68 @@ def _net_git_remote_name(args: list[str]) -> str | None:
     """The remote a fetch, pull or dry-run push names (`origin` when none is
     given), or None for any other command or when a URL is given directly."""
     sub, rest = _net_git_sub(args)
-    if sub not in ("fetch", "pull", "push"):
+    if sub not in ("fetch", "pull", "push", "ls-remote"):
         return None
-    pos, _ = _net_positionals(rest, frozenset({"--depth", "-j", "--jobs"}))
+    pos, _ = _net_positionals(rest, _GIT_LS_REMOTE_VALUE if sub == "ls-remote"
+                              else frozenset({"--depth", "-j", "--jobs"}))
     if not pos:
         return "origin"
     return None if _NET_URL.match(pos[0]) or url_host(pos[0]) else pos[0]
 
 
-def _net_git(args: list[str]) -> list[dict]:
+def _net_git_config(args: list[str], env: dict | None = None) -> list[tuple[str, str]]:
+    """(key, value) of the configuration a git command line sets for itself:
+    `git -c K=V`, `git clone -c|--config K=V`, and GIT_CONFIG_COUNT /
+    GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n or GIT_CONFIG_PARAMETERS assigned
+    before it. These can rewrite the URL (url.*.insteadOf) or proxy it (R3B11)."""
+    vals: list[str] = []
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] == "-c" and i + 1 < len(args):
+            vals.append(args[i + 1])
+        i += 2 if args[i] in _GIT_GLOBAL_VALUE else 1
+    if i < len(args) and args[i] == "clone":
+        vals += _net_opt_values(args[i + 1:], frozenset({"-c", "--config"}), _GIT_CLONE_VALUE)
+    out = [(k, v) for k, _, v in (x.partition("=") for x in vals)]
+    env = env or {}
+    count = env.get("GIT_CONFIG_COUNT", "")
+    if count.isdigit():
+        for n in range(min(int(count), 64)):
+            k = env.get(f"GIT_CONFIG_KEY_{n}")
+            if k:
+                out.append((k, env.get(f"GIT_CONFIG_VALUE_{n}", "")))
+    out += re.findall(r"'([^']*)'='([^']*)'", env.get("GIT_CONFIG_PARAMETERS", ""))
+    # `git config --global url.X.insteadOf Y` earlier in the same command (R3F7).
+    out += re.findall(r"'([^']*)'='([^']*)'", env.get(_NET_GIT_WRITTEN, ""))
+    return out
+
+
+def _net_git_rewrite(items: list[dict], config: list[tuple[str, str]]) -> list[dict]:
+    """Apply `url.<base>.insteadOf=<prefix>`: the longest prefix wins, as in git,
+    so the item names the host git really contacts (R3B11)."""
+    rules = [(v, k[4:-len(".insteadof")]) for k, v in config
+             if k.lower().startswith("url.") and k.lower().endswith(".insteadof") and v]
+    if not rules:
+        return items
+    out = []
+    for it in items:
+        url = it.get("url")
+        best = max((r for r in rules if isinstance(url, str) and url.startswith(r[0])),
+                   key=lambda r: len(r[0]), default=None)
+        if best is None:
+            out.append(it)
+            continue
+        new = _net_url_item(it["kind"], it["program"], best[1] + url[len(best[0]):], dest=it.get("dest"))
+        out.append(new)
+    return out
+
+
+def _net_git(args: list[str], env: dict | None = None) -> list[dict]:
+    items = _net_git_items(args)
+    return _net_git_rewrite(items, _net_git_config(args, env)) if items else items
+
+
+def _net_git_items(args: list[str]) -> list[dict]:
     sub, rest = _net_git_sub(args)
     if not sub:
         return []
@@ -2150,7 +4745,19 @@ def _net_git(args: list[str]) -> list[dict]:
         pos, _ = _net_positionals(rest, _GIT_CLONE_VALUE)
         if not pos:
             return []
-        return [_net_url_item("clone", "git", pos[0], dest=pos[1] if len(pos) > 1 else None)]
+        k = _net_git_repo_index(pos)
+        return [_net_url_item("clone", "git", pos[k], dest=pos[k + 1] if len(pos) > k + 1 else None)]
+    if sub == "submodule" and rest[:1] == ["add"]:     # clones the repository (R3B9)
+        pos, _ = _net_positionals(rest[1:], _GIT_SUBMODULE_ADD_VALUE)
+        if not pos:
+            return []
+        k = _net_git_repo_index(pos)
+        return [_net_url_item("clone", "git", pos[k], dest=pos[k + 1] if len(pos) > k + 1 else None)]
+    if sub == "ls-remote":                   # contacts the remote
+        pos, _ = _net_positionals(rest, _GIT_LS_REMOTE_VALUE)
+        if pos and (_NET_URL.match(pos[0]) or _NET_SCP.match(pos[0])):
+            return [_net_url_item("clone", "git", pos[0])]
+        return [_net_item("clone", "git")]
     if sub in ("fetch", "pull"):
         pos, _ = _net_positionals(rest, frozenset({"--depth", "-j", "--jobs"}))
         if pos and (_NET_URL.match(pos[0]) or url_host(pos[0])):
@@ -2173,17 +4780,30 @@ def _net_git(args: list[str]) -> list[dict]:
     return []
 
 
-def _net_gh(args: list[str]) -> list[dict]:
+def _net_gh_url(repo: str, host: str) -> str:
+    """The URL gh fetches for a repository argument: a URL or scp remote as
+    written; `HOST/OWNER/REPO` (GitHub Enterprise) on HOST; `OWNER/REPO` on
+    GH_HOST or github.com (R3B10)."""
+    if "://" in repo or _NET_SCP.match(repo):
+        return repo
+    parts = repo.split("/")
+    if len(parts) >= 3 and "." in parts[0]:
+        return f"https://{repo}"
+    return f"https://{host}/{repo}"
+
+
+def _net_gh(args: list[str], env: dict | None = None) -> list[dict]:
+    host = (env or {}).get("GH_HOST") or "github.com"
     if args[:2] == ["repo", "clone"] and len(args) > 2:
-        repo = args[2]
-        url = repo if "://" in repo or url_host(repo) else f"https://github.com/{repo}"
-        return [_net_url_item("clone", "gh", url)]
+        return [_net_url_item("clone", "gh", _net_gh_url(args[2], host))]
     if args[:2] == ["release", "download"]:
         _, opts = _net_positionals(args[2:], _GH_DOWNLOAD_VALUE)
         dest = opts.get("-D") or opts.get("--dir") or opts.get("-O") or opts.get("--output")
         repo = opts.get("-R") or opts.get("--repo")
         if repo:
-            return [_net_url_item("fetch", "gh", f"https://github.com/{repo}", dest=dest)]
+            return [_net_url_item("fetch", "gh", _net_gh_url(repo, host), dest=dest)]
+        if host != "github.com":
+            return [dict(_net_url_item("fetch", "gh", f"https://{host}/"), url=None, dest=dest)]
         return [_net_item("fetch", "gh", host="github.com", dest=dest)]
     return []
 
@@ -2200,6 +4820,11 @@ def _net_npm_package(program: str, spec: str, registry: str | None, exec_: bool 
         return _net_url_item("install", program, url, ecosystem="npm", exec=exec_)
     if spec.startswith((".", "/", "~", "file:")):
         return None
+    if not spec.startswith("@") and "/" in spec and "@" not in spec and ":" not in spec:
+        # `npm i owner/repo[#ref]` installs from github.com/owner/repo (R3B10).
+        repo = spec.split("#", 1)[0]
+        return _net_item("install", program, ecosystem="npm", host="github.com", package=spec,
+                         url=f"https://github.com/{repo}", exec=exec_)
     at = spec.find("@", 1)
     name, version = (spec, None) if at < 0 else (spec[:at], spec[at + 1:] or None)
     alias = None
@@ -2212,14 +4837,41 @@ def _net_npm_package(program: str, spec: str, registry: str | None, exec_: bool 
     return item
 
 
-def _net_npm(prog: str, args: list[str]) -> list[dict]:
-    pos, opts = _net_positionals(args, _NPM_VALUE)
-    registry = opts.get("--registry")
+def _net_npm_create(prog: str, sub: str, spec: str, registry: str | None) -> dict | None:
+    """`npm init x`, `npm create x`, `yarn|pnpm|bun create x`: downloads and runs
+    the initializer `create-x` (`@s` -> `@s/create`, `@s/x` -> `@s/create-x`)."""
+    if spec.startswith(("-", ".", "/", "~")) or ":" in spec:
+        return None
+    at = spec.find("@", 1)
+    name, version = (spec, None) if at < 0 else (spec[:at], spec[at + 1:] or None)
+    if name.startswith("@"):
+        scope, _, rest = name.partition("/")
+        name = f"{scope}/create-{rest}" if rest else f"{scope}/create"
+    elif name.startswith("create-"):
+        pass
+    else:
+        name = "create-" + name
+    return _net_registry_item(f"{prog} {sub}", "npm", name, version, registry, exec_=True)
+
+
+def _net_npm(prog: str, args: list[str], env_registry: str | None = None) -> list[dict]:
+    pos, opts = _net_positionals(args, _NPM_PROG_VALUE.get(prog, _NPM_VALUE))
+    if pos and pos[0] not in _NPM_INSTALL[prog] and pos[0] not in _NPM_COMMANDS:
+        # An unknown first word: a value option we do not know ate the
+        # subcommand's place. Read from the first install word (R3B6).
+        k = next((k for k in range(1, len(pos)) if pos[k] in _NPM_INSTALL[prog]), 0)
+        pos = pos[k:] if k else pos
+    registry = opts.get("--registry") or env_registry
     lockfile = ((prog == "npm" and pos[:1] == ["ci"])
                 or (prog == "pnpm" and pos[:1] == ["install"] and "--frozen-lockfile" in opts)
                 or (prog == "yarn" and pos[:1] in ([], ["install"]) and "--immutable" in opts))
     if lockfile:
         return [_net_lockfile(prog, "npm", registry)]
+    if pos[:1] in (["create"], ["init"]) and len(pos) > 1:
+        item = _net_npm_create(prog, pos[0], pos[1], registry)
+        return [item] if item else []
+    if prog == "yarn" and pos[:2] == ["global", "add"]:
+        pos = pos[1:]
     if prog == "yarn" and not pos:
         pos = ["install"]
     if not pos or pos[0] not in _NPM_INSTALL[prog]:
@@ -2230,21 +4882,27 @@ def _net_npm(prog: str, args: list[str]) -> list[dict]:
     return [i for i in found if i]
 
 
-def _net_npx(prog: str, args: list[str]) -> list[dict]:
-    label = "pnpm dlx" if prog == "pnpm" else prog
-    if prog == "pnpm":
-        args = args[1:]                      # drop "dlx"
+def _net_npx(prog: str, args: list[str], env_registry: str | None = None) -> list[dict]:
+    label = prog
+    if prog in ("pnpm", "yarn", "npm"):      # pnpm dlx, yarn dlx, npm exec, npm x
+        label, args = f"{prog} {args[0]}", args[1:]
     pos, opts = _net_positionals(args, _NPX_VALUE)
-    spec = opts.get("-p") or opts.get("--package") or (pos[0] if pos else None)
-    if not spec:
-        return []
-    item = _net_npm_package(label, spec, opts.get("--registry"), exec_=True)
-    return [item] if item else []
+    # Every -p/--package is installed (R3B8); with none, the command names the package.
+    specs = _net_opt_values(args, frozenset({"-p", "--package"}), _NPX_VALUE) or pos[:1]
+    registry = opts.get("--registry") or env_registry
+    found = (_net_npm_package(label, spec, registry, exec_=True) for spec in specs if spec)
+    return [i for i in found if i]
 
 
 def _net_pip_package(program: str, spec: str, registry: str | None, exec_: bool = False) -> dict | None:
     if spec == "@" or spec.startswith((".", "/", "~")):
         return None
+    direct = _NET_PEP508_URL.match(spec)
+    if direct:                               # PEP 508 `name @ url`: the name is the package
+        url = direct.group(2)
+        url = url.split("+", 1)[1] if re.match(r"^[a-z]+\+[a-z]", url) else url
+        return _net_url_item("install", program, url, ecosystem="pypi", package=direct.group(1),
+                             exec=exec_)
     if "://" in spec:
         url = spec.split("+", 1)[1] if spec.startswith("git+") else spec
         return _net_url_item("install", program, url, ecosystem="pypi", exec=exec_)
@@ -2260,35 +4918,109 @@ def _net_pip_package(program: str, spec: str, registry: str | None, exec_: bool 
                               exact=re.compile(r"^(?:===)?v?\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?$"))
 
 
-def _net_pip(prog: str, args: list[str]) -> list[dict]:
-    pos, opts = _net_positionals(args, _PIP_VALUE)
-    if not pos or pos[0] != "install":
-        return []
-    registry = opts.get("-i") or opts.get("--index-url")
-    out: list[dict] = []
-    req = opts.get("-r") or opts.get("--requirement")
-    if req:
-        item = _net_registry_item(prog, "pypi", None, None, registry)
-        item["source"] = req
-        out.append(item)
-    for spec in pos[1:]:
-        item = _net_pip_package(prog, spec, registry)
-        if item:
-            out.append(item)
+def _net_opt_values(args: list[str], names: frozenset, takes_value: frozenset) -> list[str]:
+    """Every value given to one of `names` (`-r a -r b`, `--opt=v`, `-rFILE`),
+    in order; options are read as `_net_positionals` reads them."""
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            break
+        if a.startswith("--") and "=" in a:
+            if a.split("=", 1)[0] in names:
+                out.append(a.split("=", 1)[1])
+        elif a in takes_value and i + 1 < len(args):
+            if a in names:
+                out.append(args[i + 1])
+            i += 1
+        elif not a.startswith("--") and len(a) > 2 and a[:2] in names:
+            out.append(a[2:])                # `-rreq.txt`
+        i += 1
     return out
 
 
-def _net_uv(args: list[str]) -> list[dict]:
+_PIP_REQ_OPTS = frozenset({"-r", "--requirement"})
+_PIP_URL_OPTS = frozenset({"-c", "--constraint", "--extra-index-url", "-f", "--find-links"})
+_PIP_EDITABLE = frozenset({"-e", "--editable"})
+
+
+def _net_pip(prog: str, args: list[str], env_index: str | None = None,
+             env_extra: tuple = ()) -> list[dict]:
+    pos, opts = _net_positionals(args, _PIP_VALUE)
+    if pos and pos[0] != "install" and pos[0] not in _PIP_COMMANDS and "install" in pos:
+        pos = pos[pos.index("install"):]     # a value option we do not know ate its place (R3B6)
+    if not pos or pos[0] != "install":
+        return []
+    registry = opts.get("-i") or opts.get("--index-url") or opts.get("--default-index") or env_index
+    out: list[dict] = []
+    reqs = _net_opt_values(args, _PIP_REQ_OPTS, _PIP_VALUE)
+    if reqs:
+        item = _net_registry_item(prog, "pypi", None, None, registry)
+        item["source"] = reqs[-1]
+        out.append(item)
+    # A requirements or constraints file, an extra index or a find-links page
+    # given as a URL is fetched from that host (`--extra-index-url` is the
+    # dependency-confusion vector).
+    for url in _net_opt_values(args, _PIP_REQ_OPTS | _PIP_URL_OPTS | {"--index"}, _PIP_VALUE) + list(env_extra):
+        if "=" in url and "://" in url.split("=", 1)[1]:
+            url = url.split("=", 1)[1]       # uv's `--index name=URL`
+        if "://" in url:
+            out.append(_net_url_item("fetch", prog, url))
+    for spec in _net_opt_values(args, _PIP_EDITABLE, _PIP_VALUE) + pos[1:]:
+        words = _net_expand(spec) if "{" in spec else [spec]   # `pip install {evil,ok}==1` (R3B3)
+        if words is None:
+            out.append(_net_item("install", prog, ecosystem="pypi", package=spec, dynamic=True,
+                                 _unresolved="unreadable"))
+            continue
+        for w in words:
+            item = _net_pip_package(prog, w, registry)
+            if item:
+                out.append(item)
+    return out
+
+
+_UV_INDEX_OPTS = frozenset({"-i", "--index-url", "--default-index", "--index", "--extra-index-url",
+                            "-f", "--find-links"})
+
+
+def _net_uv(args: list[str], env: dict | None = None) -> list[dict]:
+    # Global options before the subcommand (`uv --directory app pip install …`,
+    # R3B6); an index given there still applies, so it is carried along.
+    i, carry = 0, []
+    while i < len(args) and args[i].startswith("-"):
+        a = args[i]
+        if a in _UV_INDEX_OPTS and i + 1 < len(args):
+            carry += args[i:i + 2]
+            i += 2
+        elif a.split("=", 1)[0] in _UV_INDEX_OPTS:
+            carry.append(a)
+            i += 1
+        else:
+            i += 2 if a in _UV_GLOBAL_VALUE else 1
+    args = args[i:]
+    env = env or {}
+    index = env.get("UV_INDEX_URL") or env.get("UV_DEFAULT_INDEX")
+    extra = tuple(u for k in ("UV_EXTRA_INDEX_URL", "UV_INDEX") for u in (env.get(k) or "").split())
     if args[:2] == ["pip", "install"]:
-        return _net_pip("uv pip", args[1:])
+        return _net_pip("uv pip", args[1:] + carry, index, extra)
+    if args[:2] == ["tool", "install"]:
+        return _net_pip("uv tool", args[1:] + carry, index, extra)
+    if args[:2] == ["tool", "run"]:
+        return _net_uvx("uv tool run", args[2:] + carry, index)
+    if args[:1] == ["run"]:                  # `uv run --with x==1 script.py`: each --with
+        withs = [v for k, v in zip(args, args[1:]) if k == "--with"] \
+            + [a.split("=", 1)[1] for a in args if a.startswith("--with=")]
+        found = (_net_pip_package("uv run", w, None, exec_=True) for w in withs)
+        return [i for i in found if i]
     if args[:1] == ["add"]:
-        return _net_pip("uv", ["install"] + args[1:])
+        return _net_pip("uv", ["install"] + args[1:] + carry, index, extra)
     if args[:1] == ["sync"]:
         return [_net_lockfile("uv", "pypi")]
     return []
 
 
-def _net_uvx(prog: str, args: list[str]) -> list[dict]:
+def _net_uvx(prog: str, args: list[str], env_index: str | None = None) -> list[dict]:
     exec_ = True
     if prog == "pipx":
         if not args or args[0] not in ("run", "install"):
@@ -2296,16 +5028,29 @@ def _net_uvx(prog: str, args: list[str]) -> list[dict]:
         exec_, args = args[0] == "run", args[1:]
     pos, opts = _net_positionals(args, _UVX_VALUE)
     spec = opts.get("--from") or (pos[0] if pos else None)
-    if not spec:
-        return []
-    item = _net_pip_package(prog, spec, opts.get("-i") or opts.get("--index-url"), exec_=exec_)
-    return [item] if item else []
+    registry = opts.get("-i") or opts.get("--index-url") or opts.get("--default-index") or env_index
+    out: list[dict] = []
+    item = _net_pip_package(prog, spec, registry, exec_=exec_) if spec else None
+    if item:
+        out.append(item)
+    # Every --with is installed too (R3B8); a requirements file given as a URL is fetched.
+    for w in _net_opt_values(args, frozenset({"--with", "-w"}), _UVX_VALUE):
+        for one in (x.strip() for x in w.split(",")):
+            item = _net_pip_package(prog, one, registry, exec_=exec_) if one else None
+            if item:
+                out.append(item)
+    for r in _net_opt_values(args, frozenset({"--with-requirements"}), _UVX_VALUE):
+        if "://" in r:
+            out.append(_net_url_item("fetch", prog, r))
+    return out
 
 
 def _net_brew(args: list[str]) -> list[dict]:
     pos, _ = _net_positionals(args)
     if not pos or pos[0] not in ("install", "reinstall", "tap"):
         return []
+    if pos[0] == "tap" and len(pos) > 2:     # `brew tap NAME URL` clones URL (R3B10)
+        return [_net_url_item("clone", "brew", pos[2])]
     if pos[0] == "tap":                      # clones github.com/<owner>/homebrew-<repo>
         return [_net_item("clone", "brew", host="github.com", host_inferred=True,
                           url=f"https://github.com/{owner}/homebrew-{repo}")
@@ -2314,6 +5059,8 @@ def _net_brew(args: list[str]) -> list[dict]:
 
 
 def _net_cargo(args: list[str]) -> list[dict]:
+    if args[:1] and args[0].startswith("+"):
+        args = args[1:]                      # `cargo +nightly install …`: a toolchain
     pos, opts = _net_positionals(args, _CARGO_VALUE)
     if not pos or pos[0] not in ("install", "add") or opts.get("--path"):
         return []
@@ -2337,8 +5084,10 @@ def _net_cargo(args: list[str]) -> list[dict]:
 
 def _net_go(args: list[str]) -> list[dict]:
     pos, _ = _net_positionals(args, _GO_VALUE)
-    if not pos or pos[0] not in ("install", "get"):
+    if not pos or pos[0] not in ("install", "get", "run"):
         return []
+    if pos[0] == "run":                      # `go run mod/cmd@v1`: downloads the module; later words are its args
+        pos = pos[:2] if len(pos) > 1 and "@" in pos[1] else []
     out = []
     for spec in pos[1:]:
         mod, _, ver = spec.partition("@")
@@ -2373,9 +5122,15 @@ def _oci_name(name: str) -> tuple[str, str | None]:
 
 
 def _net_docker(prog: str, args: list[str]) -> list[dict]:
-    if not args or args[0] not in ("pull", "run"):
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        i += 2 if args[i] in _DOCKER_GLOBAL_VALUE else 1
+    args = args[i:]
+    if args[:2] in (["image", "pull"], ["container", "run"], ["container", "create"]):
+        args = args[1:]
+    if not args or args[0] not in ("pull", "run", "create"):
         return []
-    pos, _ = _net_positionals(args[1:], _DOCKER_VALUE)
+    pos, _ = _net_positionals(args[1:], _DOCKER_PULL_VALUE if args[0] == "pull" else _DOCKER_VALUE)
     if not pos:
         return []
     ref = pos[0]
@@ -2388,28 +5143,60 @@ def _net_docker(prog: str, args: list[str]) -> list[dict]:
                       host=host or NETWORK_REGISTRY["oci"], host_inferred=not host)]
 
 
-def _net_extract(tokens: list[str]) -> list[dict]:
-    prog, args = _net_base(tokens[0]), tokens[1:]
+_NET_PIP_PROG = re.compile(r"pip(?:\d+(?:\.\d+)?)?")   # pip, pip3, pip3.12
+
+
+def _net_extract(tokens: list[str], env: dict | None = None) -> list[dict]:
+    """The downloads one command makes. `env` holds the NAME=VALUE assignments
+    in effect (written before it, or exported earlier in the same command):
+    a registry or GH_HOST is applied as the option would be, a proxy marks
+    the transfer redirected (R3B10, R3B11)."""
+    # Lower-cased: `Docker`, `NPM`, `CURL` run the real tool on macOS (ruling R11).
+    prog, args = _net_base(tokens[0]).lower(), tokens[1:]
     if re.fullmatch(r"python(?:\d(?:\.\d+)?)?", prog) and args[:2] == ["-m", "pip"]:
         prog, args = "pip", args[2:]
+    own = getattr(tokens, "env", {})
+    env = {**env, **own} if env else own
+    items = _net_extract_prog(prog, args, env)
+    return _net_transport(prog, args, env, items) if items else items
+
+
+def _net_npm_env_registry(prog: str, env: dict) -> str | None:
+    """The registry npm, pnpm, yarn or bun reads from the environment
+    (npm_config_* names are case-insensitive)."""
+    if not env:
+        return None
+    for k in ("YARN_NPM_REGISTRY_SERVER", "YARN_REGISTRY") if prog == "yarn" else ():
+        if env.get(k):
+            return env[k]
+    if prog in ("bun", "bunx") and env.get("BUN_CONFIG_REGISTRY"):
+        return env["BUN_CONFIG_REGISTRY"]
+    return next((v for k, v in env.items() if k.lower() == "npm_config_registry" and v), None)
+
+
+def _net_extract_prog(prog: str, args: list[str], env: dict) -> list[dict]:
     if prog == "curl":
         return _net_curl(args)
     if prog == "wget":
         return _net_wget(args)
     if prog == "git":
-        return _net_git(args)
+        return _net_git(args, env)
     if prog == "gh":
-        return _net_gh(args)
-    if prog in ("npx", "bunx") or (prog == "pnpm" and args[:1] == ["dlx"]):
-        return _net_npx(prog, args)
+        return _net_gh(args, env)
+    if prog in ("npx", "bunx") or (prog in ("pnpm", "yarn") and args[:1] == ["dlx"]) \
+            or (prog == "npm" and args[:1] in (["exec"], ["x"])):
+        return _net_npx(prog, args, _net_npm_env_registry(prog, env))
     if prog in _NPM_INSTALL:
-        return _net_npm(prog, args)
-    if prog in ("pip", "pip3"):
-        return _net_pip(prog, args)
+        return _net_npm(prog, args, _net_npm_env_registry(prog, env))
+    if _NET_PIP_PROG.fullmatch(prog):
+        return _net_pip(prog, args, env.get("PIP_INDEX_URL"),
+                        tuple(u for k in ("PIP_EXTRA_INDEX_URL", "PIP_FIND_LINKS")
+                              for u in (env.get(k) or "").split()))
     if prog == "uv":
-        return _net_uv(args)
+        return _net_uv(args, env)
     if prog in ("uvx", "pipx"):
-        return _net_uvx(prog, args)
+        return _net_uvx(prog, args, env.get("UV_INDEX_URL") or env.get("UV_DEFAULT_INDEX") if prog == "uvx"
+                        else env.get("PIP_INDEX_URL"))
     if prog == "brew":
         return _net_brew(args)
     if prog == "cargo":
@@ -2421,8 +5208,284 @@ def _net_extract(tokens: list[str]) -> list[dict]:
     return []
 
 
+# Options that send a transfer through another host: a proxy, or another
+# address for the host the URL names (R3B11).
+_CURL_PROXY_OPTS = frozenset({"-x", "--proxy", "--preproxy", "--socks4", "--socks4a", "--socks5",
+                              "--socks5-hostname", "--doh-url"})
+_CURL_CONNECT_TO = re.compile(r"(\[[^\]]*\]|[^:]*):([^:]*):(\[[^\]]*\]|[^:]*):(.*)")
+_CURL_RESOLVE = re.compile(r"[+]?(\[[^\]]*\]|[^:]*):([^:]*):(.+)")
+_BREW_MIRROR_ENV = ("HOMEBREW_BOTTLE_DOMAIN", "HOMEBREW_ARTIFACT_DOMAIN", "HOMEBREW_API_DOMAIN",
+                    "HOMEBREW_BREW_GIT_REMOTE", "HOMEBREW_CORE_GIT_REMOTE")
+_GOPROXY_DEFAULT = frozenset({"", "direct", "off", "https://proxy.golang.org"})
+
+
+def _net_transport(prog: str, args: list[str], env: dict, items: list[dict]) -> list[dict]:
+    """Mark items whose transfer the same command redirects (a proxy option or
+    variable, curl --connect-to/--resolve/--doh-url, git http.proxy, GOPROXY, a
+    Homebrew mirror) as dynamic and unresolved: never trusted, and unresolved
+    under --ioc (R3B11). Each redirect target that names a host is added as an
+    item of its own, so a listed host still matches."""
+    if prog in ("docker", "podman"):
+        return items                         # the daemon pulls, with its own settings
+    common: list[str | None] = []            # None: redirected to a target not known
+    if prog == "curl":
+        common += _net_opt_values(args, _CURL_PROXY_OPTS, _CURL_VALUE)
+        for v in _net_opt_values(args, frozenset({"--connect-to"}), _CURL_VALUE):
+            m = _CURL_CONNECT_TO.fullmatch(v)
+            if not m:
+                common.append(None)
+            elif m.group(3):
+                common.append(m.group(3) + (":" + m.group(4) if m.group(4) else ""))
+        for v in _net_opt_values(args, frozenset({"--resolve"}), _CURL_VALUE):
+            m = _CURL_RESOLVE.fullmatch(v)
+            common += [a.strip() for a in m.group(3).split(",") if a.strip()] if m else [None]
+    elif prog == "git":
+        for k, v in _net_git_config(args, env):
+            low = k.lower()
+            if low in ("http.proxy", "https.proxy") or (low.startswith("http.") and low.endswith(".proxy")):
+                common.append(v or None)
+        if env.get("GIT_PROXY_COMMAND"):
+            common.append(None)
+    elif prog in _NPM_INSTALL or prog in ("npx", "bunx"):
+        common += _net_opt_values(args, frozenset({"--proxy", "--https-proxy"}), _NPM_VALUE)
+        common += [v for k, v in env.items() if k.lower() in ("npm_config_proxy", "npm_config_https_proxy",
+                                                              "yarn_proxy", "yarn_https_proxy") and v]
+    elif _NET_PIP_PROG.fullmatch(prog) or prog in ("uv", "uvx", "pipx"):
+        common += _net_opt_values(args, frozenset({"--proxy"}), _PIP_VALUE)
+        common += [env["PIP_PROXY"]] if env.get("PIP_PROXY") else []
+    elif prog == "go":
+        common += [p for p in re.split(r"[,|]", env.get("GOPROXY", "")) if p.strip().rstrip("/") not in _GOPROXY_DEFAULT]
+    elif prog == "brew":
+        common += [env[k] for k in _BREW_MIRROR_ENV if env.get(k)]
+    elif prog == "cargo" and env.get("CARGO_HTTP_PROXY"):
+        common.append(env["CARGO_HTTP_PROXY"])
+    if not common and not any(k.lower().endswith("_proxy") and not k.lower().startswith("no_") for k in env):
+        return items
+    targets: list[str] = []
+    for it in items:
+        ts = list(common)
+        url = it.get("url") or ""
+        scheme = url.split("://", 1)[0].lower() if "://" in url else ("" if url else "https")
+        if scheme:                           # an scp remote goes over ssh: no HTTP proxy
+            ts += [env[n] for n in ("all_proxy", "ALL_PROXY", f"{scheme}_proxy", f"{scheme.upper()}_PROXY")
+                   if env.get(n)]
+        if ts:
+            it["dynamic"], it["_unresolved"] = True, "redirected"
+            targets += [t for t in ts if t]
+    program = items[0]["program"]
+    for t in dict.fromkeys(targets):
+        out = _net_url_item("fetch", program, t if "://" in t else "http://" + t)
+        if out["host"] or out["dynamic"]:
+            items.append(out)
+    return items
+
+
+# xargs reads the arguments of these from stdin: (kind, ecosystem) of the
+# dynamic item an install through xargs stands for (P2B13).
+_NET_XARGS_INSTALL = {"npm": "npm", "pnpm": "npm", "yarn": "npm", "bun": "npm", "npx": "npm", "bunx": "npm",
+                      "pip": "pypi", "pip3": "pypi", "uv": "pypi", "uvx": "pypi", "pipx": "pypi",
+                      "docker": "oci", "podman": "oci", "cargo": "crates", "go": "go", "brew": "brew"}
+_NET_XARGS_SUBS = frozenset({"i", "install", "add", "pull", "run", "get", "exec", "x", "dlx", "create"})
+_NET_ITEM_TEXT = ("url", "package", "version", "host", "dest", "source", "alias")
+
+
+# --------------------------------------------------------------------------
+# What earlier parts of the same command do to a later one's environment and
+# configuration (R3F5, R3F7), as bash scopes it. `export NAME=VALUE`, `unset
+# NAME`, `export -n NAME`, and a config write (`git config [--global]
+# url.X.insteadOf Y`, `http.proxy`; `npm|pnpm config set registry|proxy`,
+# `yarn config set …`; `pip config set *.index-url|proxy`) reach the commands
+# after them in the same shell. They do not leave a child: a pipeline element,
+# a command run in the background, `( … )`, `$( … )`, `bash -c`, a heredoc fed
+# to a shell. A later command gets them for certain only when the effect is a
+# top-level command of the plain part of the line (no `( )`, `{ }`, function,
+# if/while/for/case before it), run unconditionally (after `;`, a newline or
+# `&`) or followed by `&&` alone up to that command. Anywhere else the scope
+# cannot be told, and a later download that would come out differently with
+# and without the effect is reported both ways, unresolved: never trusted, and
+# network-ioc-unresolved under --ioc. A config file written with a redirect or
+# tee (.npmrc, .yarnrc, pip.conf, .gitconfig) cannot be read, so a later
+# download by that tool is unresolved. A config written by an earlier, separate
+# tool call is out of scope; command_rule_matches flags every config write
+# (network-config) so it is seen.
+# --------------------------------------------------------------------------
+
+_NET_GIT_WRITTEN = " git-config"             # not a variable name: cannot be assigned
+_NET_TAINT = " written"                      # families whose config file was written unread
+_NET_ENV_NAME = re.compile(r"(?i)npm_config_|yarn_|bun_config_|pip_|uv_|git_config|homebrew_"
+                           r"|(?:git_proxy_command|gh_host|goproxy|cargo_http_proxy|[a-z0-9_]*_proxy"
+                           r"| git-config)\Z")
+NET_SCOPE_EFFECTS_MAX = 256                  # effects per command read; past it every download is unresolved
+_NET_SCOPE_QUOTED = re.compile(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"|\$'(?:[^'\\]|\\.)*'|\\.|\$\{[^}]*\}")
+_NET_SCOPE_RESERVED = frozenset({"if", "then", "elif", "else", "fi", "while", "until", "for", "do", "done",
+                                 "case", "esac", "select", "function", "coproc", "[[", "]]", "((", "{", "}"})
+_NET_CONFIG_FILE = re.compile(r"(?i)(?:\.npmrc|\.yarnrc(?:\.yml)?|pip\.conf|pip\.ini|\.gitconfig"
+                              r"|\.config/git/config)['\"]?\Z")
+_NET_CONFIG_FILE_WRITE = re.compile(r"(?i)>>?\|?\s*['\"]?([^\s'\";|&<>]{0,512})")
+_NET_CONFIG_FAMILY = {".npmrc": "npm", ".yarnrc": "npm", ".yarnrc.yml": "npm", "pip.conf": "pip",
+                      "pip.ini": "pip", ".gitconfig": "git", "config": "git"}
+_NET_FAMILY_PROGS = {"npm": frozenset({"npm", "pnpm", "yarn", "bun", "npx", "bunx"}),
+                     "pip": frozenset({"pip", "pipx", "uv", "uvx"}), "git": frozenset({"git"})}
+_NET_HINT_CONFIG = re.compile(r"(?i)export|unset|declare|typeset|config|\bset\b|npmrc|yarnrc|pip\.(?:conf|ini)"
+                              r"|gitconfig|git/config")
+
+
+def _net_scope_plain(parts: list[str]) -> list[bool]:
+    """For each top-level part, whether it and every part before it are plain:
+    no `(` `)`, no `{` `}` word, no reserved word in command position. Only
+    there is a top-level command known to run in the shell itself, in order."""
+    out: list[bool] = []
+    plain = True
+    for p in parts:
+        if plain:
+            q = _NET_SCOPE_QUOTED.sub(" ", p) if any(c in p for c in "'\"\\$") else p
+            words = q.split()
+            if "(" in q or ")" in q or any(w in _NET_SCOPE_RESERVED for w in words[:1]) \
+                    or "{" in words or "}" in words:
+                plain = False
+        out.append(plain)
+    return out
+
+
+def _net_family(prog: str) -> str:
+    if _NET_PIP_PROG.fullmatch(prog) or prog in _NET_FAMILY_PROGS["pip"]:
+        return "pip"
+    return next((f for f, progs in _NET_FAMILY_PROGS.items() if prog in progs), "")
+
+
+def _net_config_effects(tokens: list[str], raw: str = "") -> "tuple[list[tuple], bool] | None":
+    """What one command writes to the network configuration of later ones:
+    (effects, whether it writes the user's own config, which every later
+    command reads), or None when it writes none. An effect is ("append", name,
+    text), ("set", name, value) or ("taint", family): a file written that
+    cannot be read."""
+    prog, args = _net_base(tokens[0]).lower(), list(tokens[1:])
+    if re.fullmatch(r"python(?:\d(?:\.\d+)?)?", prog) and args[:2] == ["-m", "pip"]:
+        prog, args = "pip", args[2:]
+    if prog == "tee" or (raw and ">" in raw):
+        targets = [a for a in args if not a.startswith("-")] if prog == "tee" else []
+        targets += [m.group(1) for m in _NET_CONFIG_FILE_WRITE.finditer(raw)] if raw and ">" in raw else []
+        fams = {_NET_CONFIG_FAMILY.get(t.rstrip("'\"").rsplit("/", 1)[-1].lower(), "") for t in targets
+                if _NET_CONFIG_FILE.search(t)}
+        if fams - {""}:
+            return [("taint", f) for f in sorted(fams - {""})], True
+    if prog == "git":
+        i = 0
+        while i < len(args) and args[i].startswith("-"):
+            i += 2 if args[i] in _GIT_GLOBAL_VALUE else 1
+        if i >= len(args) or args[i] != "config":
+            return None
+        rest = args[i + 1:]
+        if rest[:1] == ["set"]:
+            rest = rest[1:]
+        user, pos, j = False, [], 0
+        while j < len(rest):
+            a = rest[j]
+            if a in ("--global", "--system"):
+                user = True
+            elif a in ("--unset", "--unset-all", "--get", "--get-all", "--get-regexp", "--get-urlmatch", "-l",
+                       "--list", "-e", "--edit", "--remove-section", "--rename-section", "unset", "get",
+                       "list", "edit"):
+                return None
+            elif a in ("-f", "--file", "--blob", "--type", "--default", "--comment", "--value"):
+                j += 1
+            elif not a.startswith("-"):
+                pos.append(a)
+            j += 1
+        if len(pos) < 2:
+            return None
+        key, value = pos[0], pos[1]
+        low = key.lower()
+        if low.startswith("url.") and low.endswith(".insteadof") or low in ("http.proxy", "https.proxy") \
+                or (low.startswith("http.") and low.endswith(".proxy")):
+            return [("append", _NET_GIT_WRITTEN, f"'{key}'='{value}'")], user
+        if low.startswith("url.") and low.endswith(".pushinsteadof"):
+            return [], user
+        return None
+    if prog in ("npm", "pnpm", "yarn"):
+        words = [a for a in args if not a.startswith("-")]
+        if words[:2] == ["config", "set"]:
+            kv = words[2:]
+        elif prog in ("npm", "pnpm") and words[:1] == ["set"]:
+            kv = words[1:]
+        else:
+            return None
+        if not kv:
+            return None
+        key, value = kv[0].split("=", 1) if "=" in kv[0] else (kv[0], kv[1] if len(kv) > 1 else "")
+        low = key.lower().replace("_", "-")
+        names = ({"registry": "YARN_REGISTRY", "npmregistryserver": "YARN_NPM_REGISTRY_SERVER",
+                  "proxy": "yarn_proxy", "httpproxy": "yarn_proxy", "https-proxy": "yarn_https_proxy",
+                  "httpsproxy": "yarn_https_proxy"} if prog == "yarn" else
+                 {"registry": "npm_config_registry", "proxy": "npm_config_proxy",
+                  "https-proxy": "npm_config_https_proxy"})
+        if low in names:
+            return [("set", names[low], value)], True
+        if low.endswith(":registry") or "registry" in low or "proxy" in low:
+            return [], True
+        return None
+    if _NET_PIP_PROG.fullmatch(prog):
+        words = [a for a in args if not a.startswith("-")]
+        if words[:2] != ["config", "set"] or len(words) < 4:
+            return None
+        key, value = words[2].lower(), words[3]
+        field = key.rsplit(".", 1)[-1]
+        names = {"index-url": "PIP_INDEX_URL", "extra-index-url": "PIP_EXTRA_INDEX_URL", "proxy": "PIP_PROXY"}
+        if field in names:
+            return [("set", names[field], value)], True
+        if field in ("trusted-host", "find-links"):
+            return [], True
+        return None
+    return None
+
+
+def _net_env_effects(tokens: list[str]) -> "list[tuple] | None":
+    """`export NAME=VALUE` / `declare -x NAME=VALUE` (set), `export -n NAME`
+    and `unset NAME` (unset), for the names a download reads; None when the
+    command is none of these."""
+    head = tokens[0]
+    if head not in ("export", "unset", "declare", "typeset"):
+        return None
+    out: list[tuple] = []
+    opts = "".join(t[1:] for t in tokens[1:] if t.startswith("-") and not _NET_ASSIGN.match(t))
+    if head in ("declare", "typeset") and "x" not in opts:
+        return out                           # not exported: no child sees it
+    if head == "unset" and "f" in opts:
+        return out
+    drop = head == "unset" or (head == "export" and "n" in opts)
+    for t in tokens[1:]:
+        if t.startswith("-"):
+            continue
+        name, eq, value = t.partition("=")
+        if not _NET_ENV_NAME.match(name):
+            continue
+        if drop:
+            out.append(("unset", name))
+        elif eq:
+            out.append(("set", name, value))
+    return out
+
+
+def _net_apply(env: dict, ops: "list[tuple]") -> None:
+    for op in ops:
+        if op[0] == "set":
+            env[op[1]] = op[2]
+        elif op[0] == "unset":
+            env.pop(op[1], None)
+        elif op[0] == "append":
+            env[op[1]] = env.get(op[1], "") + op[2]
+        elif op[0] == "taint":
+            env[_NET_TAINT] = env.get(_NET_TAINT, "") + " " + op[1]
+
+
+def _net_signature(items: list[dict]) -> list[tuple]:
+    return [(i.get("kind"), i.get("host"), i.get("url"), i.get("package"), i.get("version"),
+             i.get("_unresolved")) for i in items]
+
+
 def network_items_from_command(cmd: str, piped_to_shell: list[str] | None = None,
-                               remotes: dict[str, str] | None = None) -> tuple[list[dict], int]:
+                               remotes: dict[str, str] | None = None,
+                               limits: list[str] | None = None) -> tuple[list[dict], int]:
     """Every download the command shows, and how many segments could not be read.
 
     `piped_to_shell`, when given, receives the raw text of each curl or wget
@@ -2432,15 +5495,50 @@ def network_items_from_command(cmd: str, piped_to_shell: list[str] | None = None
     `remotes`, when given, is one session's git remote names and the URLs they
     were added with; it is read to resolve `git pull NAME` and updated by
     `git remote add` and `git clone`, so a remote added in one command and
-    pulled in the next keeps its host. Pass a fresh dict per session, never shared."""
-    text = (cmd or "")[:MAX_SCAN_TOTAL]
+    pulled in the next keeps its host. Pass a fresh dict per session, never shared.
+
+    `limits`, when given, receives a reason when part of the command was not
+    read because of a cap or nesting limit (past 1 MiB, NET_NEST_MAX,
+    NET_TREE_MAX, NET_LEX_BUDGET): the caller reports it under --ioc (R10)."""
+    # Read up to the hard cap like the audit does, so padding before an install
+    # does not hide it. Every pass below is linear; past the cap, one segment
+    # is counted unparsed so the coverage line does not claim the whole command.
+    cmd = cmd or ""
+    text = cmd[:MAX_SCAN_HARD]
+    beyond = 1 if len(cmd) > MAX_SCAN_HARD else 0
+    if beyond and limits is not None:
+        limits.append("past 1 MiB")
     if not _NET_MAY_DOWNLOAD.search(text):
-        return [], 0
-    segments, unparsed = _net_segments(text)
+        return [], beyond
+    segments, unparsed, limit, _lines, top = _shell_walk(text)
+    if limit and limits is not None:
+        limits.append("nested or long past what is read")
+    unparsed += beyond
     found: list[dict] = []
-    for tokens, via_xargs, into_shell, raw in segments:
-        got = _net_extract(tokens)
-        prog = _net_base(tokens[0])
+    scope = _NetScope(segments, top) if _NET_HINT_CONFIG.search(text) else None
+    for idx, (tokens, via_xargs, into_shell, raw) in enumerate(segments):
+        if tokens[0] in ("export", "unset", "declare", "typeset"):
+            continue
+        got = scope.extract(idx, tokens) if scope is not None else [dict(i) for i in _net_extract(tokens, {})]
+        if any("{" in (i.get("url") or "") or "{" in (i.get("package") or "") for i in got):
+            got = _net_expand_items(got)
+        prog = _net_base(tokens[0]).lower()
+        for item in got:
+            # A substitution's output is not in the transcript: built at run time.
+            url = item.get("url")
+            if isinstance(url, str) and _LEX_PH in url and not item.get("host"):
+                # `curl https://o.io/$(date)`: the host is literal; only a
+                # substitution in the authority hides it.
+                a, b = url_host(_LEX_SUB.sub("a", url)), url_host(_LEX_SUB.sub("b", url))
+                if a and a == b:
+                    item["host"] = a
+            for k in _NET_ITEM_TEXT:
+                v = item.get(k)
+                if isinstance(v, str) and _LEX_PH in v:
+                    item[k] = _net_display(v)
+                    item["dynamic"] = True
+            if "$" in (item.get("package") or ""):
+                item["dynamic"] = True
         if prog == "git" and remotes is not None:
             hostless = len(got) == 1 and got[0]["host"] is None and not got[0]["dynamic"]
             name = _net_git_remote_name(tokens[1:])
@@ -2457,10 +5555,148 @@ def network_items_from_command(cmd: str, piped_to_shell: list[str] | None = None
             _net_git_remotes(tokens[1:], remotes)
         if via_xargs and not got and prog in ("curl", "wget"):
             got = [_net_item("fetch", prog, dynamic=True)]   # the URLs came on stdin
+        elif (via_xargs or any(_LEX_PH in t for t in tokens[1:])) and prog.lower() in _NET_XARGS_INSTALL and (
+                (got and all(i["kind"] == "install" and not i["package"] for i in got))
+                or (not got and _NET_XARGS_SUBS.intersection(t.lower() for t in tokens[1:3]))):
+            # `xargs npm i`, `xargs pip install`, `pip install $(cat reqs)`: the
+            # packages come at run time, not from a lockfile.
+            got = [_net_item("install", prog, ecosystem=_NET_XARGS_INSTALL[prog.lower()], dynamic=True)]
         if into_shell and piped_to_shell is not None and prog in ("curl", "wget") and got:
             piped_to_shell.append(raw)
         found += got
     return found, unparsed
+
+
+def network_config_write(cmd: str) -> str:
+    """The text of the first segment of `cmd` that writes download
+    configuration (see the section comment above _NET_GIT_WRITTEN), or ""."""
+    text = (cmd or "")[:MAX_SCAN_HARD]
+    if not _NET_HINT_CONFIG.search(text) or not _NET_MAY_DOWNLOAD.search(text):
+        return ""
+    for tokens, _x, _f, raw in _shell_walk(text)[0]:
+        if _net_config_effects(tokens, raw) is not None:
+            return raw
+    return ""
+
+
+class _NetScope:
+    """The environment and configuration effects of one command's segments
+    (see the section comment above _NET_GIT_WRITTEN), and the downloads of a
+    segment read under them."""
+
+    def __init__(self, segments: list, top: tuple) -> None:
+        info, parts, seps, amps = top
+        if len(info) != len(segments):       # cannot place the segments: every effect is uncertain
+            info = [(None, "eval")] * len(segments)
+        self.info = info
+        self.effects: list[tuple] = []       # (index, part, mode, ops, chain end)
+        self.overflow = False
+        plain = _net_scope_plain(parts)
+        amp = set(amps)
+        chain_end = list(range(len(parts)))
+        for k in range(len(parts) - 2, -1, -1):
+            if seps[k] == "&&":
+                chain_end[k] = chain_end[k + 1]
+        for idx, (tokens, _x, _f, raw) in enumerate(segments):
+            ops = _net_env_effects(tokens)
+            user, written = True, False
+            if ops is None:
+                got = _net_config_effects(tokens, raw)
+                if got is None:
+                    continue
+                (ops, user), written = got, True
+            if not ops:
+                continue
+            m, how = info[idx]
+            # A config write is a file: it outlasts the shell that made it, so
+            # where it ran decides only whether it ran, and before what.
+            if how == "nested" and not written:
+                mode = "nested"              # a child shell's export: reaches nothing outside it
+            elif how != "direct" or m is None or not user:
+                mode = "maybe"
+            elif seps[m] == "|" or (m and seps[m - 1] == "|") or m in amp:
+                if not written:
+                    continue                 # a pipeline element or a background job: a subshell
+                mode = "maybe"               # run alongside what follows it
+            elif not plain[m] or (m and seps[m - 1] == "||"):
+                mode = "maybe"
+            elif m and seps[m - 1] == "&&":
+                mode = "chain"
+            else:
+                mode = "certain"
+            self.effects.append((idx, m, mode, ops, chain_end[m] if m is not None else 0))
+        if len(self.effects) > NET_SCOPE_EFFECTS_MAX:
+            self.overflow = True             # past what is read: unresolved, not clean (R10)
+
+    def _envs(self, idx: int) -> "tuple[dict, list[tuple]]":
+        n, how = self.info[idx]
+        cert: dict = {}
+        maybe: list[tuple] = []
+        for e_idx, m, mode, ops, end in self.effects:
+            if e_idx == idx:
+                continue
+            if mode == "nested":
+                if how != "direct":
+                    maybe += ops
+                continue
+            if n is None or m is None:
+                maybe += ops
+            elif mode == "maybe":
+                if n >= m:
+                    maybe += ops
+            elif n > m:
+                if mode == "certain" or n <= end:
+                    _net_apply(cert, ops)
+                else:
+                    maybe += ops
+        return cert, maybe
+
+    def extract(self, idx: int, tokens: list[str]) -> list[dict]:
+        if not self.effects:
+            return [dict(i) for i in _net_extract(tokens, {})]
+        if self.overflow:
+            got = [dict(i) for i in _net_extract(tokens, {})]
+            for i in got:
+                i["dynamic"] = True
+                i["_unresolved"] = i.get("_unresolved") or "redirected"
+            return got
+        cert, maybe = self._envs(idx)
+        alts: list[dict] = []
+        if maybe:
+            b = dict(cert)
+            _net_apply(b, [op for op in maybe if op[0] != "unset"])
+            c = dict(cert)
+            _net_apply(c, [op for op in maybe if op[0] == "unset"])
+            alts = [b, c]
+        prog = _net_base(tokens[0]).lower()
+        fam = _net_family(prog)
+        taint = bool(fam) and (("taint", fam) in maybe or fam in cert.get(_NET_TAINT, "").split())
+        if getattr(tokens, "env_clear", False):
+            cert, alts = {}, []
+        else:
+            gone = getattr(tokens, "env_unset", frozenset())
+            if gone:
+                cert = {k: v for k, v in cert.items() if k not in gone}
+                alts = [{k: v for k, v in a.items() if k not in gone} for a in alts]
+            if getattr(tokens, "env_maybe", False) and cert:
+                alts.append({})
+        got = [dict(i) for i in _net_extract(tokens, cert)]
+        sig = _net_signature(got)
+        extra: list[dict] = []
+        differ = taint
+        for env in alts:
+            if env == cert:
+                continue
+            other = [dict(i) for i in _net_extract(tokens, env)]
+            if _net_signature(other) != sig:
+                differ = True
+                seen = set(sig + _net_signature(extra))
+                extra += [i for i in other if _net_signature([i])[0] not in seen]
+        if differ:
+            for i in got + extra:
+                i["dynamic"] = True
+                i["_unresolved"] = i.get("_unresolved") or "redirected"
+        return got + extra
 
 
 _NET_TOOL_WORDS = ("fetch", "browse", "download", "http")
@@ -2472,20 +5708,24 @@ def network_items_from_tool(name: str, tool_input: dict) -> list[dict]:
     n = (name or "").lower()
     if n in ("bash", "shell_command"):
         return []
-    if n in ("websearch", "web_search"):
+    if n in ("websearch", "web_search", "google_web_search"):
         return [_net_item("search", name)]
     if n in ("webfetch", "web_fetch") or any(w in n for w in _NET_TOOL_WORDS):
         inp = tool_input if isinstance(tool_input, dict) else {}
         url = next((inp[k] for k in ("url", "uri", "href") if isinstance(inp.get(k), str)), None)
+        if not url and n == "web_fetch":
+            # Gemini CLI's web_fetch takes a prompt with the URLs written into it.
+            urls, _beyond = urls_in_text(inp.get("prompt"))
+            if urls:
+                return [_net_url_item("fetch", name, u) for u in urls]
         return [_net_url_item("fetch", name, url) if url else _net_item("fetch", name)]
     return []
 
 
-AUDIT_CONFIG_FILES = (".actualis-network-trust", ".actualis-suppressions")
 _FILE_WRITE_TOOLS = frozenset({"write", "edit", "multiedit", "notebookedit", "create",
-                               "edit_file", "str_replace_editor", "str_replace_based_edit_tool"})
+                               "edit_file", "str_replace_editor", "str_replace_based_edit_tool",
+                               "write_file", "replace"})    # Gemini CLI and Qwen Code
 _WRITE_REDIRECT = re.compile(r">>?(.*)$", re.S)
-_FILE_MUTATORS = frozenset({"mv", "cp", "rm", "ln", "truncate", "install"})
 
 
 # The user-level file (suppression_paths()[0]) is `.../actualis/suppressions`.
@@ -2743,28 +5983,53 @@ def _net_item_path(item: dict) -> str | None:
     else:
         pkg = item.get("package") or ""
         path = "/" + pkg.split("/", 1)[1] if item.get("ecosystem") == "go" and "/" in pkg else ""
-    if any(seg in (".", "..") or "%2e" in seg.lower() for seg in path.split("/")):
+        # An image from an explicit registry (`ghcr.io/org/img`): the repository path.
+        if item.get("ecosystem") == "oci" and "/" in pkg and not item.get("host_inferred") \
+           and pkg.split("/", 1)[0].split(":", 1)[0] == (item.get("host") or ""):
+            path = "/" + pkg.split("/", 1)[1]
+    if any(seg in (".", "..") or "%2e" in seg.lower() for seg in path.split("/")) \
+            or "$" in path or "`" in path:       # a variable may hold `../`
         return None
     return path.lower()
 
 
-def _host_path_match(host: str, path: str, item: dict, exact: bool = False) -> bool:
+_NET_PCT_UNRESERVED = re.compile(r"%(2[dD]|3[0-9]|[46][1-9a-fA-F]|[57][0-9aA]|5[fF]|7[eE])")
+_NET_SLASHES = re.compile(r"/{2,}")
+
+
+def _ioc_path(path: str) -> str:
+    """A path as a server reads it, for IOC matching only (R3B13): percent-encoded
+    unreserved characters decoded (`%65` is `e`; `%2e` already made the path
+    unknown) and repeated slashes merged."""
+    if "%" in path:
+        path = _NET_PCT_UNRESERVED.sub(lambda m: chr(int(m.group(1), 16)), path).lower()
+    return _NET_SLASHES.sub("/", path) if "//" in path else path
+
+
+def _host_path_match(host: str, path: str, item: dict, exact: bool = False, ioc: bool = False) -> bool:
     """Whether an item's host and path fall under host[/path]: the host equal,
     or (unless exact) a suffix on a label boundary; the path a prefix on a
     segment boundary. An item with no known host, or a path that cannot be
-    known, never matches a path."""
+    known, never matches a path. With ioc, the path is compared as a server
+    reads it (_ioc_path): looser, so only for matching a block list, never trust."""
     ih = (item.get("host") or "").removesuffix(".")
     if not ih or (ih != host and (exact or not ih.endswith("." + host))):
         return False
     if not path:
         return True
     ip = _net_item_path(item)
+    if ip is not None and ioc:
+        ip = _ioc_path(ip)
     return ip is not None and (ip == path or ip.startswith(path + "/"))
 
 
 def network_trusted(item: dict, trust: list[tuple[str, str]]) -> bool:
     """Host suffix on a label boundary; path prefix on a segment boundary.
-    An item with no known host is never trusted."""
+    An item with no known host is never trusted, and neither is one whose
+    host could not be normalised or whose transport the command redirected
+    (a proxy, `--connect-to`, `--resolve`): the bytes come from elsewhere."""
+    if item.get("_unresolved"):
+        return False
     return any(_host_path_match(h, p, item) for h, p in trust)
 
 
@@ -2790,7 +6055,7 @@ def apply_network_policy(fleet: "Fleet", trust: list[tuple[str, str]], strict: b
         suppressed = fid in fleet.suppressions
         if suppressed:
             fleet.suppressed_flags += 1
-        latest = max(group, key=lambda i: (i["ts"] or "", i["project"]))
+        latest = max(group, key=lambda i: (_net_utc_key(i["ts"]), i["project"]))
         where = "a URL built from a variable" if host == "?" else host
         fleet.flags.append({
             "id": fid, "severity": "med", "categories": ["network-unasked"],
@@ -2828,7 +6093,7 @@ def network_filter(fleet: "Fleet", host: str | None = None, package: str | None 
 NETWORK_ITEM_KEYS = ("kind", "program", "host", "host_inferred", "url", "dest", "source",
                      "ecosystem", "package", "version", "pinned", "exec", "dynamic", "alias",
                      "failed", "approval", "trusted", "agent", "project", "session", "call_id", "ts", "ioc",
-                     "mode", "why", "prompt", "transcript")
+                     "mode", "why", "prompt", "transcript", "rewound")
 
 # why and prompt: what the assistant said before a call, and what the person
 # last asked. Both are kept short, redacted and cleaned when they are read.
@@ -2855,7 +6120,7 @@ def _net_context(text: str | None, last_sentence: bool = False) -> str | None:
     end = t.find(" ", 4 * NET_CONTEXT_MAX)  # bounded work; never cuts inside a token
     if end > 0:
         t = t[:end]
-    t = " ".join(clean(redact(t)).split())
+    t = " ".join(redact(clean(t)).split())
     return clip(t, NET_CONTEXT_MAX) or None
 
 
@@ -2891,8 +6156,9 @@ def _net_public(i: dict, raw: bool = False, prompts: bool = False) -> dict:
 
 
 def _net_order_key(i: dict) -> tuple:
-    """Every field that can differ, so no two distinct items tie."""
-    return tuple(str(i[k] or "") for k in (
+    """Every field that can differ, so no two distinct items tie. Time first,
+    as a UTC instant: items keep their transcript's offset."""
+    return (_net_utc_key(i["ts"]),) + tuple(str(i[k] or "") for k in (
         "ts", "agent", "project", "program", "host", "url", "package", "version", "kind",
         "dest", "source", "session", "approval"))
 
@@ -2927,7 +6193,7 @@ def network_json(fleet: "Fleet", raw: bool = False) -> dict:
                                          "first_seen": None, "trusted": False})
         h["count"] += 1
         h["unasked"] += 1 if i["approval"] == "unasked" else 0
-        if i["ts"] and (h["first_seen"] is None or i["ts"] < h["first_seen"]):
+        if i["ts"] and (h["first_seen"] is None or _net_utc_key(i["ts"]) < _net_utc_key(h["first_seen"])):
             h["first_seen"] = i["ts"]
         h["trusted"] = h["trusted"] or i["trusted"]
 
@@ -3908,6 +7174,14 @@ def load_ioc(paths: list[str]) -> IocSet:
 _IOC_RANK = {"match": 2, "unresolved": 1}
 _IOC_HOST_LABELS = 127
 _IOC_DOWNGRADE = ("npm", "pypi", "crates")      # a registry the entry may not describe
+# Hosts that serve the public registry itself (an alias, a mirror run by the
+# registry, or yarn's default): a match from one of these is the public package,
+# not a private registry's namesake (R3B12). Anything else downgrades.
+_IOC_PUBLIC_REGISTRIES = {
+    "npm": frozenset({"registry.npmjs.org", "registry.npmjs.com", "registry.yarnpkg.com"}),
+    "pypi": frozenset({"pypi.org", "pypi.python.org", "files.pythonhosted.org"}),
+    "crates": frozenset({"crates.io", "index.crates.io", "static.crates.io"}),
+}
 
 
 def _ioc_zero_totals() -> dict:
@@ -3928,8 +7202,9 @@ def _ioc_resolved(item: dict) -> list[tuple[str, str]]:
         if item.get("alias"):
             pairs.append((item["alias"], ""))
         return pairs
-    if eco == "pypi":
-        return [(name, ver)]
+    if eco == "pypi":                        # `uvx x@latest` names a tag, not a release
+        exact = item.get("pinned") or ver.startswith("===") or _ioc_pep440_key(ver)
+        return [(name, ver if exact else "")]
     if eco == "crates":
         v = ver.removeprefix("=")
         return [(name, v if item.get("pinned") and _ioc_semver_key(v) else "")]
@@ -4042,7 +7317,7 @@ def match_ioc(item: dict, ioc: IocSet) -> tuple | None:
                         verdict, reason = (("match", "version-in-spec") if inside
                                            else ("unresolved", "module-prefix" if prefix else "undecidable"))
                     if verdict == "match" and eco in _IOC_DOWNGRADE and not item.get("host_inferred") \
-                       and item.get("host") != NETWORK_REGISTRY[eco]:
+                       and item.get("host") not in _IOC_PUBLIC_REGISTRIES[eco]:
                         verdict, reason = "unresolved", "private-registry"
                     hits.append((verdict, reason, e, f"{eco}:{listed}@{redact(version) if version else '?'}"))
     url_name = _ioc_url_name(item) if item["kind"] == "install" else None
@@ -4051,7 +7326,7 @@ def match_ioc(item: dict, ioc: IocSet) -> tuple | None:
     host = (item.get("host") or "").removesuffix(".")
     if _ioc_host_checkable(item):
         for e in _ioc_host_entries(ioc, host):
-            if _host_path_match(e.host, e.path, item, e.exact_host):
+            if _host_path_match(e.host, e.path, item, e.exact_host, ioc=True):
                 hits.append(("match", "host", e, f"host:{'=' if e.exact_host else ''}{e.host}{e.path}"))
     if not hits:
         return ("clean", None, [], None, False) if clean_hit else None
@@ -4073,10 +7348,14 @@ def _ioc_failed_closed(item: dict) -> tuple:
 
 def _ioc_coverage(item: dict) -> str:
     """items_checked, or which items_not_checkable bucket an item is in."""
-    if (item["kind"] == "install" and item["ecosystem"] in IOC_CHECKABLE and item["package"]) \
-       or _ioc_host_checkable(item):
+    # A package built at run time (`npm i "$(…)"`, `xargs npm i`) was not checked.
+    dynamic = bool(item.get("dynamic"))
+    if item.get("_unresolved"):
+        return "other"                       # a host not normalised, or redirected transport
+    if (item["kind"] == "install" and item["ecosystem"] in IOC_CHECKABLE and item["package"]
+            and not (dynamic and "$" in item["package"])) or _ioc_host_checkable(item):
         return "checked"
-    if item["kind"] == "install" and not item["package"]:
+    if item["kind"] == "install" and not item["package"] and not dynamic:
         return "lockfile"
     return "no_host" if not item["host"] else "other"
 
@@ -4095,6 +7374,12 @@ def apply_ioc(fleet: "Fleet", ioc: IocSet | None) -> None:
         return
     groups: dict[tuple[str, str], list[dict]] = {}
     memo: dict[tuple, tuple | None] = {}
+    # A command read only in part (a cap or nesting limit, R10) cannot be
+    # cleared: it is listed, and flagged unresolved.
+    for item in getattr(fleet, "network_unreadable", ()):
+        if not item.get("_listed"):
+            item["_listed"] = True
+            fleet.network.append(item)
     for item in fleet.network:
         refused = bool(item.get("_refused"))
         if not refused:
@@ -4106,12 +7391,25 @@ def apply_ioc(fleet: "Fleet", ioc: IocSet | None) -> None:
         # Items that agree on every field matching reads get the same answer, so
         # forty installs of one package cost one lookup, however long the list.
         view = {k: item.get(k) for k in IOC_ITEM_FIELDS}
-        memo_key = tuple(view.values())
+        unresolved = item.get("_unresolved")
+        memo_key = tuple(view.values()) + (unresolved,)
+        if item.get("_unreadable"):
+            entry = IocEntry("error", None, None, None, None, None, "", False,
+                             None, None, None, None, -1, None)
+            memo_key = ("_unreadable",)
+            memo[memo_key] = ("unresolved", "unreadable", [entry], "unreadable", False)
         if memo_key not in memo:
             try:
                 memo[memo_key] = match_ioc(view, ioc)
             except Exception:                    # noqa: BLE001 -- fail closed, never clean
                 memo[memo_key] = _ioc_failed_closed(view)
+            if unresolved and (memo[memo_key] is None or memo[memo_key][0] != "match"):
+                # Its host could not be normalised, or the command sent the transfer
+                # somewhere else: it cannot be cleared (R15, R3B11).
+                entry = IocEntry("error", item.get("ecosystem"), None, None, None, None, "", False,
+                                 None, None, None, None, -1, None)
+                memo[memo_key] = ("unresolved", unresolved, [entry],
+                                  f"{unresolved}:{item.get('program') or '?'}@{item.get('host') or '?'}", False)
         found = memo[memo_key]
         if found is None:
             continue
@@ -4139,14 +7437,20 @@ def apply_ioc(fleet: "Fleet", ioc: IocSet | None) -> None:
         first = min(rows, key=lambda r: (r["entries"][0].source, r["entries"][0].line or 0))
         entry = first["entries"][0]
         items = [r["item"] for r in rows]
-        latest = max(items, key=lambda i: (i["ts"] or "", i["project"]))
+        latest = max(items, key=lambda i: (_net_utc_key(i["ts"]), i["project"]))
         program = latest["program"]
         why = {"private-registry": f"installed from {latest['host']}; the entry describes the public registry",
                "undecidable": "the version cannot be ordered against the entry",
                "module-prefix": "the package is inside the listed module; the version cannot be ordered against it",
                "name-from-url": "the name is read from the URL",
-               "error": "the item could not be checked; treated as unresolved"}.get(first["reason"])
-        evidence = (f"{len(items)} {'download' if key.startswith('host:') else 'install'}(s) of {key} "
+               "error": "the item could not be checked; treated as unresolved",
+               "unreadable": "part of the command was nested or long past what is read; "
+                             "treated as unresolved",
+               "host-unresolved": "the host is written in a form that cannot be normalised; "
+                                  "treated as unresolved",
+               "redirected": "the command sends the transfer through a proxy or another address; "
+                             "treated as unresolved"}.get(first["reason"])
+        evidence = (f"{len(items)} {'download' if key.startswith(('host:', 'host-unresolved:', 'redirected:')) else 'install'}(s) of {key} "
                     f"via {program} ({latest['approval']})"
                     + (f" — ran it ({program})" if any(i["exec"] for i in items) else "")
                     + (" (call failed)" if any(i["failed"] is True for i in items) else "")
@@ -4168,7 +7472,8 @@ IOC_REFS_CAP = 20
 _IOC_REASON_TEXT = {"version-unresolved": "version not resolved", "undecidable": "undecidable",
                     "module-prefix": "in a listed module",
                     "private-registry": "private registry", "name-from-url": "name from URL",
-                    "error": "could not check"}
+                    "error": "could not check", "unreadable": "not fully read",
+                    "host-unresolved": "host not normalised", "redirected": "transport redirected"}
 
 
 def _ioc_entry_json(e: IocEntry) -> dict:
@@ -4331,8 +7636,11 @@ def suppression_paths() -> list[Path]:
     return out
 
 
-def load_suppressions() -> dict[str, str]:
-    """fingerprint -> reason. Malformed lines are skipped, never fatal."""
+def load_suppressions(rejected: list[str] | None = None) -> dict[str, str]:
+    """fingerprint -> reason. Malformed lines are skipped, never fatal. An id
+    is read case-insensitively and may be followed by a tab; a line whose id
+    is not one this tool emits matches nothing, so it is not loaded, and
+    `rejected`, when given, receives it (for --suppressions to show)."""
     out: dict[str, str] = {}
     for path in suppression_paths():
         try:
@@ -4340,12 +7648,16 @@ def load_suppressions() -> dict[str, str]:
         except OSError:
             continue
         for line in text.splitlines():
-            line = line.strip()
+            line = clean(line).strip()       # clean() first: a tab becomes a space
             if not line or line.startswith("#"):
                 continue
             fp, _, reason = line.partition(" ")
-            fp = clean(fp)[:64]
+            fp = fp[:64].lower()
             if not fp:
+                continue
+            if not _FINGERPRINT.fullmatch(fp):
+                if rejected is not None:
+                    rejected.append(line[:120])
                 continue
             # `(added YYYY-MM-DD)` is written by --suppress, not typed by a
             # person. Strip it so the reason a caller sees is only the reason.
@@ -4371,6 +7683,14 @@ def add_suppression(fingerprint: str, reason: str) -> Path:
         raise ValueError(
             f"{fingerprint!r} is not an id from this tool. Ids are eight hex "
             f"characters, shown beside each finding. One per --suppress.")
+    # One entry is one line: a newline in the reason wrote a second, silent
+    # suppression (`--reason $'ok\n620e24b6 x'`). Refuse every control and
+    # line-breaking character rather than guess what was meant.
+    bad = next((ch for ch in reason
+                if ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F or ch in "\u2028\u2029"), None)
+    if bad is not None:
+        raise ValueError(f"--reason must be one line of text: it contains {bad!r}. "
+                         f"Newlines and control characters are refused.")
     reason = clean(reason).strip()[:200] or "(no reason given)"
     path = suppression_paths()[0]
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -4449,6 +7769,11 @@ def no_transcripts_message() -> str:
          "Codex", "CODEX_HOME"),
         (Path(os.environ.get("COPILOT_HOME", "~/.copilot")).expanduser() / "session-state",
          "Copilot CLI", "COPILOT_HOME"),
+        (Path(os.environ.get("GEMINI_CLI_HOME") or "~").expanduser() / ".gemini" / "tmp",
+         "Gemini CLI", "GEMINI_CLI_HOME"),
+        ((Path(os.environ.get("QWEN_RUNTIME_DIR") or os.environ.get("QWEN_HOME") or "~/.qwen")
+          .expanduser() / "projects"),
+         "Qwen Code", "QWEN_RUNTIME_DIR" if os.environ.get("QWEN_RUNTIME_DIR") else "QWEN_HOME"),
     ]
     for path, label, env in checked:
         parent_exists = path.parent.is_dir()
@@ -4468,6 +7793,8 @@ def no_transcripts_message() -> str:
         "  CLAUDE_CONFIG_DIR=/path/to/config actualis",
         "  CODEX_HOME=/path/to/codex actualis",
         "  COPILOT_HOME=/path/to/copilot actualis",
+        "  GEMINI_CLI_HOME=/path/holding/.gemini actualis",
+        "  QWEN_HOME=/path/to/.qwen actualis      (or QWEN_RUNTIME_DIR)",
         "  actualis --root /path/to/a/transcript/directory",
         "",
         "Nothing is wrong with the install. There is simply nothing to read yet:",
@@ -4495,7 +7822,8 @@ def dead_end_message(fleet: "Fleet", args) -> str:
     # What is actually on disk, ignoring every filter this run applied.
     files, newest = 0, None
     for root in roots:
-        for f in root.rglob("*.jsonl"):
+        found = [f for f in root.rglob("*.json") if f.parent.name == "chats"]
+        for f in list(root.rglob("*.jsonl")) + found:
             files += 1
             try:
                 mtime = f.stat().st_mtime
@@ -4569,13 +7897,95 @@ def pretty_project(slug: str) -> str:
     return clean(s or slug)
 
 
+_TS_MIN = datetime.min.replace(tzinfo=timezone.utc)
+
+
 def parse_ts(raw: str | None) -> datetime | None:
-    if not raw:
+    if not raw or not isinstance(raw, str):     # transcripts are untrusted: any JSON type
         return None
     try:
-        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        # Always aware UTC: a naive stamp is read as UTC, an offset is converted.
+        # Mixing naive and aware crashed every comparison, and a -05:00 record
+        # was bucketed under its local date while the buckets are UTC dates.
+        return (dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None
+                else dt.astimezone(timezone.utc))
+    except (ValueError, OverflowError):      # 9999-12-31T23:00-05:00 has no UTC time
         return None
+
+
+# The largest count _tokens() accepts. A quadrillion tokens is ~10^6 times any
+# real session; past it a value is hostile or corrupt, and a 400-digit integer
+# (valid JSON) raised OverflowError at the first `/ 1e6` and stopped every mode.
+MAX_TOKEN_VALUE = 10 ** 15
+
+
+def _tokens(v) -> int:
+    """A token count (or duration) from an untrusted transcript: a finite,
+    non-negative number no larger than MAX_TOKEN_VALUE, else 0. A string, null,
+    bool, negative or absurd count must not crash the run or move the spend."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return 0
+    if v != v or v < 0 or v > MAX_TOKEN_VALUE:     # NaN, negative, inf, absurd
+        return 0
+    return int(v)
+
+
+def _absurd_count(v) -> bool:
+    """A number too large to be a real count: _tokens() reads it as 0, and the
+    Fleet counts its line as unparsable so the skip is never silent."""
+    return (not isinstance(v, bool) and isinstance(v, (int, float))
+            and v == v and v > MAX_TOKEN_VALUE)
+
+
+def _str_or(v, default):
+    """v when it is a non-empty string, else default: an untrusted field of
+    the wrong type is absent."""
+    return v if isinstance(v, str) and v else default
+
+
+_S_IFMT, _S_IFREG = 0o170000, 0o100000
+
+
+def _open_regular(path: Path, binary: bool = False):
+    """Open a transcript-side file for reading, only if it is a regular file.
+
+    Every file an agent can write (transcripts, .project_root, projects.json,
+    session logs) is opened through here. A FIFO opened with a plain open()
+    blocks until a writer appears, so one `mkfifo` under ~/.gemini or
+    ~/.claude would hang every run, --fail-on in CI included; a device such as
+    /dev/zero behind a symlink would never end. O_NONBLOCK makes the open of a
+    FIFO return at once, and fstat on the descriptor (not the path, which could
+    be swapped in between) rejects anything that is not a regular file. Raises
+    OSError, which every caller already treats as an unreadable file.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags)
+    try:
+        if os.fstat(fd).st_mode & _S_IFMT != _S_IFREG:
+            raise OSError(f"not a regular file: {path}")
+    except BaseException:
+        os.close(fd)
+        raise
+    if binary:
+        return os.fdopen(fd, "rb")
+    return os.fdopen(fd, "r", encoding="utf-8", errors="replace")
+
+
+def _json_line(text: str) -> "tuple[bool, object]":
+    """Decode one transcript line (or embedded JSON string): (ok, value).
+
+    The one place transcript JSON is decoded. ok is False when the text is
+    unreadable: malformed, or nested deeper than the decoder can go, which
+    raises RecursionError rather than ValueError. Callers count it and move on;
+    one hostile line must never stop the run. A blank line is (True, None).
+    """
+    if not text or text.isspace():
+        return True, None
+    try:
+        return True, json.loads(text)
+    except (ValueError, RecursionError):
+        return False, None
 
 
 def codex_roots() -> list[Path]:
@@ -4600,9 +8010,9 @@ def codex_session_cost(usage: dict, model: str) -> float:
         # billed at Anthropic rates with no cache discount at all.
         ceiling = _provider_ceiling("openai") or DEFAULT_RATES
         in_rate, out_rate, provider = ceiling.input, ceiling.output, "openai"
-    total_in = usage.get("input_tokens", 0) or 0
-    cached = usage.get("cached_input_tokens", 0) or 0
-    out = usage.get("output_tokens", 0) or 0
+    total_in = _tokens(usage.get("input_tokens"))
+    cached = _tokens(usage.get("cached_input_tokens"))
+    out = _tokens(usage.get("output_tokens"))
     if provider == "openai":
         fresh = max(total_in - cached, 0)
         return (fresh / 1e6 * in_rate
@@ -4637,7 +8047,8 @@ COPILOT_APPROVED = frozenset({"approved", "approved-for-location"})
 
 # Refusal kinds that mean a person said no, rather than a policy. Copilot's
 # value was captured from a real denial in a scratch session.
-HUMAN_REFUSALS = frozenset({"user-rejected", "copilot:denied-interactively-by-user"})
+HUMAN_REFUSALS = frozenset({"user-rejected", "copilot:denied-interactively-by-user",
+                            "gemini:user-denied", "qwen:user-denied"})
 
 
 def copilot_model(raw: str) -> str:
@@ -4660,16 +8071,352 @@ def copilot_session_cost(usage: dict, model: str) -> float:
     assumed rate as a Claude record with no TTL split.
     """
     r = rate_for(model)
-    total_in = usage.get("inputTokens", 0) or 0
-    rd = usage.get("cacheReadTokens", 0) or 0
-    wr = usage.get("cacheWriteTokens", 0) or 0
-    out = usage.get("outputTokens", 0) or 0
+    total_in = _tokens(usage.get("inputTokens"))
+    rd = _tokens(usage.get("cacheReadTokens"))
+    wr = _tokens(usage.get("cacheWriteTokens"))
+    out = _tokens(usage.get("outputTokens"))
     fresh = max(total_in - rd - wr, 0)
     read_mult = OPENAI_CACHED_MULT if r.provider == "openai" else r.cache_read
     return (fresh / 1e6 * r.input
             + rd / 1e6 * r.input * read_mult
             + wr / 1e6 * r.input * CACHE_WRITE_ASSUMED_MULT
             + out / 1e6 * r.output)
+
+
+# --------------------------------------------------------------------------
+# Gemini CLI and Qwen Code
+#
+# Formats read from source, not from anyone's transcripts:
+#   Gemini CLI  google-gemini/gemini-cli @204db94 (v0.63.0 stable, 0.64 preview),
+#               packages/core/src/services/chatRecordingService.ts and
+#               chatRecordingTypes.ts; config/storage.ts and projectRegistry.ts
+#               for where files live.
+#   Qwen Code   QwenLM/qwen-code @6212189 (0.25.1),
+#               packages/core/src/services/chatRecordingService.ts.
+# Qwen forked Gemini CLI but replaced chat recording with a Claude-Code-like
+# tree of records, so the two have separate readers.
+# --------------------------------------------------------------------------
+
+def _existing_dirs(candidates: list[Path]) -> list[Path]:
+    """The candidates that are directories, each once (by resolved path)."""
+    out: list[Path] = []
+    for p in candidates:
+        try:
+            if p.is_dir() and p.resolve() not in {q.resolve() for q in out}:
+                out.append(p)
+        except OSError:
+            continue
+    return out
+
+
+def gemini_roots() -> list[Path]:
+    """Gemini CLI's per-project directories live under <home>/.gemini/tmp.
+
+    $GEMINI_CLI_HOME replaces the home directory itself (paths.ts homedir()),
+    so it names the directory that holds .gemini, not .gemini. A macOS
+    Seatbelt sandbox run (SANDBOX=sandbox-exec) writes under
+    <home>/.cache/.gemini instead (storage.ts), so both are read."""
+    env = os.environ.get("GEMINI_CLI_HOME")
+    home = Path(env).expanduser() if env else Path.home()
+    return _existing_dirs([home / ".gemini" / "tmp", home / ".cache" / ".gemini" / "tmp"])
+
+
+def qwen_roots() -> list[Path]:
+    """Qwen Code writes <runtime>/projects/<cwd slug>/chats/<session>.jsonl.
+
+    The runtime directory is $QWEN_RUNTIME_DIR when set, else the global
+    directory: $QWEN_HOME (which names the .qwen directory itself), else
+    ~/.qwen. When the runtime directory was moved, the global one is read too,
+    so sessions written before the move are not lost."""
+    env = os.environ.get("QWEN_HOME")
+    base = Path(env).expanduser() if env else Path.home() / ".qwen"
+    runtime = os.environ.get("QWEN_RUNTIME_DIR")
+    cands = ([Path(runtime).expanduser() / "projects"] if runtime else []) + [base / "projects"]
+    return _existing_dirs(cands)
+
+
+def _agent_root(root: Path, agent: str) -> Path:
+    """What --root names for Gemini or Qwen: the vendor directory (~/.gemini,
+    ~/.qwen) or the directory of project directories (tmp, projects)."""
+    sub = root / ("tmp" if agent == "gemini" else "projects")
+    return sub if sub.is_dir() else root
+
+
+def _project_dirs(root: Path) -> list[Path]:
+    """Per-project directories under a Gemini tmp or Qwen projects root. A
+    root that is itself one project (it holds chats/) is that project."""
+    if (root / "chats").is_dir():
+        return [root]
+    try:
+        return sorted(d for d in root.iterdir() if d.is_dir())
+    except OSError as exc:
+        print(f"actualis: cannot read {root}: {exc.strerror or exc}", file=sys.stderr)
+        return []
+
+
+def gemini_session_files(project_dir: Path) -> list[Path]:
+    """chats/*.jsonl (v0.39+), chats/*.json (the legacy single object), and
+    chats/<parent session>/*.jsonl (subagents). A rewrite leaves backups named
+    *.jsonl.unreadable-<ms> and *.jsonl.tmp-<pid>; their suffix excludes them."""
+    chats = project_dir / "chats"
+    out: list[Path] = []
+    try:
+        entries = sorted(chats.iterdir())
+    except OSError:
+        return out
+    for e in entries:
+        try:
+            if e.is_dir():
+                out.extend(sorted(g for g in e.iterdir() if g.suffix == ".jsonl" and g.is_file()))
+            elif e.suffix in (".jsonl", ".json") and e.is_file():
+                out.append(e)
+        except OSError:
+            continue
+    return out
+
+
+def qwen_session_files(project_dir: Path) -> list[Path]:
+    try:
+        return sorted(f for f in (project_dir / "chats").glob("*.jsonl") if f.is_file())
+    except OSError:
+        return []
+
+
+_ROOT_MARKER_MAX = 4096
+# A legacy (<= v0.38) Gemini session is one JSON document, decoded whole (about
+# ten times its size in memory). Past this it is counted unparsable, not read.
+GEMINI_JSON_MAX = 64 << 20
+
+
+def gemini_registry(root: Path) -> dict[str, str]:
+    """slug -> project path, inverted from <runtime>/projects.json
+    ({"projects": {"<abs path>": "<slug>"}}). Wrong types are absent."""
+    try:
+        with _open_regular(root.parent / "projects.json") as fh:
+            text = fh.read(1 << 22)
+    except OSError:
+        return {}
+    ok, doc = _json_line(text)
+    projects = doc.get("projects") if ok and isinstance(doc, dict) else None
+    if not isinstance(projects, dict):
+        return {}
+    return {slug: path for path, slug in projects.items()
+            if isinstance(path, str) and path and isinstance(slug, str) and slug}
+
+
+def gemini_project_root(project_dir: Path, registry: dict[str, str]) -> str:
+    """The real project path: tmp/<slug>/.project_root (plain text), else the
+    projects.json registry, else "" (the caller falls back to the slug)."""
+    try:
+        with _open_regular(project_dir / ".project_root") as fh:
+            text = fh.read(_ROOT_MARKER_MAX + 1).strip()
+    except OSError:
+        text = ""
+    if text and len(text) <= _ROOT_MARKER_MAX and "\n" not in text and "\x00" not in text:
+        return text
+    return registry.get(project_dir.name, "")
+
+
+def gemini_command_project(project: str, real: str, args) -> str:
+    """Where one run_shell_command ran: its dir_path (`directory` before
+    dir_path existed) when that is an absolute path outside the project root,
+    or when no root was recovered; else the session's project."""
+    wd = args.get("dir_path", args.get("directory")) if isinstance(args, dict) else None
+    if not isinstance(wd, str) or not wd.startswith("/"):
+        return project
+    if real and (wd == real or wd.startswith(real.rstrip("/") + "/")):
+        return project
+    return path_project(wd)
+
+
+def path_project(path: str) -> str:
+    """A filesystem path as a project name, the way Codex cwds are shown."""
+    return pretty_project(path.replace("\\", "/").lstrip("/").replace("/", "-"))
+
+
+def read_gemini_session(path: Path) -> dict | None:
+    """One Gemini CLI session file, reconstructed for an audit.
+
+    Mirrors the reader in chatRecordingService.ts, with one deliberate
+    difference: messages a `$rewindTo` drops are kept and marked rewound,
+    because their tool calls ran. Returns
+      meta        merged session metadata (initial record, then every $set)
+      messages    [(record, line, rewound)], one per message id (its last
+                  version), in file order; line is None for a legacy .json
+      unparsable  lines that would not decode
+      unsupported records of a kind not read: $patch (0.64 preview) and any
+                  other unknown shape, skipped and counted
+    None when the file cannot be opened.
+    """
+    try:
+        fh = _open_regular(path)
+    except OSError:
+        return None
+    meta: dict = {}
+    live: dict[str, tuple[dict, int | None]] = {}    # insertion order, as a JS Map
+    dead: list[tuple[str, dict, int | None]] = []
+    bad = odd = anon = 0
+
+    def put(m: dict, line: int | None) -> None:
+        nonlocal anon
+        mid = m.get("id")
+        if not isinstance(mid, str) or not mid:
+            anon += 1
+            mid = f"\x00{anon}"          # no id to key on: kept, never merged
+        live[mid] = (m, line)            # an existing id keeps its place
+
+    with fh:
+        try:
+            if path.suffix == ".json":
+                text = ""
+                if os.fstat(fh.fileno()).st_size <= GEMINI_JSON_MAX:
+                    text = fh.read(GEMINI_JSON_MAX + 1)    # characters: grown since fstat
+                ok, doc = (False, None) if not text or len(text) > GEMINI_JSON_MAX \
+                    else _json_line(text)
+                if not ok:
+                    bad += 1
+                elif isinstance(doc, dict):
+                    for k, v in doc.items():
+                        if k == "messages" and isinstance(v, list):
+                            for m in v:
+                                if isinstance(m, dict):
+                                    put(m, None)
+                        elif k != "messages":
+                            meta[k] = v
+                elif doc is not None:
+                    odd += 1
+            else:
+                for n, line in enumerate(fh, 1):
+                    ok, rec = _json_line(line)
+                    if not ok:
+                        bad += 1
+                        continue
+                    if rec is None:
+                        continue
+                    if not isinstance(rec, dict):
+                        odd += 1
+                        continue
+                    to = rec.get("$rewindTo")
+                    if isinstance(to, str):
+                        # That message and everything after it leave the view.
+                        if to in live:
+                            while live:
+                                mid, (m, ln) = live.popitem()
+                                dead.append((mid, m, ln))
+                                if mid == to:
+                                    break
+                        continue
+                    if "$patch" in rec:
+                        odd += 1
+                        continue
+                    if isinstance(rec.get("id"), str) and rec["id"]:
+                        put(rec, n)
+                        continue
+                    upd = rec.get("$set")
+                    if isinstance(upd, dict):
+                        for k, v in upd.items():
+                            if k == "messages":
+                                # A full-history checkpoint (<= v0.63). Messages it
+                                # leaves out were compressed, not undone: kept.
+                                if isinstance(v, list):
+                                    for m in v:
+                                        if isinstance(m, dict):
+                                            put(m, n)
+                            else:
+                                meta[k] = v
+                        continue
+                    if isinstance(rec.get("sessionId"), str) and isinstance(rec.get("projectHash"), str):
+                        meta.update(rec)
+                        continue
+                    odd += 1
+        except OSError:
+            pass
+    chosen: dict[str, tuple[dict, int | None, bool]] = {}
+    for mid, m, ln in dead:
+        chosen[mid] = (m, ln, True)
+    for mid, (m, ln) in live.items():
+        chosen[mid] = (m, ln, False)      # re-recorded after the rewind: live again
+    msgs = sorted(chosen.values(), key=lambda t: (t[1] is None, t[1] or 0))
+    return {"meta": meta, "messages": msgs, "unparsable": bad, "unsupported": odd}
+
+
+def _parts_text(content) -> str | None:
+    """The text of a Gemini PartListUnion: a string, a Part, or Part[]."""
+    if isinstance(content, str):
+        return content if content.strip() else None
+    if isinstance(content, dict):
+        content = [content]
+    if not isinstance(content, list):
+        return None
+    texts = [p["text"] for p in content
+             if isinstance(p, dict) and isinstance(p.get("text"), str) and not p.get("thought")]
+    said = " ".join(t for t in texts if t.strip())
+    return said or None
+
+
+def _response_error(result) -> str:
+    """The error text of a tool result: Part[] of functionResponse, whose
+    response holds {"error": "..."} when the call failed or was refused."""
+    if isinstance(result, dict):
+        result = [result]
+    if not isinstance(result, list):
+        return ""
+    for p in result:
+        fr = p.get("functionResponse") if isinstance(p, dict) else None
+        resp = fr.get("response") if isinstance(fr, dict) else None
+        err = resp.get("error") if isinstance(resp, dict) else None
+        if isinstance(err, str) and err:
+            return err
+    return ""
+
+
+# The exact texts Gemini CLI writes (scheduler/state-manager.ts, policy.ts),
+# matched as prefixes so tool output that merely quotes them is not a refusal.
+GEMINI_USER_DENIED = ("[Operation Cancelled] Reason: User denied execution.",
+                      "User denied execution.")
+GEMINI_POLICY_DENIED = "Tool execution denied by policy."
+
+
+def tool_refusal(status: str, error: str) -> str | None:
+    """"user-denied" (a person said no at the prompt), "policy-denied" (a
+    policy rule blocked it), or None. Gemini records no approval, so this is
+    all that is known about who allowed a call."""
+    err = error.lstrip()[:200]
+    if status == "cancelled" and err.startswith(GEMINI_USER_DENIED):
+        return "user-denied"
+    if status == "error" and err.startswith(GEMINI_POLICY_DENIED):
+        return "policy-denied"
+    return None
+
+
+# Qwen ApprovalMode values (config/approval-mode.ts) as permission-mode keys.
+# auto-edit approves edits only, so it maps to Claude's acceptEdits reading,
+# not to "auto": a shell command still asks.
+_QWEN_MODES = {"default": "default", "plan": "plan", "auto-edit": "accept-edits",
+               "autoedit": "accept-edits", "auto": "auto", "yolo": "yolo"}
+
+
+def qwen_mode(raw) -> str | None:
+    """A Qwen approval mode as a permission-mode key (`qwen:<mode>`), or None."""
+    v = clean(raw)[:40] if isinstance(raw, str) else ""
+    if not v:
+        return None
+    key = _QWEN_MODES.get(v.lower().replace("_", "-"), v)
+    return f"qwen:{key}"
+
+
+# A URL inside free text (web_fetch takes a prompt, not a url). One bounded
+# character class after a fixed prefix: linear at any length.
+_TEXT_URL = re.compile(r"https?://[^\s\"'<>`\\(){}\[\]|^]{1,2048}", re.I)
+
+
+def urls_in_text(text: str) -> tuple[list[str], int]:
+    """Every distinct http(s) URL in text up to MAX_SCAN_HARD, and 1 when the
+    text runs past that cap (counted unparsed, never silently dropped)."""
+    if not isinstance(text, str):
+        return [], 0
+    urls = [m.group(0).rstrip(".,;:!?*") for m in _TEXT_URL.finditer(text[:MAX_SCAN_HARD])]
+    return list(dict.fromkeys(u for u in urls if len(u) > 8)), int(len(text) > MAX_SCAN_HARD)
 
 
 class Fleet:
@@ -4739,6 +8486,12 @@ class Fleet:
         self.bash_by_day: Counter = Counter()
         self.bash_moded_by_day: Counter = Counter()
         self.unsupervised_by_day: Counter = Counter()
+        # The same two counts over every command, dated or not. bash_total -
+        # bash_moded is the commands whose approval is unknown (Gemini CLI
+        # records no mode at all), which every supervision figure must name
+        # rather than silently leave out of its denominator.
+        self.bash_moded = 0
+        self.bash_unsupervised = 0
         self.bash_categories: Counter = Counter()
         self.agents_seen: set[str] = set()
         # Copilot bills in premium requests as well as tokens. Fractional
@@ -4756,6 +8509,7 @@ class Fleet:
         # everything downstream reads `network_items`, which drops them.
         self.network: list[dict] = []
         self.network_unparsed = 0
+        self.network_unreadable: list[dict] = []   # commands not read past a limit; listed under --ioc
         self.network_trust: list[str] = []
         self.network_trust_sources: list[dict] = []
         self.network_strict = False
@@ -4827,38 +8581,80 @@ class Fleet:
         # Resumed and forked sessions copy history into a new file, so one
         # tool call can sit in several transcripts. Keyed (agent, call id).
         self.seen_tool_calls: set[tuple[str, str]] = set()
+        # The same, for the records that move permission modes and refusals;
+        # _file_keys numbers each key's occurrences within the current file.
+        self.seen_records: set[tuple] = set()
+        self._file_keys: Counter = Counter()
         self.duplicate_tool_calls_skipped = 0
+        # Transcript lines (and Codex `arguments` strings) that would not
+        # decode: malformed, or nested past the decoder's limit. Skipped, and
+        # counted so a skip is never silent.
+        self.unparsable_lines = 0
+        # (root, file, line) of each line already counted for an absurd number.
+        self._absurd_lines: set[tuple] = set()
+        # Gemini CLI records of a kind this version does not read ($patch from
+        # 0.64 preview, any other unknown shape): skipped, and counted.
+        self.unsupported_records = 0
+        # Gemini tool calls a $rewindTo took out of the conversation. They ran,
+        # so they are audited and inventoried like any other, and counted here.
+        self.rewound_tool_calls = 0
+        # model -> tokens, for models with no published rate (tier UNPRICED):
+        # shown, never priced.
+        self.unpriced_tokens: Counter = Counter()
+        # Codex session id -> [largest total, project, model, token_count
+        # points], while scan_codex runs; None outside it. See scan_codex.
+        self._codex_sessions: dict[str, list] | None = None
         self.first_ts: datetime | None = None
         self.last_ts: datetime | None = None
+        # The filters this run was given (--days, --project, --agent), so
+        # --diff can tell two reports over different populations apart.
+        self.scope: dict = {"days": None, "project": "", "agent": "all"}
         self.roots: list[Path] = []
         self.files_scanned = 0
         self.bytes_scanned = 0
 
     # -- ingest ------------------------------------------------------------
 
+    def _tok(self, v) -> int:
+        """_tokens(), counting an absurd value's line as unparsable (once per
+        line: one record can carry several such fields)."""
+        if _absurd_count(v):
+            key = (self._src_root, self._src_file, self._src_line)
+            if key not in self._absurd_lines:
+                self._absurd_lines.add(key)
+                self.unparsable_lines += 1
+        return _tokens(v)
+
     def add_usage(self, project: str, model: str, usage: dict, ts: datetime | None,
                   branch: str | None = None) -> None:
         # Sanitise at the boundary of the data structure rather than at one call
         # site, so no future caller can bypass it.
+        if model == "<synthetic>" and not any(_tokens(v) for v in usage.values()
+                                              if not isinstance(v, dict)):
+            # Claude Code's own zero-usage records (an interrupted turn, an
+            # API error): no model ran, so no message and no unpriced model.
+            return
         project = clean(project)[:120] or "unknown"
         model = clean(model)[:48] or "unknown"
         branch = (clean(branch)[:120] or None) if branch else None
-        cc = usage.get("cache_creation") or {}
-        w1h = cc.get("ephemeral_1h_input_tokens", 0) or 0
-        w5m = cc.get("ephemeral_5m_input_tokens", 0) or 0
+        cc = usage.get("cache_creation")
+        cc = cc if isinstance(cc, dict) else {}
+        w1h = self._tok(cc.get("ephemeral_1h_input_tokens"))
+        w5m = self._tok(cc.get("ephemeral_5m_input_tokens"))
         assumed = 0
         if not w1h and not w5m:
             # Older transcript with no TTL split. Priced at the 1h rate and
             # counted separately so the assumption is visible in the report.
-            assumed = usage.get("cache_creation_input_tokens", 0) or 0
+            assumed = self._tok(usage.get("cache_creation_input_tokens"))
 
-        inp = usage.get("input_tokens", 0) or 0
-        out = usage.get("output_tokens", 0) or 0
-        rd = usage.get("cache_read_input_tokens", 0) or 0
+        inp = self._tok(usage.get("input_tokens"))
+        out = self._tok(usage.get("output_tokens"))
+        rd = self._tok(usage.get("cache_read_input_tokens"))
 
         in_rate, out_rate, _provider, known, src = rates_for(model, ts)
-        rate = rate_for(model)
-        if rate.long_prompt and inp + rd + w1h + w5m + assumed > LONG_PROMPT_TOKENS:
+        rate = rate_at(model, ts)
+        # Each row's own threshold: Haiku 5.5 at 100,000, Gemini Pro at 200,000.
+        if rate.long_prompt and inp + rd + w1h + w5m + assumed > rate.long_prompt_tokens:
             rate = rate.long_prompt     # the whole message, not just the excess
             in_rate, out_rate = rate.input, rate.output
         read_mult = rate.cache_read
@@ -4928,12 +8724,15 @@ class Fleet:
                 self.last_ts = ts
 
     def add_codex_session(self, project: str, model: str, usage: dict,
-                          ts: datetime | None) -> None:
+                          ts: datetime | None,
+                          days: "list[tuple[datetime | None, dict]] | None" = None) -> None:
         """Record one Codex session from its FINAL cumulative usage.
 
         `total_token_usage` is cumulative across the session and `token_count`
         events repeat, so summing either over-counts badly. The last total is
-        the session total, exactly.
+        the session total, exactly. `days`, when given, is each token_count's
+        increment over the one before it, with its time: each day's share of
+        the cost is booked to that day, not all of it to the last one.
         """
         cost = codex_session_cost(usage, model)
         _, _, _, known, tier = rates_for(model, None)
@@ -4952,11 +8751,28 @@ class Fleet:
         self.msgs_by_model[model] += 1
         self.cost_by_model[model] += cost
         self.cost_by_project[project] += cost
-        cached = usage.get("cached_input_tokens", 0) or 0
-        self.tokens["input"] += max((usage.get("input_tokens", 0) or 0) - cached, 0)
+        cached = self._tok(usage.get("cached_input_tokens"))
+        self.tokens["input"] += max(self._tok(usage.get("input_tokens")) - cached, 0)
         self.tokens["cache_read"] += cached
-        self.tokens["output"] += usage.get("output_tokens", 0) or 0
-        if ts:
+        self.tokens["output"] += self._tok(usage.get("output_tokens"))
+        if days:
+            booked, last_day = 0.0, None
+            for dts, inc in days:
+                if dts is None:
+                    continue
+                last_day = dts.date().isoformat()
+                share = codex_session_cost(inc, model)
+                self.cost_by_day[last_day] += share
+                booked += share
+                if self.first_ts is None or dts < self.first_ts:
+                    self.first_ts = dts
+                if self.last_ts is None or dts > self.last_ts:
+                    self.last_ts = dts
+            if last_day is not None and abs(cost - booked) > 1e-9:
+                # A step whose cached share outgrew its input is clamped, so the
+                # shares can miss the session price: by_day still sums to cost.
+                self.cost_by_day[last_day] += cost - booked
+        elif ts:
             self.cost_by_day[ts.date().isoformat()] += cost
             if self.first_ts is None or ts < self.first_ts:
                 self.first_ts = ts
@@ -4990,12 +8806,12 @@ class Fleet:
         self.msgs_by_model[model] += 1
         self.cost_by_model[model] += cost
         self.cost_by_project[project] += cost
-        rd = usage.get("cacheReadTokens", 0) or 0
-        wr = usage.get("cacheWriteTokens", 0) or 0
-        self.tokens["input"] += max((usage.get("inputTokens", 0) or 0) - rd - wr, 0)
+        rd = self._tok(usage.get("cacheReadTokens"))
+        wr = self._tok(usage.get("cacheWriteTokens"))
+        self.tokens["input"] += max(self._tok(usage.get("inputTokens")) - rd - wr, 0)
         self.tokens["cache_read"] += rd
         self.tokens["cache_w_assumed"] += wr
-        self.tokens["output"] += usage.get("outputTokens", 0) or 0
+        self.tokens["output"] += self._tok(usage.get("outputTokens"))
 
         self.cost_by_branch[branch_bucket(branch)] += cost
         ticket = extract_ticket(branch)
@@ -5015,9 +8831,48 @@ class Fleet:
 
     def scan_codex(self, roots: list[Path], since: datetime | None,
                    project_filter: str | None) -> None:
+        # A resumed or forked session copies its history into a new rollout
+        # under the same session id, cumulative totals included. Each session
+        # id is priced once, from the token_count totals of all its files.
+        self._codex_sessions = {}
         for root in roots:
             for f in sorted(root.rglob("rollout-*.jsonl")):
                 self._scan_codex_file(f, since, project_filter, root)
+        sessions, self._codex_sessions = self._codex_sessions, None
+        for _total, project, model, points in sessions.values():
+            self._book_codex(project, model, points, since)
+
+    def _book_codex(self, project: str, model: str,
+                    points: "list[tuple[int, datetime | None, dict]]",
+                    since: datetime | None) -> None:
+        """Price one Codex session from its cumulative token_count totals.
+
+        Totals are cumulative, so what a window used is the final total minus
+        the last total stamped before it, and each step's increment belongs to
+        the day of the token_count that reported it. Pricing the whole final
+        total under --days booked months of history to today.
+        """
+        keys = ("input_tokens", "cached_input_tokens", "output_tokens")
+        uniq = {(t, ts, tuple(u[k] for k in keys)) for t, ts, u in points}
+        # Cumulative, so ordering by total is ordering in time.
+        ordered = sorted(uniq, key=lambda p: (p[0], p[1] is not None, p[1] or _TS_MIN, p[2]))
+        prev = dict.fromkeys(keys, 0)
+        window = dict.fromkeys(keys, 0)
+        days: list[tuple[datetime | None, dict]] = []
+        last: datetime | None = None
+        for _t, ts, vals in ordered:
+            cur = dict(zip(keys, vals))
+            inc = {k: max(cur[k] - prev[k], 0) for k in keys}
+            prev = {k: max(cur[k], prev[k]) for k in keys}
+            if since and ts and ts < since:
+                continue                    # before the window: only moves the base
+            for k in keys:
+                window[k] += inc[k]
+            days.append((ts, inc))
+            if ts and (last is None or ts > last):
+                last = ts
+        if days:
+            self.add_codex_session(project, model, window, last, days)
 
     def _scan_codex_file(self, path: Path, since: datetime | None,
                          project_filter: str | None, root: Path | None = None) -> None:
@@ -5032,23 +8887,27 @@ class Fleet:
 
         cwd = model = session = None
         policy: str | None = None
-        best: dict | None = None
-        best_total = -1
-        last_ts: datetime | None = None
-        # (command, ts, mode, why, prompt, line)
-        pending: list[tuple[str, datetime | None, str | None, str | None, str | None, int]] = []
+        # (cumulative total, ts, usage) per token_count, values already read
+        # through _tok: an absurd count is 0 here and counted once.
+        points: list[tuple[int, datetime | None, dict]] = []
+        # (command, ts, mode, why, prompt, line, call id)
+        pending: list[tuple[str, datetime | None, str | None, str | None, str | None, int,
+                            str | None]] = []
         # why: the latest assistant message or reasoning summary text, until the
         # next call's output or user message. prompt: the latest user message.
         why: str | None = None
         prompt: str | None = None
+        # (ts, mode key): counted after the project filter and per turn against
+        # --days, as commands are, so a filtered-out file moves no mode.
+        modes: list[tuple[datetime | None, str]] = []
         self._start_file(path, root)
 
         try:
-            with path.open("r", encoding="utf-8", errors="replace") as fh:
+            with _open_regular(path) as fh:
                 for n, line in enumerate(fh, 1):
-                    try:
-                        rec = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
+                    ok, rec = _json_line(line)
+                    if not ok:
+                        self.unparsable_lines += 1
                         continue
                     if not isinstance(rec, dict):
                         continue
@@ -5084,10 +8943,10 @@ class Fleet:
                         why = None
 
                     if kind == "session_meta":
-                        cwd = payload.get("cwd") or cwd
-                        session = payload.get("id") or session
+                        cwd = _str_or(payload.get("cwd"), cwd)
+                        session = _str_or(payload.get("id"), session)
                     elif kind == "turn_context":
-                        cwd = payload.get("cwd") or cwd
+                        cwd = _str_or(payload.get("cwd"), cwd)
                         # Harness-written, but a tampered file reaches the terminal
                         # through these as surely as through a command: clean them.
                         model = clean(payload.get("model"))[:48] or model
@@ -5098,48 +8957,75 @@ class Fleet:
                         pol = clean(pol)[:48]
                         if pol:
                             policy = f"codex:{pol}"
-                            self.permission_modes[policy] += 1
+                            modes.append((ts, policy))
                         sb = payload.get("sandbox_policy")
-                        if isinstance(sb, dict) and sb.get("type"):
-                            self.permission_modes[f"sandbox:{clean(str(sb['type']))[:48]}"] += 1
+                        sbt = clean(sb.get("type"))[:48] if isinstance(sb, dict) else ""
+                        if sbt:
+                            modes.append((ts, f"sandbox:{sbt}"))
                     elif kind == "event_msg" and payload.get("type") == "token_count":
-                        info = payload.get("info") or {}
-                        tot = info.get("total_token_usage")
+                        info = payload.get("info")
+                        tot = info.get("total_token_usage") if isinstance(info, dict) else None
                         if isinstance(tot, dict):
-                            n = tot.get("total_tokens", 0) or 0
-                            if n > best_total:      # cumulative: keep the maximum
-                                best_total, best = n, tot
-                            if ts:
-                                last_ts = ts
+                            self._src_line = n
+                            u = {k: self._tok(tot.get(k)) for k in
+                                 ("input_tokens", "cached_input_tokens", "output_tokens",
+                                  "total_tokens")}
+                            points.append((u["total_tokens"], ts, u))
                     elif payload.get("type") == "function_call" and \
                             payload.get("name") == "shell_command":
-                        try:
-                            args = json.loads(payload.get("arguments") or "{}")
-                        except (json.JSONDecodeError, ValueError):
+                        raw_args = payload.get("arguments")
+                        ok, args = _json_line(raw_args) if isinstance(raw_args, str) else (True, {})
+                        if not ok:
+                            self.unparsable_lines += 1
+                            continue
+                        if not isinstance(args, dict):
                             continue
                         cmd = args.get("command")
-                        if cmd:
-                            pending.append((cmd, ts, policy, why, prompt, n))
-                            cwd = args.get("workdir") or cwd
+                        if isinstance(cmd, str) and cmd:
+                            pending.append((cmd, ts, policy, why, prompt, n,
+                                            _str_or(payload.get("call_id"), None)))
+                            cwd = _str_or(args.get("workdir"), cwd)
         except OSError:
             return
 
-        if since and last_ts and last_ts < since:
-            return
         project = pretty_project(cwd.lstrip("/").replace("/", "-")) if cwd else "unknown"
         if project_filter and project_filter.lower() not in project.lower():
             return
 
-        for cmd, ts, mode, why, prompt, n in pending:
+        for ts, key in modes:
+            if not (since and ts and ts < since):
+                # A resumed rollout copies the session's turn contexts.
+                if session and self._seen_copy(("codex-mode", session, ts, key)):
+                    continue
+                self.permission_modes[key] += 1
+
+        for cmd, ts, mode, why, prompt, n, call_id in pending:
+            # Per command, as the Claude and Copilot paths filter per record:
+            # a session still active in the window can hold commands from
+            # months before it, and those are outside --days.
+            if since and ts and ts < since:
+                continue
             # Normalise Codex's shell_command onto the same "Bash" tool name the
             # Claude Code path uses, so the audit is one cross-agent view.
             self._src_line = n
             self.add_tool(project, "Bash", {"command": cmd}, ts, mode,
-                          session=session, agent="codex", why=why, prompt=prompt,
-                          where=self._where())
+                          session=session, call_id=call_id, agent="codex", why=why,
+                          prompt=prompt, where=self._where())
 
-        if best:
-            self.add_codex_session(project, model or "unknown", best, last_ts)
+        if points:
+            model = model or "unknown"
+            top = max(p[0] for p in points)
+            pend = self._codex_sessions
+            if session and pend is not None:
+                seen = pend.get(session)
+                if seen is None:
+                    pend[session] = [top, project, model, list(points)]
+                else:
+                    seen[3].extend(points)
+                    if top > seen[0]:       # named after the file that got furthest
+                        seen[0], seen[1], seen[2] = top, project, model
+            else:
+                self._book_codex(project, model, points, since)
 
     def scan_copilot(self, roots: list[Path], since: datetime | None,
                      project_filter: str | None) -> None:
@@ -5174,11 +9060,11 @@ class Fleet:
         refusals: list[tuple[str, str, datetime | None]] = []     # (kind, id, ts)
         subagents: list[tuple[dict, datetime | None]] = []
         try:
-            with path.open("r", encoding="utf-8", errors="replace") as fh:
+            with _open_regular(path) as fh:
                 for n, line in enumerate(fh, 1):
-                    try:
-                        rec = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
+                    ok, rec = _json_line(line)
+                    if not ok:
+                        self.unparsable_lines += 1
                         continue
                     if not isinstance(rec, dict):
                         continue
@@ -5201,25 +9087,25 @@ class Fleet:
                         if isinstance(ctx, dict):
                             cwd, branch = _copilot_context(ctx, cwd, branch)
                     elif kind == "tool.execution_start":
-                        name = str(data.get("toolName") or "?")
+                        name = _str_or(data.get("toolName"), "?")
                         args = data.get("arguments")
                         cmd = args.get("command") if isinstance(args, dict) else None
                         cmd = cmd if name == "bash" and isinstance(cmd, str) else ""
-                        calls.append((str(data.get("toolCallId") or ""), name, cmd, ts,
+                        calls.append((_str_or(data.get("toolCallId"), ""), name, cmd, ts,
                                       args if isinstance(args, dict) else {}, why, prompt, n))
                     elif kind == "permission.requested":
                         req = data.get("permissionRequest")
-                        if isinstance(req, dict) and req.get("toolCallId"):
-                            prompted_any.add(str(req["toolCallId"]))
-                        if isinstance(req, dict) and req.get("kind") == "shell" \
-                                and req.get("toolCallId"):
-                            prompted.add(str(req["toolCallId"]))
+                        req_id = _str_or(req.get("toolCallId"), "") if isinstance(req, dict) else ""
+                        if req_id:
+                            prompted_any.add(req_id)
+                            if req.get("kind") == "shell":
+                                prompted.add(req_id)
                     elif kind == "permission.completed":
                         result = data.get("result")
-                        rk = result.get("kind") if isinstance(result, dict) else None
+                        rk = _str_or(result.get("kind"), "") if isinstance(result, dict) else ""
                         if rk and rk not in COPILOT_APPROVED:
-                            refusals.append((f"copilot:{clean(str(rk))[:40]}",
-                                             str(data.get("toolCallId") or ""), ts))
+                            refusals.append((f"copilot:{clean(rk)[:40]}",
+                                             _str_or(data.get("toolCallId"), ""), ts))
                     elif kind == "subagent.completed":
                         subagents.append((data, ts))
                     elif kind == "session.shutdown":
@@ -5245,7 +9131,8 @@ class Fleet:
             detail = {"why": why, "prompt": prompt, "where": self._where()}
             if cmd:
                 mode = "copilot:prompted" if call_id in prompted else "copilot:auto"
-                self.permission_modes[mode] += 1
+                if not (call_id and ("copilot", call_id) in self.seen_tool_calls):
+                    self.permission_modes[mode] += 1
                 # Normalised onto "Bash", as Codex is, so the audit is one view.
                 self.add_tool(project, "Bash", {"command": cmd}, ts, mode,
                               session=sid, call_id=call_id, agent="copilot", **detail)
@@ -5262,6 +9149,8 @@ class Fleet:
         for kind, call_id, ts in refusals:
             if in_window(ts):
                 active = True
+                if call_id and self._seen_copy(("copilot-refusal", call_id, kind)):
+                    continue                # the same call, refused, in a copied session
                 self._network_outcome(f"copilot:{call_id}", refused=True)
                 self.denials[kind] += 1
                 self.denials_by_project[project] += 1
@@ -5270,9 +9159,9 @@ class Fleet:
             if in_window(ts):
                 # Copilot gives a token total with no input/output split, so no
                 # usage is passed and no cost floor is recorded.
-                self.add_subagent({"resolvedModel": copilot_model(str(data.get("model") or "")),
+                self.add_subagent({"resolvedModel": copilot_model(_str_or(data.get("model"), "")),
                                    "status": "completed",
-                                   "totalDurationMs": data.get("durationMs") or 0,
+                                   "totalDurationMs": self._tok(data.get("durationMs")),
                                    "toolStats": {}}, ts)
         if active:
             self.agents_seen.add("copilot")
@@ -5297,6 +9186,343 @@ class Fleet:
         if isinstance(pr, (int, float)) and not isinstance(pr, bool):
             self.premium_requests_by_agent["copilot"] += float(pr)
 
+    def add_model_usage(self, agent: str, project: str, model: str, inp: int, out: int,
+                        cached: int, thoughts: int, tool: int, ts: datetime | None,
+                        branch: str | None = None) -> None:
+        """One Gemini-API-shaped response (Gemini CLI tokens, Qwen usageMetadata).
+
+        input already INCLUDES cached (promptTokenCount is the whole prompt);
+        thoughts are billed at the output rate; tool-use prompt tokens count
+        as input. A Pro model's whole message moves to the long-prompt rate when
+        its prompt exceeds the row's threshold. A model with no published rate
+        adds its tokens and no cost: it is never priced at a ceiling.
+        """
+        project = clean(project)[:120] or "unknown"
+        model = clean(model)[:48] or "unknown"
+        branch = (clean(branch)[:120] or None) if branch else None
+        cached = min(cached, inp)
+        fresh = inp - cached + tool
+        outp = out + thoughts
+        r = rate_at(model, ts)
+        if r.tier == DEFAULT:
+            r = unpriced_rate(model)
+        tier = r.tier
+        if r.long_prompt and inp > r.long_prompt_tokens:
+            r = r.long_prompt
+        read_mult = OPENAI_CACHED_MULT if r.provider == "openai" else r.cache_read
+        cost = (fresh / 1e6 * r.input + cached / 1e6 * r.input * read_mult
+                + outp / 1e6 * r.output)
+        known = tier in (VENDOR, VENDOR_DOC, AGGREGATOR)
+        if not known:
+            self.unknown_models[model] += 1
+            self.cost_unknown += cost
+        elif tier == AGGREGATOR:
+            self.aggregator_models[model] += 1
+        if tier == UNPRICED:
+            self.unpriced_tokens[model] += fresh + cached + outp
+        self.cost_by_tier[tier] += cost
+        self.models_by_tier[tier].add(model)
+
+        self.messages += 1
+        self.agents_seen.add(agent)
+        self.cost_by_agent[agent] += cost
+        self.units_by_agent[agent] += 1
+        self.msgs_by_model[model] += 1
+        self.cost_by_model[model] += cost
+        self.cost_by_project[project] += cost
+        self.tokens["input"] += fresh
+        self.tokens["cache_read"] += cached
+        self.tokens["output"] += outp
+        pt = self.tokens_by_project[project]
+        pt["input"] += fresh; pt["output"] += outp; pt["cache_read"] += cached
+        self.msgs_by_project[project] += 1
+        self.cache_actual[project] += fresh / 1e6 * r.input + cached / 1e6 * r.input * read_mult
+        self.cache_read_list[project] += cached / 1e6 * r.input
+        self.cache_read_paid[project] += cached / 1e6 * r.input * read_mult
+        self.cache_uncached[project] += (fresh + cached) / 1e6 * r.input
+
+        self.cost_by_branch[branch_bucket(branch)] += cost
+        ticket = extract_ticket(branch)
+        if ticket:
+            self.cost_by_ticket[ticket] += cost
+            self.msgs_by_ticket[ticket] += 1
+            self.branches_by_ticket[ticket].add(branch)
+            self.projects_by_ticket[ticket].add(project)
+            if ts:
+                self.dates_by_ticket[ticket].append(ts.date().isoformat())
+        if ts:
+            self.cost_by_day[ts.date().isoformat()] += cost
+            if self.first_ts is None or ts < self.first_ts:
+                self.first_ts = ts
+            if self.last_ts is None or ts > self.last_ts:
+                self.last_ts = ts
+
+    def _vendor_call(self, agent: str, project: str, name: str, args: dict,
+                     ts: datetime | None, mode: str | None, session: str | None,
+                     call_id: str | None, status: str, error: str, why: str | None,
+                     prompt: str | None, rewound: bool = False) -> None:
+        """One Gemini or Qwen tool call: audited and inventoried as every
+        agent's are, then its outcome applied. run_shell_command is read as the
+        shared "Bash" tool. A refusal counts as a denial; a refused call still
+        counts as attempted, as Copilot's and Claude Code's do."""
+        dup = bool(call_id) and (agent, call_id) in self.seen_tool_calls
+        cmd = args.get("command") if name == "run_shell_command" else None
+        before = len(self.network)
+        if name == "run_shell_command":
+            self.add_tool(project, "Bash", {"command": cmd} if isinstance(cmd, str) else {},
+                          ts, mode, session=session, call_id=call_id, agent=agent,
+                          why=why, prompt=prompt, where=self._where())
+        else:
+            self.add_tool(project, name, args, ts, mode, session=session, call_id=call_id,
+                          agent=agent, why=why, prompt=prompt, where=self._where())
+        if dup:
+            return
+        items = self.network[before:]
+        refusal = tool_refusal(status, error)
+        for item in items:
+            item["rewound"] = rewound
+            if refusal:
+                item["_refused"] = True
+            elif status == "success":
+                item["failed"] = False
+            elif status == "error":
+                item["failed"] = True
+        if call_id:
+            self._net_by_call.pop(f"{agent}:{call_id}", None)    # outcome applied here
+        if rewound:
+            self.rewound_tool_calls += 1
+        if refusal:
+            kind = f"{agent}:{refusal}"
+            self.denials[kind] += 1
+            self.denials_by_project[clean(project)[:120] or "unknown"] += 1
+            shown = "Bash" if name == "run_shell_command" else name
+            self._record_refusal(kind, clean(project)[:120] or "unknown", ts,
+                                 (shown, cmd[:MAX_SCAN_LINE] if isinstance(cmd, str) else ""))
+
+    def scan_gemini(self, roots: list[Path], since: datetime | None,
+                    project_filter: str | None) -> None:
+        for root in roots:
+            registry = gemini_registry(root)
+            for d in _project_dirs(root):
+                real = gemini_project_root(d, registry)
+                project = path_project(real) if real else pretty_project(d.name)
+                if project_filter and project_filter.lower() not in project.lower():
+                    continue
+                for f in gemini_session_files(d):
+                    self._scan_gemini_file(f, project, real, since, root)
+
+    def _scan_gemini_file(self, path: Path, project: str, real: str,
+                          since: datetime | None, root: Path) -> None:
+        try:
+            st = path.stat()
+        except OSError:
+            return
+        if since is not None and st.st_mtime < (since.timestamp() - 3600):
+            return
+        self.bytes_scanned += st.st_size
+        self.files_scanned += 1
+        self._start_file(path, root)
+        sess = read_gemini_session(path)
+        if sess is None:
+            return
+        self.unparsable_lines += sess["unparsable"]
+        self.unsupported_records += sess["unsupported"]
+        meta = sess["meta"]
+        sid = _str_or(meta.get("sessionId"), path.stem)
+        prompt: str | None = None
+        active = False
+
+        def in_window(t: datetime | None) -> bool:
+            return not (since and t and t < since)
+
+        for msg, line, rewound in sess["messages"]:
+            self._src_line = line
+            kind = msg.get("type")
+            ts = parse_ts(msg.get("timestamp"))
+            if kind == "user":
+                prompt = _parts_text(msg.get("content")) or prompt
+                continue
+            if kind != "gemini":
+                continue
+            why = _parts_text(msg.get("content"))
+            tok = msg.get("tokens")
+            mid = msg.get("id")
+            if isinstance(tok, dict) and in_window(ts):
+                key = f"gemini:{mid}" if isinstance(mid, str) and mid else None
+                if key and key in self.seen_message_ids:
+                    self.duplicate_usage_records += 1
+                else:
+                    if key:
+                        self.seen_message_ids.add(key)
+                    self.add_model_usage("gemini", project, _str_or(msg.get("model"), "unknown"),
+                                         self._tok(tok.get("input")), self._tok(tok.get("output")),
+                                         self._tok(tok.get("cached")), self._tok(tok.get("thoughts")),
+                                         self._tok(tok.get("tool")), ts)
+                    active = True
+            calls = msg.get("toolCalls")
+            for tc in calls if isinstance(calls, list) else ():
+                if not isinstance(tc, dict):
+                    continue
+                cts = parse_ts(tc.get("timestamp")) or ts
+                if not in_window(cts):
+                    continue
+                active = True
+                args = tc.get("args")
+                args = args if isinstance(args, dict) else {}
+                name = _str_or(tc.get("name"), "?")
+                where = gemini_command_project(project, real, args) \
+                    if name == "run_shell_command" else project
+                self._vendor_call("gemini", where, name, args, cts, None, sid,
+                                  _str_or(tc.get("id"), None), _str_or(tc.get("status"), ""),
+                                  _response_error(tc.get("result")), why, prompt, rewound)
+        if active:
+            self.agents_seen.add("gemini")
+
+    def scan_qwen(self, roots: list[Path], since: datetime | None,
+                  project_filter: str | None) -> None:
+        for root in roots:
+            for d in _project_dirs(root):
+                for f in qwen_session_files(d):
+                    self._scan_qwen_file(f, d.name, since, project_filter, root)
+
+    def _scan_qwen_file(self, path: Path, slug: str, since: datetime | None,
+                        project_filter: str | None, root: Path) -> None:
+        """One Qwen Code session: records carry their own cwd, the approval mode
+        is written per user turn and on every change, tool calls are Gemini
+        functionCall parts and results are tool_result records."""
+        try:
+            st = path.stat()
+        except OSError:
+            return
+        if since is not None and st.st_mtime < (since.timestamp() - 3600):
+            return
+        self.bytes_scanned += st.st_size
+        self.files_scanned += 1
+        self._start_file(path, root)
+        mode: str | None = None
+        cwd = branch = ""
+        prompt = why = None
+        active = False
+        # call id -> (project, name, command, ts): a result joins its call.
+        calls: dict[str, tuple[str, str, str, datetime | None, list]] = {}
+        try:
+            with _open_regular(path) as fh:
+                for n, line in enumerate(fh, 1):
+                    ok, rec = _json_line(line)
+                    if not ok:
+                        self.unparsable_lines += 1
+                        continue
+                    if not isinstance(rec, dict):
+                        continue
+                    self._src_line = n
+                    cwd = _str_or(rec.get("cwd"), cwd)
+                    branch = _str_or(rec.get("gitBranch"), branch)
+                    project = path_project(cwd) if cwd else pretty_project(slug)
+                    ts = parse_ts(rec.get("timestamp"))
+                    kind = rec.get("type")
+                    msg = rec.get("message")
+                    parts = msg.get("parts") if isinstance(msg, dict) else None
+                    parts = parts if isinstance(parts, list) else []
+                    new_mode = None
+                    if kind == "user":
+                        ctx = rec.get("executionContext")
+                        new_mode = qwen_mode(ctx.get("approvalMode")) if isinstance(ctx, dict) else None
+                        said = _parts_text(parts)
+                        if said and not any(isinstance(p, dict) and "functionResponse" in p for p in parts):
+                            prompt, why = said, None
+                    elif kind == "system" and rec.get("subtype") == "session_approval_mode":
+                        pay = rec.get("systemPayload")
+                        new_mode = qwen_mode(pay.get("mode")) if isinstance(pay, dict) else None
+                    if new_mode:
+                        mode = new_mode         # in force for the calls that follow
+                    if project_filter and project_filter.lower() not in project.lower():
+                        continue
+                    if since and ts and ts < since:
+                        continue
+                    if new_mode and not self._record_seen(rec):
+                        self.permission_modes[new_mode] += 1
+                    if kind == "assistant":
+                        said = _parts_text(parts)
+                        why = said or why
+                        usage = rec.get("usageMetadata")
+                        if isinstance(usage, dict):
+                            uid = rec.get("uuid")
+                            key = f"qwen:{uid}" if isinstance(uid, str) and uid else None
+                            if key and key in self.seen_message_ids:
+                                self.duplicate_usage_records += 1
+                            else:
+                                if key:
+                                    self.seen_message_ids.add(key)
+                                self.add_model_usage(
+                                    "qwen", project, _str_or(rec.get("model"), "unknown"),
+                                    self._tok(usage.get("promptTokenCount")),
+                                    self._tok(usage.get("candidatesTokenCount")),
+                                    self._tok(usage.get("cachedContentTokenCount")),
+                                    self._tok(usage.get("thoughtsTokenCount")),
+                                    self._tok(usage.get("toolUsePromptTokenCount")), ts, branch)
+                                active = True
+                        for p in parts:
+                            fc = p.get("functionCall") if isinstance(p, dict) else None
+                            if not isinstance(fc, dict):
+                                continue
+                            active = True
+                            name = _str_or(fc.get("name"), "?")
+                            args = fc.get("args")
+                            args = args if isinstance(args, dict) else {}
+                            cid = _str_or(fc.get("id"), None)
+                            before = len(self.network)
+                            dup = bool(cid) and ("qwen", cid) in self.seen_tool_calls
+                            self._vendor_call("qwen", project, name, args, ts, mode,
+                                              rec.get("sessionId") if isinstance(rec.get("sessionId"), str)
+                                              else path.stem, cid, "", "", why, prompt)
+                            if cid and not dup:
+                                cmd = args.get("command") if name == "run_shell_command" else None
+                                calls[cid] = (project, name, cmd if isinstance(cmd, str) else "",
+                                              ts, list(range(before, len(self.network))))
+                    elif kind == "tool_result":
+                        why = None
+                        self._qwen_result(rec, parts, calls)
+        except OSError:
+            return
+        if active:
+            self.agents_seen.add("qwen")
+
+    def _qwen_result(self, rec: dict, parts: list, calls: dict) -> None:
+        """Apply one tool_result to the call it answers (by call id)."""
+        tcr = rec.get("toolCallResult")
+        tcr = tcr if isinstance(tcr, dict) else {}
+        cid = _str_or(tcr.get("callId"), "")
+        status = _str_or(tcr.get("status"), "")
+        err = tcr.get("error")
+        if isinstance(err, dict):
+            err = err.get("message")
+        err = err if isinstance(err, str) else ""
+        for p in parts:
+            fr = p.get("functionResponse") if isinstance(p, dict) else None
+            if isinstance(fr, dict):
+                cid = cid or _str_or(fr.get("id"), "")
+                err = err or _response_error([p])
+        hit = calls.pop(cid, None) if cid else None
+        if hit is None:
+            return
+        project, name, cmd, ts, idx = hit
+        refusal = tool_refusal(status, err)
+        for i in idx:
+            if i >= len(self.network):
+                continue
+            if refusal:
+                self.network[i]["_refused"] = True
+            elif status == "success":
+                self.network[i]["failed"] = False
+            elif status == "error":
+                self.network[i]["failed"] = True
+        if refusal:
+            kind = f"qwen:{refusal}"
+            self.denials[kind] += 1
+            self.denials_by_project[clean(project)[:120] or "unknown"] += 1
+            self._record_refusal(kind, clean(project)[:120] or "unknown", ts,
+                                 ("Bash" if name == "run_shell_command" else name, cmd[:MAX_SCAN_LINE]))
+
     def add_refusal(self, kind: str, rec: dict, project: str,
                     ts: datetime | None, calls: dict[str, tuple[str, str]]) -> None:
         """Attribute one refusal to the tool call it blocked.
@@ -5311,7 +9537,8 @@ class Fleet:
         if isinstance(blocks, list):
             for b in blocks:
                 if isinstance(b, dict) and b.get("type") == "tool_result":
-                    hit = calls.get(b.get("tool_use_id") or "")
+                    tid = b.get("tool_use_id")
+                    hit = calls.get(tid) if isinstance(tid, str) and tid else None
                     if hit:
                         break
         self._record_refusal(kind, project, ts, hit)
@@ -5330,9 +9557,9 @@ class Fleet:
         self.refusals_joined += 1
         self.refusal_tool[kind][clean(name)[:48] or "?"] += 1
         if name == "Bash" and cmd:
-            head = command_head(cmd)
+            head = display_head(cmd)
             if head:
-                self.refusal_program[kind][clean(head)[:40]] += 1
+                self.refusal_program[kind][head] += 1
 
     def add_subagent(self, result: dict, ts: datetime | None) -> None:
         """One completed subagent run.
@@ -5344,35 +9571,44 @@ class Fleet:
         transcript, so what is recorded here is an explicit FLOOR.
         """
         self.sub_calls += 1
-        model = clean(result.get("resolvedModel") or "unknown")[:48] or "unknown"
+        model = result.get("resolvedModel")
+        model = (clean(model)[:48] if isinstance(model, str) else "") or "unknown"
         self.sub_by_model[model] += 1
-        self.sub_status[result.get("status") or "?"] += 1
-        self.sub_ms += result.get("totalDurationMs") or 0
+        status = result.get("status")
+        self.sub_status[(clean(status)[:48] if isinstance(status, str) else "") or "?"] += 1
+        self.sub_ms += self._tok(result.get("totalDurationMs"))
 
-        stats = result.get("toolStats") or {}
+        stats = result.get("toolStats")
+        stats = stats if isinstance(stats, dict) else {}
         for k in ("bashCount", "readCount", "editFileCount", "searchCount", "otherToolCount"):
-            self.sub_tools[k] += stats.get(k, 0) or 0
-        self.sub_lines["added"] += stats.get("linesAdded", 0) or 0
-        self.sub_lines["removed"] += stats.get("linesRemoved", 0) or 0
+            self.sub_tools[k] += self._tok(stats.get(k))
+        self.sub_lines["added"] += self._tok(stats.get("linesAdded"))
+        self.sub_lines["removed"] += self._tok(stats.get("linesRemoved"))
 
         u = result.get("usage")
         if isinstance(u, dict):
             base = model.replace("[1m]", "")
             in_rate, out_rate, _prov, _known, _src = rates_for(base, ts)
             read_mult = rate_for(base).cache_read
-            cc = u.get("cache_creation") or {}
+            cc = u.get("cache_creation")
+            cc = cc if isinstance(cc, dict) else {}
             self.sub_cost_floor += (
-                (u.get("input_tokens", 0) or 0) / 1e6 * in_rate
-                + (u.get("output_tokens", 0) or 0) / 1e6 * out_rate
-                + (cc.get("ephemeral_1h_input_tokens", 0) or 0) / 1e6 * in_rate * CACHE_WRITE_1H_MULT
-                + (cc.get("ephemeral_5m_input_tokens", 0) or 0) / 1e6 * in_rate * CACHE_WRITE_5M_MULT
-                + (u.get("cache_read_input_tokens", 0) or 0) / 1e6 * in_rate * read_mult)
+                self._tok(u.get("input_tokens")) / 1e6 * in_rate
+                + self._tok(u.get("output_tokens")) / 1e6 * out_rate
+                + self._tok(cc.get("ephemeral_1h_input_tokens")) / 1e6 * in_rate * CACHE_WRITE_1H_MULT
+                + self._tok(cc.get("ephemeral_5m_input_tokens")) / 1e6 * in_rate * CACHE_WRITE_5M_MULT
+                + self._tok(u.get("cache_read_input_tokens")) / 1e6 * in_rate * read_mult)
 
     def add_tool(self, project: str, name: str, tool_input: dict, ts: datetime | None,
                  mode: str | None = None, *, session: str | None = None,
                  call_id: str | None = None, agent: str | None = None,
                  why: str | None = None, prompt: str | None = None,
                  where: dict | None = None) -> None:
+        if not isinstance(tool_input, dict):
+            tool_input = {}
+        if "command" in tool_input and not isinstance(tool_input["command"], str):
+            # A list or object here is not a command line: read it as absent.
+            tool_input = {k: v for k, v in tool_input.items() if k != "command"}
         if call_id:
             who = agent or ("codex" if (mode or "").startswith("codex:")
                             else "copilot" if (mode or "").startswith("copilot:") else "claude")
@@ -5396,6 +9632,10 @@ class Fleet:
             return
         self.bash_total += 1
         self.bash_by_project[project] += 1
+        if mode:
+            self.bash_moded += 1
+            if is_ungated_mode(mode):
+                self.bash_unsupervised += 1
         if self.network_only:
             return
         self.bash_categories[command_category(cmd)] += 1
@@ -5406,9 +9646,9 @@ class Fleet:
                 self.bash_moded_by_day[day] += 1
                 if is_ungated_mode(mode):
                     self.unsupervised_by_day[day] += 1
-        head = command_head(cmd)
+        head = display_head(cmd)
         if head:
-            self.bash_first_token[clean(head)[:40]] += 1
+            self.bash_first_token[head] += 1
 
         shapes = unreadable_shapes(cmd)
         if shapes:
@@ -5459,18 +9699,7 @@ class Fleet:
                 e["first"] = min(e["first"] or day, day)
                 e["last"] = max(e["last"] or day, day)
 
-        matches = audit_command(cmd)
-        if oversized and not any(cat == "remote-exec" for _, cat, _ in matches):
-            matches += self._oversized_remote_exec(cmd, windows)
-        # `cu''rl … | s''h` and `curl … | busybox sh` evade the
-        # remote-exec regex on the raw text; the network tokenizer reads them
-        # dequoted. One flag per command: added only when the rule did not fire.
-        if self._net_remote_exec and not any(cat == "remote-exec" for _, cat, _ in matches):
-            # The line holding the fetch that the shell runs, not just any pipe.
-            frag = self._net_remote_exec
-            line = next((ln for ln in cmd.splitlines() if frag in ln), None) \
-                or next((ln for ln in cmd.splitlines() if "|" in ln), cmd)
-            matches.append(("high", "remote-exec", clean(line[:MAX_SCAN_LINE].strip())))
+        matches = command_rule_matches(cmd, windows, self._net_remote_exec)
         if not matches:
             return
         worst = min(matches, key=lambda m: SEVERITY_ORDER.get(m[0], 9))
@@ -5534,14 +9763,8 @@ class Fleet:
                 m = rx.search(chunk)
                 if m:
                     return [(sev, "remote-exec", _redacted_excerpt(text, base + m.start(), base + m.end()))]
-        for w in windows[1:]:
-            piped: list[str] = []
-            try:
-                network_items_from_command(w, piped)
-            except Exception:                # noqa: BLE001 -- counted as oversized already
-                continue
-            if piped:
-                return [("high", "remote-exec", clean(redact(piped[0].strip())[:200]))]
+        # The dequoted `cu''rl … | s''h` shape needs no pass here: _add_network
+        # already read the whole command up to MAX_SCAN_HARD (_net_remote_exec).
         return []
 
     # -- scan --------------------------------------------------------------
@@ -5579,6 +9802,7 @@ class Fleet:
         self._mode = None
         self._prompt = None
         self._why_id, self._why_prior = None, []
+        self._file_keys = Counter()
         root = root if root is not None else path.parent
         self._src_root = str(root)
         try:
@@ -5610,7 +9834,7 @@ class Fleet:
         self._start_file(path, root)
         calls: dict[str, tuple[str, str]] = {}
         try:
-            with path.open("r", encoding="utf-8", errors="replace") as fh:
+            with _open_regular(path) as fh:
                 for n, line in enumerate(fh, 1):
                     # Cheap prefilter: skip lines that cannot contribute to any
                     # counter. Must include the permission fields, which live on
@@ -5627,9 +9851,9 @@ class Fleet:
                     if not counts and not said and '"is_error":true' not in line \
                             and '"is_error": true' not in line:
                         continue
-                    try:
-                        rec = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
+                    ok, rec = _json_line(line)
+                    if not ok:
+                        self.unparsable_lines += 1
                         continue
                     if not isinstance(rec, dict):
                         continue
@@ -5662,10 +9886,10 @@ class Fleet:
                     if _AUDIT_GATE.search(w.lower().translate(_DEQUOTE)) and writes_audit_config(w):
                         # Model-written text: escapes and newlines out, as everywhere else.
                         # Past the first window no command text is shown.
-                        evidence = (clean(redact(w)).replace("\n", " ") if n == 0 else
+                        evidence = (redact(clean(w)).replace("\n", " ") if n == 0 else
                                     f"a {len(cmd):,}-character command writes an audit config "
                                     "file past its first 32 KB")
-                        program = clean(command_head(cmd) or "Bash")[:40]
+                        program = display_head(cmd) or "Bash"
                         break
         elif name.lower() in _FILE_WRITE_TOOLS and tool_input.get("command") != "view":
             for key in ("file_path", "path", "notebook_path"):
@@ -5699,7 +9923,7 @@ class Fleet:
         change to that meaning cannot apply to one source and not the other.
         """
         ts = parse_ts(rec.get("timestamp"))
-        mode = clean(str(rec.get("permissionMode") or ""))[:48]
+        mode = clean(rec.get("permissionMode"))[:48]
         if mode:
             # Stays in force for the tool calls that follow it, even when this
             # record is itself older than the window.
@@ -5709,16 +9933,20 @@ class Fleet:
             return
         self._network_results(rec)
 
+        denial = clean(rec.get("toolDenialKind"))[:48]
+        if (mode or denial) and self._record_seen(rec):
+            # A resumed or forked session copies its history into a new file:
+            # the copy's mode and refusal records were counted from the first.
+            mode = denial = ""
         if mode:
             self.permission_modes[mode] += 1
-        denial = clean(str(rec.get("toolDenialKind") or ""))[:48]
         if denial:
             self.denials[denial] += 1
             self.denials_by_project[project] += 1
             self.add_refusal(denial, rec, project, ts, calls)
         eff = rec.get("effort")
-        if eff:
-            self.effort_mix[str(eff)] += 1
+        if isinstance(eff, str) and eff:
+            self.effort_mix[eff] += 1
 
         msg = rec.get("message")
         if not isinstance(msg, dict):
@@ -5728,6 +9956,8 @@ class Fleet:
         if isinstance(usage, dict):
             # One billable message, however many records carry it.
             mid = msg.get("id")
+            if not isinstance(mid, str):    # a list or object here is unhashable
+                mid = None
             if mid and mid in self.seen_message_ids:
                 self.duplicate_usage_records += 1
             else:
@@ -5744,16 +9974,48 @@ class Fleet:
         if isinstance(content, list):
             for k, block in enumerate(content):
                 if isinstance(block, dict) and block.get("type") == "tool_use":
+                    inp = block.get("input")
+                    inp = inp if isinstance(inp, dict) else {}
                     self.add_tool(project, block.get("name") or "?",
-                                  block.get("input") or {}, ts, self._mode,
+                                  inp, ts, self._mode,
                                   session=rec.get("sessionId"), call_id=block.get("id"),
                                   agent="claude", why=whys.get(k), prompt=self._prompt,
                                   where=self._where())
-                    if block.get("id"):
-                        calls[block["id"]] = (
-                            block.get("name") or "?",
-                            ((block.get("input") or {}).get("command") or "")
-                            [:MAX_SCAN_LINE])
+                    bid, cmd = block.get("id"), inp.get("command")
+                    if bid and isinstance(bid, str):
+                        calls[bid] = (block.get("name") or "?",
+                                      cmd[:MAX_SCAN_LINE] if isinstance(cmd, str) else "")
+
+    def _record_seen(self, rec: dict) -> bool:
+        """Whether this Claude Code (or Qwen) record was already counted from
+        another file. Keyed on what a copy keeps: uuid, session, timestamp,
+        type and the mode or refusal it carries. A record with neither a uuid
+        nor a timestamp is never taken for a repeat."""
+        uid, raw_ts, sid = rec.get("uuid"), rec.get("timestamp"), rec.get("sessionId")
+        uid = uid if isinstance(uid, str) else ""
+        raw_ts = raw_ts if isinstance(raw_ts, str) else ""
+        if not uid and not raw_ts:
+            return False
+        msg = rec.get("message")
+        blocks = msg.get("content") if isinstance(msg, dict) else None
+        tids = tuple(b["tool_use_id"] for b in (blocks if isinstance(blocks, list) else ())
+                     if isinstance(b, dict) and isinstance(b.get("tool_use_id"), str))
+        return self._seen_copy(("rec", uid, sid if isinstance(sid, str) else "", raw_ts,
+                                str(rec.get("type")), str(rec.get("permissionMode")),
+                                str(rec.get("toolDenialKind")), tids))
+
+    def _seen_copy(self, key: tuple) -> bool:
+        """Whether `key` was already counted from an earlier file. Each key is
+        numbered by its occurrence in this file, so two identical records in
+        one file both count, while a copied file's records match the
+        original's, one for one."""
+        n = self._file_keys[key]
+        self._file_keys[key] = n + 1
+        full = key + (n,)
+        if full in self.seen_records:
+            return True
+        self.seen_records.add(full)
+        return False
 
     def _claude_context(self, rec: dict) -> dict[int, str]:
         """Note a real user prompt, and collect an assistant message's text.
@@ -5806,14 +10068,22 @@ class Fleet:
                                  else "copilot" if (mode or "").startswith("copilot:") else "claude"),
                        str(session))
                 remotes = self._git_remotes.setdefault(key, {})
+            limits: list[str] = []
             try:
-                found, unparsed = network_items_from_command(cmd, piped, remotes)
+                found, unparsed = network_items_from_command(cmd, piped, remotes, limits)
             except Exception:                   # noqa: BLE001 -- one bad command must not end the scan
                 found, unparsed, piped = [], 1, []
             self.network_unparsed += unparsed
             self._net_remote_exec = piped[0].strip() if piped else ""
+            if limits:
+                # Part of the command was not read (R10): listed and flagged
+                # unresolved under --ioc (apply_ioc), never silently clean.
+                found = found + [_net_item("fetch", NET_UNREADABLE_PROGRAM, dynamic=True,
+                                           source=limits[0], _unreadable=True)]
         else:
             found = network_items_from_tool(name, tool_input)
+            if name.lower() == "web_fetch" and not tool_input.get("url"):
+                self.network_unparsed += urls_in_text(tool_input.get("prompt"))[1]
         if not found:
             return
         if not agent:
@@ -5845,9 +10115,13 @@ class Fleet:
                         call_id=clean(str(call_id))[:120] if call_id else None,
                         ts=ts.isoformat() if ts else None,
                         failed=False if agent == "claude" else None, trusted=False, ioc=None,
+                        rewound=False,
                         mode=clean(str(mode))[:48] or None if mode else None,
                         why=why, prompt=prompt, transcript=dict(where) if where else None,
                         _command=command)
+            if item.get("_unreadable"):
+                self.network_unreadable.append(item)
+                continue
             if call_id:
                 self._net_by_call.setdefault(f"{agent}:{call_id}", []).append(len(self.network))
             self.network.append(item)
@@ -5903,7 +10177,7 @@ class Fleet:
         self.files_scanned += 1
         self.bytes_scanned += st.st_size
         try:
-            with path.open("r", encoding="utf-8", errors="replace") as fh:
+            with _open_regular(path) as fh:
                 records = json.load(fh)
         except (OSError, json.JSONDecodeError, ValueError, RecursionError):
             return
@@ -6002,11 +10276,14 @@ MIN_PROJECT_MSGS = 200
 
 
 class Finding:
-    __slots__ = ("id", "severity", "title", "evidence", "action", "impact")
+    __slots__ = ("id", "severity", "title", "evidence", "action", "impact", "project")
 
-    def __init__(self, fid, severity, title, evidence, action, impact=None):
+    def __init__(self, fid, severity, title, evidence, action, impact=None, project=""):
         self.id, self.severity, self.title = fid, severity, title
         self.evidence, self.action, self.impact = evidence, action, impact
+        # The project a per-project finding (AF002, AF006) is about, else "".
+        # Several rows share one id, so --diff keys on (id, project).
+        self.project = project
 
 
 def cache_hit_rate(t: Counter) -> float:
@@ -6067,11 +10344,11 @@ def coach(fleet: "Fleet") -> list[Finding]:
                     f"prefix on most requests.",
                     "Look for a timestamp, a random id, or unsorted JSON early in the "
                     "context. Stable content must come first.",
-                    f"~{money(waste)} of avoidable spend at current volume"))
+                    f"~{money(waste)} of avoidable spend at current volume", project=proj))
 
     # --- AF003 unsupervised execution --------------------------------------
     auto = ungated_modes(fleet.permission_modes)
-    modes = sum(fleet.permission_modes.values())
+    modes = recorded_turns(fleet.permission_modes)
     if modes > 500:
         pct = auto / modes * 100
         if pct >= 75:
@@ -6129,7 +10406,8 @@ def coach(fleet: "Fleet") -> list[Finding]:
                     f"{proj} rejects or blocks {r:.1f}% of turns; your median project "
                     f"is {med:.1f}%.",
                     "Usually a context problem rather than a model problem. A CLAUDE.md "
-                    "in that project describing its conventions is the cheapest fix."))
+                    "in that project describing its conventions is the cheapest fix.",
+                    project=proj))
 
     # --- AF007 week-over-week trend ----------------------------------------
     days = sorted(fleet.cost_by_day.items())
@@ -6279,7 +10557,86 @@ def load_report(path: Path) -> dict:
             f"{path} uses schema_version {got}; this build writes "
             f"{JSON_SCHEMA_VERSION}. Regenerate the baseline with this version "
             "rather than comparing across schemas.")
+    problem = _baseline_problem(data)
+    if problem:
+        raise ValueError(f"{path} is not a well-formed baseline: {problem}. "
+                         "Regenerate it with actualis --json.")
     return data
+
+
+def _baseline_problem(data: dict) -> str:
+    """The first field --diff reads that has the wrong type, or "".
+
+    A baseline is a file the user hands us, often a CI artifact, so it is
+    checked like any other input rather than trusted to be our own output.
+    """
+    def obj(key, v):
+        return "" if v is None or isinstance(v, dict) else f"{key} is not an object"
+
+    def rows(key, v, strs, lists):
+        if v is None:
+            return ""
+        if not isinstance(v, list):
+            return f"{key} is not an array"
+        for i, r in enumerate(v):
+            if not isinstance(r, dict):
+                return f"{key}[{i}] is not an object"
+            for k in strs:
+                if k in r and r[k] is not None and not isinstance(r[k], str):
+                    return f"{key}[{i}].{k} is not a string"
+            for k in lists:
+                if k in r and r[k] is not None and not (
+                        isinstance(r[k], list) and all(isinstance(x, str) for x in r[k])):
+                    return f"{key}[{i}].{k} is not an array of strings"
+        return ""
+
+    bash = data.get("bash")
+    scanned = data.get("scanned")
+    checks = [
+        obj("window", data.get("window")),
+        obj("bash", bash),
+        obj("scope", data.get("scope")),
+        obj("scanned", scanned),
+        rows("secrets", data.get("secrets"), ("id", "priority"), ("types", "projects")),
+        rows("coach", data.get("coach"), ("id", "severity", "title", "project", "evidence"), ()),
+        rows("bash.flags", bash.get("flags") if isinstance(bash, dict) else None,
+             ("id", "severity", "program"), ("categories",)),
+    ]
+    for key in ("cost_usd", "messages"):
+        v = data.get(key)
+        if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
+            checks.append(f"{key} is not a number")
+    if isinstance(scanned, dict):
+        r = scanned.get("roots")
+        if r is not None and not (isinstance(r, list) and all(isinstance(x, str) for x in r)):
+            checks.append("scanned.roots is not an array of strings")
+    return next((c for c in checks if c), "")
+
+
+def _finding_key(r: dict) -> str:
+    """AF002 and AF006 repeat once per project under one id, so a finding is
+    (id, project). A baseline from before `project` existed names the project
+    only at the start of the evidence ("<project> reads ...")."""
+    fid = str(r["id"])
+    proj = r.get("project")
+    if not isinstance(proj, str):
+        proj = ""
+        ev = r.get("evidence")
+        if fid in ("AF002", "AF006") and isinstance(ev, str):
+            for verb in (" reads ", " rejects "):
+                if verb in ev:
+                    proj = ev.split(verb, 1)[0]
+                    break
+    return f"{fid}\x00{proj}" if proj else fid
+
+
+def _findings_by_key(rows: object) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    if isinstance(rows, list):
+        for r in rows:
+            if isinstance(r, dict) and r.get("id"):
+                out[_finding_key(r)] = r
+    return out
 
 
 def _by_id(rows: object) -> dict[str, dict]:
@@ -6314,7 +10671,7 @@ def diff_reports(old: dict, new: dict) -> dict:
     families = [
         ("secrets", _by_id(old.get("secrets")), _by_id(new.get("secrets")),
          "priority", "credential"),
-        ("findings", _by_id(old.get("coach")), _by_id(new.get("coach")),
+        ("findings", _findings_by_key(old.get("coach")), _findings_by_key(new.get("coach")),
          "severity", "finding"),
         ("flags", _flag_kinds(old), _flag_kinds(new), "severity", "command kind"),
     ]
@@ -6340,33 +10697,77 @@ def diff_reports(old: dict, new: dict) -> dict:
         ov, nv = old.get(key), new.get(key)
         if isinstance(ov, (int, float)) and isinstance(nv, (int, float)):
             out["totals"][key] = (ov, nv)
-    out["windows"] = (
-        (old.get("window") or {}).get("from"), (old.get("window") or {}).get("to"),
-        (new.get("window") or {}).get("from"), (new.get("window") or {}).get("to"))
+    ow = old.get("window") if isinstance(old.get("window"), dict) else {}
+    nw = new.get("window") if isinstance(new.get("window"), dict) else {}
+    out["windows"] = (ow.get("from"), ow.get("to"), nw.get("from"), nw.get("to"))
     out["digests"] = (old.get("report_sha256"), new.get("report_sha256"))
+    out["scope"] = _scope_differences(old, new)
     return out
+
+
+def _scope_differences(old: dict, new: dict) -> list[tuple[str, object, object]]:
+    """(flag, baseline value, this run's value) for each filter that differs.
+
+    Two reports over different populations diff as a wall of "new" and
+    "gone": a --project api baseline against a full run lists every other
+    project's credentials as new. Compared only where both sides record it.
+    """
+    out: list[tuple[str, object, object]] = []
+    os_, ns = old.get("scope"), new.get("scope")
+    if isinstance(os_, dict) and isinstance(ns, dict):
+        for key, flag in (("days", "--days"), ("project", "--project"), ("agent", "--agent")):
+            if os_.get(key) != ns.get(key):
+                out.append((flag, os_.get(key), ns.get(key)))
+    oc, nc = old.get("scanned"), new.get("scanned")
+    if isinstance(oc, dict) and isinstance(nc, dict):
+        orr, nr = oc.get("roots"), nc.get("roots")
+        if isinstance(orr, list) and isinstance(nr, list) and \
+                sorted(map(str, orr)) != sorted(map(str, nr)):
+            out.append(("roots", ", ".join(map(str, orr)), ", ".join(map(str, nr))))
+    return out
+
+
+def _txt(v: object) -> str:
+    """A value from a baseline file, safe to print: any type, no escapes."""
+    return clean(v if isinstance(v, str) else "" if v is None else str(v))
+
+
+def _txt_list(v: object) -> str:
+    return ", ".join(_txt(x) for x in v) if isinstance(v, list) else ""
 
 
 def _label(row: dict, family: str) -> str:
     if family == "secrets":
-        types = ", ".join(row.get("types") or []) or "unknown type"
-        where = ", ".join(row.get("projects") or [])
+        types = _txt_list(row.get("types")) or "unknown type"
+        where = _txt_list(row.get("projects"))
         return f"{types}" + (f"  in {where}" if where else "")
     if family == "findings":
-        return str(row.get("title") or "")
-    prog = row.get("program") or "?"
-    cats = ", ".join(row.get("categories") or [])
+        title = _txt(row.get("title"))
+        proj = row.get("project")
+        return title + (f"  ({_txt(proj)})" if isinstance(proj, str) and proj else "")
+    prog = _txt(row.get("program")) or "?"
+    cats = _txt_list(row.get("categories"))
     return f"{prog}" + (f"  ({cats})" if cats else "")
 
 
 def render_diff(d: dict, c: C) -> None:
     rule(c, "DIFF")
-    of, ot, nf, nt = d["windows"]
+    of, ot, nf, nt = (_txt(v) for v in d["windows"])
     print(f"  baseline   {of or '?'} → {ot or '?'}")
     print(f"  this run   {nf or '?'} → {nt or '?'}")
+    scope = d.get("scope") or []
+    if scope:
+        print(f"\n  {c.yellow}▲ The two reports have a different scope{c.off}, so rows "
+              f"below may differ because a different population was read, not "
+              f"because anything changed:")
+        for flag, ov, nv in scope:
+            print(f"    {flag:<10} baseline {_txt(ov) or '(none)'}  "
+                  f"this run {_txt(nv) or '(none)'}")
     od, nd = d["digests"]
+    od = od if isinstance(od, str) else None
+    nd = nd if isinstance(nd, str) else None
     if od and nd and od == nd:
-        print(f"\n  {c.ok}Identical report.{c.off} {c.dim}Same digest ({od[:16]}), "
+        print(f"\n  {c.ok}Identical report.{c.off} {c.dim}Same digest ({_txt(od[:16])}), "
               f"so nothing below changed.{c.off}\n")
         return
 
@@ -6374,24 +10775,25 @@ def render_diff(d: dict, c: C) -> None:
     for family, blk in d["families"].items():
         noun = blk["noun"]
         rows = []
+        sk = blk["sev_key"]
         for r in blk["appeared"]:
-            sev = r.get(blk["sev_key"], "")
+            sev = _txt(r.get(sk, ""))
             rows.append((_rank(sev), "new", sev, _label(r, family), ""))
         for r in blk["resolved"]:
-            sev = r.get(blk["sev_key"], "")
+            sev = _txt(r.get(sk, ""))
             rows.append((_rank(sev), "gone", sev, _label(r, family), ""))
         for ro, rn in blk["worse"]:
-            rows.append((_rank(rn.get(blk["sev_key"], "")), "worse",
-                         rn.get(blk["sev_key"], ""), _label(rn, family),
-                         f"was {ro.get(blk['sev_key'], '')}"))
+            sev = _txt(rn.get(sk, ""))
+            rows.append((_rank(sev), "worse", sev, _label(rn, family),
+                         f"was {_txt(ro.get(sk, ''))}"))
         for ro, rn in blk["better"]:
-            rows.append((_rank(rn.get(blk["sev_key"], "")), "better",
-                         rn.get(blk["sev_key"], ""), _label(rn, family),
-                         f"was {ro.get(blk['sev_key'], '')}"))
+            sev = _txt(rn.get(sk, ""))
+            rows.append((_rank(sev), "better", sev, _label(rn, family),
+                         f"was {_txt(ro.get(sk, ''))}"))
         for ro, rn in blk["moved"]:
             delta = rn["count"] - ro.get("count", 0)
-            rows.append((_rank(rn.get(blk["sev_key"], "")), "count",
-                         rn.get(blk["sev_key"], ""), _label(rn, family),
+            sev = _txt(rn.get(sk, ""))
+            rows.append((_rank(sev), "count", sev, _label(rn, family),
                          f"{ro.get('count', 0)} → {rn['count']} ({delta:+d})"))
         if not rows:
             continue
@@ -6445,8 +10847,16 @@ def replay(fingerprint: str, events: list[ReplayEvent]) -> dict:
     if not sightings:
         return {}
 
-    first, last = sightings[0].ts, sightings[-1].ts
-    window = [e for e in events if first <= e.ts <= last]
+    # A sighting with no usable timestamp still counts (the report counts it),
+    # but it cannot place a window: the window spans the dated ones, and the
+    # undated sightings join it as themselves. Other undated commands are not
+    # placed in it, since nothing says when they ran.
+    dated = [e for e in sightings if e.ts is not None]
+    first = dated[0].ts if dated else None
+    last = dated[-1].ts if dated else None
+    window = [e for e in events
+              if e.ts is not None and first is not None and first <= e.ts <= last]
+    window += [e for e in sightings if e.ts is None]
 
     kinds: set[str] = set()
     for e in sightings:
@@ -6476,7 +10886,7 @@ def replay(fingerprint: str, events: list[ReplayEvent]) -> dict:
     def programs(rows: list[ReplayEvent], n: int) -> dict:
         c: Counter = Counter()
         for e in rows:
-            head = command_head(e.cmd)
+            head = display_head(e.cmd)       # cleaned: model-written text
             if head:
                 c[head] += 1
         return dict(c.most_common(n))
@@ -6491,10 +10901,11 @@ def replay(fingerprint: str, events: list[ReplayEvent]) -> dict:
         "fingerprint": fingerprint,
         "types": sorted(kinds),
         "window": {
-            "first_seen": first.isoformat(),
-            "last_seen": last.isoformat(),
-            "days": round((last - first).total_seconds() / 86400, 2),
+            "first_seen": first.isoformat() if first else "",
+            "last_seen": last.isoformat() if last else "",
+            "days": round((last - first).total_seconds() / 86400, 2) if dated else 0.0,
             "sightings": len(sightings),
+            "undated_sightings": len(sightings) - len(dated),
         },
         "exposure": {
             "sessions": strs(sightings, "session"),
@@ -6546,9 +10957,11 @@ def render_replay(inc: dict, c: C) -> None:
     w, ex, br, iv = inc["window"], inc["exposure"], inc["blast_radius"], inc["investigate"]
     rule(c, f"INCIDENT  {inc['fingerprint']}")
     print(f"  credential   {c.red}{', '.join(inc['types']) or 'unclassified'}{c.off}")
-    print(f"  first seen   {w['first_seen'][:19].replace('T', ' ')}")
-    print(f"  last seen    {w['last_seen'][:19].replace('T', ' ')}")
-    print(f"  exposed for  {c.bold}{w['days']} days{c.off} across {w['sightings']} appearances")
+    print(f"  first seen   {w['first_seen'][:19].replace('T', ' ') or 'undated'}")
+    print(f"  last seen    {w['last_seen'][:19].replace('T', ' ') or 'undated'}")
+    undated = w.get("undated_sightings", 0)
+    print(f"  exposed for  {c.bold}{w['days']} days{c.off} across {w['sightings']} appearances"
+          + (f"  {c.dim}({undated} undated: no usable timestamp){c.off}" if undated else ""))
 
     print(f"\n  {c.bold}WHERE IT APPEARED{c.off}")
     for label, key in (("projects", "projects"), ("branches", "branches"),
@@ -6652,7 +11065,9 @@ def render_coach(findings: list[Finding], c: C) -> None:
 def _wrap(text: str, width: int) -> list[str]:
     words, lines, cur = text.split(), [], ""
     for w in words:
-        if len(cur) + len(w) + 1 > width:
+        # `cur and`: a first word longer than the width starts the first
+        # line, rather than leaving an empty line above it.
+        if cur and len(cur) + len(w) + 1 > width:
             lines.append(cur); cur = w
         else:
             cur = f"{cur} {w}".strip()
@@ -6701,7 +11116,8 @@ def notify(title: str, message: str) -> None:
 
 
 def _jsonl_files(roots: list[Path], codex: list[Path],
-                 copilot: list[Path] | None = None) -> list[Path]:
+                 copilot: list[Path] | None = None, gemini: list[Path] | None = None,
+                 qwen: list[Path] | None = None) -> list[Path]:
     out: list[Path] = []
     for r in roots:
         try:
@@ -6718,11 +11134,61 @@ def _jsonl_files(roots: list[Path], codex: list[Path],
             out.extend(r.glob("*/events.jsonl"))
         except OSError:
             continue
+    # Gemini's legacy .json sessions are rewritten whole, never appended: not watched.
+    for r in gemini or []:
+        out.extend(f for d in _project_dirs(r) for f in gemini_session_files(d)
+                   if f.suffix == ".jsonl")
+    for r in qwen or []:
+        out.extend(f for d in _project_dirs(r) for f in qwen_session_files(d))
     return out
 
 
+WATCH_RESCAN_SECS = 30.0     # how often --watch re-walks the transcript directories
+
+
+def command_rule_matches(cmd: str, windows: list[str] | None = None,
+                         net_remote_exec: str | None = None) -> list[tuple[str, str, str]]:
+    """[(severity, category, line)] the report raises for one shell command:
+    the audit rules, the remote-exec rules past the scan cut of an oversized
+    command, and the remote execution only the network tokenizer reads
+    (`cu''rl … | s''h`, `| busybox sh`, `| /bin/bash`, `bash <(curl …)`).
+    The report and --watch both use it, so they agree (R3C8).
+    `net_remote_exec`, when the caller already read the command's network
+    items, is the fetch a shell runs ("" for none); None reads it here."""
+    matches = audit_command(cmd)
+    if len(cmd) > MAX_SCAN_TOTAL and not any(cat == "remote-exec" for _, cat, _ in matches):
+        matches += Fleet._oversized_remote_exec(cmd, windows if windows is not None else scan_windows(cmd))
+    if net_remote_exec is None:
+        piped: list[str] = []
+        try:
+            network_items_from_command(cmd, piped)
+        except Exception:                    # noqa: BLE001 -- as _add_network: never end the caller
+            piped = []
+        net_remote_exec = piped[0].strip() if piped else ""
+    # `cu''rl … | s''h` and `curl … | busybox sh` evade the
+    # remote-exec regex on the raw text; the network tokenizer reads them
+    # dequoted. One flag per command: added only when the rule did not fire.
+    if net_remote_exec and not any(cat == "remote-exec" for _, cat, _ in matches):
+        # The line holding the fetch that the shell runs, not just any pipe.
+        frag = net_remote_exec
+        line = next((ln for ln in cmd.split("\n") if frag in ln), None) \
+            or next((ln for ln in cmd.split("\n") if "|" in ln), cmd)
+        matches.append(("high", "remote-exec", clean(line[:MAX_SCAN_LINE].strip())))
+    # A write to git, npm, yarn or pip download configuration redirects every
+    # later download, including ones in later tool calls this scan cannot tie
+    # to it (R3F7): a medium finding, so the redirect is seen.
+    try:
+        written = network_config_write(cmd)
+    except Exception:                        # noqa: BLE001 -- as above: never end the caller
+        written = ""
+    if written:
+        matches.append(("med", "network-config", clean(written[:MAX_SCAN_LINE].strip())))
+    return matches
+
+
 def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
-          quiet: bool, raw: bool, copilot: list[Path] | None = None) -> int:
+          quiet: bool, raw: bool, copilot: list[Path] | None = None,
+          gemini: list[Path] | None = None, qwen: list[Path] | None = None) -> int:
     import time
 
     # Python block-buffers stdout when it is not a terminal. For a watcher that
@@ -6734,7 +11200,9 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
         pass
 
     offsets: dict[Path, int] = {}
-    for f in _jsonl_files(roots, codex, copilot):
+    files = _jsonl_files(roots, codex, copilot, gemini, qwen)
+    last_walk = time.monotonic()
+    for f in files:
         try:
             offsets[f] = f.stat().st_size      # start at EOF: history is not news
         except OSError:
@@ -6743,8 +11211,67 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
     seen_secrets: set[str] = set()
     cmds = flagged = crit = 0
     started = datetime.now(timezone.utc)
+    # A Codex rollout lives under sessions/YYYY/MM/DD, so its directory names
+    # a day, not a project: the project comes from the rollout's own cwd.
+    rollout_cwd: dict[Path, str] = {}
 
-    srcs = ", ".join(str(r) for r in (roots + codex + (copilot or [])))
+    def rollout_head_cwd(f: Path) -> str:
+        # session_meta is a rollout's first line, written before watch began.
+        try:
+            with _open_regular(f) as fh:
+                rec = _json_line(fh.readline(1 << 20))[1]
+        except OSError:
+            return ""
+        payload = rec.get("payload") if isinstance(rec, dict) else None
+        if isinstance(rec, dict) and rec.get("type") in ("session_meta", "turn_context") \
+                and isinstance(payload, dict):
+            return _str_or(payload.get("cwd"), "")
+        return ""
+
+    # Likewise a Copilot session: its directory is the session id, and the
+    # project comes from the cwd in session.start / session.context_changed.
+    copilot_cwd: dict[Path, str] = {}
+
+    def copilot_ctx(rec: object, cwd: str) -> str:
+        if not isinstance(rec, dict) or not isinstance(rec.get("data"), dict):
+            return cwd
+        kind = rec.get("type")
+        if kind not in ("session.start", "session.context_changed"):
+            return cwd
+        ctx = rec["data"].get("context") if kind == "session.start" else rec["data"]
+        return _copilot_context(ctx, cwd, "")[0] if isinstance(ctx, dict) else cwd
+
+    def copilot_head_cwd(f: Path) -> str:
+        # session.start is the first line, written before watch began.
+        try:
+            with _open_regular(f) as fh:
+                return copilot_ctx(_json_line(fh.readline(1 << 20))[1], "")
+        except OSError:
+            return ""
+
+    srcs = ", ".join(str(r) for r in (roots + codex + (copilot or []) + (gemini or [])
+                                      + (qwen or [])))
+    # Gemini re-appends a whole message each time it changes, so a call id
+    # already alerted on is not alerted on again.
+    seen_calls: set[tuple[str, str]] = set()
+    gem_projects: dict[Path, str] = {}
+
+    def vendor_of(f: Path) -> str:
+        for name, group in (("gemini", gemini or []), ("qwen", qwen or [])):
+            for r in group:
+                try:
+                    if f.is_relative_to(r):
+                        return name
+                except (ValueError, OSError):
+                    continue
+        return ""
+
+    def gemini_project(f: Path) -> str:
+        d = f.parent.parent if f.parent.name == "chats" else f.parent.parent.parent
+        if d not in gem_projects:
+            real = gemini_project_root(d, {})
+            gem_projects[d] = path_project(real) if real else pretty_project(d.name)
+        return gem_projects[d]
     print(f"{c.bold}actualis watch{c.off} {c.dim}· {len(offsets)} files · every "
           f"{interval:g}s · ctrl-c to stop{c.off}")
     print(f"{c.dim}watching {srcs}{c.off}")
@@ -6752,7 +11279,18 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
 
     try:
         while True:
-            for f in _jsonl_files(roots, codex, copilot):
+            # Walking every transcript directory is the expensive part, so it
+            # happens every WATCH_RESCAN_SECS; in between only known files are
+            # stat'ed. Offsets of files that have gone are dropped.
+            if time.monotonic() - last_walk >= WATCH_RESCAN_SECS:
+                files = _jsonl_files(roots, codex, copilot, gemini, qwen)
+                last_walk = time.monotonic()
+                live = set(files)
+                for gone in [k for k in offsets if k not in live]:
+                    del offsets[gone]
+                    rollout_cwd.pop(gone, None)
+                    copilot_cwd.pop(gone, None)
+            for f in files:
                 try:
                     size = f.stat().st_size
                 except OSError:
@@ -6766,33 +11304,81 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
                 if size == start:
                     continue
                 try:
-                    with f.open("r", encoding="utf-8", errors="replace") as fh:
+                    with _open_regular(f, binary=True) as fh:
                         fh.seek(start)
                         chunk = fh.read()
-                        offsets[f] = fh.tell()
                 except OSError:
                     continue
+                # Only complete lines are consumed. A record caught mid-write
+                # stays unread until its newline arrives, instead of being
+                # split across two polls and failing to parse both times.
+                end = chunk.rfind(b"\n")
+                if end < 0:
+                    continue
+                offsets[f] = start + end + 1
 
+                rollout = f.name.startswith("rollout-")
+                if rollout and f not in rollout_cwd:
+                    rollout_cwd[f] = rollout_head_cwd(f) if start else ""
+                vendor = vendor_of(f) if (gemini or qwen) else ""
+                is_copilot = f.name == "events.jsonl" and not vendor
+                if is_copilot and f not in copilot_cwd:
+                    copilot_cwd[f] = copilot_head_cwd(f) if start else ""
                 project = ("copilot" if f.name == "events.jsonl"
+                           else gemini_project(f) if vendor == "gemini"
                            else pretty_project(f.parent.name))
-                for line in chunk.splitlines():
+                for raw_line in chunk[:end].split(b"\n"):
+                    line = raw_line.decode("utf-8", "replace")
+                    context = (rollout and ('"session_meta"' in line or '"turn_context"' in line)) \
+                        or (is_copilot and ('"session.start"' in line
+                                            or '"session.context_changed"' in line))
                     if ('"tool_use"' not in line and '"function_call"' not in line
-                            and '"tool.execution_start"' not in line):
+                            and '"tool.execution_start"' not in line and not context
+                            and '"toolCalls"' not in line and '"functionCall"' not in line):
                         continue
-                    try:
-                        rec = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
+                    rec = _json_line(line)[1]
                     if not isinstance(rec, dict):
                         continue
-                    for command in _commands_in(rec):
+                    if rollout:
+                        payload = rec.get("payload")
+                        if rec.get("type") in ("session_meta", "turn_context") \
+                                and isinstance(payload, dict):
+                            rollout_cwd[f] = _str_or(payload.get("cwd"), rollout_cwd[f])
+                        cwd = rollout_cwd[f]
+                        project = (pretty_project(cwd.lstrip("/").replace("/", "-"))
+                                   if cwd else "codex")
+                    if is_copilot:
+                        cwd = copilot_cwd[f] = copilot_ctx(rec, copilot_cwd[f])
+                        project = (pretty_project(cwd.lstrip("/").replace("/", "-"))
+                                   if cwd else "copilot")
+                    if vendor == "qwen":
+                        cwd = _str_or(rec.get("cwd"), "")
+                        project = path_project(cwd) if cwd else pretty_project(f.parent.parent.name)
+                    try:
+                        if vendor:
+                            commands = []
+                            for cid, cmd in _vendor_shell_calls(rec, vendor):
+                                if cid and (vendor, cid) in seen_calls:
+                                    continue
+                                if cid:
+                                    seen_calls.add((vendor, cid))
+                                commands.append(cmd)
+                        else:
+                            commands = _commands_in(rec)
+                    except OSError:
+                        raise
+                    except Exception:
+                        # The watcher runs unattended: one odd record must not
+                        # switch it off.
+                        continue
+                    for command in commands:
                         cmds += 1
                         for pri, kind, fp in classify_secrets(command):
                             if fp in seen_secrets or pri == "low":
                                 continue
                             seen_secrets.add(fp)
                             crit += 1
-                            msg = f"{kind} in {project}"
+                            msg = f"{kind} in {_one_line(project)}"
                             # flush: under a service manager stdout is a file,
                             # so it is block-buffered. Without this an alert can
                             # sit unwritten for hours -- which is the whole
@@ -6800,14 +11386,14 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
                             print(f"\r{c.red}▲ SECRET{c.off}  {msg}  {c.dim}{fp}{c.off}"
                                   + " " * 20, flush=True)
                             notify("actualis: credential exposed", msg)
-                        hits = audit_command(command)
+                        hits = command_rule_matches(command)   # what the report flags (R3C8)
                         high = [h for h in hits if h[0] == "high"]
                         if high:
                             flagged += 1
                             cats = ",".join(sorted({h[1] for h in high}))
-                            line_txt = high[0][2] if raw else redact(high[0][2])
+                            line_txt = _one_line(high[0][2] if raw else redact(high[0][2]))
                             print(f"\r{c.yellow}▲ {cats}{c.off}  {line_txt[:88]}"
-                                  f"  {c.dim}{project[:28]}{c.off}" + " " * 10,
+                                  f"  {c.dim}{_one_line(project)[:28]}{c.off}" + " " * 10,
                                   flush=True)
                             if not quiet:
                                 notify(f"actualis: {cats}", line_txt[:120])
@@ -6821,6 +11407,8 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
                       f"{flagged} flagged · {crit} secrets{c.off}", end="", flush=True)
             time.sleep(interval)
     except KeyboardInterrupt:
+        # Computed here: Ctrl-C can land before the first pass has finished.
+        mins = (datetime.now(timezone.utc) - started).total_seconds() / 60
         if sys.stdout.isatty():
             print(f"\r{' ' * 72}\r", end="")
         print(f"{c.bold}stopped{c.off} after {mins:.1f}m · {cmds} commands · "
@@ -6828,24 +11416,55 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
         return 0
 
 
+def _vendor_shell_calls(rec: dict, vendor: str | None = None) -> list[tuple[str, str]]:
+    """(call id or "", command) for each run_shell_command in one Gemini CLI
+    message (toolCalls) or Qwen Code record (functionCall parts of an
+    assistant record, as the report's Qwen reader reads them). `vendor` names
+    the format the record came from: "gemini" reads only toolCalls, "qwen"
+    only the parts, so one agent's file is never read as the other's. None
+    (a record of unknown origin) reads both."""
+    out: list[tuple[str, str]] = []
+    calls = rec.get("toolCalls") if vendor != "qwen" else None
+    found = [(tc, tc.get("args")) for tc in (calls if isinstance(calls, list) else ())
+             if isinstance(tc, dict)]
+    msg = rec.get("message") if vendor != "gemini" else None
+    if vendor == "qwen" and rec.get("type") != "assistant":
+        msg = None
+    parts = msg.get("parts") if isinstance(msg, dict) else None
+    for p in parts if isinstance(parts, list) else ():
+        fc = p.get("functionCall") if isinstance(p, dict) else None
+        if isinstance(fc, dict):
+            found.append((fc, fc.get("args")))
+    for call, args in found:
+        cmd = args.get("command") if isinstance(args, dict) else None
+        if call.get("name") == "run_shell_command" and isinstance(cmd, str) and cmd:
+            out.append((_str_or(call.get("id"), ""), cmd))
+    return out
+
+
 def _commands_in(rec: dict) -> list[str]:
     """Every shell command in one transcript record, across every agent format."""
-    out: list[str] = []
+    out: list[str] = [cmd for _cid, cmd in _vendor_shell_calls(rec)]
     msg = rec.get("message")
     if isinstance(msg, dict) and isinstance(msg.get("content"), list):
         for b in msg["content"]:
             if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Bash":
-                cmd = (b.get("input") or {}).get("command")
-                if cmd:
+                inp = b.get("input")
+                cmd = inp.get("command") if isinstance(inp, dict) else None
+                if isinstance(cmd, str) and cmd:
                     out.append(cmd)
     payload = rec.get("payload")
     if isinstance(payload, dict) and payload.get("name") == "shell_command":
+        # Untrusted types (R1), as the main scanner treats them: a non-string
+        # `arguments`, a non-object decode or a non-string command is absent.
+        raw_args = payload.get("arguments")
         try:
-            args = json.loads(payload.get("arguments") or "{}")
-        except (json.JSONDecodeError, ValueError):
+            args = json.loads(raw_args) if isinstance(raw_args, str) else {}
+        except (ValueError, RecursionError):
             args = {}
-        if args.get("command"):
-            out.append(args["command"])
+        cmd = args.get("command") if isinstance(args, dict) else None
+        if isinstance(cmd, str) and cmd:
+            out.append(cmd)
     data = rec.get("data")
     if rec.get("type") == "tool.execution_start" and isinstance(data, dict) \
             and data.get("toolName") == "bash":
@@ -6870,7 +11489,7 @@ def _commands_in(rec: dict) -> list[str]:
 # --------------------------------------------------------------------------
 # What each vendor's transcript actually gives you
 #
-# Three agents are supported, unevenly, and until now nothing said how. Someone
+# Five agents are supported, unevenly, and until now nothing said how. Someone
 # comparing a Claude Code project against a Codex one was comparing different
 # measurements without being told which.
 #
@@ -6921,13 +11540,49 @@ VENDOR_CAPABILITIES = (
     ("Reasoning effort",     YES,     NO,      NO,      "effort"),
 )
 
-_VENDOR_COLUMN = {"claude": 1, "codex": 2, "copilot": 3}
+# Gemini CLI and Qwen Code, per capability above: (gemini, qwen, the field it
+# rests on). Kept beside the original table rather than widening its rows, so
+# every reader of the five-column shape is unchanged.
+VENDOR_CAPABILITIES_MORE = {
+    "Cost and token usage": (YES, YES, "Gemini: message tokens (input includes cached; "
+                             "thoughts billed as output). Qwen: usageMetadata. A model with "
+                             "no published rate shows tokens and no cost"),
+    "Per-message dedup":    (YES, YES, "Gemini: message id, last re-appended version wins; "
+                             "Qwen: record uuid"),
+    "Shell command text":   (YES, YES, "toolCalls / functionCall run_shell_command"),
+    "Project attribution":  (YES, YES, "Gemini: tmp/<slug>/.project_root or projects.json, "
+                             "else the slug; Qwen: cwd on every record"),
+    "Git branch":           (NO, YES, "Gemini sessions carry no branch; Qwen: gitBranch"),
+    "Tool refusals":        (PARTIAL, PARTIAL, "Gemini: status cancelled with 'User denied "
+                             "execution.' or error 'Tool execution denied by policy.'; "
+                             "Qwen: the same texts in tool_result, not confirmed"),
+    "Permission mode":      (NO, YES, "Gemini writes no approval and no mode change, so every "
+                             "Gemini call's approval is unknown; Qwen: executionContext."
+                             "approvalMode per turn and session_approval_mode changes"),
+    "Sandbox policy":       (NO, NO, "neither transcript records a sandbox"),
+    "Subagent activity":    (YES, PARTIAL, "Gemini: chats/<parent>/<subagent>.jsonl, a full "
+                             "transcript; Qwen: sidechain records in the session file"),
+    "Subagent cost":        (YES, PARTIAL, "Gemini subagent transcripts carry their own "
+                             "tokens and are priced like any session"),
+    "Cache TTL split":      (NO, NO, "Gemini usage has one cached count"),
+    "Reasoning effort":     (NO, NO, "thought tokens are counted, no effort level is written"),
+}
+
+_VENDOR_COLUMN = {"claude": 1, "codex": 2, "copilot": 3, "gemini": 5, "qwen": 6}
 
 
 def vendor_gaps(vendor: str) -> list[tuple[str, str]]:
     """Capabilities this vendor does not fully provide, with the reason."""
-    idx = _VENDOR_COLUMN.get(vendor, 2)
+    idx = _VENDOR_COLUMN[vendor]       # an unknown vendor is a KeyError, not Codex's gaps
+    if idx > 4:
+        return [(cap, VENDOR_CAPABILITIES_MORE[cap][2]) for cap, *_ in VENDOR_CAPABILITIES
+                if VENDOR_CAPABILITIES_MORE[cap][idx - 5] != YES]
     return [(row[0], row[4]) for row in VENDOR_CAPABILITIES if row[idx] != YES]
+
+
+# Every id coach() can emit; --why rejects anything else as a usage error.
+# Defined before EXPLAIN, whose coach text quotes the range from it.
+COACH_FINDING_IDS = tuple(f"AF{n:03d}" for n in range(1, 14))
 
 
 EXPLAIN: dict[str, dict[str, object]] = {
@@ -6937,6 +11592,10 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "Claude Code  ~/.claude/projects/**/*.jsonl  (plus $CLAUDE_CONFIG_DIR)",
             "Codex        $CODEX_HOME/sessions/**/rollout-*.jsonl",
             "Copilot CLI  $COPILOT_HOME/session-state/*/events.jsonl  (default ~/.copilot)",
+            "Gemini CLI   $GEMINI_CLI_HOME/.gemini/tmp/<project>/chats/  (default ~/.gemini;",
+            "             also ~/.cache/.gemini, where a macOS sandbox run writes)",
+            "Qwen Code    $QWEN_RUNTIME_DIR or $QWEN_HOME /projects/<project>/chats/*.jsonl",
+            "             (default ~/.qwen)",
             "",
             "Files are opened read-only. Nothing is written, cached, or sent.",
             "Every directory actually scanned is printed in the report header.",
@@ -6968,6 +11627,13 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "",
             "OpenAI differs: input_tokens INCLUDES cached, so the cached portion is",
             "billed at 0.10x and only the remainder at full rate.",
+            "",
+            "Gemini CLI and Qwen Code likewise: the prompt INCLUDES cached tokens,",
+            "and thinking tokens are billed at the output rate. Gemini Pro models",
+            "reprice a whole message above 200,000 prompt tokens, and dated Google",
+            "price changes apply by the message's UTC date. A model with no",
+            "published rate (gemini-3.5-flash, every Qwen model) adds tokens and no",
+            "cost: see --explain gemini.",
         ],
         "assumes": [
             "List prices, hardcoded and dated in the source. They drift.",
@@ -6978,18 +11644,23 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "Versions before 0.1.1 did not assume this and billed every record,",
             "which overstated a real corpus by 2.13x. If you have a figure from",
             "0.1.0, re-run it.",
-            "Models with no published rate are priced at the top of the known range",
-            "for their provider; that share is reported separately so you can",
-            "subtract it.",
+            "Claude and OpenAI models with no published rate are priced at the top",
+            "of the known range for their provider; that estimated share is",
+            "reported separately (cost_usd_from_unpriced_models) so you can",
+            "subtract it. Gemini, Gemma and Qwen ids with no published rate are",
+            "the exception: tier 'unpriced', $0 and their tokens listed",
+            "(unpriced_model_tokens), never estimated.",
         ],
         "verify": ("actualis --json | jq '.cost_usd, .duplicate_usage_records_skipped, "
-                   ".cost_usd_from_unpriced_models'"),
+                   ".cost_usd_from_unpriced_models, .unpriced_model_tokens'"),
     },
     "vendors": {
         "measures": "What each agent's transcript actually contains, and what it does not.",
         "formula": [
-            "capability                claude   codex    copilot",
-        ] + [f"  {cap:<24}{c:<9}{x:<9}{p}" for cap, c, x, p, _why in VENDOR_CAPABILITIES] + [
+            "capability                claude   codex    copilot  gemini   qwen",
+        ] + [f"  {cap:<24}{c:<9}{x:<9}{p:<9}{VENDOR_CAPABILITIES_MORE[cap][0]:<9}"
+             f"{VENDOR_CAPABILITIES_MORE[cap][1]}"
+             for cap, c, x, p, _why in VENDOR_CAPABILITIES] + [
             "",
             "Every row names the transcript field it rests on; see",
             "VENDOR_CAPABILITIES in the source.",
@@ -7035,6 +11706,71 @@ EXPLAIN: dict[str, dict[str, object]] = {
         ],
         "verify": ("jq -c 'select(.type==\"session.shutdown\") | .data.modelMetrics' "
                    "~/.copilot/session-state/*/events.jsonl"),
+    },
+    "gemini": {
+        "measures": "How a Gemini CLI session is read, and what it cannot show.",
+        "formula": [
+            "Source    $GEMINI_CLI_HOME/.gemini/tmp/<project>/chats/ (GEMINI_CLI_HOME",
+            "          replaces the home dir; default ~/.gemini), and ~/.cache/.gemini",
+            "          where a macOS sandbox run writes. session-*.jsonl, the legacy",
+            "          session-*.json, and chats/<parent session>/*.jsonl subagents",
+            "Messages  the last line of each message id wins (Gemini re-appends a",
+            "          message whenever it changes). $set merges metadata. $rewindTo",
+            "          removes a message and all after it from the conversation; their",
+            "          tool calls ran, so they are kept and counted as rewound. $patch",
+            "          (0.64 preview) and unknown records are skipped and counted",
+            "Project   tmp/<slug>/.project_root, else projects.json, else the slug; a",
+            "          command whose dir_path is an absolute path outside the root is",
+            "          attributed to that path",
+            "Cost      per message: (input - cached + tool) x input rate",
+            "          + cached x cached rate + (output + thoughts) x output rate.",
+            "          Pro models above 200,000 prompt tokens: the long-prompt rate",
+            "Approval  unknown for every call: not recorded",
+            "Refusal   status cancelled + 'User denied execution.' (a person), or",
+            "          status error + 'Tool execution denied by policy.' (a policy)",
+        ],
+        "assumes": [
+            "Gemini CLI does not write whether a person approved a call, or the",
+            "approval mode (YOLO, auto-edit) it ran in. Even an auto-approved call",
+            "is recorded like one a person allowed, so this is not guessed.",
+            "Models Google's price list does not name (gemini-3-pro-preview,",
+            "gemini-3.5-flash) show tokens and no cost. A free-tier session cannot",
+            "be told apart, so Gemini cost is API-equivalent.",
+            "logs.json, checkpoints and shell_history are not read: they hold the",
+            "person's own prompts and ! commands, not what the agent ran.",
+            "--watch reads JSONL sessions only; a legacy .json session is rewritten",
+            "whole, never appended.",
+        ],
+        "verify": "actualis --agent gemini --json | jq '.by_agent, .rewound_tool_calls, "
+                  ".unsupported_records, .unpriced_model_tokens'",
+    },
+    "qwen": {
+        "measures": "How a Qwen Code session is read, and what it cannot show.",
+        "formula": [
+            "Source    $QWEN_RUNTIME_DIR/projects/<cwd slug>/chats/<session>.jsonl, and",
+            "          $QWEN_HOME/projects (QWEN_HOME is the .qwen directory; default",
+            "          ~/.qwen)",
+            "Project   the cwd written on every record; the branch from gitBranch",
+            "Commands  functionCall parts named run_shell_command",
+            "Cost      usageMetadata per assistant record, once per record uuid:",
+            "          promptTokenCount includes cachedContentTokenCount; thoughts",
+            "          are billed at the output rate",
+            "Mode      executionContext.approvalMode per user turn, and",
+            "          session_approval_mode records on every change: yolo and auto",
+            "          are unasked; default, plan and auto-edit are unknown",
+            "Refusal   a tool_result with the same denial texts as Gemini CLI",
+        ],
+        "assumes": [
+            "auto-edit approves edits only, so a shell command in it still asks: it",
+            "is not counted as unsupervised. Whether a person approved one call is",
+            "not recorded.",
+            "Qwen publishes no USD price this tool can cite, so Qwen models show",
+            "tokens and no cost. A model with a published price (a Gemini, Claude",
+            "or OpenAI id run through Qwen Code) is priced at that rate.",
+            "The refusal texts are Gemini CLI's, inherited by the fork; Qwen's own",
+            "were not confirmed.",
+        ],
+        "verify": "actualis --agent qwen --json | jq '.by_agent, .permission_modes'",
     },
     "diff": {
         "measures": "What changed between a saved report and this one.",
@@ -7205,35 +11941,51 @@ EXPLAIN: dict[str, dict[str, object]] = {
         "measures": "Downloads and fetches the agents made (actualis --network), and whether a person approved each.",
         "formula": [
             "The inventory is a tripwire, not a guarantee. It reads only what the",
-            "transcript shows. Shell commands are split on && || ; | and newlines",
-            "(outside quotes), on the dequoted text, so cu''rl and \"cu\"rl read as curl.",
+            "transcript shows. Shell commands are read as bash reads them, by the",
+            "same lexer the shell audit uses: split on && || ; | & and newlines",
+            "outside quotes and # comments, on the dequoted text ($'...' decoded), so",
+            "cu''rl and \"cu\"rl read as curl.",
             "Also read, as commands of their own:",
             "  command substitution $(...) and backticks, and process substitution",
-            "  <(...), to three levels;",
+            "  <(...), at any depth (200 levels), also inside an unquoted heredoc;",
             "  the string after a shell's -c, including combined flags (bash -lc,",
-            "  sh -xc), and the arguments of eval;",
-            "  the bodies of if/while/until/for loops, { } and ( ) groups, and a leading !.",
+            "  sh -xc), su -c, find -exec, the arguments of eval, and a heredoc or",
+            "  here-string fed to a shell, to 8 levels;",
+            "  the action of trap 'CMD' SIGNAL;",
+            "  the bodies of if/while/until/for loops, case arms, { } and ( ) groups,",
+            "  and a leading !.",
+            "Brace expansion is applied to the program word and to URLs (cu{r,}l is",
+            "curl, https://{a,b}.io is two URLs), up to 16 words. Arithmetic and",
+            "[[ ... ]] text is not read as commands; their substitutions are.",
             "Skipped to reach the command: sudo env time nice nohup command exec",
-            "timeout stdbuf doas busybox xargs, and VAR=value. Under xargs the",
+            "timeout stdbuf doas busybox xargs coproc setsid caffeinate arch flock",
+            "watch, and VAR=value. Under xargs the",
             "arguments may arrive on stdin, so a bare `xargs curl` is recorded as a",
             "fetch with a variable host.",
             "Recognised programs: curl wget git gh npm pnpm yarn bun npx bunx pip",
             "pip3 uv uvx pipx brew cargo go docker podman.",
             "Counted as unreadable (totals.unparsed_segments), not skipped silently:",
-            "a segment with a quote left open, and substitution nested deeper than",
-            "3 levels.",
+            "a segment with a quote left open, a brace expansion past 16 words, and",
+            "nesting past the levels above",
+            "(under --ioc, such a command is also an unresolved item).",
             "A git remote is resolved to the URL it was added or cloned with earlier",
             "in the same session; a remote name that resolves to nothing has no host",
             "and is listed, not flagged.",
             "Tool calls: WebFetch,",
-            "WebSearch, web_fetch, web_search, and any tool named like",
-            "fetch/browse/download/http.",
+            "WebSearch, web_fetch, web_search, google_web_search, and any tool named",
+            "like fetch/browse/download/http. Gemini's web_fetch takes a prompt, not",
+            "a url: every http(s) URL written in the prompt is an item.",
             "",
             "approval  asked    Copilot asked the person before the call",
             "          unasked  the call ran in auto or bypass mode, Codex 'never', or a",
             "                   Copilot standing rule",
             "          unknown  default mode: an allowlist rule may have approved it",
-            "                   without asking; the transcript does not say",
+            "                   without asking; the transcript does not say. Every",
+            "                   Gemini CLI call: Gemini records no approval at all",
+            "Qwen Code: yolo and auto are unasked; default, plan and auto-edit unknown.",
+            "A Gemini or Qwen call a person declined or a policy blocked is a refusal",
+            "and leaves the inventory. A Gemini call a later rewind removed from the",
+            "conversation still ran: it stays, with rewound: true.",
             "",
             "--network-strict makes each untrusted, unasked or unknown, not-failed",
             "(program, host) group a medium finding. --network-trust HOST[/PATH] and",
@@ -7293,6 +12045,10 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "               No call_id is recorded for Codex.",
             "  Copilot      why: the latest assistant.message text, cleared when a",
             "               tool completes. prompt: the latest user.message.",
+            "  Gemini CLI   why: the text of the message holding the call. prompt:",
+            "               the latest user message.",
+            "  Qwen Code    why: the latest assistant text, cleared by a tool result.",
+            "               prompt: the latest user message.",
             "A field the records do not give is null.",
             "",
             "To see the exact transcript record behind an item:",
@@ -7351,7 +12107,10 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "                     or tarball URL (name-from-url), a Go package inside",
             "                     a listed module could not be ordered",
             "                     (module-prefix), or checking failed",
-            "                     (error). Medium finding, network-ioc-unresolved.",
+            "                     (error); also a host that cannot be normalised",
+            "                     (host-unresolved) or a transfer the command sends",
+            "                     through a proxy or another address (redirected).",
+            "                     Medium finding, network-ioc-unresolved.",
             "A listed name whose version is outside every spec is clean, and only",
             "counted (clean_name_matches).",
             "",
@@ -7473,7 +12232,8 @@ EXPLAIN: dict[str, dict[str, object]] = {
     "coach": {
         "measures": "Findings worth acting on, benchmarked against your own history.",
         "formula": [
-            "Each finding AF001-AF011 has a documented threshold. Comparisons are",
+            f"Each finding {COACH_FINDING_IDS[0]}-{COACH_FINDING_IDS[-1]} has a documented "
+            "threshold. Comparisons are",
             "against YOUR OWN median: project vs project, week vs week, ticket vs",
             "your median ticket.",
             "",
@@ -7527,6 +12287,7 @@ def render_explain(topic: str | None, c: C) -> int:
     return 0
 
 
+
 def render_why(fid: str, fleet: Fleet, c: C) -> int:
     """Explain one finding against the user's actual numbers."""
     fid = fid.upper()
@@ -7539,17 +12300,27 @@ def render_why(fid: str, fleet: Fleet, c: C) -> int:
             print(f"  {c.dim}Currently firing: {', '.join(known)}{c.off}")
         print(f"  {c.dim}All findings and their thresholds: docs/findings.md{c.off}\n")
         return 1
-    f = found[0]
-    col = c.red if f.severity == "critical" else (c.yellow if f.severity == "high" else c.cyan)
-    print(f"  {col}{f.severity.upper()}{c.off}  {c.bold}{f.title}{c.off}\n")
-    print(f"  {c.bold}Why it fired, with your numbers{c.off}")
-    for line in _wrap(f.evidence, 84):
-        print(f"    {line}")
-    if f.impact:
-        print(f"\n  {c.bold}Estimated impact{c.off}\n    {c.yellow}{f.impact}{c.off}")
-    print(f"\n  {c.bold}What to do{c.off}")
-    for line in _wrap(f.action, 84):
-        print(f"    {line}")
+    # AF002 and AF006 fire once per project under one id: explain every one,
+    # or fixing the first and re-running looks like whack-a-mole.
+    if len(found) > 1:
+        names = [" ".join(str(f.project or "?").split())[:66] for f in found]
+        print(f"  {c.bold}Firing for {len(found)} projects:{c.off} {', '.join(names)}")
+        print(f"  {c.dim}Narrow to one with --project.{c.off}\n")
+    for i, f in enumerate(found):
+        if len(found) > 1:
+            print(f"  {c.bold}── {names[i]}{c.off}\n")
+        col = c.red if f.severity == "critical" else (c.yellow if f.severity == "high" else c.cyan)
+        print(f"  {col}{f.severity.upper()}{c.off}  {c.bold}{f.title}{c.off}\n")
+        print(f"  {c.bold}Why it fired, with your numbers{c.off}")
+        for line in _wrap(f.evidence, 84):
+            print(f"    {line}")
+        if f.impact:
+            print(f"\n  {c.bold}Estimated impact{c.off}\n    {c.yellow}{f.impact}{c.off}")
+        print(f"\n  {c.bold}What to do{c.off}")
+        for line in _wrap(f.action, 84):
+            print(f"    {line}")
+        if i < len(found) - 1:
+            print()
     print(f"\n  {c.dim}Threshold and method: docs/findings.md#{fid.lower()}{c.off}")
     print(f"  {c.dim}Underlying data:      actualis --json{c.off}\n")
     return 0
@@ -7591,6 +12362,7 @@ AGENT_COMMANDS = [
     ("Codex", "codex"),
     ("GitHub Copilot CLI", "copilot"),
     ("Gemini CLI", "gemini"),
+    ("Qwen Code", "qwen"),
     ("Cursor Agent", "cursor-agent"),
     ("Aider", "aider"),
     ("Cline", "cline"),
@@ -7785,11 +12557,11 @@ MCP_TOOLS = [
     },
     {
         "name": "explain",
+        # Built from EXPLAIN so a new topic is advertised the day it ships.
         "description": "How a number is computed, what it assumes, and how to verify it "
-                       "independently. Topics: sources, cost, cache, tickets, secrets, "
-                       "subagents, shell, coach, agents.",
+                       "independently. Topics: " + ", ".join(sorted(EXPLAIN)) + ".",
         "inputSchema": {"type": "object", "properties": {
-            "topic": {"type": "string"}}, "required": ["topic"]},
+            "topic": {"type": "string", "enum": sorted(EXPLAIN)}}, "required": ["topic"]},
     },
     {
         "name": "verify_agents",
@@ -7816,10 +12588,13 @@ MCP_TOOLS = [
 MCP_CACHE_MAX = 8
 MCP_MAX_DAYS = 3650
 MCP_MAX_PROJECT = 200
+MCP_MAX_LINE = 1_000_000     # bytes; a longer JSON-RPC line is refused unparsed
 
 
 def clamp_days(v: object) -> int | None:
     """Client-supplied window, bounded. bool is an int in Python and must not pass."""
+    if isinstance(v, float) and v.is_integer():    # 7.0 is a natural thing to send
+        v = int(v)
     if isinstance(v, bool) or not isinstance(v, int):
         return None
     return min(max(v, 1), MCP_MAX_DAYS)
@@ -7828,10 +12603,62 @@ def clamp_days(v: object) -> int | None:
 class _MCPCache:
     """A scan takes ~80s over a large fleet, so hold it — but only a few, LRU."""
 
-    def __init__(self) -> None:
+    def __init__(self, scope: dict | None = None) -> None:
         self._store: OrderedDict[tuple, Fleet] = OrderedDict()
+        # The --root, --agent, --days and --project the server was started
+        # with (R14). A client may narrow them, never widen them.
+        self.scope = scope or {}
+
+    def _narrow(self, days: int | None, project: str | None) -> tuple:
+        cli_days = self.scope.get("days")
+        if cli_days:
+            days = min(days, cli_days) if days else cli_days
+        cli_project = self.scope.get("project")
+        if cli_project:
+            want, have = (project or "").lower(), cli_project.lower()
+            if not project or have in want:
+                project = project or cli_project      # the client's is the narrower one
+            elif want in have:
+                project = cli_project
+            else:
+                raise _MCPClientError(
+                    f"this server was started with --project {clean(cli_project)[:100]}; "
+                    f"ask for a project whose name contains it, or for none")
+        return days, project
+
+    def _scan(self, f: Fleet, since: datetime | None, project: str | None) -> None:
+        """The same roots and parsers main() would read for this scope."""
+        agent = self.scope.get("agent") or "all"
+        root = self.scope.get("root")
+        if root:
+            root = Path(root).expanduser()
+            if agent == "codex":
+                f.roots.append(root)
+                f.scan_codex([root], since, project)
+            elif agent == "copilot":
+                f.roots.append(root)
+                f.scan_copilot([root], since, project)
+            elif agent in ("gemini", "qwen"):
+                vroot = _agent_root(root, agent)
+                f.roots.append(vroot)
+                (f.scan_gemini if agent == "gemini" else f.scan_qwen)([vroot], since, project)
+            else:
+                f.scan([root], since, project, progress=False)
+            return
+        roots = transcript_roots() if agent in ("all", "claude") else []
+        if roots:
+            f.scan(roots, since, project, progress=False)
+        for name, find, scan in (("codex", codex_roots, f.scan_codex),
+                                 ("copilot", copilot_roots, f.scan_copilot),
+                                 ("gemini", gemini_roots, f.scan_gemini),
+                                 ("qwen", qwen_roots, f.scan_qwen)):
+            found = find() if agent in ("all", name) else []
+            if found:
+                f.roots.extend(found)
+                scan(found, since, project)
 
     def fleet(self, days: int | None = None, project: str | None = None) -> Fleet:
+        days, project = self._narrow(days, project)
         key = (days, project)
         if key in self._store:
             self._store.move_to_end(key)
@@ -7839,33 +12666,61 @@ class _MCPCache:
             f = Fleet()
             # The same cutoff as the CLI's --days, so the two never disagree.
             since = window_start(days) if days else None
-            roots = transcript_roots()
-            if roots:
-                f.scan(roots, since, project, progress=False)
-            croots = codex_roots()
-            if croots:
-                f.roots.extend(croots)
-                f.scan_codex(croots, since, project)
-            proots = copilot_roots()
-            if proots:
-                f.roots.extend(proots)
-                f.scan_copilot(proots, since, project)
+            self._scan(f, since, project)
             self._store[key] = f
             while len(self._store) > MCP_CACHE_MAX:
                 self._store.popitem(last=False)
         return self._store[key]
 
 
+class _MCPClientError(ValueError):
+    """A bad request from the client. Only this is echoed back (-32602): its
+    message names what the client sent. Any other ValueError comes from inside
+    a scan, may quote paths or data, and gets the redacted -32603 reply."""
+
+
+_MCP_TOOL_BY_NAME = {t["name"]: t for t in MCP_TOOLS}
+
+
 def _mcp_call(name: str, args: dict, cache: _MCPCache) -> dict:
-    project = args.get("project")
-    f = cache.fleet(clamp_days(args.get("days")),
+    if not isinstance(args, dict):
+        raise _MCPClientError("arguments must be an object")
+
+    # Tools that need no scan answer before one is started: a scan takes
+    # minutes over a large fleet, and an unknown name must not cost one.
+    if name == "explain":
+        topic = str(args.get("topic", "")).lower()
+        e = EXPLAIN.get(topic)
+        if not e:
+            return {"topics": sorted(EXPLAIN), "error": f"unknown topic: {topic[:100]}"}
+        return {"topic": topic, "measures": e["measures"], "formula": e["formula"],
+                "assumes": e["assumes"], "verify_independently": e["verify"]}
+
+    if name == "verify_agents":
+        rows = verify_agents()
+        return {"agents": rows,
+                "note": "a valid signature proves origin and integrity, not safety; "
+                        "unsigned is normal for npm and script installs"}
+
+    tool = _MCP_TOOL_BY_NAME.get(name) if isinstance(name, str) else None
+    if tool is None:
+        raise _MCPClientError(f"unknown tool: {str(name)[:100]}")
+    # Only the arguments a tool declares reach the cache key. Otherwise a
+    # client varying an ignored `project` forced a fresh full scan per call.
+    declared = tool["inputSchema"].get("properties", {})
+    project = args.get("project") if "project" in declared else None
+    days = clamp_days(args.get("days")) if "days" in declared else None
+    if "days" in declared and args.get("days") is not None and days is None:
+        # "7" or 7.5 used to mean all time without a word.
+        raise _MCPClientError("days must be a whole number of days, e.g. 7")
+    f = cache.fleet(days,
                     project[:MCP_MAX_PROJECT] if isinstance(project, str) else None)
 
     if name == "fleet_summary":
         ctx = Counter()
         for t in f.tokens_by_project.values():
             ctx.update(t)
-        modes = sum(f.permission_modes.values())
+        modes = recorded_turns(f.permission_modes)
         unsup = ungated_modes(f.permission_modes)
         top = sorted(f.cost_by_project.items(), key=lambda kv: -kv[1])[:8]
         return {
@@ -7874,10 +12729,18 @@ def _mcp_call(name: str, args: dict, cache: _MCPCache) -> dict:
                        "active_days": f.active_days},
             "messages": f.messages,
             "cost_usd_list_price": round(f.total_cost, 2),
+            # Estimated spend (family or ceiling price), as in --json. Models
+            # with no price at all (tier unpriced) add no cost: they are listed
+            # with their tokens in unpriced_model_tokens instead.
             "cost_usd_from_unpriced_models": round(f.cost_unknown, 2),
+            "unpriced_model_tokens": dict(f.unpriced_tokens),
             "duplicate_usage_records_skipped": f.duplicate_usage_records,
             "cost_note": "provider list prices; a subscription bills a flat fee, so read "
-                         "this as consumption rather than a bill",
+                         "this as consumption rather than a bill. "
+                         "cost_usd_from_unpriced_models is the estimated part (models "
+                         "priced by family or provider ceiling); models with no "
+                         "published rate at all are in unpriced_model_tokens and "
+                         "add no cost",
             "cache_hit_rate_pct": round(cache_hit_rate(ctx), 1),
             "cache_saved_usd": round(sum(f.cache_uncached.values())
                                      - sum(f.cache_actual.values()), 2),
@@ -7885,10 +12748,17 @@ def _mcp_call(name: str, args: dict, cache: _MCPCache) -> dict:
             "top_projects": [{"project": p, "cost_usd": round(c, 2)} for p, c in top],
             "shell_commands": f.bash_total,
             "unsupervised_pct": round(unsup / modes * 100, 1) if modes else None,
+            "unsupervised_basis": "turns with a recorded permission mode",
+            "moded_commands": f.bash_moded,
+            "unmoded_commands": max(f.bash_total - f.bash_moded, 0),
         }
 
     if name == "ticket_cost":
         want = args.get("ticket")
+        if isinstance(want, bool) or not isinstance(want, (str, int, type(None))):
+            raise _MCPClientError("ticket must be a string, e.g. '#412' or 'PROJ-456'")
+        if isinstance(want, int):
+            want = str(want)                 # 412 is a natural thing for a model to send
         rows = sorted(f.cost_by_ticket.items(), key=lambda kv: -kv[1])
         if want:
             key = want if want.startswith("#") or "-" in want else f"#{want}"
@@ -7901,7 +12771,10 @@ def _mcp_call(name: str, args: dict, cache: _MCPCache) -> dict:
                     "messages": f.msgs_by_ticket[t],
                     "branches": sorted(f.branches_by_ticket[t]),
                     "active_days": len(set(f.dates_by_ticket.get(t, [])))}
-        lim = args.get("limit") if isinstance(args.get("limit"), int) else 15
+        lim = args.get("limit")
+        # bool is an int; a negative limit sliced off the last ticket instead.
+        lim = (min(max(lim, 1), 200) if isinstance(lim, int) and not isinstance(lim, bool)
+               else 15)
         med = _median(list(f.cost_by_ticket.values())) if f.cost_by_ticket else 0
         return {"ticket_count": len(rows), "median_ticket_usd": round(med, 2),
                 "unattributed_usd": round(f.cost_by_branch.get("trunk", 0)
@@ -7912,40 +12785,38 @@ def _mcp_call(name: str, args: dict, cache: _MCPCache) -> dict:
     if name == "exposed_secrets":
         want = args.get("priority", "all")
         rank = {"critical": 0, "high": 1, "low": 2}
+        # An unknown priority ("medium") used to return every row unfiltered.
+        if not isinstance(want, str) or (want not in rank and want != "all"):
+            raise _MCPClientError("priority must be one of critical, high, low, all")
         rows = sorted(f.secrets.items(), key=lambda kv: (rank.get(kv[1]["priority"], 9),
                                                          -kv[1]["uses"]))
         if want in rank:
             rows = [r for r in rows if r[1]["priority"] == want]
         return {
             "distinct_secrets": len(rows),
-            "worth_rotating": sum(1 for _, e in rows if e["priority"] != "low"),
+            # As the report counts it: a credential the user suppressed as not
+            # a credential is not worth rotating.
+            "worth_rotating": sum(1 for _, e in rows
+                                  if e["priority"] != "low" and not e.get("suppressed")),
+            "suppressed": sum(1 for _, e in rows if e.get("suppressed")),
             "note": "a fingerprint is sha256[:8] of the value, or for a password, of "
-                    "where it appeared; values are never stored or returned",
+                    "where it appeared; values are never stored or returned. A "
+                    "suppressed row was marked as not a credential on this machine",
             "secrets": [{"priority": e["priority"], "types": sorted(e["kinds"]),
                          "fingerprint": fp, "uses": e["uses"],
-                         "first_seen": e["first"], "last_seen": e["last"],
+                         "first_seen": e["first"] or "", "last_seen": e["last"] or "",
                          "projects": sorted(e["projects"]),
-                         "distinct_values": e.get("distinct_values", 1)} for fp, e in rows[:50]],
+                         "distinct_values": e.get("distinct_values", 1),
+                         "suppressed": bool(e.get("suppressed")),
+                         "suppressed_reason": e.get("suppressed_reason", "")}
+                        for fp, e in rows[:50]],
         }
-
-    if name == "explain":
-        topic = str(args.get("topic", "")).lower()
-        e = EXPLAIN.get(topic)
-        if not e:
-            return {"topics": sorted(EXPLAIN), "error": f"unknown topic: {topic}"}
-        return {"topic": topic, "measures": e["measures"], "formula": e["formula"],
-                "assumes": e["assumes"], "verify_independently": e["verify"]}
-
-    if name == "verify_agents":
-        rows = verify_agents()
-        return {"agents": rows,
-                "note": "a valid signature proves origin and integrity, not safety; "
-                        "unsigned is normal for npm and script installs"}
 
     if name == "coach_findings":
         return {"findings": [{"id": x.id, "severity": x.severity, "title": x.title,
                               "evidence": x.evidence, "action": x.action,
-                              "impact": x.impact} for x in coach(f)]}
+                              "impact": x.impact, "project": x.project}
+                             for x in coach(f)]}
 
     if name == "shell_audit":
         sub = f.sub_tools.get("bashCount", 0)
@@ -7975,35 +12846,82 @@ def _mcp_call(name: str, args: dict, cache: _MCPCache) -> dict:
                     "anything returned here is written back into a transcript",
         }
 
-    raise ValueError(f"unknown tool: {name}")
+    raise _MCPClientError(f"unknown tool: {name}")
 
 
-def mcp_serve() -> int:
-    """JSON-RPC over stdio. Nothing but protocol may be written to stdout."""
-    cache = _MCPCache()
+def _mcp_lines(stream):
+    """Lines from stdin, at most MCP_MAX_LINE long. An overlong line is
+    drained and yielded as None, so it is refused without ever being held."""
+    while True:
+        raw = stream.readline(MCP_MAX_LINE + 1)
+        if not raw:
+            return
+        nl = b"\n" if isinstance(raw, bytes) else "\n"
+        if len(raw) > MCP_MAX_LINE and not raw.endswith(nl):
+            while True:
+                more = stream.readline(MCP_MAX_LINE)
+                if not more or more.endswith(nl):
+                    break
+            yield None
+            continue
+        yield raw
+
+
+def mcp_serve(scope: dict | None = None) -> int:
+    """JSON-RPC over stdio. Nothing but protocol may be written to stdout.
+
+    No line may stop the server: a parse failure answers -32700, anything that
+    is not a request object (a batch included) answers -32600, and the loop
+    carries on with the next line. `scope` holds the --root, --agent, --days
+    and --project it was started with; every answer stays inside them."""
+    cache = _MCPCache(scope)
     out = sys.stdout
 
     def send(obj: dict) -> None:
         out.write(json.dumps(obj) + "\n")
         out.flush()
 
-    for line in sys.stdin:
-        line = line.strip()
+    def error(rid, code: int, message: str) -> None:
+        send({"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}})
+
+    # Bytes, decoded leniently: a strict text stdin raised UnicodeDecodeError
+    # out of the iterator on one bad byte, outside every handler.
+    stdin = getattr(sys.stdin, "buffer", None) or sys.stdin
+    for raw in _mcp_lines(stdin):
+        if raw is None:
+            error(None, -32700, f"parse error: line longer than {MCP_MAX_LINE} bytes")
+            continue
+        line = (raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw).strip()
         if not line:
             continue
         try:
             req = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
+        except (ValueError, RecursionError):    # RecursionError: deeply nested input
+            error(None, -32700, "parse error")
+            continue
+        if not isinstance(req, dict):
+            error(None, -32600, "invalid request: batches are not supported"
+                  if isinstance(req, list) else "invalid request")
             continue
         method, rid = req.get("method"), req.get("id")
+        # NaN and infinity parse, but a reply echoing them is not valid JSON.
+        if rid is not None and (isinstance(rid, bool) or not isinstance(rid, (str, int, float))
+                                or (isinstance(rid, float)
+                                    and (rid != rid or rid in (float("inf"), float("-inf"))))):
+            error(None, -32600, "invalid request: id must be a string or number")
+            continue
+        if not isinstance(method, str):
+            error(rid, -32600, "invalid request: method must be a string")
+            continue
 
         # Notifications carry no id and get no reply.
-        if rid is None and str(method or "").startswith("notifications/"):
+        if rid is None and method.startswith("notifications/"):
             continue
 
         try:
             if method == "initialize":
-                asked = (req.get("params") or {}).get("protocolVersion")
+                params = req.get("params")
+                asked = params.get("protocolVersion") if isinstance(params, dict) else None
                 result = {
                     "protocolVersion": asked if asked in MCP_PROTOCOL_VERSIONS
                                        else MCP_PROTOCOL_VERSIONS[0],
@@ -8013,8 +12931,12 @@ def mcp_serve() -> int:
             elif method in ("tools/list", "server/discover"):
                 result = {"tools": MCP_TOOLS, "ttlMs": 3_600_000, "cacheScope": "session"}
             elif method == "tools/call":
-                params = req.get("params") or {}
-                payload = _mcp_call(params.get("name"), params.get("arguments") or {}, cache)
+                params = req.get("params")
+                if not isinstance(params, dict):
+                    raise _MCPClientError("params must be an object")
+                arguments = params.get("arguments")
+                payload = _mcp_call(params.get("name"),
+                                    {} if arguments is None else arguments, cache)
                 result = {"content": [{"type": "text",
                                        "text": json.dumps(payload, indent=2)}],
                           "structuredContent": payload,
@@ -8024,10 +12946,12 @@ def mcp_serve() -> int:
             else:
                 if rid is not None:
                     send({"jsonrpc": "2.0", "id": rid,
-                          "error": {"code": -32601, "message": f"method not found: {method}"}})
+                          "error": {"code": -32601,
+                                    "message": f"method not found: {method[:100]}"}})
                 continue
-        except ValueError as exc:
-            # Deliberate, client-facing: the message is the caller's own tool name.
+        except _MCPClientError as exc:
+            # Deliberate, client-facing: the message names what the caller sent.
+            # Any other ValueError falls through to the redacted branch below.
             if rid is not None:
                 send({"jsonrpc": "2.0", "id": rid,
                       "error": {"code": -32602, "message": str(exc)[:200]}})
@@ -8141,7 +13065,18 @@ def make_output_printable(json_mode: bool) -> None:
     """Guarantee that printing a report cannot raise on this terminal."""
     for name in ("stdout", "stderr"):
         stream = getattr(sys, name, None)
-        if stream is None or _stream_handles_glyphs(stream):
+        if stream is None:
+            continue
+        if _stream_handles_glyphs(stream):
+            # The codec carries every glyph, but a lone surrogate from a
+            # transcript is unencodable in any codec: escape it, never raise.
+            # (surrogateescape, the default under a C or UTF-8-mode locale,
+            # covers only U+DC80-DCFF, so it raises on the rest.)
+            if getattr(stream, "errors", "strict") in ("strict", "surrogateescape"):
+                try:
+                    stream.reconfigure(errors="backslashreplace")
+                except (AttributeError, OSError, ValueError):
+                    pass
             continue
         if json_mode and name == "stdout":
             # JSON is defined in terms of Unicode; give it a codec that can
@@ -8396,7 +13331,7 @@ def _render_network_sessions(fleet: "Fleet", n: dict, c: "C", top: int, raw: boo
             groups.setdefault(i["session"] or "", []).append(i)
     for g in groups.values():
         g.sort(key=_net_order_key)
-    order = sorted(groups, key=lambda s: (max((i["ts"] or "") for i in groups[s]), s), reverse=True)
+    order = sorted(groups, key=lambda s: (max(_net_utc_key(i["ts"]) for i in groups[s]), s), reverse=True)
     shown = order[:min(max(top, 0), NET_SESSIONS)]
     print(f"  {want.upper()}, BY SESSION   {c.dim}newest first{c.off}")
     for sid in shown:
@@ -8503,8 +13438,8 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False,
           f" · {num(t['unknown'])} unknown"
           + (f" · {num(t['failed'])} failed" if t["failed"] else ""))
     if t["unknown"]:
-        print(f"  {c.dim}unknown = default mode, where an allowlist rule may have approved it "
-              f"without asking{c.off}")
+        print(f"  {c.dim}unknown = no record of who approved it (an allowlist rule in default "
+              f"mode, or an agent with none){c.off}")
     if fleet.network_trust_sources:
         parts = []
         for src in fleet.network_trust_sources:
@@ -8520,7 +13455,9 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False,
     items = fleet.network_items
     if filters:
         joined = " \u00b7 ".join(filters)
-        print(f"  {c.dim}FILTER   {joined}{c.off}"[:NET_VIEW_WIDTH + len(c.dim) + len(c.off)])
+        # Clip the text, not the escape-wrapped string: slicing that dropped the
+        # trailing reset and left the rest of the report dim.
+        print(f"  {c.dim}{clip('FILTER   ' + joined, NET_VIEW_WIDTH - 2)}{c.off}")
     _render_network_strip(n, c)
     if filters:
         _render_network_items(fleet, c, top, raw, filters)
@@ -8925,7 +13862,7 @@ def write_network_html(page: str, out_dir: Path) -> Path:
     """Write the page, never over an existing file: O_EXCL makes that hold
     even under a race, and a lost race takes the next name. 0600 because the
     page holds commands and URLs from the user's transcripts."""
-    data = page.encode("utf-8")
+    data = page.encode("utf-8", "replace")     # a lone surrogate must not abort the write
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     for _ in range(100):                     # a lost race takes the next name; bounded
         path = network_html_path(out_dir)
@@ -8946,6 +13883,55 @@ def write_network_html(page: str, out_dir: Path) -> Path:
             pass
         raise
     return path
+
+
+# Characters that start a new line in a terminal or a Markdown job summary.
+# clean() keeps newlines on purpose (a command is multi-line), so a model id, branch,
+# cwd or session id holding one printed whole fake lines -- a forged "no
+# high-severity findings", or a ``` that closed the action's code fence.
+_LINE_BREAKS = re.compile("[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]")
+
+
+def _one_line(text: str) -> str:
+    """text with every line break made visible: a newline or carriage return
+    as the two characters backslash-n or backslash-r, any other separator as a
+    space. For display only: --json keeps
+    the raw value, which JSON escapes anyway."""
+    if not isinstance(text, str) or not _LINE_BREAKS.search(text):
+        return text
+    return _LINE_BREAKS.sub(lambda m: {"\n": "\\n", "\r": "\\r"}.get(m.group(), " "), text)
+
+
+def _display_safe(v):
+    """v with _one_line applied to every string in it, keys included; the
+    container types (Counter, defaultdict, namedtuple, set) are kept."""
+    if isinstance(v, str):
+        return _one_line(v)
+    if isinstance(v, dict):
+        out = v.copy()
+        out.clear()
+        for k, x in v.items():
+            out[_display_safe(k)] = _display_safe(x)
+        return out
+    if isinstance(v, list):
+        return [_display_safe(x) for x in v]
+    if isinstance(v, tuple):
+        items = [_display_safe(x) for x in v]
+        return type(v)(*items) if hasattr(v, "_fields") else tuple(items)
+    if isinstance(v, (set, frozenset)):
+        return type(v)(_display_safe(x) for x in v)
+    return v
+
+
+def _display_view(fleet: "Fleet") -> "Fleet":
+    """The fleet as the terminal and Markdown views show it (R13): every
+    transcript string one line. Counts are unchanged; the digest is still taken
+    from the fleet itself, so it matches --json."""
+    cls = type(fleet)
+    view = cls.__new__(cls)
+    view.__dict__.update({k: _display_safe(v) for k, v in fleet.__dict__.items()})
+    view._display_of = fleet
+    return view
 
 
 def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
@@ -8983,7 +13969,9 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
                   f" · {num(n_un)} unasked → actualis --network")
         # Printed so a screenshot of this report can be checked against the
         # --json payload it came from. Same fleet, same digest.
-        print(f"  {c.dim}digest        {report_digest(_to_json_body(fleet)):.16}"
+        # raw: under --no-redact the --json payload is unredacted, so its digest is too.
+        print(f"  {c.dim}digest        "
+              f"{report_digest(_to_json_body(getattr(fleet, '_display_of', fleet), raw)):.16}"
               f"  (sha256, first 16){c.off}")
         if fleet.duplicate_usage_records:
             # Shown rather than hidden: this number is the difference between
@@ -9005,8 +13993,9 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
             print(f"  {c.yellow}▲ rates       last verified {PRICING_VERIFIED}, "
                   f"{age} days ago. Prices move; treat this as dated.{c.off}")
         if fleet.cost_unknown > 0:
-            print(f"  {c.dim}unpriced      {money(fleet.cost_unknown)} of the total "
-                  f"is from models with no published rate{c.off}")
+            print(f"  {c.dim}estimated     {money(fleet.cost_unknown)} of the total "
+                  f"is estimated: models with no published rate, priced by family or "
+                  f"provider ceiling{c.off}")
         tok = sum(fleet.tokens.values())
         print(f"  tokens        {num(tok)}")
         print(f"  {c.bold}cost{c.off}          {c.bold}{money(fleet.total_cost)}{c.off} "
@@ -9045,7 +14034,7 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
             print(f"  {'agent':<22} {'units':>9} {'cost':>13}   share")
             for a, cost in sorted(fleet.cost_by_agent.items(), key=lambda kv: -kv[1]):
                 share = (cost / fleet.total_cost * 100) if fleet.total_cost else 0
-                unit = "messages" if a == "claude-code" else "sessions"
+                unit = "messages" if a in ("claude-code", "gemini", "qwen") else "sessions"
                 print(f"  {a:<22} {num(fleet.units_by_agent[a]):>9} {money(cost):>13}   "
                       f"{c.dim}{share:5.1f}%  {unit}{c.off}")
 
@@ -9228,6 +14217,10 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
     if fleet.permission_modes:
         modes = "  ".join(f"{k}={num(v)}" for k, v in fleet.permission_modes.most_common(5))
         print(f"  permission    {modes}")
+    unmoded = max(fleet.bash_total - fleet.bash_moded, 0)
+    if unmoded and not fleet.network_only:
+        print(f"  {c.dim}no mode       {num(unmoded)} of {num(fleet.bash_total)} shell commands "
+              f"had no recorded permission mode; who approved them is unknown{c.off}")
     if fleet.denials:
         den = "  ".join(f"{k}={num(v)}" for k, v in fleet.denials.most_common(5))
         print(f"  denied        {den}")
@@ -9313,9 +14306,21 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
     if not bash_only:
         render_coach(coach(fleet), c)
 
-    if fleet.unknown_models:
-        print(f"\n  {c.yellow}▲{c.off} unpriced models seen, billed at Opus-tier rates: "
-              f"{', '.join(fleet.unknown_models)}")
+    no_rate = fleet.models_by_tier.get(UNPRICED, set())
+    ceiling = [m for m in fleet.unknown_models if m not in no_rate]
+    if ceiling:
+        print(f"\n  {c.yellow}▲{c.off} models priced by inference (a family sibling or the "
+              f"provider ceiling), not a published rate: {', '.join(ceiling)}")
+    if no_rate:
+        print(f"\n  {c.yellow}▲{c.off} no published rate, so tokens shown and cost NOT counted: "
+              + ", ".join(f"{m} ({num(fleet.unpriced_tokens[m])} tokens)"
+                          if fleet.unpriced_tokens.get(m) else m for m in sorted(no_rate)))
+    if fleet.rewound_tool_calls:
+        print(f"\n  {c.dim}{num(fleet.rewound_tool_calls)} Gemini tool calls were later rewound out "
+              f"of their conversation. They ran, so they are audited and counted.{c.off}")
+    if fleet.unsupported_records:
+        print(f"\n  {c.yellow}▲{c.off} {num(fleet.unsupported_records)} transcript records of a "
+              f"kind this version does not read were skipped (e.g. Gemini $patch).")
 
     if fleet.aggregator_models:
         print(f"\n  {c.yellow}▲{c.off} priced from a third party, not the vendor's own "
@@ -9327,8 +14332,9 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
     print(f"{c.dim}  Ask how any of this was computed:  actualis --explain")
     print(f"  Ask why a finding fired:            actualis --why AF004{c.off}")
     print()
-    print(f"{c.dim}  Costs are Anthropic API list prices (verified 2026-10-08). On a Pro/Max")
-    print(f"  subscription your actual outlay is the flat fee; read this as consumption.")
+    print(f"{c.dim}  Costs are provider list prices (Anthropic, OpenAI, Google; oldest rates")
+    print(f"  verified {PRICING_VERIFIED}). On a Pro/Max subscription your actual outlay")
+    print(f"  is the flat fee; read this as consumption.")
     print(f"  Flags mean 'worth looking at', not 'wrong'. Nothing left this machine.")
     if not raw:
         print(f"  Credentials are redacted; --no-redact disables that.{c.off}")
@@ -9355,7 +14361,7 @@ def render_share(fleet: "Fleet", c: C) -> None:
     projects = sorted(fleet.cost_by_project.values(), reverse=True)
     conc = (projects[0] / fleet.total_cost * 100) if projects and fleet.total_cost else 0
 
-    modes = sum(fleet.permission_modes.values())
+    modes = recorded_turns(fleet.permission_modes)
     unsup = ungated_modes(fleet.permission_modes)
     unsup_pct = (unsup / modes * 100) if modes else 0
 
@@ -9365,8 +14371,12 @@ def render_share(fleet: "Fleet", c: C) -> None:
     tools_total = sum(fleet.tools.values())
     bash_pct = (fleet.bash_total / tools_total * 100) if tools_total else 0
 
-    crit = sum(1 for e in fleet.secrets.values() if e["priority"] == "critical")
-    rotate = sum(1 for e in fleet.secrets.values() if e["priority"] != "low")
+    # Suppressed credentials stay in the distinct total but leave the
+    # actionable counts, as in the report, the gate and the tray.
+    live = fleet.actionable_secrets
+    crit = sum(1 for e in live.values() if e["priority"] == "critical")
+    rotate = sum(1 for e in live.values() if e["priority"] != "low")
+    n_suppressed = len(fleet.secrets) - len(live)
 
     tickets = sorted(fleet.cost_by_ticket.values())
     med_ticket = _median(tickets) if tickets else 0.0
@@ -9395,14 +14405,23 @@ def render_share(fleet: "Fleet", c: C) -> None:
     plural = "" if fleet.bash_total == 1 else "s"
     print(f"  {b}{num(fleet.bash_total)}{o} shell command{plural}   "
           f"{d}{bash_pct:.0f}% of all tool calls{o}")
-    if modes:
+    unmoded = max(fleet.bash_total - fleet.bash_moded, 0)
+    if modes and not unmoded:
         print(f"  {b}{unsup_pct:.0f}%{o} of turns ran unsupervised")
+    elif modes:
+        print(f"  {b}{unsup_pct:.0f}%{o} of turns with a recorded permission mode ran unsupervised")
+    if unmoded:
+        # Named, never silently dropped from the denominator above.
+        print(f"  {b}{num(unmoded)}{o} of {num(fleet.bash_total)} shell commands had no "
+              f"recorded permission mode {d}(who approved them is unknown){o}")
     if sub_bash:
         print(f"  {b}{blind:.0f}%{o} of shell activity happened inside subagents, "
               f"where the commands are not recorded")
     if fleet.secrets:
         print(f"  {b}{num(len(fleet.secrets))}{o} distinct credentials found in command "
-              f"history   {d}{num(crit)} critical, {num(rotate)} worth rotating{o}")
+              f"history   {d}{num(crit)} critical, {num(rotate)} worth rotating"
+              + (f", {num(n_suppressed)} suppressed" if n_suppressed else "")
+              + f"{o}")
 
     if fleet.msgs_by_model:
         # Through the same gate as the card: a fine-tune id is identifying.
@@ -9422,8 +14441,8 @@ def render_share(fleet: "Fleet", c: C) -> None:
 
     print(f"\n  {d}Generated locally by actualis. No project names, branches,")
     print(f"  paths, commands or identifiers are included in this summary.")
-    print(f"  Costs are Anthropic and OpenAI list prices; a subscription bills a")
-    print(f"  flat fee, so read this as consumption.{o}\n")
+    print(f"  Costs are provider list prices (Anthropic, OpenAI, Google); a")
+    print(f"  subscription bills a flat fee, so read this as consumption.{o}\n")
 
 
 # --------------------------------------------------------------------------
@@ -9491,23 +14510,37 @@ def card_model(fleet: "Fleet", mode: str, days: int | None = None,
     m: dict = {"mode": mode, "days": n, "label": f"ACTUALIS · LAST {n} DAYS"}
 
     if mode == "supervision":
-        moded = sum(fleet.bash_moded_by_day.values())
-        unsup = sum(fleet.unsupervised_by_day.values())
-        if moded:
+        moded = fleet.bash_moded
+        unsup = fleet.bash_unsupervised
+        unmoded = max(commands - moded, 0)      # approval unknown: no mode recorded
+        if moded and not unmoded:
             m["hero"] = f"{unsup / moded * 100:.0f}%"
             m["caption"] = "of my agents' shell commands ran with nobody approving them"
             m["share"] = (f"{m['hero']} of my coding agents' shell commands ran "
                           f"unsupervised in the last {n} days. {CARD_INSTALL}")
+        elif moded:
+            # Some commands (every Gemini CLI one) have no recorded mode. The
+            # share is of the commands that do, and says so: leaving the rest
+            # out of the denominator silently would overstate it.
+            m["hero"] = f"{unsup / moded * 100:.0f}%"
+            m["caption"] = f"of {num(moded)} commands with a recorded mode ran unapproved"
+            m["share"] = (f"{m['hero']} of the {num(moded)} shell commands my coding agents "
+                          f"ran with a recorded permission mode ran unsupervised in the last "
+                          f"{n} days; {num(unmoded)} more had no recorded mode. {CARD_INSTALL}")
         else:
             m["hero"] = "—"
             m["caption"] = "no permission mode was recorded for these commands"
             m["share"] = (f"My coding agents ran {num(commands)} shell commands in "
                           f"the last {n} days. {CARD_INSTALL}")
         m.update(header="SUPERVISION", hero_label="unsupervised",
-                 stats=[(num(commands), "commands"), (refused, "refused"), (agents, "agents")],
+                 stats=[(num(commands), "commands"), (refused, "refused"), (agents, "agents")]
+                 + ([(num(unmoded), "no mode")] if unmoded and moded else []),
+                 # "gated", not "you": a mode that can stop for approval does not
+                 # mean a person approved (an allowlist rule may have).
                  bars=[("auto", float(unsup), num(unsup)),
-                       ("you", float(moded - unsup), num(moded - unsup)),
-                       ("refused", float(fleet.refusals), refused)],
+                       ("gated", float(moded - unsup), num(moded - unsup))]
+                 + ([("no mode", float(unmoded), num(unmoded))] if unmoded else [])
+                 + [("refused", float(fleet.refusals), refused)],
                  series=[(fleet.unsupervised_by_day[d] / fleet.bash_moded_by_day[d] * 100)
                          if fleet.bash_moded_by_day[d] else None for d in window],
                  series_max=100.0)
@@ -9890,6 +14923,25 @@ def layout_hero(m: dict) -> list:
     return ops
 
 
+def _compact_bar_text(value: float, text: str, width: int) -> str:
+    """A bar's value text that fits `width` characters without changing the
+    number it shows: as written when it fits, else a compact unit ($12.3M,
+    123M) from the bar's numeric value, else nothing. Never a slice of the
+    digits, which reads as a different figure."""
+    if len(text) <= width:
+        return text
+    pre = "$" if text.startswith("$") else ""
+    v = value if isinstance(value, (int, float)) and value == value else -1.0
+    for div, unit in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if v >= div:
+            for digits in (1, 0):
+                out = f"{pre}{v / div:.{digits}f}{unit}"
+                if len(out) <= width:
+                    return out
+            break
+    return ""
+
+
 def layout_terminal(m: dict) -> list:
     """Layout C: the card as a terminal session, on a 24x48 character grid."""
     P = CARD_PALETTE
@@ -9920,7 +14972,7 @@ def layout_terminal(m: dict) -> list:
             ops.append(at(41, row, P["fg"], text))
         else:   # x2 fits 10 characters in the same 7 cells
             ops.append(Text(TERM_X + 41 * CELL_W, TERM_Y + row * CELL_H + 16, 2,
-                            P["fg"], text[:10]))
+                            P["fg"], _compact_bar_text(value, text, 10)))
     spark_row = 6 + max(len(bars), 3)    # one blank row after the bars
     ops.append(at(0, spark_row, P["muted"], f"{m['days']}d"[:4]))
     if m["trend"]:
@@ -9941,7 +14993,8 @@ def card_paths(out_dir: Path) -> tuple:
     while True:
         stem = "actualis-card" if n == 1 else f"actualis-card-{n}"
         svg, png = out_dir / f"{stem}.svg", out_dir / f"{stem}.png"
-        if not svg.exists() and not png.exists():
+        # lexists: a dangling symlink is taken too, as for network_html_path
+        if not os.path.lexists(svg) and not os.path.lexists(png):
             return svg, png
         n += 1
 
@@ -9950,19 +15003,33 @@ def write_card(m: dict, style: str, out_dir: Path) -> tuple:
     """Write one card. Mode "x" makes never-overwrite hold even under a race."""
     ops = layout_hero(m) if style == "hero" else layout_terminal(m)
     svg_data, png_data = svg_text(ops), png_bytes(ops)   # render before opening anything
-    svg, png = card_paths(out_dir)
-    with svg.open("x", encoding="utf-8", newline="\n") as fh:
-        fh.write(svg_data)
-    try:
-        with png.open("xb") as fh:
-            fh.write(png_data)
-    except BaseException:
+    for _ in range(100):                     # a lost race takes the next name; bounded
+        svg, png = card_paths(out_dir)
         try:
-            svg.unlink()
-        except OSError:
-            pass
-        raise
-    return svg, png
+            fh = svg.open("x", encoding="utf-8", newline="\n")
+        except FileExistsError:
+            continue
+        with fh:
+            fh.write(svg_data)
+        try:
+            with png.open("xb") as fh:
+                fh.write(png_data)
+        except FileExistsError:
+            # The PNG name was taken after card_paths looked: give back the SVG
+            # and take the next stem, so the pair keeps one name.
+            try:
+                svg.unlink()
+            except OSError:
+                pass
+            continue
+        except BaseException:
+            try:
+                svg.unlink()
+            except OSError:
+                pass
+            raise
+        return svg, png
+    raise FileExistsError("no free actualis-card-N name after 100 tries")
 
 
 # --------------------------------------------------------------------------
@@ -10002,6 +15069,9 @@ JSON_SCHEMA: dict[str, str] = {
     "scanned.bytes": "int",
     "scanned.roots": "array",
     "scanned.roots[]": "str",
+    "scope.days": "int|null",
+    "scope.project": "str",
+    "scope.agent": "str",
     "messages": "int",
     "cost_usd": "float",
     "cost_usd_from_unpriced_models": "float",
@@ -10021,6 +15091,7 @@ JSON_SCHEMA: dict[str, str] = {
     "cost_note": "str",
     "duplicate_usage_records_skipped": "int",
     "duplicate_tool_calls_skipped": "int",
+    "unparsable_lines": "int",
     "duplicate_note": "str",
     "tokens.*": "int",
     "by_agent.*": "float",
@@ -10057,6 +15128,8 @@ JSON_SCHEMA: dict[str, str] = {
     "bash.commands.*": "int",
     "bash.flag_counts.*": "int",
     "bash.oversized_commands": "int",
+    "bash.flagged.high": "int",
+    "bash.flagged.medium": "int",
     "bash.flags": "array",
     "bash.flags[].id": "str",
     "bash.flags[].program": "str",
@@ -10076,6 +15149,7 @@ JSON_SCHEMA: dict[str, str] = {
     "coach[].evidence": "str",
     "coach[].action": "str",
     "coach[].impact": "str|null",
+    "coach[].project": "str",
     "secret_exposures": "int",
     "suppressed_secrets": "int",
     "suppression_note": "str",
@@ -10095,6 +15169,9 @@ JSON_SCHEMA: dict[str, str] = {
     "secret_projects.*": "int",
     "redacted": "bool",
     "permission_modes.*": "int",
+    "unsupervised_pct": "float|null",
+    "moded_commands": "int",
+    "unmoded_commands": "int",
     "denials.*": "int",
     "suppressed_flags": "int",
     "vendors.capabilities": "array",
@@ -10102,6 +15179,8 @@ JSON_SCHEMA: dict[str, str] = {
     "vendors.capabilities[].claude": "str",
     "vendors.capabilities[].codex": "str",
     "vendors.capabilities[].copilot": "str",
+    "vendors.capabilities[].gemini": "str",
+    "vendors.capabilities[].qwen": "str",
     "vendors.capabilities[].depends_on": "str",
     "vendors.note": "str",
     "unreadable_commands.count": "int",
@@ -10180,6 +15259,7 @@ JSON_SCHEMA: dict[str, str] = {
     "network.items[].transcript.root": "str",
     "network.items[].transcript.file": "str",
     "network.items[].transcript.line": "int|null",
+    "network.items[].rewound": "bool",
     "network.items_truncated": "bool",
     "network.strict": "bool",
     "network.trust": "array",
@@ -10242,6 +15322,9 @@ JSON_SCHEMA: dict[str, str] = {
     "network.ioc.matches_truncated": "bool",
     "unknown_models.*": "int",
     "aggregator_priced_models.*": "int",
+    "unpriced_model_tokens.*": "int",
+    "rewound_tool_calls": "int",
+    "unsupported_records": "int",
 }
 
 # A matched item is shown exactly as network.items shows it.
@@ -10286,7 +15369,10 @@ def report_digest(payload: dict) -> str:
         body["coach"] = [f for f in body["coach"]
                          if not (isinstance(f, dict)
                                  and f.get("id") in REPORT_DIGEST_CLOCK_FINDINGS)]
-    return hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
+    # surrogatepass: identical bytes for any encodable text, so docs/json.md's
+    # recipe still verifies; a lone surrogate that slipped past clean() can no
+    # longer crash the report (R3).
+    return hashlib.sha256(canonical_json(body).encode("utf-8", "surrogatepass")).hexdigest()
 
 
 # Dotted paths into the payload (a top-level key is a path of one part).
@@ -10304,6 +15390,7 @@ REPORT_DIGEST_CLOCK_FINDINGS = frozenset({"AF013"})
 #   1    the tool could not run: no transcripts, an unreadable --root
 #   2    a command line usage error -- argparse owns this one, not us
 #   3    findings at or above --fail-on
+#   4    --self-check: a check failed
 #   130  interrupted
 #
 # Findings are 3, not 1 and not 2. 1 already meant "could not run" before
@@ -10316,6 +15403,7 @@ EXIT_OK = 0
 EXIT_CANNOT_RUN = 1
 EXIT_USAGE = 2        # argparse's, reserved rather than used
 EXIT_FINDINGS = 3
+EXIT_SELF_CHECK_FAILED = 4   # --self-check: a privacy claim did not hold
 
 # What each threshold includes. Ordered, so a lower threshold is a superset.
 FAIL_ON_LEVELS = ("critical", "high", "any")
@@ -10356,6 +15444,10 @@ def failing_findings(fleet: Fleet, level: str) -> list[str]:
         out.append(f"{len(ioc_unresolved)} unresolved IOC match group(s)")
 
     for finding in coach(fleet):
+        # A finding that depends on today's date, not on the transcripts, must
+        # not turn a gate red on a fixed day with nothing changed (AF013).
+        if finding.id in REPORT_DIGEST_CLOCK_FINDINGS:
+            continue
         if finding.severity == "critical" or (want_high and finding.severity == "high") \
            or (want_any and finding.severity == "info"):
             out.append(f"{finding.id} {finding.title}")
@@ -10393,6 +15485,7 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
         },
         "scanned": {"files": fleet.files_scanned, "bytes": fleet.bytes_scanned,
                     "roots": [str(r) for r in fleet.roots]},
+        "scope": dict(fleet.scope),
         "messages": fleet.messages,
         "cost_usd": float(round(fleet.total_cost, 4)),
         "cost_usd_from_unpriced_models": float(round(fleet.cost_unknown, 4)),
@@ -10413,11 +15506,15 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
                     "family and default are inferences, and a total is only as "
                     "sound as its weakest component.",
         },
-        "cost_note": "models with no published rate are priced at the top of the "
-                     "known range for their provider, so that share is an upper "
-                     "bound among current models rather than a measurement",
+        "cost_note": "Claude and OpenAI models with no published rate are priced at "
+                     "the top of the known range for their provider, so that share "
+                     "(cost_usd_from_unpriced_models) is an upper bound among current "
+                     "models rather than a measurement. Gemini, Gemma and Qwen ids "
+                     "with no published rate are tier unpriced: $0, never estimated, "
+                     "listed in unpriced_model_tokens",
         "duplicate_usage_records_skipped": fleet.duplicate_usage_records,
         "duplicate_tool_calls_skipped": fleet.duplicate_tool_calls_skipped,
+        "unparsable_lines": fleet.unparsable_lines,
         "duplicate_note": "one billable message can appear many times in a "
                           "transcript while a response streams; repeats are "
                           "counted once, by message id",
@@ -10457,8 +15554,8 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
              "branches": sorted(fleet.branches_by_ticket[t]),
              "projects": sorted(fleet.projects_by_ticket[t]),
              "active_days": len(set(fleet.dates_by_ticket.get(t, []))),
-             "first_seen": min(fleet.dates_by_ticket[t]) if fleet.dates_by_ticket.get(t) else None,
-             "last_seen": max(fleet.dates_by_ticket[t]) if fleet.dates_by_ticket.get(t) else None}
+             "first_seen": min(fleet.dates_by_ticket[t]) if fleet.dates_by_ticket.get(t) else "",
+             "last_seen": max(fleet.dates_by_ticket[t]) if fleet.dates_by_ticket.get(t) else ""}
             for t, cost in sorted(fleet.cost_by_ticket.items(), key=lambda kv: -kv[1])
         ],
         "by_branch": {k: round(v, 4) for k, v in
@@ -10472,11 +15569,19 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
             "commands": dict(fleet.bash_first_token.most_common(50)),
             "flag_counts": dict(fleet.flag_counts),
             "oversized_commands": fleet.oversized_commands,
+            # The counts the report prints as "flagged N high  M medium":
+            # one per command, suppressed ones left out. flag_counts counts
+            # per category and includes suppressed flags, so it cannot stand in.
+            "flagged": {
+                "high": sum(1 for f in fleet.actionable_flags if f["severity"] == "high"),
+                "medium": sum(1 for f in fleet.actionable_flags if f["severity"] == "med"),
+            },
             "flags": [{**f, "evidence": (f["evidence"] if raw else redact(f["evidence"]))[:240]}
                       for f in fleet.flags],
         },
         "coach": [{"id": f.id, "severity": f.severity, "title": f.title,
-                   "evidence": f.evidence, "action": f.action, "impact": f.impact}
+                   "evidence": f.evidence, "action": f.action, "impact": f.impact,
+                   "project": f.project}
                   for f in coach(fleet)],
         "secret_exposures": fleet.secret_exposures,
         "suppressed_secrets": fleet.suppressed_secrets,
@@ -10486,7 +15591,7 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
                             "should look different from a clean one.",
         "secrets": [
             {"priority": e["priority"], "types": sorted(e["kinds"]), "id": fp,
-             "uses": e["uses"], "first_seen": e["first"], "last_seen": e["last"],
+             "uses": e["uses"], "first_seen": e["first"] or "", "last_seen": e["last"] or "",
              "projects": sorted(e["projects"]),
              "suppressed": bool(e.get("suppressed")),
              "suppressed_reason": e.get("suppressed_reason", ""),
@@ -10499,11 +15604,24 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
         "secret_projects": dict(fleet.secret_projects),
         "redacted": not raw,
         "permission_modes": dict(fleet.permission_modes),
+        # The share --share prints as "N% of turns ran unsupervised", computed
+        # once here so readers (the tray) need not re-derive it from
+        # permission_modes and drift (a Codex `sandbox:` key is not a turn).
+        "unsupervised_pct": (ungated_modes(fleet.permission_modes)
+                             / recorded_turns(fleet.permission_modes) * 100)
+                            if recorded_turns(fleet.permission_modes) else None,
+        # unsupervised_pct covers only what has a recorded mode. These say how
+        # many shell commands that is, and how many have none (approval
+        # unknown: every Gemini CLI command), so no reader has to assume.
+        "moded_commands": fleet.bash_moded,
+        "unmoded_commands": max(fleet.bash_total - fleet.bash_moded, 0),
         "denials": dict(fleet.denials),
         "suppressed_flags": fleet.suppressed_flags,
         "vendors": {
             "capabilities": [
-                {"capability": cap, "claude": c, "codex": x, "copilot": p, "depends_on": why}
+                {"capability": cap, "claude": c, "codex": x, "copilot": p,
+                 "gemini": VENDOR_CAPABILITIES_MORE[cap][0], "qwen": VENDOR_CAPABILITIES_MORE[cap][1],
+                 "depends_on": f"{why}. {VENDOR_CAPABILITIES_MORE[cap][2]}"}
                 for cap, c, x, p, why in VENDOR_CAPABILITIES
             ],
             "note": "a section fed by a field one vendor does not write is "
@@ -10540,6 +15658,9 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
         "network": network_json(fleet, raw),
         "unknown_models": dict(fleet.unknown_models),
         "aggregator_priced_models": dict(fleet.aggregator_models),
+        "unpriced_model_tokens": dict(fleet.unpriced_tokens.most_common()),
+        "rewound_tool_calls": fleet.rewound_tool_calls,
+        "unsupported_records": fleet.unsupported_records,
     }
 
 
@@ -10572,6 +15693,15 @@ def _actualis_command() -> list[str]:
     # some other installation, and the service then runs a different version
     # than the one that wrote it -- silently, and possibly for months.
     argv0 = Path(sys.argv[0]) if sys.argv and sys.argv[0] else None
+    # Run as `python3 actualis.py` from a checkout: THIS file and THIS
+    # interpreter, before PATH gets a chance to name some other install.
+    here = Path(__file__).resolve()
+    if argv0:
+        try:
+            if argv0.resolve() == here:
+                return [sys.executable, str(here)]
+        except OSError:
+            pass
     if argv0 and argv0.suffix != ".py":
         try:
             resolved = argv0.resolve()
@@ -10594,13 +15724,39 @@ def _xml_escape(text: str) -> str:
                 .replace(">", "&gt;").replace('"', "&quot;"))
 
 
+def _unit_safe(text: str, what: str) -> str:
+    """Refuse a control character: a newline in a path ends a unit directive
+    and starts another one, and no unit format can carry it safely."""
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text):
+        raise ValueError(f"cannot write a unit: the {what} contains a control "
+                         f"character: {text!r}")
+    return text
+
+
+def _systemd_quote(arg: str) -> str:
+    """One ExecStart= argument, per systemd's own rules.
+
+    `%` is a specifier and `$` an environment reference, so both are doubled
+    everywhere; an argument with whitespace, a quote or a backslash is wrapped
+    in double quotes with `\\` and `\"` escaped.
+    """
+    out = arg.replace("%", "%%").replace("$", "$$")
+    if not arg or any(ch.isspace() or ch in "\"'\\;" for ch in arg):
+        out = '"' + out.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return out
+
+
 def service_unit(kind: str, interval: float = 4.0, quiet: bool = False) -> str:
+    """Raises ValueError for a path no unit format can carry safely."""
     # `--interval 4.0` is valid but reads like a mistake in a unit file.
     secs = f"{interval:g}"
     argv = _actualis_command() + ["--watch", "--interval", secs]
     if quiet:
         argv.append("--quiet")
+    for a in argv:
+        _unit_safe(a, "command")
     log = Path(SERVICE_LOG).expanduser()
+    _unit_safe(str(log), "log path")
 
     if kind == "launchd":
         args = "\n".join(f"      <string>{_xml_escape(a)}</string>" for a in argv)
@@ -10641,7 +15797,7 @@ def service_unit(kind: str, interval: float = 4.0, quiet: bool = False) -> str:
 '''
 
     if kind == "systemd":
-        cmd = " ".join(argv)
+        cmd = " ".join(_systemd_quote(a) for a in argv)
         return f'''# Generated by actualis {__version__} on this machine.
 # A user unit, not a system one: it must run as you, with your permissions.
 # Logs go to the journal, which rotates on its own -- read them with
@@ -10674,6 +15830,16 @@ WantedBy=default.target
     # not, and there is no process to signal (N) because launchd -- not
     # actualis -- opened this file. That has a consequence worth stating in the
     # file itself rather than burying in a doc, so it is a comment below.
+    #
+    # newsyslog splits its lines on whitespace and has no quoting, and the
+    # owner field is user:group, so anything else is refused, not mangled.
+    user = os.environ.get("USER", "root")
+    for value, what in ((str(log), "log path"), (user, "user name")):
+        if any(ch.isspace() for ch in value) or (what == "user name" and ":" in value):
+            raise ValueError(f"cannot write a newsyslog line: the {what} {value!r} contains "
+                             f"whitespace{' or a colon' if what == 'user name' else ''}, "
+                             "which newsyslog.conf cannot carry.")
+        _unit_safe(value, what)
     return f'''# Generated by actualis {__version__}. Optional: macOS log rotation.
 # Only events are logged (the heartbeat is suppressed when stdout is not a
 # terminal), so this file grows slowly -- but it grows.
@@ -10687,7 +15853,7 @@ WantedBy=default.target
 # On Linux this problem does not exist: the journal handles it.
 #
 # logfile                       owner:group  mode count size(KB) when flags
-{log}  {os.environ.get("USER", "root")}:staff  644  5  1024  *  NC
+{log}  {user}:staff  644  5  1024  *  NC
 '''
 
 
@@ -10802,7 +15968,7 @@ def _digest_file(path: Path) -> tuple[str, int, float] | None:
     try:
         st = path.stat()
         h = hashlib.sha256()
-        with path.open("rb") as fh:
+        with _open_regular(path, binary=True) as fh:
             for chunk in iter(lambda: fh.read(1 << 20), b""):
                 h.update(chunk)
         return h.hexdigest(), st.st_size, st.st_mtime
@@ -10827,7 +15993,8 @@ def _tree_state(roots: list[Path]) -> dict[str, tuple[int, float]]:
     return state
 
 
-def self_check(c: C, days: int | None = 7, root: str | None = None) -> int:
+def self_check(c: C, days: int | None = 7, root: str | None = None,
+               agent: str = "all") -> int:
     """Verify the privacy claims by executing them. Returns an exit code.
 
     Honours --root: if you tell the tool which directory to read, that is the
@@ -10857,8 +16024,22 @@ def self_check(c: C, days: int | None = 7, root: str | None = None) -> int:
         for line in _wrap(why, 78):
             print(f"          {c.dim}{line}{c.off}")
 
-    roots = ([Path(root).expanduser()] if root
-             else transcript_roots() + codex_roots() + copilot_roots())
+    # Routed as main() routes them: --agent says how --root is read, and which
+    # vendors' default directories are read without it. Every root parsed by
+    # the Claude reader made a Codex corpus "reconcile" with nothing parsed.
+    if root:
+        r = Path(root).expanduser()
+        slot = {"codex": 1, "copilot": 2, "gemini": 3, "qwen": 4}.get(agent, 0)
+        if slot >= 3:
+            r = _agent_root(r, agent)
+        by_agent = tuple([r] if i == slot else [] for i in range(5))
+    else:
+        by_agent = (transcript_roots() if agent in ("all", "claude") else [],
+                    codex_roots() if agent in ("all", "codex") else [],
+                    copilot_roots() if agent in ("all", "copilot") else [],
+                    gemini_roots() if agent in ("all", "gemini") else [],
+                    qwen_roots() if agent in ("all", "qwen") else [])
+    roots = [r for group in by_agent for r in group]
     if roots:
         result(True, "the only directories this run reads",
                "; ".join(str(r) for r in roots))
@@ -10882,7 +16063,10 @@ def self_check(c: C, days: int | None = 7, root: str | None = None) -> int:
     #    always meaningful.
     sample: list[Path] = []
     for root in roots:
-        for f in root.rglob("*.jsonl"):
+        # Gemini's legacy sessions are single .json objects under chats/.
+        legacy = (f for f in root.rglob("*.json") if f.parent.name == "chats") \
+            if root in by_agent[3] else ()
+        for f in [*root.rglob("*.jsonl"), *legacy]:
             sample.append(f)
             if len(sample) >= SELF_CHECK_SAMPLE:
                 break
@@ -10898,7 +16082,7 @@ def self_check(c: C, days: int | None = 7, root: str | None = None) -> int:
         skipped("no file created or deleted under the transcript roots",
                 "Same reason: there is no tree to compare.")
     else:
-        _self_check_corpus(roots, sample, result, c, days)
+        _self_check_corpus(roots, sample, result, c, days, skipped, by_agent)
 
     # 3. Where this build is allowed to write, named explicitly.
     writable = [str(p) for p in suppression_paths()]
@@ -10906,8 +16090,9 @@ def self_check(c: C, days: int | None = 7, root: str | None = None) -> int:
            "Suppressions, and only when you pass --suppress: "
            + "; ".join(writable)
            + ". A card, and only when you pass --card: actualis-card[-N].svg and "
-           "actualis-card[-N].png in the current directory, or in --out. Neither "
-           "is ever overwritten.")
+           "actualis-card[-N].png in the current directory, or in --out. A network "
+           "report, and only when you pass --network --html: actualis-network[-N].html "
+           "in the current directory, or in --out. None is ever overwritten.")
 
     # 4. What the binary itself is, so it can be compared with what was published.
     try:
@@ -10942,11 +16127,11 @@ def self_check(c: C, days: int | None = 7, root: str | None = None) -> int:
     else:
         verdict = f"{c.ok}All checks passed.{c.off}"
     print(f"\n  {verdict}\n")
-    return EXIT_OK if ok else EXIT_FINDINGS
+    return EXIT_OK if ok else EXIT_SELF_CHECK_FAILED
 
 
 def _self_check_corpus(roots: list[Path], sample: list[Path], result, c: C,
-                       days: int | None) -> None:
+                       days: int | None, skipped=None, by_agent=None) -> None:
     """The checks that need something to read.
 
     Split out so that the checks which do NOT need a corpus -- the import scan,
@@ -10958,16 +16143,32 @@ def _self_check_corpus(roots: list[Path], sample: list[Path], result, c: C,
 
     fleet = Fleet()
     since = window_start(days, datetime.now(timezone.utc)) if days else None
-    fleet.scan(roots, since, None, progress=False)
-    copilot = [r for r in roots if r in copilot_roots()]
-    if copilot:
-        fleet.scan_copilot(copilot, since, None)
+    claude_r, codex_r, copilot_r, gemini_r, qwen_r = (
+        by_agent if by_agent is not None else (roots, [], [], [], []))
+    fleet.scan(claude_r, since, None, progress=False)
+    if codex_r:
+        fleet.scan_codex(codex_r, since, None)
+    if copilot_r:
+        fleet.scan_copilot(copilot_r, since, None)
+    if gemini_r:
+        fleet.scan_gemini(gemini_r, since, None)
+    if qwen_r:
+        fleet.scan_qwen(qwen_r, since, None)
 
-    problems = network_reconciles(network_json(fleet))
-    result(not problems, "network totals reconcile",
-           "Items equal asked + unasked + unknown and the sum of kinds, hosts add up, "
-           "and every approval and kind is a known one."
-           if not problems else "; ".join(problems))
+    if fleet.files_scanned == 0 and skipped is not None:
+        # Totals over nothing reconcile trivially; a pass here would claim a
+        # check that never ran.
+        skipped("network totals reconcile",
+                "No session file was parsed in the format --agent names "
+                f"({len(sample)} file{'' if len(sample) == 1 else 's'} found by name), so "
+                "there were no totals to compare. Pass --agent codex, copilot, gemini or qwen "
+                "for those directories.")
+    else:
+        problems = network_reconciles(network_json(fleet))
+        result(not problems, "network totals reconcile",
+               "Items equal asked + unasked + unknown and the sum of kinds, hosts add up, "
+               "and every approval and kind is a known one."
+               if not problems else "; ".join(problems))
 
     changed = [str(f) for f in sample if _digest_file(f) != before[f]]
     result(not changed,
@@ -11060,7 +16261,7 @@ def is_ungated_mode(key: str) -> bool:
     the three cannot disagree about what "unsupervised" means again.
     """
     k = key.lower()
-    return "auto" in k or "bypass" in k or key == "codex:never"
+    return "auto" in k or "bypass" in k or "yolo" in k or key == "codex:never"
 
 
 def ungated_modes(modes: "Counter") -> int:
@@ -11077,9 +16278,20 @@ def ungated_modes(modes: "Counter") -> int:
     return sum(v for k, v in modes.items() if is_ungated_mode(k))
 
 
+def recorded_turns(modes: "Counter") -> int:
+    """Turns with a recorded permission mode: the denominator for ungated_modes.
+
+    Codex writes a sandbox policy beside the approval policy on every
+    turn_context, and both land in permission_modes. Counting the `sandbox:`
+    entries as turns counted every Codex turn twice, so a fleet running 100%
+    `never` scored 50% ungated.
+    """
+    return sum(v for k, v in modes.items() if not k.startswith("sandbox:"))
+
+
 def _aisvs_9_2_1(fleet: "Fleet") -> tuple[str, str]:
     modes = fleet.permission_modes
-    total = sum(modes.values())
+    total = recorded_turns(modes)
     if not total:
         return UNKNOWN, "no permission mode was recorded in these transcripts."
     ungated = ungated_modes(modes)
@@ -11104,11 +16316,14 @@ def _aisvs_9_2_2(fleet: "Fleet") -> tuple[str, str]:
 
 
 def _aisvs_9_3_1(fleet: "Fleet") -> tuple[str, str]:
-    high = sum(v for k, v in fleet.flag_counts.items() if k.startswith("high:"))
+    # Commands, not category matches, and only actionable ones: a suppressed
+    # flag is a recorded decision, as in 9.5.4.
+    high = sum(1 for f in fleet.actionable_flags
+               if f.get("severity") == "high" and "network-ioc" not in f.get("categories", ()))
     if not fleet.bash_total:
         return UNKNOWN, "no shell activity recorded."
     if high:
-        return FAILING, (f"{high:,} commands matched high-severity shapes "
+        return FAILING, (f"{high:,} command{'' if high == 1 else 's'} matched high-severity shapes "
                          f"(destructive, egress, credential reads) out of "
                          f"{fleet.bash_total:,}. Those ran; a least-privilege "
                          f"sandbox that permits them is not least-privilege "
@@ -11205,6 +16420,7 @@ INCIDENT_SCHEMA = {
     "window.last_seen": "str",
     "window.days": "float",
     "window.sightings": "int",
+    "window.undated_sightings": "int",
     "exposure.sessions": "array",
     "exposure.sessions[]": "str",
     "exposure.projects": "array",
@@ -11263,46 +16479,98 @@ class ReplayEvent:
         self.root = root
 
 
-def _claude_events(roots: list[Path], since: datetime | None) -> list[ReplayEvent]:
+def _claude_files(root: Path) -> list[Path]:
+    """The files Fleet.scan reads, in its order: <root>/<project>/*.jsonl."""
+    try:
+        dirs = sorted(d for d in root.iterdir() if d.is_dir())
+    except OSError:
+        return []
+    return [f for d in dirs for f in sorted(d.glob("*.jsonl"))]
+
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _replay_attr(v) -> str:
+    """A session id or branch fit to show and to key on: a string, cleaned
+    and cut, or "" (an untrusted field of the wrong type is absent)."""
+    return clean(v)[:120] if isinstance(v, str) else ""
+
+
+def _replay_project_ok(project: str, project_filter: str | None) -> bool:
+    """--project, matched as the report matches it: a case-insensitive
+    substring of the report's own project name."""
+    return not project_filter or project_filter.lower() in project.lower()
+
+
+def _replay_untimed_ok(ts: datetime | None, since: datetime | None) -> bool:
+    """Whether a record belongs in the replay. An untimed record is kept, as
+    the report counts it: dropping it made a fingerprint taken from the
+    report's own table "not appear"."""
+    return ts is None or not (since and ts < since)
+
+
+def _claude_events(roots: list[Path], since: datetime | None,
+                   project_filter: str | None = None) -> list[ReplayEvent]:
+    # The same files and the same tool-call dedup as the report: a resumed or
+    # forked session copies its history, and counting the copy twice would
+    # overstate the exposure the report itself counted once.
     out: list[ReplayEvent] = []
+    seen: set[str] = set()
     for root in roots:
-        for f in sorted(root.rglob("*.jsonl")):
+        for f in _claude_files(root):
             project = pretty_project(f.parent.name)
+            if not _replay_project_ok(project, project_filter):
+                continue
             try:
-                fh = f.open(encoding="utf-8", errors="replace")
+                fh = _open_regular(f)
             except OSError:
                 continue
             with fh:
                 for line in fh:
                     if '"Bash"' not in line:
                         continue          # cheap prefilter; most records are not
-                    try:
-                        rec = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
+                    rec = _json_line(line)[1]      # unreadable: skipped, as by the report
                     if not isinstance(rec, dict):
                         continue
                     ts = parse_ts(rec.get("timestamp"))
-                    if ts is None or (since and ts < since):
+                    if not _replay_untimed_ok(ts, since):
                         continue
+                    msg = rec.get("message")
+                    content = msg.get("content") if isinstance(msg, dict) else None
+                    ids = [b["id"] for b in (content if isinstance(content, list) else [])
+                           if isinstance(b, dict) and b.get("type") == "tool_use"
+                           and isinstance(b.get("id"), str) and b["id"]]
+                    if ids and all(i in seen for i in ids):
+                        continue
+                    seen.update(ids)
+                    session = _replay_attr(rec.get("sessionId")) or _replay_attr(rec.get("session_id"))
+                    branch = _replay_attr(rec.get("gitBranch"))
                     for cmd in _commands_in(rec):
                         if cmd:
-                            out.append(ReplayEvent(
-                                ts, cmd,
-                                rec.get("sessionId") or rec.get("session_id") or "",
-                                project, rec.get("gitBranch") or "",
-                                "claude", str(root)))
+                            out.append(ReplayEvent(ts, cmd, session, project, branch,
+                                                   "claude", str(root)))
     return out
 
 
-def _codex_events(roots: list[Path], since: datetime | None) -> list[ReplayEvent]:
-    """Codex records no git branch, so those stay empty rather than invented."""
+def _codex_events(roots: list[Path], since: datetime | None,
+                  project_filter: str | None = None) -> list[ReplayEvent]:
+    """Codex records no git branch, so those stay empty rather than invented.
+
+    Read as the report reads it: the session is session_meta's id (the file
+    name only when there is none), a call id already seen in another file
+    (a resumed rollout copies its history) is counted once, and the project is
+    the report's name for the rollout's last cwd.
+    """
     out: list[ReplayEvent] = []
+    seen: set[str] = set()
     for root in roots:
         for f in sorted(root.rglob("rollout-*.jsonl")):
             cwd = ""
+            session = _replay_attr(f.stem)
+            found: list[tuple[datetime | None, str]] = []
             try:
-                fh = f.open(encoding="utf-8", errors="replace")
+                fh = _open_regular(f)
             except OSError:
                 continue
             with fh:
@@ -11310,47 +16578,51 @@ def _codex_events(roots: list[Path], since: datetime | None) -> list[ReplayEvent
                     if "shell_command" not in line and "session_meta" not in line \
                             and "turn_context" not in line:
                         continue
-                    try:
-                        rec = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
+                    rec = _json_line(line)[1]      # unreadable: skipped, as by the report
                     if not isinstance(rec, dict):
                         continue
                     payload = rec.get("payload")
                     if not isinstance(payload, dict):
                         continue
                     if rec.get("type") in ("session_meta", "turn_context"):
-                        cwd = payload.get("cwd") or cwd
+                        cwd = _str_or(payload.get("cwd"), cwd)
+                        if rec.get("type") == "session_meta":
+                            session = _replay_attr(payload.get("id")) or session
                         continue
                     if payload.get("type") != "function_call" or \
                             payload.get("name") != "shell_command":
                         continue
+                    raw_args = payload.get("arguments")
+                    ok, args = _json_line(raw_args) if isinstance(raw_args, str) else (True, {})
+                    if ok and isinstance(args, dict):
+                        cwd = _str_or(args.get("workdir"), cwd)     # as the report does
                     ts = parse_ts(rec.get("timestamp"))
-                    if ts is None or (since and ts < since):
+                    if not _replay_untimed_ok(ts, since):
                         continue
-                    try:
-                        args = json.loads(payload.get("arguments") or "{}")
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-                    cmd = args.get("command") if isinstance(args, dict) else None
-                    if isinstance(cmd, list):
-                        cmd = " ".join(str(x) for x in cmd)
-                    if cmd:
-                        out.append(ReplayEvent(
-                            ts, str(cmd), f.stem,
-                            pretty_project(Path(cwd).name if cwd else "codex"),
-                            "", "codex", str(root)))
+                    call_id = _str_or(payload.get("call_id"), None)
+                    if call_id is not None:
+                        if call_id in seen:
+                            continue
+                        seen.add(call_id)
+                    found.extend((ts, cmd) for cmd in _commands_in(rec))
+            project = pretty_project(cwd.lstrip("/").replace("/", "-")) if cwd else "unknown"
+            if _replay_project_ok(project, project_filter):
+                out.extend(ReplayEvent(ts, cmd, session, project, "", "codex", str(root))
+                           for ts, cmd in found)
     return out
 
 
-def _copilot_events(roots: list[Path], since: datetime | None) -> list[ReplayEvent]:
-    """Copilot records the branch, so unlike Codex it is carried through."""
+def _copilot_events(roots: list[Path], since: datetime | None,
+                    project_filter: str | None = None) -> list[ReplayEvent]:
+    """Copilot records the branch, so unlike Codex it is carried through. The
+    project is the report's name for the session's last cwd."""
     out: list[ReplayEvent] = []
     for root in roots:
         for f in sorted(root.glob("*/events.jsonl")):
             cwd = branch = ""
+            found: list[tuple[datetime | None, str, str]] = []
             try:
-                fh = f.open(encoding="utf-8", errors="replace")
+                fh = _open_regular(f)
             except OSError:
                 continue
             with fh:
@@ -11358,10 +16630,7 @@ def _copilot_events(roots: list[Path], since: datetime | None) -> list[ReplayEve
                     if "tool.execution_start" not in line and "session.start" not in line \
                             and "session.context_changed" not in line:
                         continue
-                    try:
-                        rec = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
+                    rec = _json_line(line)[1]      # unreadable: skipped, as by the report
                     if not isinstance(rec, dict) or not isinstance(rec.get("data"), dict):
                         continue
                     kind = rec.get("type")
@@ -11371,28 +16640,124 @@ def _copilot_events(roots: list[Path], since: datetime | None) -> list[ReplayEve
                             cwd, branch = _copilot_context(ctx, cwd, branch)
                         continue
                     ts = parse_ts(rec.get("timestamp"))
-                    if ts is None or (since and ts < since):
+                    if not _replay_untimed_ok(ts, since):
                         continue
-                    for cmd in _commands_in(rec):
-                        out.append(ReplayEvent(
-                            ts, cmd, f.parent.name,
-                            pretty_project(Path(cwd).name if cwd else "copilot"),
-                            str(branch), "copilot", str(root)))
+                    found.extend((ts, cmd, branch) for cmd in _commands_in(rec))
+            project = pretty_project(cwd.lstrip("/").replace("/", "-")) if cwd else "copilot"
+            if _replay_project_ok(project, project_filter):
+                out.extend(ReplayEvent(ts, cmd, _replay_attr(f.parent.name), project,
+                                       _replay_attr(b), "copilot", str(root))
+                           for ts, cmd, b in found)
+    return out
+
+
+def _gemini_events(roots: list[Path], since: datetime | None,
+                   project_filter: str | None = None) -> list[ReplayEvent]:
+    """Gemini CLI records no branch. Read with the report's reader, so a
+    re-appended message is one message and a rewound call is still a call."""
+    out: list[ReplayEvent] = []
+    seen: set[str] = set()
+    for root in roots:
+        registry = gemini_registry(root)
+        for d in _project_dirs(root):
+            real = gemini_project_root(d, registry)
+            project = path_project(real) if real else pretty_project(d.name)
+            if not _replay_project_ok(project, project_filter):
+                continue
+            for f in gemini_session_files(d):
+                sess = read_gemini_session(f)
+                if sess is None:
+                    continue
+                sid = _replay_attr(sess["meta"].get("sessionId")) or _replay_attr(f.stem)
+                for msg, _line, _rewound in sess["messages"]:
+                    if msg.get("type") != "gemini":
+                        continue
+                    mts = parse_ts(msg.get("timestamp"))
+                    calls = msg.get("toolCalls")
+                    for tc in calls if isinstance(calls, list) else ():
+                        if not isinstance(tc, dict):
+                            continue
+                        ts = parse_ts(tc.get("timestamp")) or mts
+                        if not _replay_untimed_ok(ts, since):
+                            continue
+                        hits = _vendor_shell_calls({"toolCalls": [tc]}, "gemini")
+                        if not hits:
+                            continue
+                        cid = hits[0][0]
+                        if cid:
+                            if cid in seen:
+                                continue
+                            seen.add(cid)
+                        args = tc.get("args")
+                        out.append(ReplayEvent(ts, hits[0][1], sid,
+                                               gemini_command_project(project, real, args),
+                                               "", "gemini", str(root)))
+    return out
+
+
+def _qwen_events(roots: list[Path], since: datetime | None,
+                 project_filter: str | None = None) -> list[ReplayEvent]:
+    """Qwen Code records cwd and branch on every record."""
+    out: list[ReplayEvent] = []
+    seen: set[str] = set()
+    for root in roots:
+        for d in _project_dirs(root):
+            for f in qwen_session_files(d):
+                try:
+                    fh = _open_regular(f)
+                except OSError:
+                    continue
+                with fh:
+                    for line in fh:
+                        if "functionCall" not in line:
+                            continue
+                        rec = _json_line(line)[1]
+                        if not isinstance(rec, dict):
+                            continue
+                        ts = parse_ts(rec.get("timestamp"))
+                        if not _replay_untimed_ok(ts, since):
+                            continue
+                        cwd = _str_or(rec.get("cwd"), "")
+                        project = path_project(cwd) if cwd else pretty_project(d.name)
+                        if not _replay_project_ok(project, project_filter):
+                            continue
+                        for cid, cmd in _vendor_shell_calls(rec, "qwen"):
+                            if cid:
+                                if cid in seen:
+                                    continue
+                                seen.add(cid)
+                            out.append(ReplayEvent(
+                                ts, cmd, _replay_attr(rec.get("sessionId")) or _replay_attr(f.stem),
+                                project, _replay_attr(rec.get("gitBranch")), "qwen", str(root)))
     return out
 
 
 def replay_events(since: datetime | None = None,
-                  root: str | None = None) -> list[ReplayEvent]:
-    """Every recorded command across every vendor, oldest first."""
+                  root: str | None = None, agent: str = "all",
+                  project: str | None = None) -> list[ReplayEvent]:
+    """Every recorded command in the report's scope, oldest first.
+
+    Scoped as the report is: --agent picks the vendors (a --root is read with
+    that one parser; with no --agent, with every parser, as before) and
+    --project keeps the projects whose report name contains it."""
+    readers = (("claude", _claude_events, transcript_roots),
+               ("codex", _codex_events, codex_roots),
+               ("copilot", _copilot_events, copilot_roots),
+               ("gemini", _gemini_events, gemini_roots),
+               ("qwen", _qwen_events, qwen_roots))
+    events: list[ReplayEvent] = []
     if root:
-        base = [Path(root).expanduser()]
-        events = _claude_events(base, since) + _codex_events(base, since) \
-            + _copilot_events(base, since)
+        base = Path(root).expanduser()
+        for name, read, _roots in readers:
+            if agent in ("all", name):
+                events += read([_agent_root(base, name) if name in ("gemini", "qwen")
+                                else base], since, project)
     else:
-        events = _claude_events(transcript_roots(), since)
-        events += _codex_events(codex_roots(), since)
-        events += _copilot_events(copilot_roots(), since)
-    events.sort(key=lambda e: e.ts)
+        for name, read, roots in readers:
+            if agent in ("all", name):
+                events += read(roots(), since, project)
+    # Undated events (kept, see _replay_untimed_ok) sort after every dated one.
+    events.sort(key=lambda e: (e.ts is None, e.ts or _EPOCH))
     return events
 
 
@@ -11452,6 +16817,11 @@ def _completion_spec() -> list[tuple[str, list[str], str]]:
 def completion_script(shell: str) -> str:
     spec = _completion_spec()
     flags = [opt for opt, _, _ in spec]
+    # --card/--explain take an optional value; --ioc/--network-trust repeat.
+    actions = build_parser()._actions
+    optional = {o for a in actions if a.nargs == "?" for o in a.option_strings}
+    repeat = {o for a in actions if isinstance(a, argparse._AppendAction)
+              for o in a.option_strings}
     header = (f"# actualis {shell} completion, generated by "
               f"`actualis --completions {shell}` (v{__version__}).\n"
               "# Regenerate after upgrading; do not edit by hand.\n")
@@ -11459,7 +16829,12 @@ def completion_script(shell: str) -> str:
     if shell == "bash":
         cases = []
         for opt, values, hint in spec:
-            if values:
+            if values and opt in optional:
+                # The value may be left out: a flag typed next is completed
+                # as a flag, not offered the value list.
+                cases.append(f'        {opt}) if [[ "$cur" != -* ]]; then COMPREPLY=($(compgen -W "'
+                             f'{" ".join(values)}" -- "$cur")); return; fi;;')
+            elif values:
                 cases.append(f'        {opt}) COMPREPLY=($(compgen -W "'
                              f'{" ".join(values)}" -- "$cur")); return;;')
             elif hint == "dir":
@@ -11483,7 +16858,9 @@ def completion_script(shell: str) -> str:
         for opt, values, hint in spec:
             desc = ""
             arg = ""
-            if values:
+            if values and opt in optional:
+                arg = f"=::value:({' '.join(values)})"
+            elif values:
                 arg = f"=:value:({' '.join(values)})"
             elif hint == "dir":
                 arg = "=:directory:_files -/"
@@ -11491,7 +16868,8 @@ def completion_script(shell: str) -> str:
                 arg = "=:file:_files"
             elif hint == "none":
                 arg = "=:value:"
-            lines.append(f"    '{opt}{arg}{desc}' \\")
+            star = "*" if opt in repeat else ""
+            lines.append(f"    '{star}{opt}{arg}{desc}' \\")
         # #compdef must be the very first line or zsh ignores the file, and
         # the body runs bare: the completion system calls this file, so a
         # self-invoking wrapper would run _arguments outside a completion
@@ -11522,6 +16900,54 @@ def completion_script(shell: str) -> str:
 
 # --------------------------------------------------------------------------
 
+MIN_INTERVAL = 0.5
+MAX_INTERVAL = 3600.0
+MAX_DAYS = 36500        # a century; far larger overflows the date arithmetic
+
+
+def _interval_arg(text: str) -> float:
+    """--interval: a finite number of seconds from 0.5 to 3600.
+
+    The single source of the bounds: --watch used to clamp silently to these
+    while this accepted up to a day. NaN and infinity crash time.sleep(), and
+    --service would bake them into a unit that restarts forever.
+    """
+    try:
+        v = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
+    if v != v or not MIN_INTERVAL <= v <= MAX_INTERVAL:
+        raise argparse.ArgumentTypeError(
+            f"must be at least {MIN_INTERVAL:g} and at most {MAX_INTERVAL:g} seconds, "
+            f"got {text!r}")
+    return v
+
+
+def _days_arg(text: str) -> int:
+    """--days: a whole number of days, 1 to MAX_DAYS (0 used to mean all time)."""
+    try:
+        v = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if not 1 <= v <= MAX_DAYS:
+        raise argparse.ArgumentTypeError(f"must be from 1 to {MAX_DAYS}, got {text!r}")
+    return v
+
+
+def _top_arg(text: str) -> int:
+    """--top: a whole number, 1 or more. A negative slice dropped the last rows."""
+    try:
+        v = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if v < 1:
+        raise argparse.ArgumentTypeError(f"must be 1 or more, got {text!r}")
+    return v
+
+
+AGENT_CHOICES = ["all", "claude", "codex", "copilot", "gemini", "qwen"]
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The parser, built separately so completions can be generated FROM it.
 
@@ -11532,11 +16958,15 @@ def build_parser() -> argparse.ArgumentParser:
         prog="actualis",
         description="What actually ran. Local, read-only, honest about limits.",
     )
-    ap.add_argument("--days", type=int, metavar="N", help="only the last N days")
+    ap.add_argument("--days", type=_days_arg, metavar="N",
+                    help=f"only the last N days (1 to {MAX_DAYS})")
     ap.add_argument("--project", metavar="SUBSTR", help="only projects matching SUBSTR")
     ap.add_argument("--diff", metavar="OLD.json",
                     help="compare against a saved --json report")
-    ap.add_argument("--top", type=int, default=12, metavar="N", help="projects to list (default 12)")
+    # default None, so a --top given to a view that never lists projects is
+    # refused rather than dropped; main() fills in 12 after that check.
+    ap.add_argument("--top", type=_top_arg, default=None, metavar="N",
+                    help="text report: projects to list, 1 or more (default 12)")
     ap.add_argument("--bash", action="store_true", help="shell audit only")
     ap.add_argument("--coach", action="store_true", help="coaching findings only")
     ap.add_argument("--aisvs", action="store_true",
@@ -11565,11 +16995,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--watch", action="store_true",
                     help="live monitor: alert on new secrets and risky commands")
-    ap.add_argument("--interval", type=float, default=4.0, metavar="SEC",
-                    help="--watch poll interval (default 4)")
+    ap.add_argument("--interval", type=_interval_arg, default=None, metavar="SEC",
+                    help=f"--watch poll interval, {MIN_INTERVAL:g} to {MAX_INTERVAL:g} (default 4)")
     ap.add_argument("--quiet", action="store_true",
                     help="--watch: notify on secrets only, not every flagged command")
-    ap.add_argument("--agent", choices=["all", "claude", "codex", "copilot"], default="all",
+    ap.add_argument("--agent", choices=AGENT_CHOICES, default="all",
                     help="which agents to include (default: all)")
     ap.add_argument("--no-redact", action="store_true",
                     help="do NOT redact credentials from output (unsafe to share)")
@@ -11647,6 +17077,56 @@ def main(argv: list[str] | None = None) -> int:
     # cannot carry the report's glyphs, printing raises rather than degrades.
     make_output_printable(args.json)
 
+    # Checked before anything runs, so a refused --suppress writes nothing.
+    # --fail-on is never silently ignored: these modes return before the gate.
+    if args.fail_on:
+        for flag, on in (("--diff", args.diff), ("--why", args.why),
+                         ("--replay", args.replay), ("--watch", args.watch),
+                         ("--mcp", args.mcp), ("--explain", args.explain is not None),
+                         ("--agents", args.agents), ("--suppress", args.suppress),
+                         ("--suppressions", args.suppressions),
+                         ("--self-check", args.self_check), ("--service", args.service),
+                         ("--completions", args.completions)):
+            if on:
+                ap.error(f"--fail-on cannot be combined with {flag}: "
+                         f"{flag} does not evaluate the gate.")
+    # Nor is --json: these modes print text, or would print something else.
+    if args.json:
+        for flag, on in (("--share", args.share), ("--coach", args.coach),
+                         ("--aisvs", args.aisvs), ("--bash", args.bash),
+                         ("--why", args.why), ("--explain", args.explain is not None),
+                         ("--suppress", args.suppress),
+                         ("--suppressions", args.suppressions),
+                         ("--self-check", args.self_check), ("--service", args.service),
+                         ("--completions", args.completions), ("--watch", args.watch),
+                         ("--mcp", args.mcp)):
+            if on:
+                ap.error(f"--json cannot be combined with {flag}: {flag} has no JSON form.")
+    views = [flag for flag, on in (("--share", args.share), ("--coach", args.coach),
+                                   ("--aisvs", args.aisvs), ("--bash", args.bash)) if on]
+    if len(views) > 1:
+        ap.error(f"{views[0]} cannot be combined with {views[1]}: each is a different view.")
+    if args.ci_log:
+        # The log is the whole input: these would be accepted and then ignored.
+        # It is a Claude Code log, so --agent claude agrees with it.
+        for flag, on in (("--root", args.root),
+                         ("--agent", args.agent not in ("all", "claude")),
+                         ("--project", args.project is not None),
+                         ("--replay", args.replay)):
+            if on:
+                ap.error(f"--ci-log cannot be combined with {flag}: "
+                         f"the execution log is the only input.")
+        # Only the scanning modes read it; these would read something else.
+        for flag, on in (("--watch", args.watch), ("--mcp", args.mcp),
+                         ("--explain", args.explain is not None), ("--agents", args.agents),
+                         ("--suppress", args.suppress),
+                         ("--suppressions", args.suppressions),
+                         ("--self-check", args.self_check), ("--service", args.service),
+                         ("--completions", args.completions)):
+            if on:
+                ap.error(f"--ci-log cannot be combined with {flag}: "
+                         f"{flag} never reads the execution log.")
+
     if args.card and args.json:
         ap.error("--card writes files; it cannot also emit --json.")
     # --ioc is never silently ignored: a mode it cannot reach is an error.
@@ -11657,6 +17137,23 @@ def main(argv: list[str] | None = None) -> int:
                          ("--coach", args.coach), ("--aisvs", args.aisvs)):
             if on:
                 ap.error(f"--network cannot be combined with {flag}.")
+    if args.ioc:
+        # These return before the IOC list is loaded.
+        for flag, on in (("--replay", args.replay), ("--agents", args.agents),
+                         ("--why", args.why), ("--explain", args.explain is not None),
+                         ("--suppress", args.suppress),
+                         ("--suppressions", args.suppressions),
+                         ("--self-check", args.self_check), ("--service", args.service),
+                         ("--completions", args.completions)):
+            if on:
+                ap.error(f"--ioc cannot be combined with {flag}: {flag} never reads it.")
+        # These views never show the IOC block; only the gate reads the matches.
+        for flag, on in (("--coach", args.coach), ("--aisvs", args.aisvs),
+                         ("--share", args.share)):
+            if on and not args.fail_on:
+                ap.error(f"--ioc cannot be combined with {flag} without --fail-on: "
+                         f"{flag} never shows IOC matches. Use --network --ioc, or "
+                         f"add --fail-on to gate on them.")
     for flag, on in (("--host", args.host), ("--package", args.package),
                      ("--session", args.session), ("--unasked", args.unasked)):
         if on is not None and on is not False and not args.network:
@@ -11678,6 +17175,21 @@ def main(argv: list[str] | None = None) -> int:
                          ("--self-check", args.self_check)):
             if on:
                 ap.error(f"--html writes a file; it cannot be combined with {flag}.")
+    if args.network:
+        # After the --html check, which names these with its own message.
+        for flag, on in (("--why", args.why), ("--agents", args.agents),
+                         ("--explain", args.explain is not None),
+                         ("--suppress", args.suppress),
+                         ("--suppressions", args.suppressions),
+                         ("--self-check", args.self_check), ("--service", args.service),
+                         ("--completions", args.completions)):
+            if on:
+                ap.error(f"--network cannot be combined with {flag}.")
+    for flag, on in (("--agents", args.agents), ("--replay", args.replay),
+                     ("--watch", args.watch), ("--mcp", args.mcp)):
+        if args.with_prompts and on:
+            ap.error(f"--with-prompts cannot be combined with {flag}: "
+                     f"{flag} has no prompt field.")
     if args.with_prompts and not (args.json or args.html):
         ap.error("--with-prompts applies only to --json or --html; "
                  "the text view already shows prompts.")
@@ -11699,6 +17211,99 @@ def main(argv: list[str] | None = None) -> int:
                          ("--service", args.service)):
             if on:
                 ap.error(f"--card writes files; it cannot be combined with {flag}.")
+    # One primary mode per run: main() runs the first it meets and would drop
+    # the rest without a word (a --suppress write, a --why, a whole view).
+    modes = [flag for flag, on in (
+        ("--diff", args.diff), ("--why", args.why), ("--replay", args.replay),
+        ("--watch", args.watch), ("--mcp", args.mcp),
+        ("--explain", args.explain is not None), ("--agents", args.agents),
+        ("--suppress", args.suppress), ("--suppressions", args.suppressions),
+        ("--self-check", args.self_check), ("--service", args.service),
+        ("--completions", args.completions), ("--card", args.card),
+        ("--share", args.share), ("--coach", args.coach), ("--aisvs", args.aisvs),
+        ("--bash", args.bash)) if on]
+    if len(modes) > 1:
+        ap.error(f"{modes[0]} cannot be combined with {modes[1]}: each is a different mode.")
+    if args.service:
+        # The unit runs `actualis --watch` with only --interval and --quiet.
+        for flag, on in (("--root", args.root), ("--agent", args.agent != "all"),
+                         ("--no-redact", args.no_redact)):
+            if on:
+                ap.error(f"--service cannot be combined with {flag}: the unit it "
+                         f"prints watches the default roots and passes only "
+                         f"--interval and --quiet.")
+    # Scope and option flags are never silently dropped either (R4, R14): a
+    # mode that would ignore one refuses it, naming both. Checked before the
+    # modes that return early, so a refused --suppress writes nothing.
+    mode = modes[0] if modes else None
+    if args.reason is not None and not args.suppress:
+        ap.error("--reason applies only to --suppress: it records why a suppression is correct.")
+    for flag, on in (("--quiet", args.quiet), ("--interval", args.interval is not None)):
+        if not on or args.watch or args.service in ("launchd", "systemd"):
+            continue
+        if args.service:
+            ap.error(f"--service {args.service} cannot be combined with {flag}: "
+                     f"the {args.service} rule rotates the log and runs no watcher.")
+        ap.error(f"{flag} applies only to --watch, or to the --service launchd or "
+                 f"systemd unit that runs it.")
+    if args.top is not None:
+        # Only the text report (and --bash, --network, which print its
+        # sections) lists top-N rows.
+        off = mode if mode not in (None, "--bash") else \
+            "--json" if args.json else "--html" if args.html else None
+        if off:
+            ap.error(f"--top cannot be combined with {off}: only the text report "
+                     f"lists top projects.")
+    else:
+        args.top = 12
+    if args.interval is None:
+        args.interval = 4.0
+    # mode -> the scope flags it honours. Modes not listed (the scanning
+    # report, --json, --network, --bash, --diff) honour all of them.
+    no_text = ("--root", "--agent", "--days", "--project")    # no credential text printed
+    honours = {
+        "--explain": (), "--agents": (), "--completions": (), "--suppress": (),
+        "--suppressions": (), "--service": (),
+        "--watch": ("--root", "--agent", "--no-redact"),
+        "--self-check": ("--root", "--agent", "--days"),
+        "--replay": no_text, "--mcp": no_text, "--why": no_text, "--card": no_text,
+        "--share": no_text, "--coach": no_text, "--aisvs": no_text,
+    }
+    if mode in honours:
+        for flag, on in (("--root", args.root is not None), ("--agent", args.agent != "all"),
+                         ("--days", args.days is not None),
+                         ("--project", args.project is not None),
+                         ("--no-redact", args.no_redact)):
+            if on and flag not in honours[mode]:
+                why = ("it prints no credential text" if flag == "--no-redact"
+                       else "it does not read that scope")
+                ap.error(f"{mode} cannot be combined with {flag}: {why}.")
+    # The P2D3 rule for --ioc, applied to its siblings: these views never show
+    # network findings, and these modes never compute them.
+    for flag, on in (("--network-strict", args.network_strict),
+                     ("--network-trust", bool(args.network_trust))):
+        if not on:
+            continue
+        if mode in ("--replay", "--agents", "--why", "--explain", "--suppress",
+                    "--suppressions", "--self-check", "--service", "--completions",
+                    "--watch", "--mcp", "--card"):
+            ap.error(f"{flag} cannot be combined with {mode}: {mode} never reads it.")
+        if mode in ("--coach", "--aisvs", "--share") and not args.fail_on:
+            ap.error(f"{flag} cannot be combined with {mode} without --fail-on: "
+                     f"{mode} never shows network findings. Use --network, or "
+                     f"add --fail-on to gate on them.")
+    if args.mcp and args.root and not Path(args.root).expanduser().is_dir():
+        ap.error(f"--mcp --root: {clean(args.root)} is not a directory.")
+    # Before the modes that return early (--service, --self-check,
+    # --completions), so none of them drops these silently.
+    if not args.card and args.style != "hero":
+        ap.error("--style applies only to --card.")
+    if args.out and not (args.card or args.html):
+        ap.error("--out applies only to --card or --html.")
+    if args.explain and args.explain.lower() not in EXPLAIN:
+        ap.error(f"--explain takes a topic ({', '.join(sorted(EXPLAIN))}); "
+                 f"got {args.explain!r}. Run --explain alone for the list.")
+    if args.card:
         card_dir = Path(args.out).expanduser() if args.out else Path.cwd()
         if not card_dir.is_dir():
             print(f"actualis: {card_dir} is not a directory.\n"
@@ -11713,12 +17318,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.service:
         # Unit to stdout, instructions to stderr: `> file` must yield a file
         # that works, and still tell the user what to do with it.
-        print(service_unit(args.service, args.interval, args.quiet), end="")
+        try:
+            unit = service_unit(args.service, args.interval, args.quiet)
+        except ValueError as exc:
+            print(f"actualis: {exc}", file=sys.stderr)
+            return EXIT_CANNOT_RUN
+        print(unit, end="")
         print(service_install_notes(args.service), file=sys.stderr)
         return EXIT_OK
 
     if args.self_check:
-        return self_check(C(use_color()), args.days, args.root)
+        return self_check(C(use_color()), args.days, args.root, args.agent or "all")
 
     if args.completions:
         print(completion_script(args.completions), end="")
@@ -11729,13 +17339,20 @@ def main(argv: list[str] | None = None) -> int:
             ap.error(f"--replay takes a credential fingerprint: eight hex "
                      f"characters, as printed in the report. Got {args.replay!r}.")
 
+    if args.why and args.why.upper() not in COACH_FINDING_IDS:
+        ap.error(f"--why takes a finding id ({COACH_FINDING_IDS[0]}-{COACH_FINDING_IDS[-1]}); "
+                 f"got {args.why!r}. All findings: docs/findings.md")
     if args.diff and args.json:
         ap.error("--diff renders a comparison; it cannot also emit --json. "
                  "Save this run with --json, then diff the two files.")
-    if not args.card and args.style != "hero":
-        ap.error("--style applies only to --card.")
-    if args.out and not (args.card or args.html):
-        ap.error("--out applies only to --card or --html.")
+    baseline = None
+    if args.diff:
+        # Before the scan: a bad baseline is a bad argument, and finding that
+        # out after reading every transcript wastes the whole run.
+        try:
+            baseline = load_report(Path(args.diff).expanduser())
+        except ValueError as exc:
+            ap.error(f"--diff: {clean(str(exc))}")
 
     since = None
     if args.days:
@@ -11747,8 +17364,11 @@ def main(argv: list[str] | None = None) -> int:
         for path in suppression_paths():
             mark = "" if path.exists() else f"  {c.dim}(none){c.off}"
             print(f"  {c.dim}{path}{c.off}{mark}")
-        current = load_suppressions()
+        rejected: list[str] = []
+        current = load_suppressions(rejected)
         print()
+        for line in rejected:
+            print(f"  {c.yellow}▲{c.off} ignored, not an id from this tool: {line}")
         if not current:
             print(f"  {c.dim}Nothing suppressed. Add one with:{c.off}")
             print(f"    actualis --suppress <id> --reason \"why\"")
@@ -11767,7 +17387,7 @@ def main(argv: list[str] | None = None) -> int:
         except AuditConfigId as exc:
             ap.error(str(exc))
         except ValueError as exc:
-            sys.exit(f"actualis: {exc}")
+            ap.error(str(exc))
         print(f"  suppressed {args.suppress} in {path}")
         if not args.reason:
             print(f"  {c.yellow}▲{c.off} no --reason given. In six months nobody "
@@ -11777,10 +17397,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.mcp:
-        return mcp_serve()
+        return mcp_serve({"root": args.root, "agent": args.agent, "days": args.days,
+                          "project": args.project})
 
     if args.explain is not None:
-        return render_explain(args.explain or None, C(use_color()))
+        return render_explain(args.explain.lower() or None, C(use_color()))
 
     if args.agents:
         rows = verify_agents()
@@ -11794,22 +17415,25 @@ def main(argv: list[str] | None = None) -> int:
     if args.watch:
         if args.root:
             root = Path(args.root).expanduser()
-            w_roots, w_codex, w_copilot = (
-                ([], [root], []) if args.agent == "codex"
-                else ([], [], [root]) if args.agent == "copilot"
-                else ([root], [], []))
+            slot = {"codex": 1, "copilot": 2, "gemini": 3, "qwen": 4}.get(args.agent, 0)
+            if slot >= 3:
+                root = _agent_root(root, args.agent)
+            w_roots, w_codex, w_copilot, w_gemini, w_qwen = (
+                [root] if i == slot else [] for i in range(5))
         else:
             w_roots = transcript_roots() if args.agent in ("all", "claude") else []
             w_codex = codex_roots() if args.agent in ("all", "codex") else []
             w_copilot = copilot_roots() if args.agent in ("all", "copilot") else []
-        return watch(w_roots, w_codex, max(args.interval, 0.5),
-                     C(use_color()), args.quiet, args.no_redact, w_copilot)
+            w_gemini = gemini_roots() if args.agent in ("all", "gemini") else []
+            w_qwen = qwen_roots() if args.agent in ("all", "qwen") else []
+        return watch(w_roots, w_codex, args.interval,
+                     C(use_color()), args.quiet, args.no_redact, w_copilot, w_gemini, w_qwen)
 
     if args.replay:
         since_r = window_start(args.days, datetime.now(timezone.utc)) if args.days else None
         if not args.json and sys.stderr.isatty():
             print("  reading transcripts...", end="", file=sys.stderr, flush=True)
-        events = replay_events(since_r, args.root)
+        events = replay_events(since_r, args.root, args.agent or "all", args.project)
         if not args.json and sys.stderr.isatty():
             print("\r" + " " * 30 + "\r", end="", file=sys.stderr, flush=True)
         inc = replay(args.replay, events)
@@ -11822,7 +17446,7 @@ def main(argv: list[str] | None = None) -> int:
             json.dump(inc, sys.stdout, indent=2)
             print()
         else:
-            render_replay(inc, C(use_color()))
+            render_replay(_display_safe(inc), C(use_color()))
         return EXIT_OK
 
     # Loaded here, after every mode that never scans: a malformed trust file
@@ -11834,8 +17458,11 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, OSError) as exc:
         ap.error(str(exc))
 
-    # --network shows only the inventory; --fail-on and --why read findings.
-    fleet = Fleet(network_only=bool(args.network and not args.fail_on and not args.why))
+    # --network shows only the inventory; --fail-on reads findings (--why
+    # with --network is refused above).
+    fleet = Fleet(network_only=bool(args.network and not args.fail_on))
+    fleet.scope = {"days": args.days or None, "project": clean(args.project or ""),
+                   "agent": clean(args.agent or "all")}
     fleet.with_prompts = args.with_prompts
     progress = not args.json and sys.stderr.isatty()
 
@@ -11871,6 +17498,11 @@ def main(argv: list[str] | None = None) -> int:
         elif args.agent == "copilot":
             fleet.roots.append(root)
             fleet.scan_copilot([root], since, args.project)
+        elif args.agent in ("gemini", "qwen"):
+            vroot = _agent_root(root, args.agent)
+            fleet.roots.append(vroot)
+            (fleet.scan_gemini if args.agent == "gemini" else fleet.scan_qwen)(
+                [vroot], since, args.project)
         else:
             fleet.scan([root], since, args.project, progress=progress)
     else:
@@ -11894,6 +17526,20 @@ def main(argv: list[str] | None = None) -> int:
                 fleet.scan_copilot(proots, since, args.project)
             elif args.agent == "copilot":
                 sys.exit(no_transcripts_message())
+        if args.agent in ("all", "gemini"):
+            groots = gemini_roots()
+            if groots:
+                fleet.roots.extend(groots)
+                fleet.scan_gemini(groots, since, args.project)
+            elif args.agent == "gemini":
+                sys.exit(no_transcripts_message())
+        if args.agent in ("all", "qwen"):
+            qroots = qwen_roots()
+            if qroots:
+                fleet.roots.extend(qroots)
+                fleet.scan_qwen(qroots, since, args.project)
+            elif args.agent == "qwen":
+                sys.exit(no_transcripts_message())
 
     if fleet.messages == 0 and fleet.bash_total == 0:
         print(dead_end_message(fleet, args), file=sys.stderr)
@@ -11904,18 +17550,17 @@ def main(argv: list[str] | None = None) -> int:
     apply_network_policy(fleet, network_trust, args.network_strict, trust_sources)
     apply_ioc(fleet, ioc)
 
-    if args.diff:
-        try:
-            baseline = load_report(Path(args.diff).expanduser())
-        except ValueError as exc:
-            print(f"actualis: {exc}", file=sys.stderr)
-            return EXIT_CANNOT_RUN
-        render_diff(diff_reports(baseline, to_json(fleet, raw=args.no_redact)),
+    if baseline is not None:
+        render_diff(_display_safe(diff_reports(baseline, to_json(fleet, raw=args.no_redact))),
                     C(use_color()))
         return EXIT_OK
 
+    # What the terminal (and the --ci-log job summary) shows: one line per
+    # transcript string (R13). --json, --html and the gate read the fleet.
+    view = _display_view(fleet) if not (args.json or args.html or args.card) else fleet
+
     if args.why:
-        return render_why(args.why, fleet, C(use_color()))
+        return render_why(args.why, view, C(use_color()))
 
     if args.card:
         out_dir = card_dir
@@ -11932,6 +17577,11 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_CANNOT_RUN
         print(f"  {svg}\n  {png}\n\n  {model['share']}")
         return EXIT_OK
+
+    # The verdict is decided before any output (R5): a reader that closes
+    # stdout early must not turn a failing gate into a pass. _cli() reads it.
+    _PENDING_GATE[:] = [(args.fail_on, failing_findings(fleet, args.fail_on),
+                         _suppressed_count(fleet))] if args.fail_on else []
 
     if args.html:
         page = render_network_html(network_json(fleet, raw=args.no_redact),
@@ -11951,35 +17601,133 @@ def main(argv: list[str] | None = None) -> int:
         json.dump(network_json(fleet, raw=args.no_redact) if args.network
                   else to_json(fleet, raw=args.no_redact), sys.stdout, indent=2)
         print()
+        if args.no_redact:
+            print("actualis: --no-redact is on: this output may contain live secrets.",
+                  file=sys.stderr)
     elif args.share:
-        render_share(fleet, C(use_color()))
+        render_share(view, C(use_color()))
     elif args.aisvs:
-        render_aisvs(aisvs_findings(fleet), C(use_color()))
+        render_aisvs(aisvs_findings(view), C(use_color()))
     elif args.coach:
-        render_coach(coach(fleet), C(use_color()))
+        render_coach(coach(view), C(use_color()))
     else:
-        render(fleet, C(use_color()), bash_only=args.bash, top=args.top, raw=args.no_redact,
+        render(view, C(use_color()), bash_only=args.bash, top=args.top, raw=args.no_redact,
                network_only=args.network, network_filters=network_filter_names(args))
 
-    if args.fail_on:
-        reasons = failing_findings(fleet, args.fail_on)
-        # stderr, so `--json` on stdout stays byte-identical and a pipeline can
-        # capture the report and the verdict separately.
-        if reasons:
-            print(f"actualis: FAIL at --fail-on {args.fail_on}", file=sys.stderr)
-            for r in reasons:
-                print(f"  - {r}", file=sys.stderr)
-            print(f"  {len(fleet.secrets) - len(fleet.actionable_secrets)} suppressed "
-                  f"finding(s) were not counted.", file=sys.stderr)
-            return EXIT_FINDINGS
-        print(f"actualis: PASS at --fail-on {args.fail_on}", file=sys.stderr)
+    if _PENDING_GATE:
+        return _gate_verdict()
     return EXIT_OK
 
 
-if __name__ == "__main__":
+# (level, reasons, suppressed count) for the run in progress, set by main()
+# before it writes the report, so a closed stdout still gets the gate's code.
+_PENDING_GATE: list = []
+
+
+def _suppressed_count(fleet: Fleet) -> int:
+    """Suppressed credentials AND suppressed flags: both leave the gate."""
+    return (len(fleet.secrets) - len(fleet.actionable_secrets)
+            + len(fleet.flags) - len(fleet.actionable_flags))
+
+
+def _gate_verdict() -> int:
+    """Print the pending --fail-on verdict to stderr and return its exit code.
+
+    The code is decided first and returned whatever happens to stderr: a reader
+    that closes stderr mid-verdict (`2>&1 | head -1`) must not turn a failing
+    gate into a pass (R5), and the verdict leaves the pending list only once it
+    has been reported, or reporting it has failed."""
+    if not _PENDING_GATE:
+        return EXIT_OK
+    level, reasons, suppressed = _PENDING_GATE[-1]
+    code = EXIT_FINDINGS if reasons else EXIT_OK
+    # stderr, so `--json` on stdout stays byte-identical and a pipeline can
+    # capture the report and the verdict separately.
     try:
-        sys.exit(main())
+        if reasons:
+            print(f"actualis: FAIL at --fail-on {level}", file=sys.stderr)
+            for r in reasons:
+                print(f"  - {_one_line(r)}", file=sys.stderr)
+            print(f"  {suppressed} suppressed finding(s) were not counted.", file=sys.stderr)
+        else:
+            print(f"actualis: PASS at --fail-on {level}", file=sys.stderr)
+        sys.stderr.flush()
+    except (OSError, ValueError):            # BrokenPipeError is an OSError
+        _silence_stderr()
+    finally:
+        _PENDING_GATE[:] = []
+    return code
+
+
+def _reader_gone(exc: BaseException) -> bool:
+    """True when `exc` is a write to a std stream whose reader has gone.
+
+    POSIX reports that as EPIPE (BrokenPipeError). Windows reports a write or
+    flush to a pipe with no reader as EINVAL (errno 22) instead: only there,
+    and only for an error that names no file (a bad path is EINVAL on Windows
+    too, and carries its filename), is it treated the same way.
+    """
+    if isinstance(exc, BrokenPipeError):
+        return True
+    return (sys.platform == "win32" and isinstance(exc, OSError)
+            and exc.errno == 22 and exc.filename is None)
+
+
+def _silence_fd(stream) -> None:
+    """Point a stream's descriptor at the null device once its reader has gone.
+
+    Otherwise the interpreter's own flush at exit fails again and replaces the
+    exit code with 120, a code the docs do not list.
+    """
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, stream.fileno())
+        finally:
+            os.close(devnull)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def _silence_stdout() -> None:
+    """Point stdout at the null device once its reader has gone."""
+    _silence_fd(sys.stdout)
+
+
+def _silence_stderr() -> None:
+    """Point stderr at the null device once its reader has gone."""
+    _silence_fd(sys.stderr)
+
+
+def _cli(argv: list[str] | None = None) -> int:
+    """main() with the process-level handling: Ctrl-C and a closed stdout or stderr."""
+    code = None
+    _PENDING_GATE[:] = []
+    try:
+        code = main(argv)
+        sys.stdout.flush()
     except KeyboardInterrupt:
-        sys.exit(130)
-    except BrokenPipeError:
-        os._exit(0)
+        return 130
+    except OSError as exc:
+        if not _reader_gone(exc):
+            raise
+        # `actualis | head` is not an error, but it must not turn a failing
+        # gate into exit 0 either: the verdict was decided before the output.
+        # Only the stream whose reader has gone is silenced, so a closed
+        # stderr does not throw away a report still buffered for stdout.
+        for stream, silence in ((sys.stdout, _silence_stdout), (sys.stderr, _silence_stderr)):
+            try:
+                stream.flush()
+            except (OSError, ValueError):
+                silence()
+        if code is None:
+            code = _gate_verdict()
+    try:
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        _silence_stderr()
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(_cli())

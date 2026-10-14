@@ -2,7 +2,7 @@
 
 `actualis --json` emits the full report as machine-readable data.
 **Credentials are redacted by default**, including here; `--no-redact` disables
-that and prints a warning.
+that and prints a warning to stderr (stdout stays pure JSON).
 
 ## Top-level keys
 
@@ -13,28 +13,32 @@ that and prints a warning.
 | `version` | tool version. Changes far more often than `schema_version` and means something different |
 | `window` | `from`, `to`, `days`, `active_days` |
 | `scanned` | `files`, `bytes`, `roots[]` |
+| `scope` | the filters this run was given: `days` (`--days N`, or `null` for no limit), `project` (`--project`, `""` when not given), `agent` (`--agent`: `all` by default, or `claude`, `codex`, `copilot`, `gemini`, `qwen`). `--diff` warns when these or `scanned.roots` differ between the two reports |
 | `messages` | count of assistant messages with usage |
 | `cost_usd` | total, at provider list prices |
-| `cost_usd_from_unpriced_models` | how much of `cost_usd` was estimated: models priced by family inference or the default ceiling, not from a price list, vendor docs or an aggregator |
+| `cost_usd_from_unpriced_models` | how much of `cost_usd` was estimated: models priced by family inference or the default ceiling, not from a price list, vendor docs or an aggregator. Despite the name it does **not** cover the `unpriced` tier (Gemini, Gemma and Qwen ids with no published rate), which adds $0 and is listed in `unpriced_model_tokens`; the key keeps its name for compatibility |
 | `copilot_unpriced_sessions` | Copilot sessions with no shutdown record, counted but not priced (not $0) |
 | `cost_note` | how unpriced models are rated, and in which direction that errs |
 | `pricing` | where each rate came from, how old the table is, and how much of the total rests on a published price. See [Rate provenance](#rate-provenance) |
 | `duplicate_usage_records_skipped` | repeated records for the same message, counted once |
 | `duplicate_tool_calls_skipped` | tool calls seen again in another transcript (resumed and forked sessions copy history), counted once, by tool call id; the copy in the file read first is kept |
+| `unparsable_lines` | transcript lines that would not decode (malformed JSON, or nested deeper than the decoder allows), plus Codex `arguments` strings that would not, plus legacy Gemini `.json` sessions over 64 MiB (not decoded, one each); each is skipped and counted, never fatal. Claude lines the prefilter skips are not decoded, so not counted |
+| `unsupported_records` | Gemini CLI records that decode but are of a kind this version does not read: `$patch` lines (Gemini CLI 0.64 preview), any other `$` operation, and any other unknown shape. Skipped and counted, never fatal |
+| `rewound_tool_calls` | Gemini CLI tool calls in messages a later `$rewindTo` took out of the conversation. They ran, so they are audited and inventoried like any other call (their network items carry `rewound: true`) and counted here |
 | `duplicate_note` | why repeats occur and how they are collapsed |
-| `tokens` | `input`, `output`, `cache_w_1h`, `cache_w_5m`, `cache_w_assumed`, `cache_read` |
-| `by_agent` | cost per agent (`claude-code`, `codex`, `copilot`) |
+| `tokens` | `input`, `output`, `cache_w_1h`, `cache_w_5m`, `cache_w_assumed`, `cache_read`. For Gemini CLI and Qwen Code, `input` is the prompt minus its cached part plus tool-use prompt tokens, `cache_read` the cached part, and `output` includes thinking tokens (billed at the output rate) |
+| `by_agent` | cost per agent (`claude-code`, `codex`, `copilot`, `gemini`, `qwen`) |
 | `subagents` | see below |
-| `cache` | `fleet_hit_rate_pct`, `saved_usd`, `by_project{}` |
+| `cache` | `fleet_hit_rate_pct`, `saved_usd`, `by_project{}`: per project, largest context first, `hit_rate_pct`, `context_tokens` (input plus cache writes plus cache reads) and `saved_usd` |
 | `by_ticket[]` | see below |
 | `by_ticket` | cost and message counts per ticket, parsed from branch names |
 | `by_branch` | cost per branch bucket, including `trunk` and `detached HEAD` |
 | `by_model` | cost per model |
 | `by_project` | cost per project |
-| `by_day` | cost per calendar day, ascending |
+| `by_day` | cost per calendar day (UTC date), ascending |
 | `tools` | tool-call counts, descending |
-| `bash` | `total`, `commands{}`, `flag_counts{}`, `oversized_commands` (commands over 32 KB, each also a medium `oversized-command` flag), `flags[]` |
-| `coach` | findings: `id`, `severity`, `title`, `evidence`, `action`, `impact` |
+| `bash` | `total`, `commands{}` (program name to count; a program name that is itself a credential, such as a pasted token run as a command, is counted as `(credential)`), `flag_counts{}`, `oversized_commands` (commands over 32 KB, each also a medium `oversized-command` flag), `flagged.high` and `flagged.medium` (the report's "flagged N high M medium": one per command, suppressed flags left out; `flag_counts` counts per category and includes suppressed flags), `flags[]`: `id`, `severity`, `categories[]`, `program`, `project`, `when` (null when undated), `evidence` (240 characters, redacted unless `--no-redact`), `had_secret` (the command also contained a credential), `suppressed` and `suppressed_reason` |
+| `coach` | findings: `id`, `severity`, `title`, `evidence`, `action`, `impact`, `project` (the project a per-project finding such as `AF002` or `AF006` is about, `""` for fleet-wide findings; `--diff` matches findings on `id` and `project`) |
 | `secrets` | array; see below |
 | `secret_exposures` | commands containing credential material |
 | `suppressed_secrets` | credential findings marked as false positives on this machine |
@@ -43,12 +47,16 @@ that and prints a warning.
 | `secret_projects` | those commands per project |
 | `redacted` | whether values were masked (`true` unless `--no-redact`) |
 | `permission_modes` | turns per permission mode |
+| `unsupervised_pct` | percentage of recorded turns that ran in a mode that does not stop for approval, as `--share` prints it (Codex `sandbox:` entries are not turns); `null` when no permission mode was recorded. It covers only turns with a recorded mode: read it with `unmoded_commands` |
+| `moded_commands` | shell commands run with a recorded permission mode |
+| `unmoded_commands` | shell commands with no recorded permission mode, so who approved them is unknown (every Gemini CLI command; older transcripts of other agents). They are in no supervision share's denominator; `--share`, `--card supervision`, the report and the tray name this count instead of leaving it out silently |
 | `denials` | rejections by kind |
 | `refusals` | what was stopped and by which gate, joined to the blocked command. See below |
 | `unreadable_commands` | commands whose real content the transcript does not contain. See below |
 | `vendors` | what each agent's transcript actually provides, and what it does not |
 | `network` | downloads and fetches the agents made, with approval. See [network](#network) |
-| `unknown_models` | models seen with no pricing entry, billed at Opus-tier rates |
+| `unknown_models` | models seen with no pricing entry, so priced by inference: the newest sibling in the model family, or else the most expensive rate on file for the provider (the global ceiling when the provider is unknown). Excludes those in `pricing.models_by_tier.unpriced`, which are not billed at all. A dated or alias id of a model in the table (`claude-sonnet-4-5-20250929`, `claude-sonnet-4@20250514`, `claude-opus-4-0`) is that model, priced from its own row, and is not listed here |
+| `unpriced_model_tokens` | model to token count, for Gemini CLI and Qwen Code models with no published rate (tier `unpriced`): `gemini-3-pro-preview`, `gemini-3.5-flash`, every Qwen model, and any model id those agents report that has no price. Their tokens are in `tokens`; their cost is not in `cost_usd` and is not estimated |
 | `aggregator_priced_models` | models priced from a third party because the vendor publishes no rate for that id |
 
 ## Inferred cache TTL
@@ -73,7 +81,7 @@ rather than checked. `pricing` says.
 
 ```json
 { "verified": "2026-10-08", "age_days": 0, "stale": false, "stale_after_days": 90,
-  "tier_order": ["vendor","vendor-doc","aggregator","family","default"],
+  "tier_order": ["vendor","vendor-doc","aggregator","family","default","unpriced"],
   "confident_pct": 28.17,
   "cost_by_tier":   { "vendor": 3.0, "aggregator": 3.15, "family": 4.5 },
   "models_by_tier": { "vendor": ["claude-sonnet-5"], "family": ["claude-sonnet-4-9"] } }
@@ -88,6 +96,13 @@ rather than checked. `pricing` says.
 | `aggregator` | a third party that tracks prices |
 | `family` | **inferred** from the most expensive current sibling in the same model family |
 | `default` | **inferred** from the most expensive rate known for that provider, or the global ceiling |
+| `unpriced` | **no price at all**: a Gemini, Gemma or Qwen model id with no published rate, or any model Gemini CLI or Qwen Code reports that would otherwise fall to `default`. Priced at zero and listed, never estimated: a Claude ceiling on a Flash model would overstate it 10-30x |
+
+Gemini rows come from Google's price list (Standard paid tier), with the
+long-prompt rate for Pro models above 200,000 prompt tokens and dated price
+changes (`gemini-3.6-flash`, `gemini-3.8-flash`, `gemini-4-argon`) applied by
+the UTC date of each message. Free-tier Gemini use is not distinguishable in
+the transcript, so Gemini cost is an API-equivalent figure.
 
 A model is resolved in that order: exact entry, then nearest family sibling,
 then the provider ceiling, then the global ceiling. Each step reports the tier
@@ -161,7 +176,8 @@ print("match  :", claimed == actual)
 EOF
 ```
 
-Or in one line, if you have `jq` and prefer not to run Python:
+Or in one line, if you have jq 1.7 or later and prefer not to run Python (jq 1.6
+and earlier re-format numbers, so `0.0` becomes `0` and the digest never matches):
 
 ```sh
 jq -Sc 'del(.report_sha256, .pricing.age_days, .pricing.stale) | .coach |= map(select(.id != "AF013"))' report.json | tr -d '\n' | shasum -a 256
@@ -198,14 +214,14 @@ not parse (a script, `poetry add`, `npm exec`) gives no item.
 | `totals.items` | all network items found |
 | `totals.asked` / `unasked` / `unknown` | items by approval, see below |
 | `totals.failed` | items whose command is known to have failed |
-| `totals.unparsed_segments` | command segments that could not be read: a segment with a quote left open, or substitution nested deeper than three levels |
+| `totals.unparsed_segments` | command segments that could not be read: a segment with a quote left open, a command string (`bash -c`, `eval`, a here-string or heredoc fed to a shell) nested more than eight levels deep, substitutions nested more than 200 deep, a program word or URL whose brace expansion makes more than 16 words, a command whose nested strings exceed the 2 MiB lexing budget, or the part of a command past 1 MiB (counted once per command). Under `--ioc`, a command not fully read for one of the last five reasons is also listed as an item (`kind` `fetch`, `program` `(unreadable)`, `dynamic` `true`) and matched `unresolved` with reason `unreadable` |
 | `by_kind` | counts of `install`, `clone`, `fetch` and `search` items |
 | `by_day[]` | per UTC date with at least one item, oldest first: `date` (`YYYY-MM-DD`), `items`, `unasked`. Added in 0.3.0 |
 | `by_day_undated` | items with no timestamp, so not in `by_day`; `sum(by_day[].items) + by_day_undated == totals.items` |
 | `by_project[]` | per project, most items first: `project`, `items`, `unasked`; the sums equal `totals.items` and `totals.unasked` |
-| `hosts[]` | per host: `count`, `unasked`, `first_seen`, and `trusted` if any item from it matched the trust list |
+| `hosts[]` | per host: `count`, `unasked`, `first_seen` (the earliest item `ts` by UTC instant; the string keeps that item's own offset), and `trusted` if any item from it matched the trust list |
 | `packages[]` | per `ecosystem` and `name`: `versions` seen, `pinned` (every install named an exact version: a full `MAJOR.MINOR.PATCH` for npm, crates and go, `==` for pypi, an `@sha256:` digest for images; for crates, `cargo add` is pinned only with `=1.2.3` and `cargo install --version 1.2.3` is exact; ranges, tags and prefixes are not pinned), `exec` (any install ran code), `count`, `unasked` |
-| `items[]` | one record per item (`package`, `version` and `alias` are redacted like `url` unless `--no-redact`): `kind`, `program`, `host`, `host_inferred`, `url`, `dest`, `source`, `ecosystem`, `package`, `version`, `pinned`, `exec`, `dynamic`, `alias` (the name an npm alias installs under, `x` in `x@npm:evil@1.0.0`, where `package` is `evil`; else `null`), `failed` (`null` when unknown), `approval`, `trusted`, `agent`, `project`, `session`, `call_id` (the tool call's id in the transcript, an opaque string, `null` when there is none), `ts`, `ioc` (`match`, `unresolved` or `null`; see `network.ioc`), `mode` (the permission-mode key `approval` was judged from, or `null`), `why` (the assistant's own words before the call: the last sentence, at most 160 characters, or `null`), `prompt` (the person's last real message before the turn, at most 160 characters; `null` unless `--with-prompts`), `transcript` (`root`, `file` relative to `root`, and the 1-based `line` of the record that made the call; `line` is `null` for a `--ci-log` array; `transcript` is `null` for an item not read from a file) |
+| `items[]` | one record per item (`package`, `version` and `alias` are redacted like `url` unless `--no-redact`): `kind`, `program`, `host`, `host_inferred`, `url`, `dest`, `source`, `ecosystem`, `package`, `version`, `pinned`, `exec`, `dynamic` (`true` when the URL or registry is built from a shell variable, or when curl/wget read their URLs from a file: `wget -i`, `curl -K`; a variable only in the path or query keeps the literal `host`, so `https://evil.example/$VER/x` has `host` `evil.example`, while `https://$HOST/x` has `host` `null`; an install from `--registry "$R"` or `-i "$IDX"` has `host` `null`, never the public default; also `true` when the host is written in a form that cannot be normalised (`host` `null`), and when the same command redirects the transfer through a proxy or another address, which also keeps it untrusted; `host` is normalised as curl resolves it: percent-decoded, IDNA, lower case, no trailing dot, an IPv4 address in any numeric form as a dotted quad), `alias` (the name an npm alias installs under, `x` in `x@npm:evil@1.0.0`, where `package` is `evil`; else `null`), `failed` (`null` when unknown), `approval`, `trusted`, `agent`, `project`, `session`, `call_id` (the tool call's id in the transcript, an opaque string, `null` when there is none), `ts`, `ioc` (`match`, `unresolved` or `null`; see `network.ioc`), `mode` (the permission-mode key `approval` was judged from, or `null`), `why` (the assistant's own words before the call: the last sentence, at most 160 characters, or `null`), `prompt` (the person's last real message before the turn, at most 160 characters; `null` unless `--with-prompts`), `transcript` (`root`, `file` relative to `root`, and the 1-based `line` of the record that made the call; `line` is `null` for a `--ci-log` array; `transcript` is `null` for an item not read from a file), `rewound` (see below) |
 | `items_truncated` | `true` when `items` was cut at the cap |
 | `strict` | whether `--network-strict` was on |
 | `trust` | the trusted host or host-and-path entries in force |
@@ -228,9 +244,19 @@ is in `actualis --explain network`; a field the records do not give is
 
 **Approval values.** `asked`: the user was prompted and approved. `unasked`:
 the agent ran it without asking, in a mode that does not prompt. `unknown`:
-default mode, where an allowlist rule may have approved it without asking.
+no record of who approved it: default mode, where an allowlist rule may have
+approved it without asking, or an agent that records no approval at all.
+**Gemini CLI records no approval and no approval mode**, so every Gemini item
+is `unknown` with `mode` `null`; a call a person declined, or a policy blocked,
+is a refusal and leaves the inventory. Qwen Code records its approval mode
+(`qwen:yolo` and `qwen:auto` are `unasked`; `qwen:default`, `qwen:plan` and
+`qwen:accept-edits`, Qwen's `auto-edit`, which still asks before a shell
+command, are `unknown`).
 
-**Cap.** `items` holds the newest 2000 items, newest first, in a fixed total
+**rewound.** `true` for a Gemini CLI call whose message a later `$rewindTo`
+removed from the conversation; the call still ran. `false` otherwise.
+
+**Cap.** `items` holds the newest 2000 items, newest first (by UTC instant), in a fixed total
 order. `totals`, `hosts` and `packages` always cover every item.
 
 **Redaction.** `url`, `dest` and `source` are redacted unless `--no-redact`.
@@ -266,10 +292,14 @@ it is `{"enabled": false, "sources": [], "totals": {...all zero}, "matches": [],
 - `reason`: `any-version`, `version-in-spec` or `host` (match);
   `version-unresolved`, `undecidable`, `module-prefix` (a Go package inside a
   listed module whose version cannot be ordered), `private-registry`,
-  `name-from-url` or `error` (unresolved).
+  `name-from-url`, `error`, `unreadable` (part of the command was not read
+  because of a nesting or length limit, or a brace or curl glob expands to more
+  than 64 words), `host-unresolved` (the host is written in a form that cannot
+  be normalised) or `redirected` (the command sends the transfer through a proxy
+  or to another address) (unresolved).
 - `format`: `lines`, `osv-json` or `osv-jsonl`.
 - `entry.kind`: `package`, `host`, or `error` (a placeholder when checking the
-  item failed; `source` is then `-1`).
+  item failed or the command was not fully read; `source` is then `-1`).
 
 **Order.** Not refused first, then match before unresolved, then newest, then
 the item, then the entry's `(source, line)`: the same input gives the same
@@ -335,6 +365,8 @@ an empty collection.
 ```
 
 `id` is `sha256[:8]` of the value. The value itself is never emitted.
+`first_seen` and `last_seen` are `""` when no record that carried the credential
+had a readable timestamp; they are never `null`.
 
 Each entry also carries `suppressed` and `suppressed_reason`. **A suppressed
 finding is still listed here and still counted** — it is held back from the
@@ -359,24 +391,37 @@ toward `--fail-on`.
   "first_seen": "2026-05-06", "last_seen": "2026-06-02" }
 ```
 
+`first_seen` and `last_seen` are `""` when none of the ticket's records had a
+readable timestamp; they are never `null`.
+
 ## `vendors`
 
-Three agents are read; their transcripts do not contain the same things.
+Five agents are read; their transcripts do not contain the same things.
 
-| Capability | Claude Code | Codex | Copilot CLI |
-|---|---|---|---|
-| Cost and token usage | yes | yes | yes |
-| Per-message dedup | yes | partial | partial |
-| Shell command text | yes | yes | yes |
-| Project attribution | yes | yes | yes |
-| Git branch | yes | no | yes |
-| Tool refusals | yes | no | yes |
-| Permission mode | yes | yes | yes |
-| Sandbox policy | no | yes | no |
-| Subagent activity | partial | no | partial |
-| Subagent cost | no | no | no |
-| Cache TTL split | partial | no | no |
-| Reasoning effort | yes | no | no |
+| Capability | Claude Code | Codex | Copilot CLI | Gemini CLI | Qwen Code |
+|---|---|---|---|---|---|
+| Cost and token usage | yes | yes | yes | yes | yes |
+| Per-message dedup | yes | partial | partial | yes | yes |
+| Shell command text | yes | yes | yes | yes | yes |
+| Project attribution | yes | yes | yes | yes | yes |
+| Git branch | yes | no | yes | no | yes |
+| Tool refusals | yes | no | yes | partial | partial |
+| Permission mode | yes | yes | yes | **no** | yes |
+| Sandbox policy | no | yes | no | no | no |
+| Subagent activity | partial | no | partial | yes | partial |
+| Subagent cost | no | no | no | yes | partial |
+| Cache TTL split | partial | no | no | no | no |
+| Reasoning effort | yes | no | no | no | no |
+
+Each capability row in the payload has `gemini` and `qwen` beside `claude`,
+`codex` and `copilot`. Gemini CLI writes neither whether a person approved a
+call nor the approval mode (YOLO, auto-edit) it ran in, so its approval is
+always `unknown`; only a refusal ("User denied execution.") or a policy block
+("Tool execution denied by policy.") is recorded.
+
+The payload is `vendors.capabilities[]`, one row per capability above: `capability`
+(the row's name), then `claude`, `codex`, `copilot`, `gemini` and `qwen` (`yes`,
+`no` or `partial`), and `depends_on`; `vendors.note` says why it matters.
 
 Every row in the payload also carries `depends_on`, naming the transcript field
 the claim rests on, so it can be checked against the parser rather than taken on
@@ -435,6 +480,11 @@ it is here so a clean report cannot be mistaken for a complete one.
   "by_week":    { "2026-W31": { "user-rejected": 40 } } }
 ```
 
+It also carries two strings: `join_note`, on how a refusal is joined to the call
+it blocked (an unjoined one means the call was not in the same session file), and
+`scope_note`, on what the counts cover (this machine only, bounded by transcript
+retention).
+
 A refusal is its own record, carrying `toolDenialKind`. It holds no `tool_use`
 block of its own — it points back at the call it blocked through `tool_use_id`
 on its `tool_result`. Reading the refusal record alone tells you that something
@@ -445,7 +495,8 @@ auto-mode policy, and `automode-unavailable` means the deciding model was
 unreachable.
 
 **Program names only, never command text.** The commands people refuse are the
-ones least suited to being pasted into an issue.
+ones least suited to being pasted into an issue. A program name that is itself a credential
+(a pasted token run as a command) is counted as `(credential)`.
 
 Two limits worth stating. This is **one machine**: refusals are not deduplicated
 across developers, so the same policy firing on ten laptops counts ten times.
@@ -476,10 +527,10 @@ claude mcp add actualis -- actualis --mcp
 
 | tool | returns |
 |---|---|
-| `fleet_summary` | window, spend, cache hit rate, top projects, unsupervised share |
+| `fleet_summary` | window, spend (with `cost_usd_from_unpriced_models` and `unpriced_model_tokens` as in `--json`), cache hit rate, top projects, unsupervised share (`unsupervised_pct` over turns with a recorded mode, with `moded_commands` and `unmoded_commands`) |
 | `ticket_cost` | cost for one ticket, or the most expensive ones |
-| `exposed_secrets` | rotation list: priority, types, fingerprint, dates |
-| `coach_findings` | `AF001`–`AF011` with evidence and actions |
+| `exposed_secrets` | rotation list: priority, types, fingerprint, dates (`first_seen`/`last_seen` are `""` when unknown, as in `--json`), and `suppressed`/`suppressed_reason` per row. `worth_rotating` leaves out suppressed credentials, as the report does; `suppressed` counts them. `priority` must be `critical`, `high`, `low` or `all` |
+| `coach_findings` | `AF001`–`AF013` with evidence, actions and `project` (the project an AF002/AF006 row is about, else `""`) |
 | `shell_audit` | counts by category, permission modes, the subagent blind spot |
 | `explain` | how a figure is computed, what it assumes, how to verify it |
 | `verify_agents` | installed agent platforms and their signature status |
@@ -488,6 +539,15 @@ claude mcp add actualis -- actualis --mcp
 written back into a transcript that this tool then scans, so the surface is
 narrow by design: aggregates, types, `sha256[:8]` fingerprints and counts. Never
 a secret value, never raw command text. Tests assert both.
+
+A bad argument is a JSON-RPC invalid-params error (`-32602`): an unknown
+`priority`, or a `days` that is not a whole number (`"7"`, `7.5`).
+
+The server answers only from the scope it was started with: `--root`, `--agent`,
+`--days` and `--project` apply to every tool. A client's `days` or `project` can
+narrow that scope, never widen it; a `project` outside the server's `--project` is
+an invalid-params error. `--no-redact` and `--top` are refused (exit 2), because no
+tool returns a credential value or a top-N list.
 
 Both the retired `initialize` handshake and the stateless 2026-07-28 style are
 answered, since clients in the wild vary. The scan is cached for the life of the
@@ -510,7 +570,9 @@ A non-zero value here is normal and healthy. Zero on a large scan is suspicious.
 
 `cost_usd_from_unpriced_models` is the share of `cost_usd` attributable to
 models absent from the rate table (priced by family inference or the default
-ceiling). Models priced from an aggregator are known, not unpriced; they are
+ceiling): the *estimated* part. It excludes the `unpriced` tier, whose models
+add no cost and are listed in `unpriced_model_tokens`; so a value of 0 with
+models in `pricing.models_by_tier.unpriced` is consistent. Models priced from an aggregator are known, not unpriced; they are
 listed in `aggregator_priced_models`. Those are priced at the top of the known
 range for their provider, so that share is an upper bound among current models,
 not a measurement. It is reported separately rather than folded in so you can

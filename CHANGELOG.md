@@ -1,5 +1,408 @@
 # Changelog
 
+## Unreleased
+
+### Upgrading from 0.3.0: what can change a gate
+
+The same transcripts can give a different exit code than they did on 0.3.0.
+Each of these is listed in full below.
+
+- **New agents are read by default.** `--agent` defaults to `all`, which now
+  includes Gemini CLI and Qwen Code. On a machine with their transcripts, their
+  commands, credentials and downloads join the report and the gate.
+- **`--fail-on` can newly exit 3** on transcripts 0.3.0 passed:
+  - new `high` `remote-exec` shapes: a shell fed code through a heredoc, a
+    here-string, `cat <<EOF | sh`, `bash < <(…)` or `eval "$(curl …)"`;
+    `curl … | /usr/bin/env bash` and other shells named by path; a brace-expanded
+    program word (`cu{r,}l … | sh`); and commands that comments, quoting,
+    heredocs, line continuations or `$'…'` used to hide from the audit;
+  - newly counted credentials (`high`, or `critical` for a private key): classic
+    `sk-` OpenAI keys, `npm_`, `shpat_`, `lin_api_` and `ya29.` tokens, PEM and
+    armored PGP private keys, quoted JSON keys, `aws configure set`, `gh secret
+    set --body`, quoted passwords holding `;` or spaces, credential options given
+    with a space (`--token VALUE`), cookies, `.netrc` lines and `Authorization:`
+    values with no scheme;
+  - newly flagged shell commands: `rm -r -f`, `rm --recursive --force`, `rm -rfv`,
+    `sudo` after `then`, `do`, `(`, `$(`, an assignment or `time`, `/usr/bin/sudo`,
+    `cat` of `~/.ssh/id_ed25519` or `id_ecdsa`, `curl --json @file`, and a curl
+    upload to a remote host that mentions "localhost" only in a header or query;
+  - a failing gate whose output was piped into something that exits early
+    (`| head`, `| true`, `2>&1 | head -1`) used to exit 0 or 120. It now keeps 3.
+- **`--ioc` and `--network-strict` see more.** Downloads hidden by shell syntax,
+  options, wrappers, proxies, brace expansion, percent-encoded or numeric hosts,
+  or padding before an install are now inventoried and matched (`network-ioc`,
+  `high`). A download that cannot be read or resolved (nested too deep, too long,
+  a host that cannot be normalised, a redirected request, a brace expansion over
+  16 words) is now `network-ioc-unresolved` instead of passing clean. Under
+  `--network-strict`, redirected downloads, a registry given as a variable,
+  `gh`/`brew tap`/`npm i owner/repo` hosts and trusted path prefixes followed by
+  a shell variable are no longer trusted, so `network-unasked` findings can rise.
+- **Combinations that used to be ignored now exit 2.** One mode per run;
+  `--fail-on`, `--json`, `--network`, `--ioc`, `--ci-log`, `--with-prompts`,
+  `--top`, `--no-redact`, `--reason`, `--quiet`, `--interval` and the scope flags
+  are refused where they would be dropped (full list under Changed). A CI line
+  that passed one of them can now exit 2.
+- **Bounds now exit 2:** `--days` below 1 or above 36500, `--top` below 1,
+  `--interval` outside 0.5 to 3600 seconds (or `nan`/`inf`), an unknown
+  `--explain` topic, a malformed `--suppress` id or unknown `--why` id (was 1), a
+  malformed or wrong-schema `--diff` baseline (was a traceback or 1), and an
+  `--mcp --root` that does not exist.
+- **A failed `--self-check` exits 4**, not 3.
+- **AF013 (rate table age) no longer fails `--fail-on`.** A gate that went red
+  only on the table's age now passes. AF013 is still reported.
+- **Figures move.** Resumed or forked sessions no longer count permission modes,
+  denials and refusals twice; Codex turns are no longer counted twice in AF003
+  and AISVS 9.2.1; Codex approval modes respect `--project` and `--days`; Codex
+  under `--days` counts only the window's tokens; dated and alias model ids are
+  priced as themselves; Google and Qwen models with no published price are no
+  longer billed at the Claude ceiling. AF003, AF006, AISVS 9.2.x and the
+  spend-based findings (AF001, AF007, AF009, AF010) can appear or vanish.
+- **Counts change** (`secret_exposures`, `secret_projects`,
+  `unreadable_commands`, `duplicate_tool_calls_skipped`), and `report_sha256` is
+  not comparable with 0.3.0. Take a fresh `--diff` baseline.
+- **`--fail-on any` can newly exit 3** on the new medium `network-config` flag:
+  a command that writes download configuration (git `insteadOf` or proxy,
+  npm/pnpm/yarn registry or proxy, pip index, or a write to `.npmrc`,
+  `.yarnrc`, `pip.conf`, `.gitconfig`).
+- **Cookie suppressions need re-adding.** A cookie credential's id now names
+  the cookie (`cookie:<program>:<NAME>`), not the header, so a suppression
+  written for a cookie finding on 0.3.0 no longer matches.
+- **GitHub Action:** `fail-on` is case-insensitive, `fail-on: None` no longer
+  skips the gate silently, and an unrecognised value fails the job.
+
+### Added
+
+- **Gemini CLI support.** Reads `~/.gemini/tmp` (or
+  `$GEMINI_CLI_HOME/.gemini/tmp`, plus `~/.cache/.gemini/tmp` from macOS sandbox
+  runs): the legacy `.json` sessions, the JSONL sessions with `$set` and
+  `$rewindTo`, and subagent sessions.
+  - Shell commands are audited and inventoried like every other agent's.
+    `web_fetch` URLs (taken from its prompt) and `google_web_search` reach the
+    network inventory; `write_file` and `replace` reach the audit-config
+    tripwire.
+  - Gemini CLI records no approvals, so every Gemini network item's approval is
+    `unknown`. A call a person declined, or a policy blocked, counts as a
+    refusal.
+  - Tool calls a later rewind removed are still audited, marked `rewound`, and
+    counted in `rewound_tool_calls`.
+- **Qwen Code support.** Reads `~/.qwen/projects` (or `$QWEN_HOME`,
+  `$QWEN_RUNTIME_DIR`), with the real cwd and branch per record and the approval
+  mode per turn: `yolo` and `auto` count as unasked; `auto-edit` (which still
+  asks before shell commands), `default` and `plan` as unknown.
+- **`--agent gemini` and `--agent qwen`.** Both agents also work with `--root`,
+  `--watch`, `--replay`, `--self-check` and the MCP server. `--explain gemini`
+  and `--explain qwen` describe them.
+- **Gemini API prices** from Google's price list, including the long-prompt rate
+  above 200,000 tokens for Pro models and the announced price changes for
+  gemini-3.6-flash, gemini-3.8-flash and gemini-4-argon, applied by message
+  date.
+- **An `unpriced` pricing tier.** Models with no published price
+  (gemini-3-pro-preview, gemini-3.5-flash, every Qwen model) show their tokens
+  and no cost, instead of a guessed one.
+- **`make security`** builds a pinned Kali image and runs bandit, trufflehog,
+  gitleaks and a transcript fuzzer (Claude Code, Codex and Copilot CLI formats)
+  against a read-only checkout, with no network and a throwaway home. It works
+  on native Linux Docker hosts, reports a scanner that failed to run as FAILED,
+  and reports unverified secret candidates outside the fixture allowlist.
+  Documented in CONTRIBUTING.md and SECURITY.md.
+- **`make security-remote`** runs the same scan on the build server over SSH
+  (`SECURITY_HOST`, default `mac-mini`). It sends a git bundle of `HEAD`
+  (committed work only) and copies `security-out/` back.
+- **New `--json` fields.** All are additive, so `schema_version` stays 1:
+  - `scope` (`days`, `project`, `agent`) and `coach[].project`;
+  - `unsupervised_pct`, `moded_commands` and `unmoded_commands`;
+  - `bash.flagged.high` and `bash.flagged.medium` (suppressed flags left out);
+  - `unparsable_lines`, `unsupported_records`, `rewound_tool_calls` and
+    `unpriced_model_tokens`;
+  - `vendors.capabilities[].gemini` and `.qwen`, and `network.items[].rewound`;
+  - two new `network.ioc.matches[].reason` values, `host-unresolved` and
+    `redirected`;
+  - in `--replay --json`, `window.undated_sightings`.
+- **MCP additions.** `fleet_summary` adds `moded_commands`, `unmoded_commands`,
+  `unsupervised_basis` and `unpriced_model_tokens`; `exposed_secrets` rows carry
+  `suppressed` and `suppressed_reason`; `coach_findings` includes `project`.
+- **GitHub Action `gate-reasons` output**, counting what the gate actually failed
+  on, including flagged shell commands and IOC hits.
+- **`--diff` warns** when the two reports were made with different filters or
+  roots.
+
+- **`network-config` shell-audit finding (medium)**, so a download redirect
+  set in one tool call is visible even when a later call's download cannot be
+  tied to it.
+
+### Changed
+
+- **One mode per run.** Combining two of `--diff`, `--why`, `--replay`,
+  `--watch`, `--mcp`, `--explain`, `--agents`, `--suppress`, `--suppressions`,
+  `--self-check`, `--service`, `--completions`, `--card`, `--share`, `--coach`,
+  `--aisvs` and `--bash` is a usage error that names both. Before, one was
+  silently dropped, including a `--suppress` write.
+- **Flags a mode would drop are refused (exit 2), naming both flags:**
+  - `--fail-on` with a mode that never evaluates the gate (`--diff`, `--why`,
+    `--replay`, `--watch`, `--mcp`, `--explain`, `--agents`, `--suppress`,
+    `--suppressions`, `--self-check`, `--service`, `--completions`);
+  - `--json` with `--share`, `--coach`, `--aisvs`, `--bash`, `--why`,
+    `--explain`, `--suppress`, `--suppressions`, `--self-check`, `--service`,
+    `--completions`, `--watch` or `--mcp`;
+  - `--network` and `--ioc` with modes that would drop them; `--ioc` with
+    `--why`; `--ioc`, `--network-strict` or `--network-trust` with `--coach`,
+    `--aisvs` or `--share` unless `--fail-on` is given;
+  - `--ci-log` with `--root`, `--agent`, `--project`, `--replay` or a mode that
+    does not scan;
+  - `--with-prompts` with `--agents`, `--replay`, `--watch` or `--mcp`;
+  - `--top` with `--json`, `--html` or any mode other than the text report,
+    `--bash` and `--network`;
+  - `--reason` without `--suppress`; `--quiet` or `--interval` without `--watch`
+    (or with `--service newsyslog`);
+  - `--root`, `--agent`, `--days`, `--project` or `--no-redact` with
+    `--explain`, `--agents`, `--completions`, `--suppress` or `--suppressions`;
+    `--days` or `--project` with `--watch` or `--service`; `--project` or
+    `--no-redact` with `--self-check`; `--service` with `--root`, `--agent` or
+    `--no-redact`;
+  - `--no-redact` with `--replay`, `--mcp`, `--why`, `--card`, `--share`,
+    `--coach` or `--aisvs`;
+  - `--out` or `--style` with `--service`, `--self-check` or `--completions`.
+- **A failed `--self-check` exits 4** (it used to exit 3, the code for findings
+  at or above `--fail-on`).
+- **AF013 is reported but not gated.** The rate table's age changes with the
+  date, not the transcripts.
+- **`--mcp` honours `--root`, `--agent`, `--days` and `--project`.** Every tool
+  answers only from that scope; a client can narrow it but not widen it.
+- **`--replay` honours `--agent` and `--project`**, names Codex and Copilot
+  projects as the report does (so `exposure.projects` matches
+  `secrets[].projects`), and names a Codex session by its id.
+- **`--why AF002` / `--why AF006`** explain every project the finding fires for,
+  not only the first.
+- **Supervision figures say what they cover.** `--card supervision`, `--share`,
+  the report and the tray say how many commands had no recorded permission mode
+  (Gemini CLI never records one) instead of leaving them out. The card's "you"
+  bar is now "gated": a mode that can stop for approval does not mean a person
+  approved.
+- **Unpriced cost is labelled "estimated".** Unpriced models are priced by
+  inference (a family sibling or the provider ceiling), and the report says so
+  instead of "billed at Opus-tier rates". `cost_usd_from_unpriced_models` keeps
+  its name and meaning, and is documented as excluding the `unpriced` tier.
+  `--explain cost`, the footers and the network legend describe the Google rates,
+  the `unpriced` tier and agents that record no approval.
+- **Deeper reading.** Nested command strings are read to 8 levels (was 3) and
+  substitutions to 200; brace expansion is read up to 16 words. `trap` actions
+  are read; arithmetic and `[[ ]]` text is not read as commands.
+- **Timestamps are compared and printed in UTC.** A timestamp with an offset is
+  counted on its UTC date; `bash.flags[].when` and network item times print with
+  `+00:00`.
+- **Program names are matched case-insensitively** (`Docker`, `NPM`, `CURL`), as
+  on macOS's case-insensitive filesystem, where these spellings run the real
+  tool.
+- **`--share` leaves out suppressed credentials** and says how many were
+  suppressed; MCP `worth_rotating` matches the report.
+- **The tray reads the CLI's figures** for "ran unsupervised" and "flagged N
+  high", so it agrees with the report for Codex and leaves out suppressed flags.
+- **The test suite is hermetic and date-proof.** It runs in a temp home and
+  working directory, fails if a test reads your real home, measures timing in CPU
+  time with wide headroom, and no longer depends on the date.
+
+### Fixed
+
+- **Malformed transcripts no longer stop the run.** A wrong-typed field (a string
+  token count, a list `command`, an object `arguments`, a numeric `cwd`, a list
+  or object Copilot `permission.completed` kind, and similar) is treated as
+  absent in the report, `--replay`, `--self-check` and `--watch`. A malformed or
+  too deeply nested line is skipped and counted in `unparsable_lines`. A lone
+  UTF-16 surrogate, a token count or duration above 10^15, and negative or
+  non-finite token counts no longer crash or produce negative or infinite cost.
+- **Wrong-typed harness fields are absent, not values.** Permission mode, denial
+  kind, effort, Copilot tool name, call id, model and Codex sandbox type are no
+  longer counted as values such as `"['bypassPermissions']"`.
+- **Timestamps without a timezone** no longer crash the scan when mixed with
+  aware ones or used with `--days`, and network items, `hosts[].first_seen` and
+  flag times sort by real instant across time zones.
+- **Resumed and forked sessions are counted once.** A Codex session copied into
+  another rollout is priced once and its tool calls dedupe by call id; permission
+  modes, denials and refusals are no longer counted twice for Claude Code, Codex,
+  Copilot and Qwen Code; `--replay` counts a resumed session's copied tool calls
+  once, for Claude Code and Codex.
+- **Codex under `--days`** filters commands one by one, counts only the tokens
+  used inside the window and books each day's usage to that day. Before,
+  resuming an old session moved its whole cost to today.
+- **AF003 and AISVS 9.2.1** counted every Codex turn twice, halving the
+  unsupervised share; an all-`never` Codex fleet now reads 100%. AISVS 9.3.1
+  counts commands, not category matches, and leaves out suppressed flags.
+- **Pricing ids.** Dated, `-0` alias and Vertex `@YYYYMMDD` ids are priced as
+  their own model (`claude-opus-4-1-20250805` and `claude-opus-4-20250514` at
+  $15/$75, `claude-sonnet-4-20250514` at $3/$15, `claude-3-5-haiku-20241022` at
+  $0.80/$4), not as the newest sibling, the fallback, or unpriced. Claude Code's
+  zero-usage `<synthetic>` records are no longer counted as messages. A Gemini
+  Pro message in a Claude Code transcript switches to the long-prompt rate above
+  200,000 prompt tokens, as Google bills it.
+- **Tickets.** Jira keys must be uppercase, so `renovate/node-18.x` is not a
+  ticket; `hotfix/CVE-2024-1234` is one ticket per CVE, not per year.
+- **Download parsing.** `docker run` options that take a value no longer replace
+  the image name, and docker global options and `docker image pull` /
+  `docker container run` are read; short-option clusters, npm `--omit dev` and
+  curl/wget option values (`--etag-save`, `-A`, `-D`, …) no longer create phantom
+  downloads; `pip install 'name@git+https://…'` keeps the package name;
+  `pip install -e|-r|-c URL`, `--extra-index-url` and `--find-links` show the
+  URL's host; a variable in a URL's path, query or port keeps its host;
+  `wget -i FILE` and `curl -K FILE` show a download from a file.
+- **More downloads inventoried:** `npm exec`/`npm x`, `create`/`npm init <x>`,
+  `yarn dlx`, `yarn global add`, `go run pkg@version`, `uv tool install|run`,
+  `uv run --with`, `pip3.12`-style names, `cargo +toolchain install`, URLs written
+  without `http://`, bare-IP and `user@host/x` curl and wget URLs, shell function
+  bodies, `git submodule add`, `git ls-remote`, `git config remote.NAME.url`
+  followed by a fetch, and every repeated `curl --url`, `npx -p` and `--with`.
+- **IOC matching.** A `host:` or trust entry with a path (`ghcr.io/org`) matches
+  images from that registry and organisation; host/path entries match
+  percent-encoded or doubled-slash paths; a match from a public registry alias
+  (`registry.yarnpkg.com`, `registry.npmjs.com`, `pypi.python.org`) is no longer
+  called a private registry; `uvx tool@latest` against a listed version is
+  "version not resolved"; a package or URL built from `$(…)` is marked dynamic
+  and not counted as checked; `xargs npm i` is not a lockfile install.
+- **Shell audit.** The program of `cd x && npm test` is `npm` (category test),
+  `sudo -u postgres psql` is `psql`, a quoted value containing `;` is not a
+  program name, and `apt install sudo` is not flagged. `[[ =~ ]]`, `$((…))`,
+  `for ((…))` and an escaped `\>|` or `\>&` no longer produce phantom installs or
+  merge two commands.
+- **`--watch`** alerts on every shape the report flags high, no longer misses a
+  record still being written or stops on a malformed one, prints its summary when
+  stopped during the first pass, walks the directories every 30 seconds instead
+  of every poll, and names the project of a Codex or Copilot alert from its
+  working directory. `--replay` and `--watch` no longer read Gemini CLI sessions
+  as Qwen Code ones.
+- **`--replay`** finds credentials in records with no usable timestamp (counted
+  in `window.undated_sightings`; `first_seen`/`last_seen` are `""` when all are
+  undated), and reads the same files as the report.
+- **`--self-check`** reads Codex and Copilot directories with their own parsers,
+  honours `--agent`, says "skipped" for "network totals reconcile" when nothing
+  was parsed, and lists the `--network --html` report among the write paths.
+- **`--diff`** reports a per-project finding (AF002, AF006) that appears or
+  clears in one project while another has it.
+- **MCP server.** A malformed message (invalid JSON or UTF-8, deep nesting, a
+  line over 1 MB) gets a parse error (-32700) and a batch, non-object message or
+  non-finite id an invalid request error (-32600); the server keeps serving.
+  `explain`, `verify_agents` and unknown tools answer without scanning, and
+  `explain` lists every topic. `ticket_cost` bounds `limit` to 1-200 and accepts
+  a numeric ticket; `days: 7.0` is honoured, while a non-whole `days` or an
+  unknown `priority` is an invalid-params error (an unknown priority used to
+  return every credential). Internal errors are no longer reported as invalid
+  params.
+- **Entry point and CLI.** The pip/pipx `actualis` command keeps the gate's exit
+  code when piped into `| head`; `--ci-log FILE --agent claude` works again;
+  `--explain` topics are case-insensitive; a suppression written with a tab or
+  an upper-case id works, and one with an id actualis never emits is listed as
+  ignored; `--network` with long filters no longer dims the rest of the report;
+  wrapped text no longer starts with a blank line.
+- **Output.** `--json --no-redact` warns on stderr like the other views; with
+  `--no-redact` the text digest matches `report_sha256`; the FAIL summary's
+  suppressed count includes shell and IOC flags; `first_seen`/`last_seen` in
+  `--json` and MCP are `""`, never `null`, when no timestamp was readable.
+- **Hangs and memory.** A FIFO, device or other non-regular file in a transcript
+  directory no longer blocks every run (report, CI gate, `--watch`, `--replay`,
+  MCP, tray); it is skipped as unreadable. A legacy Gemini `.json` session over
+  64 MiB is counted as unparsable instead of read whole.
+- **`--service systemd`** quotes `ExecStart` as systemd expects, so paths with
+  spaces, `%` or `$` work, and from a source checkout points at that checkout.
+- **`--card`** takes the next free name when `actualis-card.png`/`.svg` is a
+  dangling symlink or appears mid-write, and shows a figure too long for its slot
+  in a compact unit (`$12.3M`) instead of cutting it.
+- **GitHub Action.** The gate's message counts what it failed on (it used to say
+  "0 finding(s)"), and the `findings` and `ioc-matches` outputs are no longer
+  empty on Windows runners.
+- **Tray.** Suppressed credentials no longer count toward the badge or alert;
+  Codex `never` counts as unsupervised; the cost line names its window, and
+  changing it rescans without re-announcing old exposures; the menu stays
+  responsive during a scan, which stops after 5 minutes; the Windows alert is a
+  real toast.
+- **Tools and packaging.** `tools/denials.py` no longer crashes on malformed
+  records; `tools/price-check.py --fetch` checks aggregator-priced models and
+  exits 1 when a priced model is missing from its source; the sdist includes the
+  files its tests read.
+- **Docs.** docs/json.md documents `vendors.capabilities[]`,
+  `cache.by_project.*.hit_rate_pct` and `context_tokens`, `bash.flags[].had_secret`,
+  `refusals.join_note` and `refusals.scope_note`, and notes that the jq digest
+  recipe needs jq 1.7; `--explain coach` names AF001-AF013; shell completions
+  allow a flag straight after `--card` or `--explain`.
+
+### Security
+
+- A credential value longer than 256 characters (a session token, for one)
+  was masked only up to 256 characters and the rest was printed. Masks now
+  cover the whole value, quoted values to their closing quote.
+- Every pair in a `Cookie:` header or curl `-b`/`--cookie` list is read on its
+  own; a session cookie after a harmless one was printed.
+- A token right after a printf escape (`\n`, `\t`, `\x20`) or a terminal
+  escape sequence of any kind is now masked and counted.
+- An `export` that cannot reach a later command (inside `( … )`, a pipeline,
+  `bash -c`, `$( … )`, a function, or undone by `unset`/`env -i`) no longer
+  rewrites that command's download host; where the scope is unclear the
+  download is unresolved, never trusted. This closed an `--ioc` and
+  `--network-trust` bypass introduced earlier in this release cycle.
+- Hosts containing `ß`, `ς` or zero-width joiners are unresolved instead of
+  mapped with IDNA 2003, which differs from what curl and browsers contact.
+- **Credentials that were counted but printed in full are now masked
+  everywhere:** bare JWTs (such as a Supabase service-role key), Slack `xoxa-`,
+  `xoxr-` and `xoxs-` tokens, and a private key given as a PEM block in a `KEY=`
+  or JSON value (such as a GCP service-account `"private_key"`).
+- **More credential shapes are masked and counted:** PEM and armored PGP private
+  key blocks (critical "private key"); quoted JSON keys, including JSON with
+  escaped quotes inside an argument; `aws configure set aws_secret_access_key`;
+  `gh secret set NAME --body`; a quoted password containing `;`, `|`, `&` or
+  spaces (it was printed whole or with its tail showing); credential options with
+  a space (`--token`, `--api-key`, `--client-secret`, `--passphrase` and
+  similar); curl `-b`/`--cookie`, `Cookie:` headers and `.netrc` lines; and
+  `Authorization:` values with no scheme word.
+- **Masking could be dodged.** A secret before or after an already-masked URL
+  password in the same value, a token right after a colour code (`\033[1m`), or an
+  invisible or control character inside a token (which was then stripped from
+  output, printing the token whole) could leave it unmasked. Redaction now
+  ignores those characters and is idempotent.
+- **A credential typed as a command** no longer appears as a program name in
+  "most run", refusals by program, `bash.commands` or MCP `shell_audit`; it is
+  shown as `(credential)`.
+- **Terminal and Markdown injection.** A line break in a model name, branch, cwd
+  or other field can no longer inject lines into the report, `--ci-log`,
+  `--replay`, `--diff`, watch alerts or the verdict (shown as `\n`; `--json` keeps
+  the raw value). `--replay`, `--diff` baselines and `tools/denials.py` strip
+  terminal escapes. The Action's job summary uses a fence longer than any
+  backtick run in the report. Output strips lone surrogates, Unicode tag
+  characters, variation selectors, the Arabic letter mark and other invisible
+  characters.
+- **The shell audit and network inventory share one bash-aware lexer**, so
+  comments, `$'…'` (cut at a NUL as bash does), quoting, heredocs, here-strings,
+  line continuations, `&`, `case`/`esac`, backticks, `trap`, `coproc`, `{fd}>`
+  and substitutions in heredocs, `case` arms, `su -c`, `find -exec` and wrappers
+  no longer hide commands or downloads. Every line up to 1 MiB is read, and lines
+  split only on newline. Before, several of these let `--ioc … --fail-on high`
+  pass on a listed package.
+- **IOC and trust bypasses closed.** Host entries match the host really
+  contacted: percent-encoded names, every numeric IPv4 spelling curl accepts,
+  IPv4-mapped IPv6 and internationalised or fullwidth names; a host that cannot
+  be normalised is unresolved. Installs hidden by global options, `pnpm add -w`,
+  `env -S`, `watch`, other shells and long-form wrapper options are read. A
+  download the command redirects (proxy, `--connect-to`, `--resolve`,
+  `--doh-url`, `GOPROXY`, `http.proxy`) is never trusted and is unresolved under
+  `--ioc`; `insteadOf` and registry/index variables are applied. A registry given
+  as a variable, `gh`/`GH_HOST`/`brew tap`/`npm i owner/repo` hosts, and a
+  trusted path prefix followed by a shell variable (which could expand to `../`)
+  are no longer trusted. A command nested or long past what is read is
+  unresolved (`unreadable`) instead of clean.
+- **Egress exemption.** A curl upload is exempt only when every destination is
+  loopback: "localhost" in a header, referer or query, or a localhost URL sent
+  elsewhere by `--resolve`, `--connect-to`, `--preproxy`, `--doh-url` or a SOCKS
+  proxy, no longer exempts it.
+- **Denial of service.** Commands crafted to make the audit take seconds or
+  minutes (whitespace runs, long `curl`/`dd` lines, the scp/rsync egress rule)
+  run in linear time; a `$'…'` value that decoded to internal marker characters
+  no longer crashes the run before the gate is evaluated; a FIFO in a transcript
+  directory no longer hangs it; the MCP server survives malformed input.
+- **Config injection.** `--service` refuses a command or log path containing a
+  control character (a newline could add a unit directive), and
+  `--service newsyslog` refuses values newsyslog.conf cannot carry.
+  `--suppress --reason` refuses a newline or other control character, which used
+  to write a second, unannounced suppression line.
+- **Repository hygiene.** A stray, unreviewed tray binary (`tray-go/tray`) was
+  removed and is now ignored. The transcript fuzzer now parses the Codex and
+  Copilot transcripts it mutates, and its nested-JSON mutations take effect.
+
 ## 0.3.0 (2026-10-13)
 
 ### Upgrading from 0.2.2: what can change a gate

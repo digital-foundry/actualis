@@ -37,6 +37,7 @@ is one finding per group, suppressible, and still counted when suppressed.
 | `network-unasked` | med | `--network-strict`: an unasked download from a source not trusted | `any` |
 | `network-ioc` | high | `--ioc`: a download matched a known-bad entry | `high`, `any` |
 | `network-ioc-unresolved` | med | `--ioc`: a listed name whose version cannot be decided, a private-registry install, a name read from a URL, or an item that could not be checked | `any` |
+| `network-config` | med | a command writes download configuration: `git config url.*.insteadOf`/`http.proxy`, `npm`/`pnpm`/`yarn config set` registry or proxy, `pip config set` index or proxy, or a redirect into `.npmrc`, `.yarnrc`, `pip.conf`, `.gitconfig`. It redirects later downloads, including ones in later tool calls the inventory cannot tie to it ([ioc.md](ioc.md)) | `any` |
 | `audit-config` | high | an agent wrote the suppression or trust files; cannot be suppressed | `high`, `any` |
 
 **A finding's id hashes its severity and category. A change in severity is a

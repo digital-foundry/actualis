@@ -1,0 +1,4 @@
+^tests/
+^tools/make-demo-fleet\.py$
+^docs/superpowers/plans/
+^agentfleet\.py$

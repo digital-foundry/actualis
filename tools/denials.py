@@ -29,6 +29,34 @@ import re
 import sys
 from pathlib import Path
 
+# --- untrusted text --------------------------------------------------------
+# Tool names and refusal reasons come straight from transcripts, and an agent
+# (or anything it fetched) can put terminal escapes and credentials in them.
+# actualis.py, beside this tool in the repo, has the sanitiser and redactor the
+# rest of the project uses. Without it, controls are still stripped, and the
+# free-text reason is withheld rather than printed unredacted.
+
+_CONTROL_FALLBACK = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff]")
+try:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    import actualis as _A  # noqa: E402
+except Exception:  # noqa: BLE001 -- any import failure means "not available"
+    _A = None
+finally:
+    sys.path.pop(0)
+
+
+def safe(text, *, free_text: bool = False) -> str:
+    """Untrusted text made safe to print: controls stripped, credentials redacted."""
+    if not isinstance(text, str):
+        return ""
+    if _A is not None:
+        return _A.redact(_A.clean(text))
+    if free_text:
+        return "(withheld: actualis.py not found to redact it)"
+    return _CONTROL_FALLBACK.sub("", text)
+
+
 # --- transcript discovery (mirrors actualis.py, kept standalone on purpose) ---
 
 def transcript_roots(explicit: str | None = None) -> list[Path]:
@@ -129,12 +157,20 @@ def collect(roots: list[Path]) -> dict:
                         for b in blocks:
                             if not isinstance(b, dict):
                                 continue
-                            if b.get("type") == "tool_use" and b.get("id"):
-                                calls[b["id"]] = (b.get("name") or "?", b.get("input") or {})
+                            # Any field may hold any JSON type: a wrong type is absent.
+                            bid = b.get("id")
+                            if b.get("type") == "tool_use" and isinstance(bid, str) and bid:
+                                name = b.get("name")
+                                inp = b.get("input")
+                                calls[bid] = (safe(name) or "?",
+                                              inp if isinstance(inp, dict) else {})
                             elif rec.get("toolDenialKind") and b.get("type") == "tool_result":
-                                denials.append((str(rec["toolDenialKind"]),
-                                                b.get("tool_use_id") or "",
-                                                str(b.get("content") or "")[:120]))
+                                tid = b.get("tool_use_id")
+                                denials.append((safe(str(rec["toolDenialKind"])) or "?",
+                                                tid if isinstance(tid, str) else "",
+                                                # redacted before it is cut to 64, so a
+                                                # credential is never half-shown
+                                                str(b.get("content") or "")[:4000]))
 
     by_kind: dict[str, dict] = {}
     joined = 0
@@ -144,14 +180,16 @@ def collect(roots: list[Path]) -> dict:
                                       "programs": collections.Counter(),
                                       "reasons": collections.Counter()})
         k["total"] += 1
-        k["reasons"][re.sub(r"\s+", " ", reason)[:64]] += 1
+        k["reasons"][safe(re.sub(r"\s+", " ", reason), free_text=True)[:64]] += 1
         if tid in calls:
             joined += 1
             k["joined"] += 1
             name, inp = calls[tid]
             k["tools"][name] += 1
             if name == "Bash":
-                k["programs"][command_head(inp.get("command") or "") or "?"] += 1
+                cmd = inp.get("command")
+                head = command_head(cmd) if isinstance(cmd, str) else None
+                k["programs"][safe(head) or "?"] += 1
 
     return {"files": files, "tool_calls": len(calls), "denials": len(denials),
             "joined": joined, "by_kind": by_kind}

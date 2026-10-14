@@ -6,7 +6,7 @@ PYTHON ?= python3
 ARGS   ?=
 
 .DEFAULT_GOAL := help
-.PHONY: help run network check install uninstall test tray formula clean
+.PHONY: help run network check install uninstall test security security-remote tray formula clean
 
 help:
 	@echo "make run [ARGS='--days 30']  run the report from this checkout"
@@ -15,6 +15,8 @@ help:
 	@echo "make install                 install the 'actualis' command from this checkout (uv, else pipx)"
 	@echo "make uninstall               remove the installed command"
 	@echo "make test                    run the test suite"
+	@echo "make security [FUZZ_ITERATIONS=300]  Kali scanners + transcript fuzzer (needs Docker)"
+	@echo "make security-remote [SECURITY_HOST=mac-mini]  same scan, on the build server over SSH"
 	@echo "make tray                    build the tray app (needs Go)"
 	@echo "make formula [VERSION=x.y.z] print the Homebrew formula for a PyPI release"
 	@echo "make clean                   remove build output and caches"
@@ -55,3 +57,29 @@ formula:
 
 clean:
 	rm -rf build dist *.egg-info __pycache__ tests/__pycache__ tools/__pycache__
+
+# Kali-packaged scanners (bandit, trufflehog, gitleaks, zzuf) plus the
+# transcript fuzzer, in a container with the checkout mounted read-only, no
+# network, and a throwaway HOME: it cannot see this machine's transcripts.
+# Reports land in security-out/.
+FUZZ_ITERATIONS ?= 300
+SECURITY_LABEL ?= local
+security:
+	docker build -q -t actualis-security:kali tools/security
+	mkdir -p security-out
+	# --user: the host uid, so the container can write security-out/ on a
+	# native Linux Docker host (Docker Desktop remaps uids; Linux does not).
+	docker run --rm --network none --read-only --tmpfs /tmp:exec,size=2g \
+		--label actualis-security="$(SECURITY_LABEL)" \
+		--user "$$(id -u):$$(id -g)" \
+		-e FUZZ_ITERATIONS=$(FUZZ_ITERATIONS) \
+		-v "$(CURDIR):/src:ro" -v "$(CURDIR)/security-out:/out" \
+		actualis-security:kali sh /src/tools/security/run.sh
+
+# The same scan on the build server (default mac-mini), over SSH rather than
+# Actions: this repo is public and the build server's runners do not take
+# public repositories. Sends committed history only; reports come back to
+# security-out/.
+SECURITY_HOST ?= mac-mini
+security-remote:
+	SECURITY_HOST=$(SECURITY_HOST) FUZZ_ITERATIONS=$(FUZZ_ITERATIONS) sh tools/security/remote.sh

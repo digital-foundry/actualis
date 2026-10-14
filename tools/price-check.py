@@ -55,6 +55,26 @@ def offline_report() -> int:
     return 1 if stale else 0
 
 
+def source_for(rate) -> str:
+    """The RATE_SOURCES page a rate was taken from: the aggregator for an
+    aggregator-tier rate (no vendor line exists for it), else its provider."""
+    return A.AGGREGATOR if rate.tier == A.AGGREGATOR else rate.provider
+
+
+def missing_models(seen: dict) -> list:
+    """(model, rate) for each priced model id absent from its fetched source page."""
+    missing = []
+    for model, rate in sorted(A.PRICING.items()):
+        body = seen.get(source_for(rate))
+        if body is None:
+            continue
+        # Model ids appear on pricing pages in several spellings.
+        variants = {model, model.replace("-", " "), model.replace("-", ".")}
+        if not any(v.lower() in body.lower() for v in variants):
+            missing.append((model, rate))
+    return missing
+
+
 def fetch_report() -> int:
     """Fetch each source and report whether the models we price still appear.
 
@@ -81,22 +101,15 @@ def fetch_report() -> int:
 
     print("\n  model ids not found on their provider's page — either renamed,")
     print("  retired, or the page changed shape. Check by hand:\n")
-    missing = []
-    for model, rate in sorted(A.PRICING.items()):
-        body = seen.get(rate.provider)
-        if body is None:
-            continue
-        # Model ids appear on pricing pages in several spellings.
-        variants = {model, model.replace("-", " "), model.replace("-", ".")}
-        if not any(v.lower() in body.lower() for v in variants):
-            missing.append((model, rate))
-            print(f"    {model:<22}{rate.tier:<12}{rate.note[:44]}")
+    missing = missing_models(seen)
+    for model, rate in missing:
+        print(f"    {model:<22}{rate.tier:<12}{rate.note[:44]}")
     if not missing:
         print("    none — every priced model id still appears on its source page")
     print("\n  Presence is not confirmation of the NUMBER. This tool deliberately")
     print("  does not parse prices: a silently mis-parsed rate would carry the")
     print("  authority of a checked one. Read the pages.\n")
-    return 0
+    return 1 if missing else 0
 
 
 def main() -> int:

@@ -17,6 +17,9 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _fixtures  # noqa: E402,F401  (first: a temp HOME, agent homes and cwd for the whole run)
+
 ROOT = Path(__file__).resolve().parent.parent
 if "actualis" in sys.modules:
     af = sys.modules["actualis"]
@@ -281,7 +284,12 @@ class TestFallbacks(Charts):
         self.assertIn("#", line)
 
     def test_explain_names_a_json_path_for_every_chart(self):
-        out = self.run_main("--explain", "network")
+        # Not through run_main: --explain reads no transcripts, so the --root
+        # and --days it appends are refused (R3D2).
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(af.main(["--explain", "network"]), 0)
+        out = buf.getvalue()
         for path in (".totals", ".by_day", ".by_kind", ".hosts", ".packages", ".by_project"):
             self.assertIn(path, out)
 

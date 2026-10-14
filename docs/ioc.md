@@ -25,11 +25,86 @@ actualis --ioc iocs.txt --json | jq '.network.ioc.totals'
 | verdict | when | finding |
 |---|---|---|
 | `match` | an any-version entry names the package; the installed version is inside the entry's spec; or a host entry matches the host the download came from | high, category `network-ioc` |
-| `unresolved` | the name matches but the comparison cannot be decided: the install named no single version (`latest`, `^4.1.0`, none), the versions do not order, the package came from a private registry, the name was read from a git or tarball URL, a Go package inside a listed module could not be ordered, or checking the item failed | medium, category `network-ioc-unresolved` |
+| `unresolved` | the name matches but the comparison cannot be decided: the install named no single version (`latest`, `^4.1.0`, none), the versions do not order, the package came from a private registry, the name was read from a git or tarball URL, a Go package inside a listed module could not be ordered, or checking the item failed. Also any download whose host is written in a form that cannot be normalised, or whose transfer the same command sends elsewhere (a proxy, `curl --connect-to`/`--resolve`), unless it matches outright | medium, category `network-ioc-unresolved` |
 
 The `reason` says which: `any-version`, `version-in-spec` or `host` for a
 match; `version-unresolved`, `undecidable`, `module-prefix`,
-`private-registry`, `name-from-url` or `error` for unresolved.
+`private-registry`, `name-from-url`, `error`, `unreadable`, `host-unresolved`
+or `redirected` for unresolved.
+
+**Hosts are compared as the downloader resolves them.** A URL's host is
+percent-decoded, IDNA-mapped (`bücher.example` is `xn--bcher-kva.example`,
+fullwidth letters fold to ASCII), lower-cased and stripped of a trailing dot; an
+IPv4 address in any numeric form curl accepts (`101058054`, `0x06060606`,
+`6.6.1542`, `[::ffff:6.6.6.6]`) is its dotted quad, so `host:6.6.6.6` matches
+them all. A host that cannot be normalised with confidence is `unresolved`
+(reason `host-unresolved`), never clean. For a `host:` entry with a path, the
+path is compared as a server reads it: `%65` is `e`, and `//` is `/`.
+
+IDNA is mapped with Python's built-in codec, which implements IDNA 2003. curl
+(libidn2) and browsers use UTS 46 (non-transitional), and the two differ on
+four deviation characters: sharp s (U+00DF, and its capital U+1E9E), final
+sigma (U+03C2), and the joiners ZWNJ (U+200C) and ZWJ (U+200D). IDNA 2003 maps
+`straße.example` to `strasse.example`, a different domain from the
+`xn--strae-oqa.example` curl contacts. A host holding any of them is therefore
+not mapped at all: it is `unresolved` (`host-unresolved`) and never trusted, so
+neither an IOC entry nor a trust entry can be matched the wrong way.
+
+**Private registries.** A package match from an explicit registry other than
+the public one is `unresolved` (`private-registry`): a private registry's
+package may only share the listed name. The public registry's own hosts and
+aliases are not private: npm `registry.npmjs.org`, `registry.npmjs.com`,
+`registry.yarnpkg.com`; pypi `pypi.org`, `pypi.python.org`,
+`files.pythonhosted.org`; crates `crates.io`, `index.crates.io`,
+`static.crates.io`. A match from one of those stays a match.
+
+**Redirected transport.** When the same command sends the transfer somewhere
+other than the host it names — curl `-x`/`--proxy`, `--preproxy`, `--socks*`,
+`--connect-to`, `--resolve`, `--doh-url`; npm `--proxy`/`--https-proxy`; pip
+`--proxy`; git `-c http.proxy=…`; a `*_proxy`, `PIP_PROXY`, `GOPROXY` or
+Homebrew mirror variable assigned or exported in the command — the download is
+`dynamic`, never trusted, and `unresolved` (`redirected`); each proxy or
+address it names is listed as an item of its own and matched like any host.
+Rewrites that say exactly where the bytes come from are applied instead:
+`git -c url.<base>.insteadOf=<prefix>` (also `clone --config`, and
+`GIT_CONFIG_COUNT`), `npm_config_registry`/`YARN_REGISTRY`/`BUN_CONFIG_REGISTRY`,
+`PIP_INDEX_URL`/`PIP_EXTRA_INDEX_URL`, `UV_INDEX_URL`/`UV_DEFAULT_INDEX`/
+`UV_EXTRA_INDEX_URL` (as `--registry` / `-i` / `--extra-index-url` would be),
+`GH_HOST` and gh's `HOST/OWNER/REPO`.
+
+**Scope of `export` and of config written in the same command.** A variable
+reaches a later command the way bash passes it. A `NAME=value` prefix applies
+to its own command and to what that command runs (`VAR=x bash -c '…'`, `VAR=x
+bash <<EOF`). An `export` (or `declare -x`) applies to the commands after it in
+the same shell; `unset NAME` and `export -n NAME` remove it; `env -i` (or `env
+-`) runs one command with none of it, `env -u NAME` without NAME, and `sudo` or
+`doas` without `-E` may reset it, so a download behind them is read both ways.
+An `export` inside a pipeline element, a background job, `( … )`, `$( … )`,
+`bash -c '…'` or a heredoc fed to a shell ends with that child and reaches
+nothing after it. Config written earlier in the same command applies to the
+later commands like an exported variable: `git config [--global|--system]
+url.<base>.insteadOf <prefix>` (and `http.proxy`, and `git config set …`),
+`npm|pnpm config set registry|proxy|https-proxy` (also `npm set`, `key=value`),
+`yarn config set registry|npmRegistryServer|httpProxy|httpsProxy`, and `pip
+config set <section>.index-url|extra-index-url|proxy`. A config write is a file,
+so it applies even from a pipeline element or a child shell, as long as it ran
+before the download. The effect is certain only when it is a top-level command
+on the plain part of the line (no `( )`, `{ }`, function, `if`/`while`/`for`/
+`case` before it) run unconditionally (after `;`, a newline or `&`) or chained
+to the download by `&&` alone; a repository-local `git config` (no `--global`)
+never is. Wherever the scope cannot be told, a download that comes out
+differently with and without the effect is listed both ways and is
+`unresolved` (`redirected`): never trusted, never a silent pass. A config file
+written by a redirect or `tee` (`.npmrc`, `.yarnrc`, `.yarnrc.yml`,
+`pip.conf`, `pip.ini`, `.gitconfig`, `.config/git/config`) cannot be read, so
+a later download by that tool in the same command is `unresolved` too. Past
+256 such effects in one command, every download in it is `unresolved`.
+
+Config written by an **earlier, separate tool call** is out of scope: the
+inventory reads one command at a time. Instead every command that writes
+download configuration (each form above, and those files) raises a medium
+shell-audit finding, category `network-config`, so the redirect is seen in the
+report, under `--fail-on any`, and in `--watch`.
 
 **Go modules.** A Go install names a package (`go install
 evil.example/m/cmd/x@v1.0.0`); lists name the module (`go:evil.example/m`). A Go
@@ -84,7 +159,12 @@ entry matches a module's origin (`host:github.com/evil` matches
 
 **Not visible.** Lockfile installs (`npm ci`, `pip install -r`, `uv sync`),
 scripts, Makefiles and postinstall hooks are out of sight, and only the
-transcripts still on this machine are read. The coverage line says how many
+transcripts still on this machine are read. So are settings outside the
+command: a registry, proxy or `insteadOf` in `.npmrc`, `pip.conf`,
+`~/.gitconfig` or the environment the agent started with, and a variable or
+config set in an earlier command (only assignments, `export`s and config
+writes in the same command are read; an earlier config write is flagged
+`network-config`). The coverage line says how many
 downloads could be checked. **No match is not "not affected".**
 
 ## The `actualis-ioc` line format, version 1
@@ -133,7 +213,9 @@ host and every subdomain, on a label boundary (`host:evil.io` matches
 `host:=hostname` matches that host only. No scheme, port, wildcard or IPv6. A
 host entry matches a host the command named, or one the session supplied as a
 URL: a git remote added or cloned earlier in the session (`git pull up`), or a
-`brew tap`'s `github.com/<owner>/homebrew-<repo>`. It never matches the default
+`brew tap`'s `github.com/<owner>/homebrew-<repo>`. An image pulled from a named
+registry matches on its registry and repository: `host:ghcr.io/evil` matches
+`docker pull ghcr.io/evil/img:1.0`. It never matches the default
 registry a bare install implies (`registry.npmjs.org` for `npm i x`). A host entry with no path naming
 `github.com`, a registry or another shared host loads with a warning, because
 it matches every download from there.

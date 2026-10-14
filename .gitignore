@@ -22,3 +22,10 @@ tray-go/actualis-tray.exe
 # the old name sat in the tree for weeks.
 tray-go/actualis-tray
 tray-go/actualis-tray.exe
+# `go build` with no -o names the binary after the module: tray. One was
+# committed by accident and sat in the tree, unreviewable, for weeks.
+tray-go/tray
+tray-go/tray.exe
+security-out/
+security-out.log
+.claude/worktrees/

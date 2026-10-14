@@ -96,7 +96,11 @@ A **newly** appearing critical credential raises a native notification and
 flashes the badge three times. Deduplicated by fingerprint, so the same secret
 never announces itself twice, and the first scan only establishes a baseline —
 announcing a month of history at launch trains you to ignore the notification
-permanently.
+permanently. Changing the window re-baselines the same way: widening it to 90
+days brings older exposures into view, and they are not new. A credential you
+suppressed (with a reason) does not count toward the badge or the alert, as it
+does not count toward `--fail-on`. On Windows the notification is a toast
+through the built-in WinRT API (Windows 10 and later).
 
 ## What the count means
 
