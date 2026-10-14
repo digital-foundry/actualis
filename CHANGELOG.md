@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 (2026-10-13)
 
 ### Upgrading from 0.3.0: what can change a gate
 
