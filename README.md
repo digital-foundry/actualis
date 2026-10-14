@@ -151,9 +151,6 @@ pipx install actualis                       # same, with pipx
 All three install the same file PyPI serves. Upgrade with `brew upgrade actualis`,
 `uv tool upgrade actualis` or `pipx upgrade actualis`.
 
-The network view (`--network`, `--ioc`, `--network-strict`, `--network-trust`)
-arrives in 0.3.0. Until that is released, install from a checkout to get it.
-
 ### From a checkout
 
 The file runs as it is, with nothing to install:
