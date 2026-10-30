@@ -24,7 +24,7 @@
 - The mark is `⊕🌐` (`NET_MARK = "⊕\U0001F310"`); ASCII fallback `[+net]`. It appears only on lines that report network use.
 - Companion exit codes: 0 done, 1 runtime error (network, quota, bad response), 2 usage error (no key, refused combination, no consent without a terminal). `actualis` keeps its codes (3 = findings).
 - Tests are hermetic: synthetic hosts only (`*.example`), a temp HOME and cache dir, and no socket to anything but loopback. Never read real transcripts. Never commit a real key.
-- Every commit message ends with `Refs #<issue>` (Task 0) and the line `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
+- Every commit message ends with `Refs #67` (Task 0) and the line `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 - Run the whole suite with `python3 -m unittest discover -s tests` before every commit that touches `actualis.py`.
 
 ## Decisions this plan makes beyond the spec
@@ -223,7 +223,7 @@ Expected: PASS, and no existing test fails. If an existing test does a real DNS 
 git add tests/_fixtures.py tests/test_reputation_match.py actualis.py
 git commit -m "Tests: isolate the reputation cache and block non-loopback sockets
 
-Refs #N
+Refs #67
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -405,7 +405,7 @@ python3 -m unittest discover -s tests
 git add actualis.py tests/test_reputation_match.py
 git commit -m "Reputation: Safe Browsing expressions and private-host skipping
 
-Refs #N
+Refs #67
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -812,7 +812,7 @@ python3 -m unittest discover -s tests
 git add actualis.py tests/_reputation.py tests/test_reputation_match.py
 git commit -m "Reputation: read-only cache loader, fail closed on a bad list
 
-Refs #N
+Refs #67
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1229,7 +1229,7 @@ Run: `python3 -m unittest discover -s tests`. The schema freeze test will now fa
 git add actualis.py tests/test_reputation_match.py
 git commit -m "Reputation: offline matcher, findings and --fail-on gate
 
-Refs #N
+Refs #67
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1660,7 +1660,7 @@ Expected: PASS. If golden-file tests under `tests/goldens` change because `netwo
 git add actualis.py tests/test_reputation_cli.py tests/test_actualis.py tests/goldens
 git commit -m "Reputation: --reputation flag, JSON, text and HTML output, self-check line
 
-Refs #N
+Refs #67
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2467,7 +2467,7 @@ git add actualis_reputation.py tests/_reputation.py tests/test_reputation_compan
         .github/workflows/test.yml tools/brew-formula.py tools/security/run.sh
 git commit -m "actualis-reputation: CLI, keys, scrubber, cache writer, consent, session record
 
-Refs #N
+Refs #67
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -3038,7 +3038,7 @@ Expected: PASS. The TLS test is skipped where `openssl` is missing.
 git add actualis_reputation.py tests/_reputation.py tests/test_reputation_companion.py
 git commit -m "actualis-reputation update: Safe Browsing list download with Rice decoding and checksums
 
-Refs #N
+Refs #67
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -3299,7 +3299,7 @@ Expected: PASS.
 git add actualis_reputation.py tests/test_reputation_companion.py
 git commit -m "actualis-reputation confirm: prefix lookup with decoys, full-hash confirmations
 
-Refs #N
+Refs #67
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -3520,7 +3520,7 @@ Expected: PASS.
 git add actualis_reputation.py tests/test_reputation_companion.py
 git commit -m "actualis-reputation virustotal: throttled domain reports, daily budget, cached results
 
-Refs #N
+Refs #67
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -3770,7 +3770,7 @@ Expected: PASS and builds.
 git add tray-go/
 git commit -m "Tray: network badge while actualis-reputation runs
 
-Refs #N
+Refs #67
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -3900,7 +3900,7 @@ Expected: PASS.
 git add README.md docs/ CHANGELOG.md actualis.py tests/test_reputation_cli.py
 git commit -m "Docs: host reputation setup, diagrams, attribution, findings and JSON fields
 
-Refs #N
+Refs #67
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -3977,7 +3977,7 @@ Aggregate-only checks of the real corpus are allowed (counts, exit codes). Do no
 
 - [ ] **Step 6: Hand off**
 
-Use superpowers:finishing-a-development-branch. Push and open the PR only with the user's go-ahead. The PR body carries `Closes #N`, the rulings list from this plan, the manual-acceptance results, and the attribution line.
+Use superpowers:finishing-a-development-branch. Push and open the PR only with the user's go-ahead. The PR body carries `Closes #67`, the rulings list from this plan, the manual-acceptance results, and the attribution line.
 
 ---
 
