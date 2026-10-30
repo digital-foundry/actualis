@@ -4,15 +4,19 @@ tests/_reputation.py into the temp home."""
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import socket
 import sys
+import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _fixtures  # noqa: E402,F401  (first: a temp HOME, agent homes and cwd for the whole run)
 from test_review_r2_X import af  # noqa: E402
+import _reputation as R  # noqa: E402
 
 
 class TestIsolation(unittest.TestCase):
@@ -68,6 +72,107 @@ class TestExpressions(unittest.TestCase):
 
     def test_mark_falls_back_to_ascii(self):
         self.assertEqual(af.NET_MARK.translate(af._GLYPH_TABLE), "[+net]")
+
+
+class CacheCase(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(dir=_fixtures.TEMP_HOME)
+        self.root = Path(self._tmp.name) / "rep"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+
+class TestLoader(CacheCase):
+    def test_absent(self):
+        d = af.load_reputation(self.root)
+        self.assertEqual((d.status, d.lists), ("absent", {}))
+
+    def test_ok_reads_all_lists(self):
+        R.write_cache(self.root, {"mw-4b": [R.prefix("evil.example/")]})
+        d = af.load_reputation(self.root)
+        self.assertEqual(d.status, "ok", d.error)
+        self.assertEqual(set(d.lists), set(af.REPUTATION_LISTS))
+        self.assertEqual(d.lists["mw-4b"], R.prefix("evil.example/"))
+        self.assertIsNotNone(d.oldest)
+
+    def test_corrupt_checksum(self):
+        R.write_cache(self.root, {"mw-4b": [R.prefix("evil.example/")]})
+        f = next((self.root / "gsb").glob("mw-4b.*.prefixes"))
+        f.write_bytes(b"\x00\x00\x00\x01")
+        d = af.load_reputation(self.root)
+        self.assertEqual(d.status, "corrupt")
+        self.assertIn("mw-4b", d.error)
+
+    def test_corrupt_missing_list(self):
+        R.write_cache(self.root)
+        state = json.loads((self.root / "gsb" / "state.json").read_text())
+        state["lists"] = state["lists"][1:]
+        (self.root / "gsb" / "state.json").write_text(json.dumps(state))
+        self.assertEqual(af.load_reputation(self.root).status, "corrupt")
+
+    def test_corrupt_not_json_or_wrong_schema(self):
+        R.write_cache(self.root)
+        (self.root / "gsb" / "state.json").write_text("{nope")
+        self.assertEqual(af.load_reputation(self.root).status, "corrupt")
+        (self.root / "gsb" / "state.json").write_text(json.dumps({"schema": 2, "lists": []}))
+        self.assertEqual(af.load_reputation(self.root).status, "corrupt")
+
+    def test_corrupt_file_name_escapes_the_directory(self):
+        R.write_cache(self.root)
+        state = json.loads((self.root / "gsb" / "state.json").read_text())
+        state["lists"][0]["file"] = "../../etc/passwd"
+        (self.root / "gsb" / "state.json").write_text(json.dumps(state))
+        self.assertEqual(af.load_reputation(self.root).status, "corrupt")
+
+    @unittest.skipIf(os.name == "nt", "symlinks need privileges on Windows")
+    def test_corrupt_symlinked_file(self):
+        R.write_cache(self.root)
+        f = next((self.root / "gsb").glob("se-4b.*.prefixes"))
+        real = self.root / "elsewhere"
+        real.write_bytes(f.read_bytes())
+        f.unlink()
+        f.symlink_to(real)
+        d = af.load_reputation(self.root)
+        self.assertEqual(d.status, "corrupt")
+        self.assertIn("symlink", d.error)
+
+    def test_corrupt_unsorted_list(self):
+        R.write_cache(self.root)
+        gsb = self.root / "gsb"
+        blob = b"\x00\x00\x00\x02\x00\x00\x00\x01"
+        sha = hashlib.sha256(blob).hexdigest()
+        state = json.loads((gsb / "state.json").read_text())
+        e = state["lists"][0]
+        fname = f"{e['name']}.{sha[:16]}.prefixes"
+        (gsb / fname).write_bytes(blob)
+        e.update(file=fname, sha256=sha, prefix_count=2)
+        (gsb / "state.json").write_text(json.dumps(state))
+        d = af.load_reputation(self.root)
+        self.assertEqual(d.status, "corrupt")
+        self.assertIn("not sorted", d.error)
+
+    def test_bad_confirmations_are_ignored_not_fatal(self):
+        R.write_cache(self.root)
+        (self.root / "gsb" / "confirmations.json").write_text("[1,2")
+        d = af.load_reputation(self.root)
+        self.assertEqual((d.status, d.confirmations), ("ok", {}))
+        self.assertIsNotNone(d.confirmations_error)
+
+    def test_vt_and_threshold(self):
+        R.write_cache(self.root, vt=[R.vt_result("evil.example", 5)], vt_threshold=3)
+        d = af.load_reputation(self.root)
+        self.assertEqual(d.vt_threshold, 3)
+        self.assertEqual(d.vt["evil.example"]["stats"]["malicious"], 5)
+
+    def test_last_network_reads_the_newest_valid_line(self):
+        R.write_cache(self.root, log=[{"at": "2026-10-30T14:02:00+00:00", "provider": "gsb"},
+                                      {"at": "2026-10-30T15:00:00+00:00", "provider": "vt"}])
+        with open(self.root / "network-log.jsonl", "a") as fh:
+            fh.write("{broken\n")
+        self.assertEqual(af.reputation_last_network(self.root),
+                         {"at": "2026-10-30T15:00:00+00:00", "provider": "vt"})
+        self.assertIsNone(af.reputation_last_network(self.root / "nope"))
 
 
 if __name__ == "__main__":

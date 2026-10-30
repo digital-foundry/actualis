@@ -7635,6 +7635,183 @@ def sb_hash(expr: str) -> bytes:
     return hashlib.sha256(expr.encode("utf-8")).digest()
 
 
+REPUTATION_FILE_MAX = 64 << 20           # a prefix list, or any cache file, past this is refused
+REPUTATION_LOG_TAIL = 64 << 10
+_REPUTATION_FILE_NAME = re.compile(r"[a-z0-9-]+\.[0-9a-f]{16}\.prefixes")
+
+
+class ReputationData:
+    """What the reputation cache holds, read once per run. status is "ok",
+    "absent" (never updated) or "corrupt" (a list failed its check: treated as
+    no lists, so a gate cannot pass on tampered data)."""
+
+    def __init__(self, directory: "Path | None" = None) -> None:
+        self.directory = directory
+        self.status = "absent"
+        self.error: str | None = None
+        self.lists: dict[str, bytes] = {}
+        self.state: dict[str, dict] = {}
+        self.oldest: datetime | None = None
+        self.confirmations: dict[bytes, dict] = {}
+        self.confirmations_error: str | None = None
+        self.vt: dict[str, dict] = {}
+        self.vt_threshold = 2
+        self.vt_error: str | None = None
+        self.last_network: dict | None = None
+
+
+def _parse_utc(text: object) -> "datetime | None":
+    if not isinstance(text, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _read_cache_file(path: Path, limit: int = REPUTATION_FILE_MAX) -> "bytes | None":
+    """A cache file's bytes; None if absent. OSError for a symlink, a
+    non-regular file or one over `limit`."""
+    if os.path.islink(path):
+        raise OSError(f"{path.name} is a symlink; refusing it")
+    try:
+        fh = _open_regular(path, binary=True)
+    except FileNotFoundError:
+        return None
+    with fh:
+        data = fh.read(limit + 1)
+    if len(data) > limit:
+        raise OSError(f"{path.name} is over {limit >> 20} MiB")
+    return data
+
+
+def _b64_bytes(text: object, size: int | None = None) -> "bytes | None":
+    if not isinstance(text, str):
+        return None
+    try:
+        raw = base64.b64decode(text, validate=True)
+    except (ValueError, TypeError):
+        return None
+    return raw if size is None or len(raw) == size else None
+
+
+def _load_confirmations(path: Path) -> dict:
+    raw = _read_cache_file(path)
+    if raw is None:
+        return {}
+    doc = json.loads(raw)
+    if not isinstance(doc, dict) or doc.get("schema") != 1 or not isinstance(doc.get("entries"), list):
+        raise ValueError("confirmations.json: not schema 1")
+    out: dict[bytes, dict] = {}
+    for e in doc["entries"]:
+        if not isinstance(e, dict):
+            continue
+        p = _b64_bytes(e.get("prefix"), 4)
+        at, until = _parse_utc(e.get("confirmed_at")), _parse_utc(e.get("cache_until"))
+        if p is None or at is None or until is None or not isinstance(e.get("full_hashes"), list):
+            continue
+        hashes = []
+        for fh in e["full_hashes"]:
+            h = _b64_bytes(fh.get("hash"), 32) if isinstance(fh, dict) else None
+            types = fh.get("threat_types") if isinstance(fh, dict) else None
+            if h is None or not isinstance(types, list) or not all(isinstance(t, str) for t in types):
+                continue
+            hashes.append({"hash": h, "threat_types": sorted(set(types)), "canary": fh.get("canary") is True})
+        out[p] = {"full_hashes": hashes, "confirmed_at": at, "cache_until": until}
+    return out
+
+
+def _load_vt(path: Path, data: "ReputationData") -> None:
+    raw = _read_cache_file(path)
+    if raw is None:
+        return
+    doc = json.loads(raw)
+    if not isinstance(doc, dict) or doc.get("schema") != 1 or not isinstance(doc.get("results"), list):
+        raise ValueError("vt/results.json: not schema 1")
+    t = doc.get("vt_threshold")
+    data.vt_threshold = t if isinstance(t, int) and not isinstance(t, bool) and 1 <= t <= 100 else 2
+    for r in doc["results"]:
+        if not isinstance(r, dict) or not isinstance(r.get("host"), str):
+            continue
+        at = _parse_utc(r.get("checked_at"))
+        stats = r.get("stats") if isinstance(r.get("stats"), dict) else {}
+        clean_stats = {k: v for k, v in stats.items()
+                       if k in ("malicious", "suspicious", "harmless", "undetected", "timeout")
+                       and isinstance(v, int) and not isinstance(v, bool) and v >= 0}
+        if at is None or r.get("status") not in ("found", "unknown"):
+            continue
+        data.vt[r["host"].lower()] = {"stats": clean_stats, "status": r["status"], "checked_at": at}
+
+
+def reputation_last_network(directory: "Path | None" = None) -> "dict | None":
+    """The newest valid line of network-log.jsonl, or None. Never raises."""
+    try:
+        path = (directory or reputation_dir()) / "network-log.jsonl"
+        raw = _read_cache_file(path)
+    except OSError:
+        return None
+    if not raw:
+        return None
+    for line in reversed(raw[-REPUTATION_LOG_TAIL:].decode("utf-8", "replace").splitlines()):
+        ok, rec = _json_line(line)
+        if ok and isinstance(rec, dict) and _parse_utc(rec.get("at")) and isinstance(rec.get("provider"), str):
+            return {"at": rec["at"], "provider": rec["provider"]}
+    return None
+
+
+def load_reputation(directory: "Path | None" = None) -> ReputationData:
+    """Read the cache, read-only. A bad list makes the whole set corrupt; bad
+    confirmations or VirusTotal files are ignored with a note (ignoring them
+    can only leave a host a candidate, never clear it)."""
+    root = directory or reputation_dir()
+    data = ReputationData(root)
+    data.last_network = reputation_last_network(root)
+    try:                                     # first: VirusTotal results count even with no Safe Browsing lists
+        _load_vt(root / "vt" / "results.json", data)
+    except (OSError, ValueError) as exc:
+        data.vt, data.vt_error = {}, str(exc)
+    gsb = root / "gsb"
+    try:
+        raw = _read_cache_file(gsb / "state.json")
+        if raw is None:
+            return data
+        doc = json.loads(raw)
+        if not isinstance(doc, dict) or doc.get("schema") != 1 or not isinstance(doc.get("lists"), list):
+            raise ValueError("state.json is not schema 1")
+        by_name = {e.get("name"): e for e in doc["lists"] if isinstance(e, dict)}
+        for name in REPUTATION_LISTS:
+            e = by_name.get(name)
+            if e is None:
+                raise ValueError(f"state.json has no {name} list")
+            fname, sha, count = e.get("file"), e.get("sha256"), e.get("prefix_count")
+            fetched = _parse_utc(e.get("fetched_at"))
+            if not (isinstance(fname, str) and _REPUTATION_FILE_NAME.fullmatch(fname)
+                    and isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha)
+                    and isinstance(count, int) and not isinstance(count, bool) and fetched):
+                raise ValueError(f"state.json: the {name} entry is malformed")
+            blob = _read_cache_file(gsb / fname)
+            if blob is None:
+                raise ValueError(f"{name}: {fname} is missing")
+            if len(blob) != 4 * count or hashlib.sha256(blob).hexdigest() != sha:
+                raise ValueError(f"{name}: checksum does not match")
+            if any(blob[i:i + 4] > blob[i + 4:i + 8] for i in range(0, len(blob) - 4, 4)):
+                raise ValueError(f"{name}: prefixes are not sorted")
+            data.lists[name] = blob
+            data.state[name] = {"fetched_at": fetched, "next_update_at": _parse_utc(e.get("next_update_at")),
+                                "prefix_count": count, "version": e.get("version")}
+            data.oldest = fetched if data.oldest is None else min(data.oldest, fetched)
+    except (OSError, ValueError) as exc:     # json.JSONDecodeError is a ValueError
+        data.status, data.error, data.lists, data.state = "corrupt", str(exc), {}, {}
+        return data
+    data.status = "ok"
+    try:
+        data.confirmations = _load_confirmations(gsb / "confirmations.json")
+    except (OSError, ValueError) as exc:
+        data.confirmations_error = str(exc)
+    return data
+
+
 def render_ioc(fleet: "Fleet", c: "C", raw: bool = False) -> None:
     """The IOC block of NETWORK. Nothing without --ioc. Every printed field
     is cleaned; item fields come from the redacted public view."""
