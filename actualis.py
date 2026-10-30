@@ -7528,6 +7528,27 @@ def ioc_json(fleet: "Fleet", raw: bool = False) -> dict:
             "matches_truncated": len(rows) > NETWORK_ITEMS_CAP}
 
 
+# ---------------------------------------------------------------------------
+# Host reputation (offline). actualis only READS the cache that the companion
+# command actualis-reputation writes (docs/reputation.md); nothing here can
+# open a socket, and --self-check keeps proving it.
+
+def reputation_dir() -> Path:
+    """Where actualis-reputation keeps its cache. Never created here."""
+    env = os.environ.get("ACTUALIS_REPUTATION_DIR")
+    if env:
+        return Path(env).expanduser()
+    if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
+        return Path(os.environ["LOCALAPPDATA"]) / "actualis" / "reputation"
+    base = os.environ.get("XDG_CACHE_HOME")
+    if not base:
+        try:
+            base = str(Path.home() / ".cache")
+        except RuntimeError:                 # no home directory at all
+            raise OSError("no home directory; set ACTUALIS_REPUTATION_DIR") from None
+    return Path(base) / "actualis" / "reputation"
+
+
 def render_ioc(fleet: "Fleet", c: "C", raw: bool = False) -> None:
     """The IOC block of NETWORK. Nothing without --ioc. Every printed field
     is cleaned; item fields come from the redacted public view."""
