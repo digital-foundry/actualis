@@ -7549,6 +7549,92 @@ def reputation_dir() -> Path:
     return Path(base) / "actualis" / "reputation"
 
 
+NET_MARK = "⊕\U0001F310"            # ⊕🌐: on every line that reports network use, nowhere else
+REPUTATION_LISTS = ("mw-4b", "se-4b", "uws-4b", "uwsa-4b", "pha-4b")
+REPUTATION_THREAT = {"mw-4b": "MALWARE", "se-4b": "SOCIAL_ENGINEERING", "uws-4b": "UNWANTED_SOFTWARE",
+                     "uwsa-4b": "UNWANTED_SOFTWARE", "pha-4b": "POTENTIALLY_HARMFUL_APPLICATION"}
+REPUTATION_THREAT_TEXT = {"MALWARE": "malware", "SOCIAL_ENGINEERING": "phishing (social engineering)",
+                          "UNWANTED_SOFTWARE": "unwanted software",
+                          "POTENTIALLY_HARMFUL_APPLICATION": "a potentially harmful application"}
+REPUTATION_CONFIRM_TTL = 30 * 60         # Google: warn only on a full-hash answer under 30 minutes old
+REPUTATION_STALE_DAYS = 7
+GSB_ADVISORY = "Advisory provided by Google"
+GSB_ADVISORY_URL = "https://developers.google.com/safe-browsing/v4/advisory"
+SB_HOST_SUFFIXES = 5                     # the exact host, then hosts from the last five labels
+SB_PATH_PREFIXES = 4                     # "/" and up to three directories below it
+_SB_IPV4 = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}")
+
+
+def reputation_skip(host: str) -> bool:
+    """Hosts never looked up and never sent anywhere: loopback, private,
+    link-local, IPv6 literals, single-label names and the local-only
+    suffixes. They are never on a public list, and naming them to a provider
+    would say which internal systems the agents touch."""
+    h = (host or "").lower().rstrip(".")
+    if not h or h.startswith("[") or "." not in h:
+        return True
+    if h.endswith((".internal", ".home.arpa", ".lan")):
+        return True
+    return _local_host(h)
+
+
+def _sb_path_canon(path: str) -> str:
+    """Safe Browsing's path canonicalisation, minus the query (never hashed):
+    percent-decode until stable, resolve . and .., collapse //, re-escape
+    bytes <= 0x20, >= 0x7f, '#' and '%'."""
+    path = path.split("#", 1)[0].split("?", 1)[0] or "/"
+    raw = path.encode("utf-8", "surrogatepass")
+    for _ in range(8):                   # %2541 -> %41 -> A; bounded
+        nxt = _NET_PCT.sub(lambda m: bytes([int(m.group(1), 16)]), raw)
+        if nxt == raw:
+            break
+        raw = nxt
+    segs: list[bytes] = []
+    for seg in raw.split(b"/"):
+        if seg in (b"", b"."):
+            continue
+        if seg == b"..":
+            if segs:
+                segs.pop()
+            continue
+        segs.append(seg)
+    out = b"/" + b"/".join(segs)
+    if raw.endswith(b"/") and segs:
+        out += b"/"
+    return "".join(chr(b) if 0x20 < b < 0x7f and b not in (0x23, 0x25) else f"%{b:02X}" for b in out)
+
+
+def sb_expressions(host: str, path: str = "") -> list[str]:
+    """The host-suffix / path-prefix expressions Safe Browsing hashes for one
+    canonical host (and, when the inventory recorded one, a URL path)."""
+    host = host.lower().rstrip(".")
+    while ".." in host:
+        host = host.replace("..", ".")
+    hosts = [host]
+    if not _SB_IPV4.fullmatch(host):
+        tail = host.split(".")[-5:]
+        for k in range(len(tail) - 1):        # never the bare TLD
+            cand = ".".join(tail[k:])
+            if cand not in hosts:
+                hosts.append(cand)
+    hosts = hosts[:SB_HOST_SUFFIXES]
+    paths = ["/"]
+    if path and path != "/":
+        exact = _sb_path_canon(path)
+        dirs = exact.split("/")[1:-1]
+        paths = [exact] if exact != "/" else []
+        prefix = "/"
+        for d in [""] + dirs[:SB_PATH_PREFIXES - 1]:
+            prefix = prefix + d + "/" if d else prefix
+            if prefix not in paths:
+                paths.append(prefix)
+    return [h + p for h in hosts for p in paths]
+
+
+def sb_hash(expr: str) -> bytes:
+    return hashlib.sha256(expr.encode("utf-8")).digest()
+
+
 def render_ioc(fleet: "Fleet", c: "C", raw: bool = False) -> None:
     """The IOC block of NETWORK. Nothing without --ioc. Every printed field
     is cleaned; item fields come from the redacted public view."""
@@ -13049,6 +13135,7 @@ _GLYPH_FALLBACK = {
     # Sparkline levels, lowest to highest (written as escapes: see _BLOCKS).
     "\u2581": "_", "\u2582": ".", "\u2583": ":", "\u2584": "-",
     "\u2585": "=", "\u2586": "+", "\u2587": "*",
+    "\u2295": "[+", "\U0001F310": "net]",     # NET_MARK -> [+net]
 }
 _GLYPH_TABLE = str.maketrans(_GLYPH_FALLBACK)
 
