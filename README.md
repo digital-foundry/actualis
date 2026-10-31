@@ -12,9 +12,11 @@ brew install digital-foundry/tap/actualis   # or: uv tool install actualis / pip
 actualis
 ```
 
-No account, no config file, no network: actualis never uses the network. The optional `actualis-reputation` command does, only when you run it, and tells you what it sends. It reads files already on your disk
-and prints a report, across **Claude Code**, **Codex**, **GitHub Copilot CLI**, **Gemini CLI**
-and **Qwen Code** together.
+No account, no config file, no network: actualis never uses the network. The
+optional `actualis-reputation` command does, only when you run it, and tells you
+what it sends. It reads files already on your disk and prints a report, across
+**Claude Code**, **Codex**, **GitHub Copilot CLI**, **Gemini CLI** and **Qwen Code**
+together.
 
 **What it finds that you probably don't know:**
 

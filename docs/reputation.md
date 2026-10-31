@@ -151,7 +151,7 @@ credentials, transcript text, or the key in a URL. `confirm` and `virustotal`
 read only what `actualis --network --json` printed.
 
 **Decoys.** Each `confirm` request carries at least 30 prefixes and at most
-1000. The decoys are drawn from the lists you downloaded, so they look like
+970 real ones (topped up to 30 with decoys). The decoys are drawn from the lists you downloaded, so they look like
 real entries; random prefixes are used only to make up a shortfall.
 
 **Hosts never looked up or sent.** These are skipped entirely: they are never
@@ -237,7 +237,9 @@ and the lists are not.
 **Freshness.** The report header shows the list age, for example
 `reputation: Google Safe Browsing lists from 2026-10-30 14:02 UTC, 3 h old`.
 Lists older than 7 days raise a medium `reputation-stale` finding, because a
-stale list can only miss new threats, not invent hits. `update` honours the
+stale list cannot make a host listed on its own (a listing always needs a fresh
+confirmation), but it can miss new threats and keep candidates for entries since
+removed. `update` honours the
 server's `minimumWaitDuration` (capped at 24 hours); if you run it too soon it
 says `lists are current` and sends nothing.
 
@@ -328,7 +330,7 @@ sequenceDiagram
       end
     end
   end
-  A-->>U: report + --json; exit 3 if a listed host meets --fail-on
+  A-->>U: report + --json, exit 3 if a listed host meets --fail-on
   Note over A: no socket is ever opened
 ```
 
@@ -348,7 +350,7 @@ sequenceDiagram
   R->>G: GET /v5/hashes:search?hashPrefixes=… (key in X-Goog-Api-Key)
   G-->>R: fullHashes (threatType, attributes), cacheDuration
   R->>R: drop decoy results, store full hashes + confirmed_at + cache_until
-  R-->>U: ⊕🌐 network used: 1 request; run actualis again within min(30 min, cacheDuration)
+  R-->>U: ⊕🌐 network used: 1 request, run actualis again within min(30 min, cacheDuration)
   U->>A: actualis --network --reputation --fail-on high
   A-->>U: listed hosts are high findings with "Advisory provided by Google"
 ```
@@ -365,7 +367,7 @@ sequenceDiagram
   R-->>U: ⊕🌐 disclosure (N hostnames in plain text, ~N/4 minutes)
   U->>R: consent or --yes
   loop each host, at most 4 a minute, stop at the daily budget
-    R->>V: GET /api/v3/domains/{host} (x-apikey)
+    R->>V: GET /api/v3/domains/{host} or /api/v3/ip_addresses/{ip} (x-apikey)
     alt 200
       V-->>R: last_analysis_stats
     else 404

@@ -154,10 +154,6 @@ class TestSelfCheck(unittest.TestCase):
         self.assertNotIn("actualis_reputation", af.imports_in(src))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestDocs(unittest.TestCase):
     def test_reputation_doc(self):
         doc = (ROOT / "docs" / "reputation.md").read_text(encoding="utf-8")
@@ -170,7 +166,7 @@ class TestDocs(unittest.TestCase):
             self.assertIn(needle, doc, needle)
 
     def test_readme(self):
-        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        readme = " ".join((ROOT / "README.md").read_text(encoding="utf-8").split())   # line wraps do not matter
         self.assertIn("Optional: host reputation (uses the network)", readme)
         self.assertIn("actualis never uses the network. The optional `actualis-reputation` command does, "
                       "only when you run it, and tells you what it sends.", readme)
@@ -189,3 +185,18 @@ class TestDocs(unittest.TestCase):
 
     def test_explain_topic(self):
         self.assertIn("reputation", af.EXPLAIN)
+
+    def test_mermaid_has_no_semicolons(self):
+        doc = (ROOT / "docs" / "reputation.md").read_text(encoding="utf-8")
+        inside = False
+        for line in doc.splitlines():
+            if line.startswith("```"):
+                inside = line.startswith("```mermaid")
+            elif inside:
+                self.assertNotIn(";", line, line)
+
+
+
+if __name__ == "__main__":
+    unittest.main()
+
