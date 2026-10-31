@@ -152,6 +152,34 @@ class TestLoader(CacheCase):
         self.assertEqual(d.status, "corrupt")
         self.assertIn("not sorted", d.error)
 
+    def test_nested_json_fails_closed(self):
+        deep = b"[" * 300000 + b"]" * 300000
+        R.write_cache(self.root, vt=[])
+        (self.root / "gsb" / "confirmations.json").write_bytes(deep)
+        (self.root / "vt" / "results.json").write_bytes(deep)
+        d = af.load_reputation(self.root)
+        self.assertEqual((d.status, d.confirmations, d.vt), ("ok", {}, {}))
+        self.assertTrue(d.confirmations_error)
+        self.assertTrue(d.vt_error)
+        (self.root / "gsb" / "state.json").write_bytes(deep)
+        self.assertEqual(af.load_reputation(self.root).status, "corrupt")
+
+    @unittest.skipIf(os.name == "nt", "symlinks need privileges on Windows")
+    def test_corrupt_symlinked_state(self):
+        R.write_cache(self.root)
+        s = self.root / "gsb" / "state.json"
+        real = self.root / "state.real"
+        real.write_bytes(s.read_bytes())
+        s.unlink()
+        s.symlink_to(real)
+        self.assertEqual(af.load_reputation(self.root).status, "corrupt")
+
+    def test_corrupt_fetched_in_the_future(self):
+        R.write_cache(self.root, fetched_at=datetime.now(timezone.utc) + timedelta(days=3))
+        d = af.load_reputation(self.root)
+        self.assertEqual(d.status, "corrupt")
+        self.assertIn("future", d.error)
+
     def test_bad_confirmations_are_ignored_not_fatal(self):
         R.write_cache(self.root)
         (self.root / "gsb" / "confirmations.json").write_text("[1,2")

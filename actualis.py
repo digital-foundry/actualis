@@ -7769,8 +7769,8 @@ def load_reputation(directory: "Path | None" = None) -> ReputationData:
     data.last_network = reputation_last_network(root)
     try:                                     # first: VirusTotal results count even with no Safe Browsing lists
         _load_vt(root / "vt" / "results.json", data)
-    except (OSError, ValueError) as exc:
-        data.vt, data.vt_error = {}, str(exc)
+    except (OSError, ValueError, RecursionError) as exc:
+        data.vt, data.vt_error = {}, str(exc) or "nested too deeply"
     gsb = root / "gsb"
     try:
         raw = _read_cache_file(gsb / "state.json")
@@ -7797,18 +7797,20 @@ def load_reputation(directory: "Path | None" = None) -> ReputationData:
                 raise ValueError(f"{name}: checksum does not match")
             if any(blob[i:i + 4] > blob[i + 4:i + 8] for i in range(0, len(blob) - 4, 4)):
                 raise ValueError(f"{name}: prefixes are not sorted")
+            if fetched > datetime.now(timezone.utc) + timedelta(days=1):
+                raise ValueError(f"{name}: fetched_at is in the future")
             data.lists[name] = blob
             data.state[name] = {"fetched_at": fetched, "next_update_at": _parse_utc(e.get("next_update_at")),
                                 "prefix_count": count, "version": e.get("version")}
             data.oldest = fetched if data.oldest is None else min(data.oldest, fetched)
-    except (OSError, ValueError) as exc:     # json.JSONDecodeError is a ValueError
+    except (OSError, ValueError, RecursionError) as exc:     # JSONDecodeError is a ValueError
         data.status, data.error, data.lists, data.state = "corrupt", str(exc), {}, {}
         return data
     data.status = "ok"
     try:
         data.confirmations = _load_confirmations(gsb / "confirmations.json")
-    except (OSError, ValueError) as exc:
-        data.confirmations_error = str(exc)
+    except (OSError, ValueError, RecursionError) as exc:
+        data.confirmations_error = str(exc) or "nested too deeply"
     return data
 
 
