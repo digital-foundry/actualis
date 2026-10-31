@@ -7812,7 +7812,7 @@ def gsb_verdict(host: str, path: str, data: "ReputationData", now: datetime) -> 
             continue
         out["checked_at"] = max(filter(None, (out["checked_at"], c["confirmed_at"])))
         for fh in c["full_hashes"]:
-            if fh["hash"] in full and not fh.get("canary"):
+            if fh["hash"] in full:
                 types.update(fh["threat_types"])
     if types:
         out["state"], out["threat_types"] = "listed", sorted(types)
@@ -7895,27 +7895,30 @@ def apply_reputation(fleet: "Fleet", data: "ReputationData | None", now: "dateti
             category = {"listed": "reputation-listed", "candidate": "reputation-candidate",
                         "suspicious": "reputation-suspicious"}[state]
             gk = (category, f"{'gsb' if google else 'vt'}:{host}")
-            grp = groups.setdefault(gk, {"items": [], "verdict": best[2], "google": google, "host": host})
+            grp = groups.setdefault(gk, {"items": [], "verdict": best[2], "google": google, "host": host,
+                                         "types": set()})
             grp["items"].append(item)
+            grp["types"].update(best[2].get("threat_types", ()))
     for (category, key), grp in sorted(groups.items()):
         items, v, host = grp["items"], grp["verdict"], grp["host"]
         latest = max(items, key=lambda i: (_net_utc_key(i["ts"]), i["project"]))
         n = f"{len(items)} download(s) via {latest['program']}"
         if category == "reputation-listed" and grp["google"]:
-            what = " or ".join(REPUTATION_THREAT_TEXT.get(t, t.lower()) for t in v["threat_types"])
+            what = " or ".join(REPUTATION_THREAT_TEXT.get(t, t.lower()) for t in sorted(grp["types"]))
             evidence = (f"{host} is currently listed by Google Safe Browsing as suspected {what} "
-                        f"(checked {_utc_hm(v['checked_at'])}); {n}. {GSB_ADVISORY}")
+                        f"(checked {_utc_hm(v['checked_at'])}); {n}")
         elif category == "reputation-listed":
             evidence = (f"{host} flagged malicious by {v['malicious']} VirusTotal engines "
                         f"(checked {_utc_hm(v['checked_at'])}); {n}")
         elif category == "reputation-candidate":
             evidence = (f"possible match for {host} in Google Safe Browsing lists, not confirmed; "
-                        f"run `actualis-reputation confirm`; {n}. {GSB_ADVISORY}")
+                        f"run `actualis-reputation confirm`; {n}")
         else:
             evidence = (f"{host}: {v['malicious']} malicious and {v['suspicious']} suspicious VirusTotal "
                         f"engines, below the threshold of {v['threshold']} (checked {_utc_hm(v['checked_at'])}); {n}")
+        advisory = category in ("reputation-listed", "reputation-candidate") and grp["google"]
         _reputation_flag(fleet, "high" if category == "reputation-listed" else "med", category, key,
-                         latest, evidence)
+                         latest, evidence, ". " + GSB_ADVISORY if advisory else "")
     if data.oldest and now - data.oldest > timedelta(days=REPUTATION_STALE_DAYS):
         days = (now - data.oldest).days
         _reputation_flag(fleet, "med", "reputation-stale", "gsb-lists", None,
@@ -7924,7 +7927,9 @@ def apply_reputation(fleet: "Fleet", data: "ReputationData | None", now: "dateti
 
 
 def _reputation_flag(fleet: "Fleet", severity: str, category: str, key: str, latest: "dict | None",
-                     evidence: str) -> None:
+                     evidence: str, suffix: str = "") -> None:
+    """suffix (the Google advisory) is appended after the body is clipped, so
+    a long host cannot cut it off."""
     fid = flag_id(severity, [category], key)
     suppressed = fid in fleet.suppressions
     if suppressed:
@@ -7932,8 +7937,8 @@ def _reputation_flag(fleet: "Fleet", severity: str, category: str, key: str, lat
     fleet.flags.append({
         "id": fid, "severity": severity, "categories": [category], "program": key,
         "project": latest["project"] if latest else "", "when": latest["ts"] if latest else None,
-        "evidence": redact(clean(evidence))[:240], "had_secret": False, "suppressed": suppressed,
-        "suppressed_reason": fleet.suppressions.get(fid, ""),
+        "evidence": redact(clean(evidence))[:240 - len(suffix)] + suffix, "had_secret": False,
+        "suppressed": suppressed, "suppressed_reason": fleet.suppressions.get(fid, ""),
     })
 
 

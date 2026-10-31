@@ -278,6 +278,13 @@ class TestMatcher(CacheCase):
                                                     at=NOW - timedelta(minutes=5))])
         self.assertEqual(af.gsb_verdict("evil.example", "", d, NOW)["state"], "not-listed")
 
+    def test_mixed_canary_hash_with_enforceable_type_is_listed(self):
+        c = R.confirmation("evil.example/", listed=["evil.example/"], at=NOW - timedelta(minutes=5))
+        c["full_hashes"][0]["canary"] = True      # MALWARE plus a CANARY detail
+        d = self.data(lists={"mw-4b": [R.prefix("evil.example/")]}, confirmations=[c])
+        v = af.gsb_verdict("evil.example", "", d, NOW)
+        self.assertEqual((v["state"], v["threat_types"]), ("listed", ["MALWARE"]))
+
     def test_vt_threshold_and_suspicious(self):
         d = self.data(vt=[R.vt_result("bad.example", 3), R.vt_result("meh.example", 1),
                           R.vt_result("sus.example", 0, 2), R.vt_result("new.example", status="unknown"),
@@ -319,6 +326,34 @@ class TestApply(CacheCase):
         self.assertEqual((rep["state"], rep["provider"], rep["advisory"]),
                          ("listed", "google-safe-browsing", "Advisory provided by Google"))
         self.assertEqual(f.reputation_totals["listed"], 2)
+
+    def test_long_host_never_clips_the_advisory(self):
+        host = "a" * 60 + "." + "b" * 60 + "." + "c" * 60 + ".example"
+        for kw in ({"confirmations": [R.confirmation(host + "/", listed=[host + "/"],
+                                                     at=NOW - timedelta(minutes=5))]}, {}):
+            f = self.run_apply(rep_fleet(f"curl https://{host}/a"),
+                               lists={"mw-4b": [R.prefix(host + "/")]}, **kw)
+            ev = f.flags[0]["evidence"]
+            self.assertLessEqual(len(ev), 240)
+            self.assertTrue(ev.endswith("Advisory provided by Google"), ev)
+
+    def test_listed_unions_threat_types_across_paths(self):
+        f = rep_fleet("curl https://evil.example/a", "curl https://evil.example/b")
+        d_types = [["MALWARE"], ["SOCIAL_ENGINEERING"]]
+        real = af.gsb_verdict
+        calls = iter(d_types)
+
+        def fake(host, path, data, now):
+            return {"state": "listed", "threat_types": next(calls), "checked_at": NOW, "candidates": {}}
+        af.gsb_verdict = fake
+        try:
+            R.write_cache(self.root, fetched_at=NOW - timedelta(hours=1), lists={"mw-4b": [b"\0\0\0\0"]})
+            af.apply_reputation(f, af.load_reputation(self.root), NOW)
+        finally:
+            af.gsb_verdict = real
+        ev = f.flags[0]["evidence"]
+        self.assertIn("malware", ev)
+        self.assertIn("phishing", ev)
 
     def test_candidate_flag_and_candidates(self):
         f = self.run_apply(rep_fleet("curl https://evil.example/a"), lists={"se-4b": [R.prefix("evil.example/")]})
