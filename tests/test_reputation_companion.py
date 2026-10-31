@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import ssl
 import tempfile
 import unittest
 from unittest import mock
@@ -611,6 +612,7 @@ class TestTlsRefusesUntrustedCert(CompanionCase):
 
         srv = HTTPServer(("127.0.0.1", 0), H)
         sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        sctx.minimum_version = ssl.TLSVersion.TLSv1_2
         sctx.load_cert_chain(str(cert), str(key))
         srv.socket = sctx.wrap_socket(srv.socket, server_side=True)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -1051,3 +1053,9 @@ class ProtobufReaderTest(unittest.TestCase):
 
     def test_empty_search_response_has_no_hashes(self):
         self.assertEqual(ar.pb_search(b""), {"fullHashes": []})
+
+
+class TlsFloorTest(unittest.TestCase):
+    def test_default_context_refuses_old_tls(self):
+        session = ar.NetSession("update", "gsb", ar.Scrubber(), receipt=None, out=io.StringIO())
+        self.assertGreaterEqual(ar.Http(session).context.minimum_version, ssl.TLSVersion.TLSv1_2)

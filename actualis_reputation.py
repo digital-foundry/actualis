@@ -478,7 +478,10 @@ class Http:
             raise ValueError("scheme must be https or http")
         self.session = session
         self.endpoints = dict(endpoints or {GSB_HOST: GSB_HOST, VT_HOST: VT_HOST})
-        self.context = context or ssl.create_default_context()
+        if context is None:
+            context = ssl.create_default_context()
+            context.minimum_version = ssl.TLSVersion.TLSv1_2   # explicit: 3.9's default follows the OpenSSL build
+        self.context = context
         self.scheme = scheme
         handlers = [_NoRedirect(), urllib.request.HTTPSHandler(context=self.context)]
         if proxies is not None:                  # None: honour HTTPS_PROXY and the system settings
