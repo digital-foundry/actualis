@@ -895,12 +895,12 @@ class TestAgentVerification(unittest.TestCase):
 class TestDocumentation(unittest.TestCase):
     """Docs drift silently. These fail the build instead."""
 
-    SRC = (ROOT / "actualis.py").read_text()
+    SRC = (ROOT / "actualis.py").read_text(encoding="utf-8")
 
     def test_every_finding_id_is_documented(self):
         import re
         ids = sorted(set(re.findall(r'"(AF\d{3})"', self.SRC)))
-        doc = (ROOT / "docs" / "findings.md").read_text()
+        doc = (ROOT / "docs" / "findings.md").read_text(encoding="utf-8")
         self.assertTrue(ids)
         for fid in ids:
             with self.subTest(fid=fid):
@@ -910,7 +910,7 @@ class TestDocumentation(unittest.TestCase):
     def test_every_flag_is_documented(self):
         import re
         flags = sorted(set(re.findall(r'ap\.add_argument\("(--[a-z-]+)"', self.SRC)))
-        readme = (ROOT / "README.md").read_text()
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
         for flag in flags:
             with self.subTest(flag=flag):
                 self.assertIn(f"`{flag}", readme, f"{flag} is not in the README")
@@ -919,7 +919,7 @@ class TestDocumentation(unittest.TestCase):
         import re
         kinds = sorted(set(re.findall(
             r'"(?:critical|high)",\s*"([A-Za-z0-9 /]+)",\s*re\.compile', self.SRC)))
-        doc = (ROOT / "docs" / "secrets.md").read_text()
+        doc = (ROOT / "docs" / "secrets.md").read_text(encoding="utf-8")
         self.assertTrue(kinds)
         for k in kinds:
             with self.subTest(kind=k):
@@ -931,7 +931,7 @@ class TestDocumentation(unittest.TestCase):
         field consumers cannot rely on."""
         f = af.Fleet()
         payload = af.to_json(f)
-        doc = (ROOT / "docs" / "json.md").read_text()
+        doc = (ROOT / "docs" / "json.md").read_text(encoding="utf-8")
         undocumented = [k for k in payload if f"`{k}`" not in doc]
         self.assertEqual(undocumented, [],
                          f"undocumented --json keys: {undocumented}")
@@ -943,7 +943,7 @@ class TestDocumentation(unittest.TestCase):
             with self.subTest(rel=rel):
                 f = ROOT / rel
                 self.assertTrue(f.exists(), f"{rel} missing")
-                self.assertGreater(len(f.read_text()), 400, f"{rel} looks like a stub")
+                self.assertGreater(len(f.read_text(encoding="utf-8")), 400, f"{rel} looks like a stub")
 
 
 class TestRoots(unittest.TestCase):
@@ -1392,7 +1392,7 @@ class TestJSONSchemaFreeze(unittest.TestCase):
         self.assertIsInstance(af.JSON_SCHEMA_VERSION, int)
 
     def test_the_compatibility_policy_is_written_down(self):
-        doc = (ROOT / "docs" / "json.md").read_text()
+        doc = (ROOT / "docs" / "json.md").read_text(encoding="utf-8")
         for phrase in ["schema_version", "Compatibility", "never"]:
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, doc)
@@ -1472,7 +1472,7 @@ class TestReportDigest(unittest.TestCase):
         self.assertIn(af.to_json(fleet)["report_sha256"][:16], buf.getvalue())
 
     def test_the_verification_procedure_is_documented(self):
-        doc = (ROOT / "docs" / "json.md").read_text()
+        doc = (ROOT / "docs" / "json.md").read_text(encoding="utf-8")
         for phrase in ["report_sha256", "sort_keys", "sha256"]:
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, doc)
@@ -1818,14 +1818,14 @@ class TestSuppressions(unittest.TestCase):
         fp = next(iter(f.secrets))
         path = af.add_suppression(fp, "temporary")
         self.assertIn(fp, af.load_suppressions())
-        kept = [ln for ln in path.read_text().splitlines() if not ln.startswith(fp)]
+        kept = [ln for ln in path.read_text(encoding="utf-8").splitlines() if not ln.startswith(fp)]
         path.write_text("\n".join(kept) + "\n")
         self.assertNotIn(fp, af.load_suppressions())
 
     def test_a_suppression_records_why(self):
         """A file of bare fingerprints is unreviewable six months later."""
         path = af.add_suppression("a41f9c02", "vendor example key in our docs")
-        body = path.read_text()
+        body = path.read_text(encoding="utf-8")
         self.assertIn("a41f9c02", body)
         self.assertIn("vendor example key in our docs", body)
         self.assertRegex(body, r"\(added \d{4}-\d{2}-\d{2}\)")
@@ -1836,7 +1836,7 @@ class TestSuppressions(unittest.TestCase):
 
     def test_the_file_is_plain_text_and_survives_hand_editing(self):
         path = af.add_suppression("a1b2c3d4", "one")
-        path.write_text(path.read_text()
+        path.write_text(path.read_text(encoding="utf-8")
                         + "\n# a comment someone added by hand\n"
                         + "  e5f6a7b8   spaced out reason  \n"
                         + "\n")
