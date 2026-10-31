@@ -112,6 +112,9 @@ def read_key(provider: str, key_command: "str | None", scrub: Scrubber, env=os.e
             raise UsageError(f"--key-command: {exc}") from None
         if not argv:
             raise UsageError("--key-command is empty")
+        if len(argv) == 1 and _key_shaped(argv[0]):
+            raise UsageError("--key-command looks like a key, not a command; pass a command that prints "
+                             "the key (for example `op read ...`), or set the key variable instead")
         try:
             r = subprocess.run(argv, capture_output=True, text=True, timeout=120)   # noqa: S603 (no shell)
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -130,6 +133,16 @@ def read_key(provider: str, key_command: "str | None", scrub: Scrubber, env=os.e
                          f". _ ~ -); check --key-command or ${var}")
     scrub.add(key)
     return key
+
+
+def _key_line(args, provider: str) -> str:
+    """The disclosure's Key line. Says whether the variable is set; never its value."""
+    if args.dry_run:
+        return "(not read: --dry-run)"
+    if args.key_command:
+        return "--key-command (not shown)"
+    var = PROVIDERS[provider][2]
+    return f"${var} (set, not shown)" if os.environ.get(var, "").strip() else f"${var} (not set)"
 
 
 def cache_root() -> Path:
@@ -273,6 +286,8 @@ class NetSession:
                 flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0) \
                     | getattr(os, "O_BINARY", 0)
                 fd = os.open(self.receipt, flags, 0o600)
+                if hasattr(os, "fchmod"):
+                    os.fchmod(fd, 0o600)            # a receipt that already existed ends up 0600 too
                 with os.fdopen(fd, "wb") as fh:
                     fh.write(body.encode())
             except OSError as e:
@@ -630,6 +645,14 @@ def _batch(http: Http, key: str, names: "list[str]", versions: dict, describe: s
     return lists
 
 
+def _check_names(names: "list[str]", lists: "list[dict]") -> None:
+    """Lists are paired with the requested names by position; refuse a reply
+    whose names do not match, so a reordered reply cannot be stored under the wrong list."""
+    for name, hl in zip(names, lists):
+        if hl.get("name") != name:
+            raise NetError("Safe Browsing sent its lists in an unexpected order or with other names")
+
+
 def _apply_checked(old: bytes, hl: dict) -> "bytes | None":
     """The new list if it applies and matches its checksum, else None."""
     try:
@@ -654,8 +677,7 @@ def cmd_update(args, ctx) -> int:
               ("Sends", "nothing about your hosts: downloads list updates"
                         + (" (full lists on this first run)" if first else "")),
               ("Never", "commands, paths, query strings, credentials, transcript text"),
-              ("Key", "(not read: --dry-run)" if args.dry_run else
-               ("--key-command (not shown)" if args.key_command else "$ACTUALIS_GSB_KEY (set, not shown)"))], out)
+              ("Key", _key_line(args, "gsb"))], out)
     if args.dry_run:
         out.write(f"would request: GET https://{GSB_HOST}{GSB_BATCH_PATH} for {', '.join(due)}\n")
         out.write(f"{MARK} network used: nothing sent (--dry-run)\n")
@@ -673,6 +695,7 @@ def cmd_update(args, ctx) -> int:
             new: "dict[str, tuple[bytes, dict]]" = {}
             lists = _batch(http, key, due, versions, f"downloading {len(due)} list update(s)")
             retry = []
+            _check_names(due, lists)
             for name, hl in zip(due, lists):
                 blob = _apply_checked(data.lists.get(name, b""), hl)
                 if blob is None:
@@ -681,6 +704,7 @@ def cmd_update(args, ctx) -> int:
                     new[name] = (blob, hl)
             if retry:
                 lists = _batch(http, key, retry, {}, f"checksum mismatch: downloading {len(retry)} full list(s)")
+                _check_names(retry, lists)
                 for name, hl in zip(retry, lists):
                     blob = _apply_checked(b"", {**hl, "partialUpdate": False})
                     if blob is None or "sha256Checksum" not in hl:
@@ -812,8 +836,7 @@ def cmd_confirm(args, ctx) -> int:
                         f"mixed with {sum(decoy_counts)} random decoys drawn from the downloaded lists.\nGoogle never sees a host or URL."),
               ("Skips", f"{skipped} private or local hosts"),
               ("Never", "commands, paths, query strings, credentials, transcript text"),
-              ("Key", "(not read: --dry-run)" if args.dry_run else
-               ("--key-command (not shown)" if args.key_command else "$ACTUALIS_GSB_KEY (set, not shown)"))], out)
+              ("Key", _key_line(args, "gsb"))], out)
     if args.dry_run:
         for c, d in zip(chunks, decoy_counts):
             out.write(f"would send: {', '.join(base64.b64encode(p).decode() for p in c)} "
@@ -988,6 +1011,10 @@ def cmd_virustotal(args, ctx) -> int:
     stored = doc.get("vt_threshold")
     threshold = args.vt_threshold if args.vt_threshold is not None else (
         stored if isinstance(stored, int) and not isinstance(stored, bool) and 1 <= stored <= 100 else 2)
+    if args.vt_threshold is not None and not args.dry_run and stored != args.vt_threshold:
+        write_json(cache_root() / "vt" / "results.json", {**doc, "vt_threshold": args.vt_threshold})
+        doc["vt_threshold"] = args.vt_threshold
+        out.write(f"VirusTotal threshold set to {args.vt_threshold}\n")
     today = now.date().isoformat()
     count = doc["daily"].get("count", 0)
     used = count if doc["daily"].get("date") == today and isinstance(count, int) \
@@ -1013,8 +1040,7 @@ def cmd_virustotal(args, ctx) -> int:
               ("Skips", f"{private} private or local hosts, {unusable} unusable names, "
                         f"{len(hosts) - len(todo)} checked in the last 24 h"),
               ("Never", "URLs, paths, commands, credentials, transcript text"),
-              ("Key", "(not read: --dry-run)" if args.dry_run else
-               ("--key-command (not shown)" if args.key_command else "$ACTUALIS_VT_KEY (set, not shown)"))], out)
+              ("Key", _key_line(args, "vt"))], out)
     if args.dry_run:
         for h in plan:
             out.write(f"would send: {h}\n")

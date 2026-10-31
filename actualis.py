@@ -6258,7 +6258,7 @@ def reputation_json(fleet: "Fleet") -> dict:
     """network.reputation. Always an object; enabled false without --reputation."""
     data = fleet.reputation
     out = {"enabled": data is not None, "lists_status": None, "provider_lists": {}, "lists_age_hours": None,
-           "stale": False, "vt_results": 0, "totals": dict(fleet.reputation_totals), "candidates": [],
+           "stale": False, "vt_results": 0, "vt_status": None, "totals": dict(fleet.reputation_totals), "candidates": [],
            "advisory": {"text": None, "url": None}, "network_last_used": {"at": None, "provider": None}}
     if data is None:
         return out
@@ -6270,6 +6270,7 @@ def reputation_json(fleet: "Fleet") -> dict:
         out["lists_age_hours"] = max(0, int((now - data.oldest).total_seconds() // 3600))
         out["stale"] = now - data.oldest > timedelta(days=REPUTATION_STALE_DAYS)
     out["vt_results"] = len(data.vt)
+    out["vt_status"] = "corrupt" if data.vt_error else ("ok" if data.vt_present else "absent")
     out["candidates"] = sorted(({"prefix_b64": base64.b64encode(p).decode(), "expressions": n}
                                 for p, n in fleet.reputation_candidates.items()),
                                key=lambda c: c["prefix_b64"])
@@ -7694,6 +7695,7 @@ class ReputationData:
         self.vt: dict[str, dict] = {}
         self.vt_threshold = 2
         self.vt_error: str | None = None
+        self.vt_present = False
         self.last_network: dict | None = None
 
 
@@ -7763,6 +7765,7 @@ def _load_vt(path: Path, data: "ReputationData") -> None:
     raw = _read_cache_file(path)
     if raw is None:
         return
+    data.vt_present = True
     doc = json.loads(raw)
     if not isinstance(doc, dict) or doc.get("schema") != 1 or not isinstance(doc.get("results"), list):
         raise ValueError("vt/results.json: not schema 1")
@@ -7988,7 +7991,7 @@ def load_reputation(directory: "Path | None" = None) -> ReputationData:
     data.last_network = reputation_last_network(root)
     try:                                     # first: VirusTotal results count even with no Safe Browsing lists
         _load_vt(root / "vt" / "results.json", data)
-    except (OSError, ValueError, RecursionError) as exc:
+    except (OSError, ValueError, RecursionError, TypeError, AttributeError) as exc:
         data.vt, data.vt_error = {}, str(exc) or "nested too deeply"
     gsb = root / "gsb"
     try:
@@ -7998,7 +8001,7 @@ def load_reputation(directory: "Path | None" = None) -> ReputationData:
         doc = json.loads(raw)
         if not isinstance(doc, dict) or doc.get("schema") != 1 or not isinstance(doc.get("lists"), list):
             raise ValueError("state.json is not schema 1")
-        by_name = {e.get("name"): e for e in doc["lists"] if isinstance(e, dict)}
+        by_name = {e["name"]: e for e in doc["lists"] if isinstance(e, dict) and isinstance(e.get("name"), str)}
         for name in REPUTATION_LISTS:
             e = by_name.get(name)
             if e is None:
@@ -8022,13 +8025,13 @@ def load_reputation(directory: "Path | None" = None) -> ReputationData:
             data.state[name] = {"fetched_at": fetched, "next_update_at": _parse_utc(e.get("next_update_at")),
                                 "prefix_count": count, "version": e.get("version")}
             data.oldest = fetched if data.oldest is None else min(data.oldest, fetched)
-    except (OSError, ValueError, RecursionError) as exc:     # JSONDecodeError is a ValueError
+    except (OSError, ValueError, RecursionError, TypeError, AttributeError) as exc:   # JSONDecodeError is a ValueError
         data.status, data.error, data.lists, data.state = "corrupt", str(exc), {}, {}
         return data
     data.status = "ok"
     try:
         data.confirmations = _load_confirmations(gsb / "confirmations.json")
-    except (OSError, ValueError, RecursionError) as exc:
+    except (OSError, ValueError, RecursionError, TypeError, AttributeError) as exc:
         data.confirmations_error = str(exc) or "nested too deeply"
     return data
 
@@ -12700,8 +12703,10 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "       skipped     a private or local host, never looked up or sent",
             "",
             "Lists older than 7 days raise reputation-stale. With --fail-on, absent or",
-            "corrupt lists exit 2 before scanning. The cache is in",
-            "$ACTUALIS_REPUTATION_DIR, else ~/.cache/actualis/reputation.",
+            "corrupt lists, or a corrupt VirusTotal file, exit 2 before scanning.",
+            "The cache is in $ACTUALIS_REPUTATION_DIR; else %LOCALAPPDATA%\\actualis\\reputation",
+            "on Windows; else $XDG_CACHE_HOME/actualis/reputation; else",
+            "~/.cache/actualis/reputation.",
         ],
         "assumes": [
             "A listing is about now, not about when the agent reached the host.",
@@ -12709,7 +12714,7 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "A Google result carries \"Advisory provided by Google\"; both providers",
             "are for non-commercial use. See docs/reputation.md.",
         ],
-        "verify": "actualis --network --reputation --json | jq '.network.reputation.totals'",
+        "verify": "actualis --network --reputation --json | jq '.reputation.totals'",
     },
     "cache": {
         "measures": "Share of input context served from cache, and what that saved.",
@@ -15874,6 +15879,7 @@ JSON_SCHEMA: dict[str, str] = {
     "network.reputation.lists_age_hours": "int|null",
     "network.reputation.stale": "bool",
     "network.reputation.vt_results": "int",
+    "network.reputation.vt_status": "str|null",
     "network.reputation.totals.checked": "int",
     "network.reputation.totals.skipped": "int",
     "network.reputation.totals.none": "int",
@@ -18119,6 +18125,16 @@ def main(argv: list[str] | None = None) -> int:
         print(msg, file=sys.stderr)
         if args.fail_on:
             return EXIT_USAGE
+    if reputation is not None and reputation.vt_error:
+        print(f"actualis: --reputation: vt/results.json in {reputation.directory} is unreadable "
+              f"({clean(reputation.vt_error)}); VirusTotal verdicts are ignored. Run "
+              f"`actualis-reputation virustotal` to rebuild it.", file=sys.stderr)
+        if args.fail_on:
+            return EXIT_USAGE
+    if reputation is not None and reputation.confirmations_error:
+        print(f"actualis: --reputation: gsb/confirmations.json in {reputation.directory} is unreadable "
+              f"({clean(reputation.confirmations_error)}); matches stay candidates. Run "
+              f"`actualis-reputation confirm`.", file=sys.stderr)
 
     # --network shows only the inventory; --fail-on reads findings (--why
     # with --network is refused above).

@@ -110,6 +110,57 @@ class TestCli(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("failed their check", err)
 
+    def test_corrupt_vt_file_fails_closed_under_fail_on(self):
+        def cache(rep):
+            now = datetime.now(timezone.utc)
+            R.write_cache(rep, {}, vt=[R.vt_result("vtbad.example", malicious=9, at=now)])
+        vt_cmds = ["curl https://vtbad.example/x"]
+        code, _, _ = run(vt_cmds, "--network", "--reputation", "--fail-on", "high", cache=cache)
+        self.assertEqual(code, 3)
+
+        def corrupt(rep):
+            cache(rep)
+            (rep / "vt" / "results.json").write_text('{"schema": 1, "results": [')
+        code, out, err = run(vt_cmds, "--network", "--reputation", "--fail-on", "high", cache=corrupt)
+        self.assertEqual(code, 2)
+        self.assertIn("vt/results.json", err)
+        code, out, err = run(vt_cmds, "--network", "--reputation", cache=corrupt)
+        self.assertEqual(code, 0, err)
+        self.assertIn("vt/results.json", err)
+        self.assertEqual(json.loads(out)["reputation"]["vt_status"], "corrupt")
+
+    def test_vt_status_ok_and_absent(self):
+        code, out, _ = run(CMDS, "--network", "--reputation", cache=listed_cache)
+        self.assertEqual(json.loads(out)["reputation"]["vt_status"], "absent")
+
+        def with_vt(rep):
+            R.write_cache(rep, {}, vt=[R.vt_result("a.example")])
+        code, out, _ = run(CMDS, "--network", "--reputation", cache=with_vt)
+        self.assertEqual(json.loads(out)["reputation"]["vt_status"], "ok")
+
+    def test_corrupt_confirmations_file_prints_a_note_and_keeps_exit(self):
+        def corrupt(rep):
+            listed_cache(rep)
+            (rep / "gsb" / "confirmations.json").write_text("{not json")
+        code, out, err = run(CMDS, "--network", "--reputation", "--fail-on", "any", cache=corrupt)
+        self.assertIn("confirmations.json", err)
+        self.assertNotEqual(code, 2)
+
+    def test_unhashable_state_name_reads_as_corrupt(self):
+        def bad(rep):
+            (rep / "gsb").mkdir(parents=True)
+            (rep / "gsb" / "state.json").write_text(json.dumps({"schema": 1, "lists": [{"name": ["mw-4b"]}]}))
+        code, out, err = run(CMDS, "--network", "--reputation", cache=bad)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(json.loads(out)["reputation"]["lists_status"], "corrupt")
+
+    def test_explain_reputation_names_every_cache_location(self):
+        r = subprocess.run([sys.executable, str(ROOT / "actualis.py"), "--explain", "reputation"],
+                           capture_output=True, text=True, timeout=60)
+        for word in ("XDG_CACHE_HOME", "LOCALAPPDATA", "ACTUALIS_REPUTATION_DIR", "jq '.reputation.totals'"):
+            self.assertIn(word, r.stdout)
+
     def test_refused_combinations(self):
         for extra in (["--card"], ["--watch"], ["--mcp"], ["--self-check"], ["--agents"],
                       ["--coach"], ["--share"], ["--explain"]):

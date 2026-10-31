@@ -452,6 +452,10 @@ or the directory in `ACTUALIS_REPUTATION_DIR`. Directories are 0700 and files
 0600. Only `actualis-reputation` writes them, atomically (temp file, fsync,
 rename), and never through a symlink. `actualis` only reads.
 
+The checksums detect corruption, not deliberate tampering: anyone who can write the
+cache can replace the lists and `state.json` together. Protect the directory
+with its 0700 mode.
+
 | File | Contents |
 |---|---|
 | `gsb/state.json` | per list: `name`, `version` token, `sha256` of the sorted prefix set, `file`, `fetched_at`, `next_update_at`, `prefix_count`. Written last: it is the commit point |

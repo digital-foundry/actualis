@@ -261,6 +261,40 @@ class TestFixRound1(CompanionCase):
             pass
         self.assertEqual(r.stat().st_mode & 0o777, 0o600)
 
+    def test_receipt_that_already_exists_ends_0600(self):
+        if os.name == "nt":
+            self.skipTest("posix modes")
+        r = self.tmp / "r.json"
+        r.write_text("old")
+        os.chmod(r, 0o644)
+        with ar.NetSession("update", "gsb", ar.Scrubber(), receipt=str(r), out=io.StringIO()):
+            pass
+        self.assertEqual(r.stat().st_mode & 0o777, 0o600)
+
+    def test_key_command_that_is_a_pasted_key_is_refused_unrun(self):
+        with mock.patch.object(ar.subprocess, "run") as run:
+            for fn in (lambda: ar.read_key("gsb", FAKE_KEY, ar.Scrubber()),):
+                with self.assertRaises(ar.UsageError) as cm:
+                    fn()
+                self.assertIn("looks like a key", str(cm.exception))
+                self.assertNotIn(FAKE_KEY, str(cm.exception))
+            run.assert_not_called()
+        os.environ["ACTUALIS_GSB_KEY"] = FAKE_KEY
+        with mock.patch.object(ar.subprocess, "run") as run:
+            code, out, err = self.cli("update", "--yes", "--key-command", FAKE_KEY)
+            self.assertEqual(code, 2)
+            self.assertNotIn(FAKE_KEY, out + err)
+            run.assert_not_called()
+
+    def test_disclosure_key_line_says_whether_the_variable_is_set(self):
+        out = io.StringIO()
+        net = argparse_ns = type("A", (), {"dry_run": False, "key_command": None})()
+        ar.disclose([("Key", ar._key_line(net, "gsb"))], out)
+        self.assertIn("ACTUALIS_GSB_KEY (not set)", out.getvalue())
+        os.environ["ACTUALIS_VT_KEY"] = FAKE_KEY
+        self.assertEqual(ar._key_line(net, "vt"), "$ACTUALIS_VT_KEY (set, not shown)")
+        self.assertNotIn(FAKE_KEY, ar._key_line(net, "vt"))
+
     def test_key_shape_is_enforced_without_echo(self):
         for bad in ("short", "a" * 513, 'abc"def' + "0" * 16, "x y " + "0" * 16, "é" * 20):
             with self.assertRaises(ar.UsageError) as cm:
@@ -368,6 +402,24 @@ class TestUpdate(CompanionCase):
         self.assertEqual(d.status, "ok", d.error)
         self.assertEqual(d.lists["mw-4b"], R.prefix("evil.example/"))
         self.assertIn("network used: 1 request to safebrowsing.googleapis.com", err)
+
+    def test_reply_with_swapped_list_names_is_refused(self):
+        body = rice_lists({"mw-4b": [R.prefix("evil.example/")]})
+        body["hashLists"][0]["name"] = "se-4b"
+        s = self.serve(body)
+        code, _, err = self.cli("update", "--yes", http_factory=s.factory)
+        self.assertEqual(code, 1, err)
+        self.assertFalse((self.rep / "gsb" / "state.json").exists())
+
+    def test_update_recovers_from_unhashable_state_name(self):
+        (self.rep / "gsb").mkdir(parents=True)
+        (self.rep / "gsb" / "state.json").write_text(json.dumps({"schema": 1, "lists": [{"name": ["mw-4b"]}]}))
+        self.assertEqual(af.load_reputation(self.rep).status, "corrupt")
+        s = self.serve(rice_lists({"mw-4b": [R.prefix("evil.example/")]}))
+        code, _, err = self.cli("update", "--yes", http_factory=s.factory)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(s.requests[0]["query"]["names"]), len(R.LISTS))
+        self.assertEqual(af.load_reputation(self.rep).status, "ok")
 
     def test_not_due_sends_nothing(self):
         s = self.serve(rice_lists({}))
@@ -816,6 +868,21 @@ class TestVirusTotal(CompanionCase):
         self.run_vt(r, ["b.example"])
         doc = json.loads((self.rep / "vt" / "results.json").read_text())
         self.assertEqual(doc["vt_threshold"], 5)
+
+    def test_explicit_threshold_is_saved_even_when_nothing_is_sent(self):
+        r = {"/api/v3/domains/a.example": [(200, vt_body())]}
+        self.run_vt(r, ["a.example"], "--vt-threshold", "5")
+        code, err, s = self.run_vt({}, ["a.example"], "--vt-threshold", "1")
+        self.assertEqual((code, s.requests), (0, []))
+        self.assertIn("threshold set to 1", err)
+        self.assertEqual(json.loads((self.rep / "vt" / "results.json").read_text())["vt_threshold"], 1)
+        self.assertEqual(len(json.loads((self.rep / "vt" / "results.json").read_text())["results"]), 1)
+
+    def test_dry_run_does_not_save_the_threshold(self):
+        r = {"/api/v3/domains/a.example": [(200, vt_body())]}
+        self.run_vt(r, ["a.example"], "--vt-threshold", "5")
+        self.run_vt({}, ["b.example"], "--vt-threshold", "1", "--dry-run")
+        self.assertEqual(json.loads((self.rep / "vt" / "results.json").read_text())["vt_threshold"], 5)
 
     def test_stats_accept_only_plain_non_negative_ints(self):
         body = {"data": {"attributes": {"last_analysis_stats": {

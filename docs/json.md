@@ -341,7 +341,8 @@ always an object; `enabled` is `false` without `--reputation`.
 | `provider_lists` | list name to the time it was fetched |
 | `lists_age_hours` | age of the oldest list, in whole hours, or `null` |
 | `stale` | `true` when the oldest list is over 7 days old |
-| `vt_results` | VirusTotal results loaded (those over 7 days old are ignored) |
+| `vt_results` | VirusTotal results loaded from `vt/results.json`, every one however old (a result over 7 days old is counted here but gives no verdict) |
+| `vt_status` | `ok`, `absent` or `corrupt` for `vt/results.json`; `null` when not enabled. `corrupt` makes `--fail-on` exit 2 |
 | `totals` | `checked`, `skipped`, `none`, `candidate`, `listed`, `not_listed`, `suspicious`, `unknown`: items by state |
 | `candidates[]` | `prefix_b64`, the 4-byte hash prefix a confirmation would send, and `expressions`, how many of a host's expressions matched. Prefixes only: `actualis-reputation confirm` reads these and never sees a host |
 | `advisory` | `text` and `url` of the Google advisory, or both `null` |
@@ -351,7 +352,7 @@ The findings are `bash.flags[]` entries with the categories `reputation-listed`
 (high), `reputation-candidate`, `reputation-suspicious` and `reputation-stale`
 (medium).
 
-Verify: `actualis --network --reputation --json | jq '.network.reputation.totals'`
+Verify: `actualis --network --reputation --json | jq '.reputation.totals'`
 
 ## Compatibility
 
