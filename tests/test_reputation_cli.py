@@ -156,3 +156,36 @@ class TestSelfCheck(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDocs(unittest.TestCase):
+    def test_reputation_doc(self):
+        doc = (ROOT / "docs" / "reputation.md").read_text(encoding="utf-8")
+        for needle in ("Advisory provided by Google", "non-commercial", "Web Risk", "false positive",
+                       "false negative", "ACTUALIS_GSB_KEY", "ACTUALIS_VT_KEY", "--key-command",
+                       "```mermaid", "sequenceDiagram", "stateDiagram-v2", "flowchart",
+                       "actualis-reputation update", "actualis-reputation confirm",
+                       "actualis-reputation virustotal", "30 minutes", "7 days", "[+net]", "--dry-run",
+                       "--receipt", "Restrict the key"):
+            self.assertIn(needle, doc, needle)
+
+    def test_readme(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("Optional: host reputation (uses the network)", readme)
+        self.assertIn("actualis never uses the network. The optional `actualis-reputation` command does, "
+                      "only when you run it, and tells you what it sends.", readme)
+        self.assertIn("docs/reputation.md", readme)
+
+    def test_findings_and_json_docs(self):
+        findings = (ROOT / "docs" / "findings.md").read_text(encoding="utf-8")
+        for cat in af.REPUTATION_FLAG_CATEGORIES:
+            self.assertIn(f"`{cat}`", findings)
+        jdoc = (ROOT / "docs" / "json.md").read_text(encoding="utf-8")
+        self.assertIn("network.reputation", jdoc)
+        self.assertIn("network.items[].reputation", jdoc)
+
+    def test_changelog(self):
+        self.assertIn("actualis-reputation", (ROOT / "CHANGELOG.md").read_text(encoding="utf-8"))
+
+    def test_explain_topic(self):
+        self.assertIn("reputation", af.EXPLAIN)
