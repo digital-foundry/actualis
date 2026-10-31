@@ -74,7 +74,10 @@ func setTooltip(text string) {
 	}
 }
 
-func watchNetworkUse() {
+// watchNetworkUse polls the in-flight marker. ended runs when a companion run
+// finishes, so the tray re-reads what it changed (a list update clears the
+// "update" badge straight away rather than at the next ten-minute scan).
+func watchNetworkUse(ended func()) {
 	t := time.NewTicker(2 * time.Second)
 	defer t.Stop()
 	for range t.C {
@@ -98,6 +101,9 @@ func watchNetworkUse() {
 		} else {
 			setIcon(under)
 			systray.SetTooltip(tip)
+			if ended != nil {
+				ended()
+			}
 		}
 	}
 }

@@ -17,6 +17,7 @@
 - `--self-check` reports when actualis-reputation last used the network.
 - `--explain reputation`.
 - Tray: a network badge while actualis-reputation runs.
+- Tray: when the Safe Browsing lists are more than a day old, the icon shows the amber update badge and the menu offers "Update Safe Browsing Lists (N days old)…". It opens a terminal running `actualis-reputation update`, where you see what is sent and confirm. The tray itself never downloads anything or holds a key. Credential warnings still take priority over the badge (#69).
 
 ### Changed
 - The README says "actualis never uses the network. The optional `actualis-reputation` command does, only

@@ -97,6 +97,12 @@ var iconNetDark []byte
 //go:embed icons/network-light.png
 var iconNetLight []byte
 
+//go:embed icons/update-dark.png
+var iconUpdDark []byte
+
+//go:embed icons/update-light.png
+var iconUpdLight []byte
+
 // iconState remembers what is currently installed so the appearance watcher
 // can reinstall the same state in the other colourway.
 var iconState struct {
@@ -154,6 +160,8 @@ func iconFor(state string, dark bool) []byte {
 		onDark, onLight = iconErrDark, iconErrLight
 	case "network":
 		onDark, onLight = iconNetDark, iconNetLight
+	case "update":
+		onDark, onLight = iconUpdDark, iconUpdLight
 	default:
 		onDark, onLight = iconIdleDark, iconIdleLight
 	}
@@ -225,16 +233,20 @@ func unsupLabel(r report) string {
 
 // findBinary resolves the CLI without a login shell's PATH, which a
 // desktop-launched process does not inherit.
-func findBinary() string {
-	if p, err := exec.LookPath("actualis"); err == nil {
+func findBinary() string { return findTool("actualis") }
+
+// findTool finds an actualis command (the CLI or its companion) on PATH or
+// where the installers put it; a tray launched by the OS has a minimal PATH.
+func findTool(name string) string {
+	if p, err := exec.LookPath(name); err == nil {
 		return p
 	}
 	home, _ := os.UserHomeDir()
 	candidates := []string{
-		filepath.Join(home, ".local", "bin", "actualis"),
-		"/opt/homebrew/bin/actualis",
-		"/usr/local/bin/actualis",
-		filepath.Join(home, "AppData", "Local", "Programs", "actualis", "actualis.exe"),
+		filepath.Join(home, ".local", "bin", name),
+		"/opt/homebrew/bin/" + name,
+		"/usr/local/bin/" + name,
+		filepath.Join(home, "AppData", "Local", "Programs", "actualis", name+".exe"),
 	}
 	for _, c := range candidates {
 		if fi, err := os.Stat(c); err == nil && !fi.IsDir() {
@@ -433,9 +445,10 @@ type ui struct {
 	seen       map[string]bool // critical fingerprints already announced
 	primed     bool            // first scan must not fire a flood of alerts
 	primedDays int             // the window the baseline in seen was taken over
+	listsDue   bool            // Safe Browsing lists exist and are at least listsDueAfter old
 
 	mHeader, mSub, mCost, mShell, mUnsup, mInvis *systray.MenuItem
-	mNet, mNetReport                             *systray.MenuItem
+	mNet, mNetReport, mLists                     *systray.MenuItem
 	mFindings                                    []*systray.MenuItem
 	mReport, mCopy, mRefresh, mQuit              *systray.MenuItem
 	mBug, mFeat, mSupport                        *systray.MenuItem
@@ -565,7 +578,7 @@ func openBrowser(target string) {
 func (u *ui) onReady() {
 	setIcon("idle")
 	go watchAppearance()
-	go watchNetworkUse()
+	go watchNetworkUse(func() { go u.refresh() })
 	setTooltip("Actualis — what actually ran")
 
 	u.mHeader = systray.AddMenuItem("Loading…", "")
@@ -588,6 +601,8 @@ func (u *ui) onReady() {
 
 	u.mReport = systray.AddMenuItem("Open Full Report", "Run the CLI in a terminal")
 	u.mNetReport = systray.AddMenuItem("Open Network Report", "What the agents downloaded, and whether anyone asked")
+	u.mLists = systray.AddMenuItem("", "Opens a terminal: you see what is sent and confirm before anything goes")
+	u.mLists.Hide()
 	u.mCopy = systray.AddMenuItem("Copy Shareable Summary", "Safe to post: nothing identifying")
 	u.mRefresh = systray.AddMenuItem("Refresh Now", "")
 
@@ -635,6 +650,8 @@ func (u *ui) loop() {
 			go openReport()
 		case <-u.mNetReport.ClickedCh:
 			go openNetworkReport()
+		case <-u.mLists.ClickedCh:
+			go openListsUpdate()
 		case <-u.mBug.ClickedCh:
 			go openBrowser(issueURL("Bug", "bug"))
 		case <-u.mFeat.ClickedCh:
@@ -736,6 +753,16 @@ func (u *ui) render() {
 	days := r.days
 	u.mu.Unlock()
 
+	age, due := listsDue()
+	u.mu.Lock()
+	u.listsDue = due
+	u.mu.Unlock()
+	if due {
+		show(u.mLists, listsLabel(age))
+	} else {
+		u.mLists.Hide()
+	}
+
 	if r.err != "" {
 		setIcon("error")
 		setTooltip("actualis: " + r.err)
@@ -755,6 +782,13 @@ func (u *ui) render() {
 		systray.SetTitle("")
 		setTooltip(fmt.Sprintf("Actualis — %d credential(s) worth rotating", r.rotatable))
 		u.mHeader.SetTitle(fmt.Sprintf("%d credential(s) worth rotating", r.rotatable))
+		u.mSub.Hide()
+	} else if due {
+		// Below the credential states: a stale list never outranks an exposure.
+		setIcon("update")
+		systray.SetTitle("")
+		setTooltip(listsTooltip("Actualis — no critical credentials exposed", age))
+		u.mHeader.SetTitle("No critical credentials exposed")
 		u.mSub.Hide()
 	} else {
 		setIcon("idle")
@@ -804,6 +838,9 @@ func (u *ui) state() string {
 	}
 	if u.rep.rotatable > 0 {
 		return "monitoring"
+	}
+	if u.listsDue {
+		return "update"
 	}
 	return "idle"
 }

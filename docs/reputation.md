@@ -98,7 +98,11 @@ when Google gave none (such a result cannot mark a host listed).
 ### Keeping the lists fresh
 
 Nothing refreshes the lists for you: actualis never runs in the background.
-Run `update` on a schedule instead. It is safe to run often:
+The tray app does tell you: once the lists are more than a day old, its icon
+shows the amber update badge and its menu offers **Update Safe Browsing
+Lists…**, which opens a terminal running `actualis-reputation update` so you
+see the disclosure and confirm. To refresh without asking, run `update` on a
+schedule instead. It is safe to run often:
 
 - After the first full download it fetches only the changes since the stored
   version, checks each list's SHA-256 checksum, and downloads a full list again
