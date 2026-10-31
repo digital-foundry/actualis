@@ -9,8 +9,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import threading
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 LISTS = ("mw-4b", "se-4b", "uws-4b", "uwsa-4b", "pha-4b")
 
@@ -75,3 +78,44 @@ def vt_result(host: str, malicious: int = 0, suspicious: int = 0, *, status: str
     return {"host": host, "status": status, "checked_at": iso(at or datetime.now(timezone.utc)),
             "stats": {"malicious": malicious, "suspicious": suspicious, "harmless": 50,
                       "undetected": 20, "timeout": 0}}
+
+
+class FakeProvider:
+    """A local stand-in for both providers. routes: {path: [(status, body bytes|dict)]},
+    answered in order (the last one repeats). Records (method, path, query, headers)."""
+
+    def __init__(self, routes: dict | None = None):
+        self.routes = {k: list(v) for k, v in (routes or {}).items()}
+        self.requests: list[dict] = []
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                u = urlsplit(self.path)
+                owner.requests.append({"path": u.path, "query": parse_qs(u.query),
+                                       "headers": {k.lower(): v for k, v in self.headers.items()}})
+                answers = owner.routes.get(u.path) or [(404, {"error": "no route"})]
+                status, body = answers.pop(0) if len(answers) > 1 else answers[0]
+                raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, *a):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def factory(self, session):
+        import actualis_reputation as ar
+        netloc = f"127.0.0.1:{self.port}"
+        # proxies={}: a developer's HTTPS_PROXY must not catch requests to the local fake.
+        return ar.Http(session, endpoints={ar.GSB_HOST: netloc, ar.VT_HOST: netloc}, scheme="http", proxies={})
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()

@@ -10,7 +10,7 @@ echo "== bandit (static analysis)"
 # B404/B603/B607: actualis shells out only to fixed argv lists (git, open,
 # xdg-open), never through a shell. The findings that matter are anything else.
 bandit -q -r -f txt -o "$OUT/bandit.txt" -s B404,B603,B607 \
-       /src/actualis.py /src/tools /src/tray-go/icons || true
+       /src/actualis.py /src/actualis_reputation.py /src/tools /src/tray-go/icons || true
 # bandit exits 1 on findings, so its rc says nothing; a missing report does.
 cat "$OUT/bandit.txt" 2>/dev/null || echo "bandit FAILED: no report written; not a clean result"
 
