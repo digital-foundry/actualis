@@ -103,20 +103,26 @@ def need_consent_possible(args, ctx) -> None:
                          "or --dry-run to see exactly what would be sent.")
 
 
+_WINDOWS = os.name == "nt"
+
+
 def read_key(provider: str, key_command: "str | None", scrub: Scrubber, env=os.environ) -> str:
     label, _host, var = PROVIDERS[provider]
     if key_command:
         try:
-            argv = shlex.split(key_command)
+            argv = shlex.split(key_command, posix=not _WINDOWS)
         except ValueError as exc:
             raise UsageError(f"--key-command: {exc}") from None
         if not argv:
             raise UsageError("--key-command is empty")
-        if len(argv) == 1 and _key_shaped(argv[0]):
+        if len(argv) == 1 and _key_shaped(argv[0].strip("\"'")):
             raise UsageError("--key-command looks like a key, not a command; pass a command that prints "
                              "the key (for example `op read ...`), or set the key variable instead")
         try:
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=120)   # noqa: S603 (no shell)
+            # Windows: the line goes to CreateProcess as typed (still no shell); POSIX
+            # splitting would eat the backslashes in C:\path\to\tool.exe.
+            r = subprocess.run(key_command if _WINDOWS else argv,  # noqa: S603 (no shell)
+                               capture_output=True, text=True, timeout=120)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise UsageError(f"--key-command could not run ({type(exc).__name__})") from None
         key = r.stdout.strip()

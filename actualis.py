@@ -7578,7 +7578,8 @@ def reputation_dir() -> Path:
     return Path(base) / "actualis" / "reputation"
 
 
-NET_MARK = "⊕\U0001F310"            # ⊕🌐: on every line that reports network use, nowhere else
+NET_MARK = "\u2295\U0001F310"       # circled plus, globe: on every line that reports network use, nowhere else
+# (escapes, not literals: the source stays readable as cp1252, which Windows tools default to)
 REPUTATION_LISTS = ("mw-4b", "se-4b", "uws-4b", "uwsa-4b", "pha-4b")
 REPUTATION_THREAT = {"mw-4b": "MALWARE", "se-4b": "SOCIAL_ENGINEERING", "uws-4b": "UNWANTED_SOFTWARE",
                      "uwsa-4b": "UNWANTED_SOFTWARE", "pha-4b": "POTENTIALLY_HARMFUL_APPLICATION"}

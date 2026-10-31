@@ -1059,3 +1059,27 @@ class TlsFloorTest(unittest.TestCase):
     def test_default_context_refuses_old_tls(self):
         session = ar.NetSession("update", "gsb", ar.Scrubber(), receipt=None, out=io.StringIO())
         self.assertGreaterEqual(ar.Http(session).context.minimum_version, ssl.TLSVersion.TLSv1_2)
+
+
+class WindowsTest(unittest.TestCase):
+    def test_key_command_goes_to_createprocess_unsplit_on_windows(self):
+        cmd = r'C:\Tools\op.exe read "op://Private/Google Safe Browsing/credential"'
+        done = subprocess.CompletedProcess(cmd, 0, stdout=FAKE_KEY + "\n", stderr="")
+        with mock.patch.object(ar, "_WINDOWS", True), mock.patch.object(ar.subprocess, "run",
+                                                                         return_value=done) as run:
+            self.assertEqual(ar.read_key("gsb", cmd, ar.Scrubber()), FAKE_KEY)
+        self.assertEqual(run.call_args.args[0], cmd)
+        self.assertNotIn("shell", run.call_args.kwargs)
+
+    def test_quoted_pasted_key_is_still_refused_on_windows(self):
+        with mock.patch.object(ar, "_WINDOWS", True), mock.patch.object(ar.subprocess, "run") as run:
+            with self.assertRaises(ar.UsageError):
+                ar.read_key("gsb", f'"{FAKE_KEY}"', ar.Scrubber())
+        run.assert_not_called()
+
+    def test_sources_read_as_cp1252(self):
+        # Windows tools (and tests using read_text() without an encoding) read cp1252;
+        # bytes it cannot map, such as an emoji's, break them.
+        for name in ("actualis.py", "actualis_reputation.py"):
+            raw = (Path(__file__).resolve().parent.parent / name).read_bytes()
+            raw.decode("cp1252")
