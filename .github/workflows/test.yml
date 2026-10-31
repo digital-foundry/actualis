@@ -63,7 +63,7 @@ jobs:
                      'hashlib','html','importlib','io','json','os','pathlib','re',
                      'shutil','struct','subprocess','sys','time','typing',
                      'unittest','zlib'}
-          tree = ast.parse(open('actualis.py').read())
+          tree = ast.parse(open('actualis.py', encoding='utf-8').read())
           found = set()
           for n in ast.walk(tree):
               if isinstance(n, ast.Import):
@@ -83,7 +83,7 @@ jobs:
           # core's list never has to grow.
           allowed = {'__future__','actualis','argparse','base64','datetime','hashlib','json','math',
                      'os','pathlib','secrets','shlex','ssl','subprocess','sys','time','urllib'}
-          tree = ast.parse(open('actualis_reputation.py').read())
+          tree = ast.parse(open('actualis_reputation.py', encoding='utf-8').read())
           found = set()
           for n in ast.walk(tree):
               if isinstance(n, ast.Import):

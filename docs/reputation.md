@@ -95,6 +95,37 @@ Google usually returns about 5 minutes, so run `confirm` and then the gate
 immediately. `confirm` prints the actual window when it finishes, and warns
 when Google gave none (such a result cannot mark a host listed).
 
+### Keeping the lists fresh
+
+Nothing refreshes the lists for you: actualis never runs in the background.
+Run `update` on a schedule instead. It is safe to run often:
+
+- After the first full download it fetches only the changes since the stored
+  version, checks each list's SHA-256 checksum, and downloads a full list again
+  if a checksum fails. Nothing is written unless every list checks out.
+- It respects Google's minimum wait between updates (usually 30 minutes,
+  capped at 24 hours). Before then it prints "lists are current" and sends
+  nothing.
+- Lists older than 7 days raise a `reputation-stale` finding, so a broken
+  schedule shows up in the next scan.
+
+A scheduled run has no terminal to ask for consent, so it needs `--yes`, and a
+key from the environment or `--key-command`:
+
+```sh
+# crontab -e: refresh hourly; Google decides how often anything is downloaded.
+# Keep the key file private: chmod 600 ~/.config/actualis/gsb-key
+0 * * * * ACTUALIS_GSB_KEY="$(cat ~/.config/actualis/gsb-key)" actualis-reputation update --yes 2>> ~/.cache/actualis/update.log
+```
+
+In CI, run `actualis-reputation update --yes` before the gate, with the key in
+a secret, and cache the reputation directory between runs to avoid a full
+download each time. `actualis-reputation status` shows each list's age and the
+next refresh time.
+
+The v5 API answers in protobuf only (it refuses `alt=json`), so the companion
+carries a small protobuf reader for the messages it uses.
+
 For VirusTotal:
 
 ```sh

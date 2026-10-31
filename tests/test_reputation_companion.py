@@ -490,7 +490,7 @@ class TestUpdate(CompanionCase):
 
     def test_bad_version_is_not_stored(self):
         body = rice_lists({})
-        body["hashLists"][0]["version"] = {"x": 1}
+        body["hashLists"][0]["version"] = R.b64(b"v" * 3100)     # over the 4096-character limit
         s = self.serve(body)
         code, _, err = self.cli("update", "--yes", http_factory=s.factory)
         self.assertEqual(code, 0, err)
@@ -1007,3 +1007,47 @@ class TestVirusTotal(CompanionCase):
     def test_ip_uses_the_ip_endpoint(self):
         code, err, s = self.run_vt({"/api/v3/ip_addresses/8.8.8.8": [(200, vt_body())]}, ["8.8.8.8"])
         self.assertEqual([r["path"] for r in s.requests], ["/api/v3/ip_addresses/8.8.8.8"])
+
+
+class ProtobufReaderTest(unittest.TestCase):
+    """Safe Browsing v5 answers in protobuf only (alt=json gives HTTP 400)."""
+
+    def test_hash_list_round_trip_matches_the_json_shape(self):
+        hl = R.hash_list("mw-4b", [R.prefix("a.example/"), R.prefix("b.example/")], wait="1800s")
+        got = ar.pb_hash_lists(R.pb_hash_lists({"hashLists": [hl]}))
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["name"], "mw-4b")
+        self.assertEqual(got[0]["additionsFourBytes"], hl["additionsFourBytes"])
+        self.assertEqual(got[0]["sha256Checksum"], hl["sha256Checksum"])
+        self.assertEqual(ar.parse_duration(got[0]["minimumWaitDuration"]), 1800.0)
+        self.assertEqual(ar.apply_list_update(b"", got[0]), ar.apply_list_update(b"", hl))
+
+    def test_unknown_and_fixed_width_fields_are_skipped(self):
+        body = R._pb(1, R._pb(1, b"mw-4b") + b"\x6d\x01\x02\x03\x04" + R._pb(15, 7)
+                     + b"\x61" + b"\x00" * 8)
+        self.assertEqual(ar.pb_hash_lists(body), [{"name": "mw-4b"}])
+
+    def test_malformed_input_raises_value_error(self):
+        for bad in (b"{\"hashLists\": []}", b"\x0a\x05mw", b"\x0a", b"\x08" + b"\xff" * 11, b"\x00\x01",
+                    b"\x0b\x00", R._pb(1, R._pb(1, b"\xff\xfe"))):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    ar.pb_hash_lists(bad)
+
+    def test_search_reads_packed_and_unpacked_attributes(self):
+        h = R.full("evil.example/")
+        det_packed = R._pb(1, 1) + R._pb(2, b"\x01")                 # MALWARE, [CANARY] packed
+        det_plain = R._pb(1, 3) + R._pb(2, 0)                        # UNWANTED_SOFTWARE, unspecified
+        det_new = R._pb(1, 42)
+        body = R._pb(1, R._pb(1, h) + R._pb(2, det_packed) + R._pb(2, det_plain) + R._pb(2, det_new)) \
+            + R._pb(2, R._pb(1, 300) + R._pb(2, 500_000_000))
+        doc = ar.pb_search(body)
+        self.assertEqual(ar.parse_duration(doc["cacheDuration"]), 300.5)
+        dets = doc["fullHashes"][0]["fullHashDetails"]
+        self.assertEqual(doc["fullHashes"][0]["fullHash"], R.b64(h))
+        self.assertEqual([(d["threatType"], d["attributes"]) for d in dets],
+                         [("MALWARE", ["CANARY"]), ("UNWANTED_SOFTWARE", ["THREAT_ATTRIBUTE_UNSPECIFIED"]),
+                          ("THREAT_TYPE_42", [])])
+
+    def test_empty_search_response_has_no_hashes(self):
+        self.assertEqual(ar.pb_search(b""), {"fullHashes": []})

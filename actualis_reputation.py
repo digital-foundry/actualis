@@ -520,6 +520,155 @@ class Http:
 
 GSB_BATCH_PATH = "/v5/hashLists:batchGet"
 
+# Safe Browsing v5 answers in protobuf only: alt=json is refused with HTTP 400
+# "Unsupported Output Format". The readers below decode the few messages used
+# here (google.security.safebrowsing.v5) into the documented JSON shape, so the
+# rest of this file handles one form. Malformed input raises ValueError.
+_THREAT_TYPES = {0: "THREAT_TYPE_UNSPECIFIED", 1: "MALWARE", 2: "SOCIAL_ENGINEERING",
+                 3: "UNWANTED_SOFTWARE", 4: "POTENTIALLY_HARMFUL_APPLICATION"}
+_THREAT_ATTRS = {0: "THREAT_ATTRIBUTE_UNSPECIFIED", 1: "CANARY", 2: "FRAME_ONLY"}
+_HASH_LIST_WIDE = {9: "additionsEightBytes", 10: "additionsSixteenBytes", 11: "additionsThirtyTwoBytes"}
+
+
+def _pb_varint(buf: bytes, i: int) -> "tuple[int, int]":
+    v = shift = 0
+    while True:
+        if i >= len(buf) or shift > 63:
+            raise ValueError("a protobuf varint is truncated or too long")
+        b = buf[i]
+        i += 1
+        v |= (b & 0x7F) << shift
+        shift += 7
+        if not b & 0x80:
+            return v, i
+
+
+def _pb_fields(buf: object) -> "list[tuple[int, object]]":
+    """(field number, value) pairs of one message: varints as int,
+    length-delimited fields as bytes; fixed-width fields are skipped."""
+    if not isinstance(buf, bytes):
+        raise ValueError("expected an embedded protobuf message")
+    out, i = [], 0
+    while i < len(buf):
+        tag, i = _pb_varint(buf, i)
+        num, wire = tag >> 3, tag & 7
+        if num == 0:
+            raise ValueError("protobuf field number 0")
+        if wire == 0:
+            v, i = _pb_varint(buf, i)
+            out.append((num, v))
+        elif wire == 2:
+            n, i = _pb_varint(buf, i)
+            if i + n > len(buf):
+                raise ValueError("a protobuf field is truncated")
+            out.append((num, buf[i:i + n]))
+            i += n
+        elif wire in (1, 5):
+            i += 8 if wire == 1 else 4
+            if i > len(buf):
+                raise ValueError("a protobuf field is truncated")
+        else:
+            raise ValueError(f"unsupported protobuf wire type {wire}")
+    return out
+
+
+def _pb_int(v: object) -> int:
+    if not isinstance(v, int):
+        raise ValueError("expected a protobuf varint")
+    return v
+
+
+def _pb_b64(v: object) -> str:
+    if not isinstance(v, bytes):
+        raise ValueError("expected protobuf bytes")
+    return base64.b64encode(v).decode()
+
+
+def _pb_duration(buf: object) -> str:
+    secs = nanos = 0
+    for num, v in _pb_fields(buf):
+        if num == 1:
+            secs = _pb_int(v)
+        elif num == 2:
+            nanos = _pb_int(v)
+    return f"{secs + nanos / 1e9}s"
+
+
+def _pb_rice(buf: object) -> dict:
+    names = {1: "firstValue", 2: "riceParameter", 3: "entriesCount"}
+    d: dict = {}
+    for num, v in _pb_fields(buf):
+        if num in names:
+            d[names[num]] = _pb_int(v)
+        elif num == 4:
+            d["encodedData"] = _pb_b64(v)
+    return d
+
+
+def _pb_hash_list(buf: object) -> dict:
+    hl: dict = {}
+    for num, v in _pb_fields(buf):
+        if num == 1:
+            if not isinstance(v, bytes):
+                raise ValueError("a list name is not text")
+            hl["name"] = v.decode("utf-8")
+        elif num == 2:
+            hl["version"] = _pb_b64(v)
+        elif num == 3:
+            hl["partialUpdate"] = bool(_pb_int(v))
+        elif num == 4:
+            hl["additionsFourBytes"] = _pb_rice(v)
+        elif num == 5:
+            hl["compressedRemovals"] = _pb_rice(v)
+        elif num == 6:
+            hl["minimumWaitDuration"] = _pb_duration(v)
+        elif num == 7:
+            hl["sha256Checksum"] = _pb_b64(v)
+        elif num in _HASH_LIST_WIDE:
+            hl[_HASH_LIST_WIDE[num]] = {}
+    return hl
+
+
+def pb_hash_lists(body: bytes) -> "list[dict]":
+    """BatchGetHashListsResponse: field 1 is the repeated HashList."""
+    return [_pb_hash_list(v) for num, v in _pb_fields(body) if num == 1]
+
+
+def pb_search(body: bytes) -> dict:
+    """SearchHashesResponse: 1 full_hashes {1 full_hash, 2 details {1 threat_type,
+    2 attributes (packed or not)}}, 2 cache_duration."""
+    doc: dict = {"fullHashes": []}
+    for num, v in _pb_fields(body):
+        if num == 2:
+            doc["cacheDuration"] = _pb_duration(v)
+        elif num == 1:
+            fh: dict = {"fullHashDetails": []}
+            for n2, v2 in _pb_fields(v):
+                if n2 == 1:
+                    fh["fullHash"] = _pb_b64(v2)
+                elif n2 == 2:
+                    det: dict = {"attributes": []}
+                    for n3, v3 in _pb_fields(v2):
+                        if n3 == 1:
+                            t = _pb_int(v3)
+                            det["threatType"] = _THREAT_TYPES.get(t, f"THREAT_TYPE_{t}")
+                        elif n3 == 2:
+                            vals = [v3] if isinstance(v3, int) else _pb_packed(v3)
+                            det["attributes"] += [_THREAT_ATTRS.get(a, f"THREAT_ATTRIBUTE_{a}") for a in vals]
+                    fh["fullHashDetails"].append(det)
+            doc["fullHashes"].append(fh)
+    return doc
+
+
+def _pb_packed(buf: object) -> "list[int]":
+    if not isinstance(buf, bytes):
+        raise ValueError("expected packed protobuf varints")
+    out, i = [], 0
+    while i < len(buf):
+        v, i = _pb_varint(buf, i)
+        out.append(v)
+    return out
+
 
 def _b64(text: object) -> bytes:
     if not isinstance(text, str):
@@ -636,11 +785,10 @@ def _batch(http: Http, key: str, names: "list[str]", versions: dict, describe: s
                             limit=LIST_RESPONSE_MAX, sent={"list_update": names}, describe=describe)
     _gsb_status(status, body)
     try:
-        lists = json.loads(body)["hashLists"]
-        if (not isinstance(lists, list) or len(lists) != len(names)
-                or not all(isinstance(h, dict) for h in lists)):
+        lists = pb_hash_lists(body)
+        if len(lists) != len(names):
             raise ValueError
-    except (ValueError, KeyError, TypeError, RecursionError):
+    except ValueError:
         raise NetError("Safe Browsing sent a response that is not a hash list") from None
     return lists
 
@@ -871,12 +1019,10 @@ def cmd_confirm(args, ctx) -> int:
                     describe=f"sending {len(chunk)} lookup(s)")
                 _gsb_status(status, body)
                 try:
-                    doc = json.loads(body or b"{}")
-                    found = doc.get("fullHashes") or []
-                    if not isinstance(found, list):
-                        raise ValueError
-                except (ValueError, AttributeError, RecursionError):
-                    raise NetError("Safe Browsing sent a search response that is not JSON") from None
+                    doc = pb_search(body)
+                    found = doc["fullHashes"]
+                except ValueError:
+                    raise NetError("Safe Browsing sent a search response that could not be read") from None
                 cache_s = parse_duration(doc.get("cacheDuration"))
                 window = min(window, cache_s)
                 until = now + timedelta(seconds=cache_s)

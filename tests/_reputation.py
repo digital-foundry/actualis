@@ -120,6 +120,79 @@ def hash_list(name: str, prefixes: list, *, removals=(), partial=False, checksum
     return hl
 
 
+# Safe Browsing v5 answers in protobuf only, so the fake encodes its JSON-shaped
+# fixtures into the same wire format (field numbers from google.security.safebrowsing.v5).
+_PB_THREATS = {"THREAT_TYPE_UNSPECIFIED": 0, "MALWARE": 1, "SOCIAL_ENGINEERING": 2,
+               "UNWANTED_SOFTWARE": 3, "POTENTIALLY_HARMFUL_APPLICATION": 4}
+_PB_ATTRS = {"THREAT_ATTRIBUTE_UNSPECIFIED": 0, "CANARY": 1, "FRAME_ONLY": 2}
+
+
+def _pb_varint(v: int) -> bytes:
+    v &= (1 << 64) - 1                      # negative int32/int64: two's complement, as protobuf does
+    out = bytearray()
+    while True:
+        b = v & 0x7F
+        v >>= 7
+        out.append(b | (0x80 if v else 0))
+        if not v:
+            return bytes(out)
+
+
+def _pb(num: int, value) -> bytes:
+    if isinstance(value, bool) or isinstance(value, int):
+        return _pb_varint(num << 3) + _pb_varint(int(value))
+    return _pb_varint(num << 3 | 2) + _pb_varint(len(value)) + value
+
+
+def _pb_duration(text: str) -> bytes:
+    secs = min(int(float(text.rstrip("s"))), (1 << 63) - 1)
+    return _pb(1, secs)
+
+
+def _pb_rice(obj: dict) -> bytes:
+    return (_pb(1, obj.get("firstValue", 0)) + _pb(2, obj.get("riceParameter", 0))
+            + _pb(3, obj.get("entriesCount", 0)) + _pb(4, base64.b64decode(obj.get("encodedData", ""))))
+
+
+def pb_hash_lists(doc: dict) -> bytes:
+    out = b""
+    for hl in doc.get("hashLists", []):
+        m = _pb(1, hl["name"].encode()) if "name" in hl else b""
+        if "version" in hl:
+            m += _pb(2, base64.b64decode(hl["version"]))
+        if hl.get("partialUpdate"):
+            m += _pb(3, 1)
+        if "additionsFourBytes" in hl:
+            m += _pb(4, _pb_rice(hl["additionsFourBytes"]))
+        if "compressedRemovals" in hl:
+            m += _pb(5, _pb_rice(hl["compressedRemovals"]))
+        if "minimumWaitDuration" in hl:
+            m += _pb(6, _pb_duration(hl["minimumWaitDuration"]))
+        if "sha256Checksum" in hl:
+            m += _pb(7, base64.b64decode(hl["sha256Checksum"]))
+        out += _pb(1, m)
+    return out
+
+
+def pb_search(doc: dict) -> bytes:
+    out = b""
+    for fh in doc.get("fullHashes", []):
+        m = _pb(1, base64.b64decode(fh["fullHash"]))
+        for det in fh.get("fullHashDetails", []):
+            d = _pb(1, _PB_THREATS.get(det.get("threatType"), 99))
+            attrs = [_PB_ATTRS.get(a, 99) for a in det.get("attributes", [])]
+            if attrs:                        # proto3 packs repeated enums
+                d += _pb(2, b"".join(_pb_varint(a) for a in attrs))
+            m += _pb(2, d)
+        out += _pb(1, m)
+    if "cacheDuration" in doc:
+        out += _pb(2, _pb_duration(doc["cacheDuration"]))
+    return out
+
+
+_PB_ROUTES = {"/v5/hashLists:batchGet": pb_hash_lists, "/v5/hashes:search": pb_search}
+
+
 class FakeProvider:
     """A local stand-in for both providers. routes: {path: [(status, body bytes|dict)]},
     answered in order (the last one repeats). Records (method, path, query, headers)."""
@@ -136,9 +209,15 @@ class FakeProvider:
                                        "headers": {k.lower(): v for k, v in self.headers.items()}})
                 answers = owner.routes.get(u.path) or [(404, {"error": "no route"})]
                 status, body, *extra = answers.pop(0) if len(answers) > 1 else answers[0]
-                raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+                ctype = "application/json"
+                if isinstance(body, bytes):
+                    raw = body
+                elif status == 200 and u.path in _PB_ROUTES:
+                    raw, ctype = _PB_ROUTES[u.path](body), "application/x-protobuf"
+                else:
+                    raw = json.dumps(body).encode()   # errors stay JSON, as Google sends them
                 self.send_response(status)
-                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(raw)))
                 for k, v in (extra[0] if extra else {}).items():
                     self.send_header(k, v)
