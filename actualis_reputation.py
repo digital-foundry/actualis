@@ -87,6 +87,21 @@ class Scrubber:
         return text
 
 
+_KEY_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~-")
+
+
+def _key_shaped(key: str) -> bool:
+    return 16 <= len(key) <= 512 and all(ch in _KEY_CHARS for ch in key)
+
+
+def need_consent_possible(args, ctx) -> None:
+    """Refuse a run that consent would refuse, before any key is read (so a
+    --key-command never runs for it)."""
+    if not (args.dry_run or args.yes or (ctx["stdin"] is not None and ctx["stdin"].isatty())):
+        raise UsageError("nothing sent: there is no terminal to ask. Pass --yes to send, "
+                         "or --dry-run to see exactly what would be sent.")
+
+
 def read_key(provider: str, key_command: "str | None", scrub: Scrubber, env=os.environ) -> str:
     label, _host, var = PROVIDERS[provider]
     if key_command:
@@ -102,15 +117,17 @@ def read_key(provider: str, key_command: "str | None", scrub: Scrubber, env=os.e
             raise UsageError(f"--key-command could not run ({type(exc).__name__})") from None
         key = r.stdout.strip()
         if r.returncode != 0:
-            scrub.add(key)
+            if _key_shaped(key):
+                scrub.add(key)
             raise UsageError(f"--key-command exited {r.returncode}; its output is not shown") from None
     else:
         key = env.get(var, "").strip()
     if not key:
         raise UsageError(f"no {label} key: set ${var} or pass --key-command CMD (see docs/reputation.md)")
+    if not _key_shaped(key):
+        raise UsageError(f"the {label} key is not shaped like an API key (16 to 512 letters, digits, "
+                         f". _ ~ -); check --key-command or ${var}")
     scrub.add(key)
-    if len(key) > 512 or not key.isprintable() or any(ch.isspace() for ch in key):
-        raise UsageError(f"the {label} key holds spaces or control characters; check --key-command or ${var}")
     return key
 
 
@@ -121,11 +138,18 @@ def cache_root() -> Path:
 def ensure_dir(path: Path) -> None:
     """Create `path` (0700) and refuse it if it, or the cache root, is a symlink."""
     root = cache_root()
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    for p in {root, path}:
+    chain = [root]
+    try:
+        rel = path.relative_to(root)
+        chain += [root.joinpath(*rel.parts[:i]) for i in range(1, len(rel.parts) + 1)]
+    except ValueError:
+        chain.append(path)
+    for p in chain:                                # before mkdir: create nothing through a link
         if os.path.islink(p):
             raise NetError(f"{p} is a symlink; refusing to write through it")
-        if os.name != "nt":
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name != "nt":
+        for p in chain:
             os.chmod(p, 0o700)
 
 
@@ -193,11 +217,13 @@ class NetSession:
         self.failure: str | None = None
         self.started = _now()
         self._live = False
+        self._flight = False
 
     def __enter__(self) -> "NetSession":
         try:
             write_json(cache_root() / "in-flight.json",
                        {"pid": os.getpid(), "provider": self.provider, "started_at": _iso(self.started)})
+            self._flight = True
         except (OSError, NetError):
             pass                                  # the tray badge is a courtesy; never block on it
         return self
@@ -217,12 +243,15 @@ class NetSession:
         self.failure = self.scrub(reason)
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        try:
-            os.unlink(cache_root() / "in-flight.json")
-        except OSError:
-            pass
+        if self._flight:
+            try:
+                os.unlink(cache_root() / "in-flight.json")
+            except OSError:
+                pass
         if exc_type is KeyboardInterrupt and not self.failure:
             self.failure = "interrupted"
+        elif exc_type is not None and not self.failure:
+            self.failure = self.scrub(exc_type.__name__)
         hosts = sorted({r["host"] for r in self.requests})
         n = len(self.requests)
         if n:
@@ -236,10 +265,15 @@ class NetSession:
         self.out.flush()
         if self.receipt:
             try:
-                Path(self.receipt).write_text(self.scrub(json.dumps(
+                body = self.scrub(json.dumps(
                     {"command": self.command, "provider": self.provider, "started_at": _iso(self.started),
                      "finished_at": _iso(_now()), "requests": self.requests, "failure": self.failure},
-                    indent=1)) + "\n")
+                    indent=1)) + "\n"
+                flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0) \
+                    | getattr(os, "O_BINARY", 0)
+                fd = os.open(self.receipt, flags, 0o600)
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(body.encode())
             except OSError as e:
                 self.out.write(f"actualis-reputation: cannot write the receipt: {e.strerror or e}\n")
         if n:
@@ -274,16 +308,16 @@ def read_report(path: str, stdin) -> dict:
             with af._open_regular(Path(path)) as fh:
                 raw = fh.read(REPORT_MAX + 1)
     except OSError as exc:
-        raise UsageError(f"cannot read {path}: {exc.strerror or exc}") from None
+        raise UsageError(f"cannot read the report file: {exc.strerror or exc}") from None
     if len(raw) > REPORT_MAX:
-        raise UsageError(f"{path} is over {REPORT_MAX >> 20} MiB")
+        raise UsageError(f"the report file is over {REPORT_MAX >> 20} MiB")
     try:
         doc = json.loads(raw)
     except ValueError:
-        raise UsageError(f"{path} is not JSON; pass the output of actualis --network --json") from None
+        raise UsageError("the report file is not JSON; pass the output of actualis --network --json") from None
     net = doc.get("network", doc) if isinstance(doc, dict) else None
     if not isinstance(net, dict) or not isinstance(net.get("hosts"), list):
-        raise UsageError(f"{path} is not actualis --network --json output")
+        raise UsageError("the report file is not actualis --network --json output")
     return net
 
 
@@ -317,8 +351,16 @@ def cmd_forget(args, ctx) -> int:
         ctx["stderr"].write("nothing deleted\n")
         return EXIT_OK
     removed = 0
-    targets = [root / f for f in CACHE_FILES] + list((root / "gsb").glob("*.prefixes")) \
-        + [p for d in (root, root / "gsb", root / "vt") if d.is_dir() for p in d.glob(".tmp-*")]
+    subdirs = []
+    for name in ("gsb", "vt"):
+        if os.path.islink(root / name):
+            ctx["stderr"].write(f"skipped {root / name}: it is a symlink; nothing was deleted through it\n")
+        else:
+            subdirs.append(root / name)
+    live = [root] + subdirs
+    targets = [root / f for f in CACHE_FILES if os.path.dirname(f) == "" or root / os.path.dirname(f) in subdirs] \
+        + (list((root / "gsb").glob("*.prefixes")) if root / "gsb" in subdirs else []) \
+        + [p for d in live if d.is_dir() for p in d.glob(".tmp-*")]
     for p in targets:
         try:
             if p.is_file() or p.is_symlink():
@@ -326,7 +368,7 @@ def cmd_forget(args, ctx) -> int:
                 removed += 1
         except OSError:
             pass
-    for d in (root / "gsb", root / "vt", root):
+    for d in (*reversed(subdirs), root):
         try:
             d.rmdir()
         except OSError:
@@ -337,8 +379,16 @@ def cmd_forget(args, ctx) -> int:
 
 class _Parser(argparse.ArgumentParser):
     def error(self, message: str):                # never echo arguments: one may be a key
-        if message.startswith("unrecognized arguments") or message.startswith("argument command"):
-            message = message.split(":", 1)[0] + " (not repeated here, in case one is a key)"
+        if message.startswith("argument ") and ": " in message:
+            head, tail = message.split(": ", 1)
+            for q in ("'", '"'):                  # drop anything quoted: it may be a key
+                tail = tail.split(q)[0]
+            message = f"{head}: {tail.strip(' :')}"
+        elif ": " in message:
+            message = message.split(": ", 1)[0]
+        else:
+            message = "".join(message.split("'")[0:1]).rstrip()
+        message += " (the value is not repeated here, in case it is a key)"
         super().error(message)
 
 
@@ -386,6 +436,7 @@ class Http:                                      # replaced in Task 6
 
 
 def cmd_update(args, ctx) -> int:                # completed in Task 6
+    need_consent_possible(args, ctx)
     disclose([("Provider", "Google Safe Browsing v5, list download"),
               ("Sends", "nothing about your hosts: downloads list updates")], ctx["stderr"])
     if not args.dry_run:
@@ -397,7 +448,12 @@ def cmd_update(args, ctx) -> int:                # completed in Task 6
     return EXIT_OK
 
 
-COMMANDS = {"status": cmd_status, "forget": cmd_forget, "update": cmd_update}
+def _not_yet(args, ctx) -> int:                  # replaced in Tasks 7 and 8
+    raise UsageError("not implemented yet")
+
+
+COMMANDS = {"status": cmd_status, "forget": cmd_forget, "update": cmd_update,
+            "confirm": _not_yet, "virustotal": _not_yet}
 
 
 def main(argv=None, *, http_factory=None, now=None, sleep=time.sleep, stdin=None, stdout=None,

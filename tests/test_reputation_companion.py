@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -176,3 +177,117 @@ class TestCore(CompanionCase):
                            capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0)
         self.assertIn(af.__version__, r.stdout)
+
+
+class TestFixRound1(CompanionCase):
+    def test_no_explicit_argument_value_is_echoed(self):
+        for argv in (("update", f"--yes={FAKE_KEY}"), ("update", f"--dry-run={FAKE_KEY}"),
+                     ("forget", f"--yes={FAKE_KEY}"), (f"--version={FAKE_KEY}",),
+                     (FAKE_KEY,), ("update", "--receipt"), ("status", FAKE_KEY),
+                     ("virustotal", "x", f"--vt-threshold={FAKE_KEY}")):
+            code, out, err = self.cli(*argv)
+            self.assertEqual(code, 2, argv)
+            self.assertNotIn(FAKE_KEY, out + err, argv)
+
+    def test_abbreviated_options_are_refused(self):
+        with self.assertRaises(SystemExit):
+            with mock.patch("sys.stderr", io.StringIO()):
+                ar.build_parser().parse_args(["update", "--key-c", "x"])
+        code, out, err = self.cli("update", f"--key={FAKE_KEY}")
+        self.assertEqual(code, 2)
+        self.assertNotIn(FAKE_KEY, out + err)
+
+    @unittest.skipIf(os.name == "nt", "symlinks")
+    def test_forget_does_not_delete_through_symlinked_subdir(self):
+        victim = self.tmp / "victim"
+        victim.mkdir()
+        for n in ("state.json", "x.prefixes", ".tmp-1", "results.json"):
+            (victim / n).write_text("keep")
+        self.rep.mkdir()
+        (self.rep / "gsb").symlink_to(victim)
+        (self.rep / "vt").symlink_to(victim)
+        code, _, err = self.cli("forget", "--yes")
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(p.name for p in victim.iterdir()),
+                         [".tmp-1", "results.json", "state.json", "x.prefixes"])
+        self.assertIn("symlink", err)
+        self.assertTrue((self.rep / "gsb").is_symlink())
+
+    def test_read_report_never_names_the_path(self):
+        key_path = FAKE_KEY
+        bad = self.tmp / "bad.json"
+        bad.write_text("not json")
+        for path in (key_path, str(bad)):
+            with self.assertRaises(ar.UsageError) as cm:
+                ar.read_report(path, io.StringIO())
+            self.assertNotIn(path, str(cm.exception))
+        with self.assertRaises(ar.UsageError) as cm:
+            ar.read_report("-", io.StringIO("[1]"))
+        self.assertIn("report file", str(cm.exception))
+
+    def test_unimplemented_commands_are_a_usage_error(self):
+        for argv in (("confirm", "x.json"), ("virustotal", "x.json")):
+            code, _, err = self.cli(*argv)
+            self.assertEqual(code, 2)
+            self.assertIn("not implemented yet", err)
+            self.assertNotIn("Traceback", err)
+
+    def test_key_command_not_run_when_consent_is_impossible(self):
+        with mock.patch.object(ar.subprocess, "run") as run:
+            code, _, err = self.cli("update", "--key-command", "x")
+        self.assertEqual(code, 2)
+        self.assertIn("--yes", err)
+        run.assert_not_called()
+
+    @unittest.skipIf(os.name == "nt", "symlinks")
+    def test_ensure_dir_creates_nothing_through_a_symlinked_root(self):
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        self.rep.symlink_to(elsewhere)
+        with self.assertRaises(ar.NetError):
+            ar.ensure_dir(self.rep / "gsb")
+        self.assertEqual(list(elsewhere.iterdir()), [])
+
+    @unittest.skipIf(os.name == "nt", "symlinks")
+    def test_receipt_is_not_written_through_a_symlink(self):
+        target = self.tmp / "target.txt"
+        target.write_text("keep")
+        link = self.tmp / "receipt.json"
+        link.symlink_to(target)
+        err = io.StringIO()
+        with ar.NetSession("update", "gsb", ar.Scrubber(), receipt=str(link), out=err):
+            pass
+        self.assertEqual(target.read_text(), "keep")
+        self.assertIn("cannot write the receipt", err.getvalue())
+
+    def test_receipt_mode_is_0600(self):
+        if os.name == "nt":
+            self.skipTest("posix modes")
+        r = self.tmp / "r.json"
+        with ar.NetSession("update", "gsb", ar.Scrubber(), receipt=str(r), out=io.StringIO()):
+            pass
+        self.assertEqual(r.stat().st_mode & 0o777, 0o600)
+
+    def test_key_shape_is_enforced_without_echo(self):
+        for bad in ("short", "a" * 513, 'abc"def' + "0" * 16, "x y " + "0" * 16, "é" * 20):
+            with self.assertRaises(ar.UsageError) as cm:
+                ar.read_key("gsb", None, ar.Scrubber(), env={"ACTUALIS_GSB_KEY": bad})
+            self.assertNotIn(bad, str(cm.exception))
+        self.assertEqual(ar.read_key("vt", None, ar.Scrubber(), env={"ACTUALIS_VT_KEY": "a" * 64}), "a" * 64)
+
+    def test_session_failure_names_the_exception_type(self):
+        receipt = self.tmp / "r.json"
+        err = io.StringIO()
+        with self.assertRaises(ar.NetError):
+            with ar.NetSession("update", "gsb", ar.Scrubber(), receipt=str(receipt), out=err):
+                raise ar.NetError("boom")
+        self.assertIn("(stopped: NetError)", err.getvalue())
+        self.assertEqual(json.loads(receipt.read_text())["failure"], "NetError")
+
+    def test_session_leaves_a_foreign_in_flight_file_when_it_wrote_none(self):
+        self.rep.mkdir()
+        (self.rep / "in-flight.json").write_text("other")
+        with mock.patch.object(ar, "write_json", side_effect=OSError("no")):
+            with ar.NetSession("update", "gsb", ar.Scrubber(), receipt=None, out=io.StringIO()):
+                pass
+        self.assertTrue((self.rep / "in-flight.json").exists())
