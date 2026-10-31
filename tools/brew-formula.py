@@ -30,19 +30,24 @@ class Actualis < Formula
   license "AGPL-3.0-or-later"
 
   # Standard library only, so there are no resources to vendor: the formula
-  # installs one file and a wrapper that runs it with brew's Python.
+  # installs two files and a wrapper for each, run with brew's Python.
   depends_on "python@3.13"
 
   def install
-    libexec.install "actualis.py"
+    libexec.install "actualis.py", "actualis_reputation.py"
     (bin/"actualis").write <<~SH
       #!/bin/bash
       exec "#{{formula_opt_bin("python@3.13")}}/python3.13" "#{{libexec}}/actualis.py" "$@"
+    SH
+    (bin/"actualis-reputation").write <<~SH
+      #!/bin/bash
+      exec "#{{formula_opt_bin("python@3.13")}}/python3.13" "#{{libexec}}/actualis_reputation.py" "$@"
     SH
   end
 
   test do
     assert_match "actualis {version}", shell_output("#{{bin}}/actualis --version")
+    assert_match "actualis-reputation {version}", shell_output("#{{bin}}/actualis-reputation --version")
     # A fresh HOME has no transcripts: it must say so and exit 1, not crash.
     ENV["HOME"] = testpath
     assert_match "no agent transcripts found", shell_output("#{{bin}}/actualis 2>&1", 1)

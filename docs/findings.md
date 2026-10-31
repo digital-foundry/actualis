@@ -30,7 +30,7 @@ user, and it is why the thresholds below are mostly relative rather than absolut
 ## Network findings
 
 Shell-audit findings (`bash.flags[]`) raised from the network inventory. Each
-is one finding per group, suppressible, and still counted when suppressed.
+is one finding per group, suppressible, and still counted when suppressed. The `reputation-*` categories are described in [reputation.md](reputation.md); a Google-based one carries "Advisory provided by Google".
 
 | category | severity | fires when | `--fail-on` |
 |---|---|---|---|
@@ -38,6 +38,10 @@ is one finding per group, suppressible, and still counted when suppressed.
 | `network-ioc` | high | `--ioc`: a download matched a known-bad entry | `high`, `any` |
 | `network-ioc-unresolved` | med | `--ioc`: a listed name whose version cannot be decided, a private-registry install, a name read from a URL, or an item that could not be checked | `any` |
 | `network-config` | med | a command writes download configuration: `git config url.*.insteadOf`/`http.proxy`, `npm`/`pnpm`/`yarn config set` registry or proxy, `pip config set` index or proxy, or a redirect into `.npmrc`, `.yarnrc`, `pip.conf`, `.gitconfig`. It redirects later downloads, including ones in later tool calls the inventory cannot tie to it ([ioc.md](ioc.md)) | `any` |
+| `reputation-listed` | high | `--reputation`: a host is currently listed by Google Safe Browsing (confirmed within 30 minutes) or flagged malicious by at least `--vt-threshold` VirusTotal engines | `high`, `any` |
+| `reputation-candidate` | med | `--reputation`: a host's hash prefix is in the local Safe Browsing lists but not confirmed; run `actualis-reputation confirm` | `any` |
+| `reputation-suspicious` | med | `--reputation`: VirusTotal engines flagged the host below the threshold, or as suspicious | `any` |
+| `reputation-stale` | med | `--reputation`: the Safe Browsing lists are over 7 days old | `any` |
 | `audit-config` | high | an agent wrote the suppression or trust files; cannot be suppressed | `high`, `any` |
 
 **A finding's id hashes its severity and category. A change in severity is a

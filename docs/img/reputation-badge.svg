@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="actualis network badge">
+  <title>actualis: uses the network</title>
+  <path d="M6 50 L21 8 H27 L42 50 H35 L24 17 L13 50 Z" fill="#0B0C0E"/>
+  <rect x="12" y="38" width="18" height="5" fill="#E08A24"/>
+  <circle cx="46" cy="46" r="15" fill="#E08A24"/>
+  <g fill="none" stroke="#0B0C0E" stroke-width="1.6" stroke-linecap="round">
+    <circle cx="46" cy="51" r="7"/>
+    <ellipse cx="46" cy="51" rx="3" ry="7"/>
+    <path d="M39 51 H53"/>
+  </g>
+  <path d="M50 33 V39 M47 36 H53" stroke="#0B0C0E" stroke-width="2.2" stroke-linecap="round" fill="none"/>
+</svg>

@@ -63,7 +63,7 @@ jobs:
                      'hashlib','html','importlib','io','json','os','pathlib','re',
                      'shutil','struct','subprocess','sys','time','typing',
                      'unittest','zlib'}
-          tree = ast.parse(open('actualis.py').read())
+          tree = ast.parse(open('actualis.py', encoding='utf-8').read())
           found = set()
           for n in ast.walk(tree):
               if isinstance(n, ast.Import):
@@ -74,6 +74,30 @@ jobs:
           print('imports:', sorted(found))
           print('outside allowlist:', extra or 'none')
           sys.exit(1 if extra else 0)"
+
+      - name: actualis-reputation imports only the standard library and actualis
+        run: |
+          uv run --python ${{ matrix.python }} python -c "
+          import ast, sys
+          # The only module allowed to use the network. Its own list, so the
+          # core's list never has to grow.
+          allowed = {'__future__','actualis','argparse','base64','datetime','hashlib','json','math',
+                     'os','pathlib','secrets','shlex','ssl','subprocess','sys','time','urllib'}
+          tree = ast.parse(open('actualis_reputation.py', encoding='utf-8').read())
+          found = set()
+          for n in ast.walk(tree):
+              if isinstance(n, ast.Import):
+                  found |= {a.name.split('.')[0] for a in n.names}
+              elif isinstance(n, ast.ImportFrom) and n.level == 0 and n.module:
+                  found.add(n.module.split('.')[0])
+          extra = sorted(found - allowed)
+          print('imports:', sorted(found))
+          print('outside allowlist:', extra or 'none')
+          sys.exit(1 if extra else 0)"
+
+      - name: actualis never imports actualis-reputation
+        shell: bash
+        run: "! grep -nE '^\\s*(import|from)\\s+actualis_reputation' actualis.py"
 
       - name: tests
         run: uv run --python ${{ matrix.python }} python -m unittest discover -s tests -v

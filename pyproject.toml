@@ -49,6 +49,7 @@ dependencies = []
 
 [project.scripts]
 actualis = "actualis:_cli"
+actualis-reputation = "actualis_reputation:_cli"
 
 [project.urls]
 Homepage = "https://actualis.app"
@@ -56,12 +57,12 @@ Source = "https://github.com/digital-foundry/actualis"
 Issues = "https://github.com/digital-foundry/actualis/issues"
 
 [tool.hatch.build.targets.wheel]
-include = ["actualis.py"]
+include = ["actualis.py", "actualis_reputation.py"]
 
 [tool.hatch.build.targets.sdist]
 # tests/ read these too (the action, the workflows, the docs, tools/), so an
 # sdist without them fails its own suite for a packager who runs it.
-include = ["actualis.py", "README.md", "LICENSE", "CHANGELOG.md", "CONTRIBUTING.md",
+include = ["actualis.py", "actualis_reputation.py", "README.md", "LICENSE", "CHANGELOG.md", "CONTRIBUTING.md",
            "SECURITY.md", "TRADEMARKS.md", "tests/",
            "action.yml", ".github/workflows/", "docs/", "tools/", "Makefile",
            "pyproject.toml"]

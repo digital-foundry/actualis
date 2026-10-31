@@ -12,9 +12,11 @@ brew install digital-foundry/tap/actualis   # or: uv tool install actualis / pip
 actualis
 ```
 
-No account, no config file, no network. It reads files already on your disk
-and prints a report, across **Claude Code**, **Codex**, **GitHub Copilot CLI**, **Gemini CLI**
-and **Qwen Code** together.
+No account, no config file, no network: actualis never uses the network. The
+optional `actualis-reputation` command does, only when you run it, and tells you
+what it sends. It reads files already on your disk and prints a report, across
+**Claude Code**, **Codex**, **GitHub Copilot CLI**, **Gemini CLI** and **Qwen Code**
+together.
 
 **What it finds that you probably don't know:**
 
@@ -273,6 +275,7 @@ multiplier applied to each · `BY AGENT` · `BY MODEL` · `CACHE EFFICIENCY` ·
 | [docs/secrets.md](docs/secrets.md) | which credential types are detected, and what is deliberately not flagged |
 | [docs/json.md](docs/json.md) | `--json` schema |
 | [docs/ioc.md](docs/ioc.md) | `--ioc`: the known-bad list format, OSV input, verdicts and the CI recipe |
+| [docs/reputation.md](docs/reputation.md) | `--reputation` and `actualis-reputation`: setup, what is sent, diagrams, accuracy, licensing |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | ground rules, and the CLA note that keeps dual licensing possible |
 | [SECURITY.md](SECURITY.md) | what counts as a vulnerability, and how to report one |
 | [CHANGELOG.md](CHANGELOG.md) | what changed |
@@ -513,8 +516,9 @@ minute to read.
 
 ## Privacy
 
-Nothing leaves your machine. No network calls, no telemetry, no analytics, no
-config file, no writes. It opens files under `~/.claude/projects` read-only and
+Nothing leaves your machine. actualis itself makes no network calls, and has no telemetry, no analytics, no
+config file, no writes. (The optional `actualis-reputation` companion is the one exception, only when you run it;
+see [Optional: host reputation](#optional-host-reputation-uses-the-network).) It opens files under `~/.claude/projects` read-only and
 prints to stdout. The whole program is one readable file; if you're about to point
 a tool at your session history, you should be able to audit it in a sitting, so it
 was written to be read.
@@ -624,6 +628,40 @@ are listed and never fail the gate, and a trusted source never exempts a
 match. The list is read only when named; nothing is fetched. No match is not
 "not affected": lockfile installs, scripts and postinstall hooks are out of
 sight. See [docs/ioc.md](docs/ioc.md) and `actualis --explain ioc`.
+
+## Optional: host reputation (uses the network)
+
+![network badge](docs/img/reputation-badge.svg)
+
+`actualis --reputation` flags hosts your agents reached that are on Google
+Safe Browsing's threat lists (or flagged by VirusTotal), and `--fail-on` can
+gate on it. actualis itself stays offline: it matches against lists on your
+disk. A separate command, `actualis-reputation`, downloads those lists and
+checks local matches. It is the only part that uses the network, it says what
+it will send before it sends anything, asks first, and shows `⊕🌐` while it
+runs. You bring your own API key.
+
+```sh
+actualis-reputation update                          # download the Safe Browsing lists
+actualis --network --reputation --json > net.json   # offline match
+actualis-reputation confirm net.json                # confirm candidates (4-byte prefixes + decoys)
+actualis --network --reputation --fail-on high      # run right after confirm: it is good for under 30 minutes
+```
+
+```
+⊕🌐 actualis-reputation uses the network.
+  Provider  Google Safe Browsing v5, hash-prefix lookup
+  Sends     4-byte SHA-256 prefixes for 3 candidates, mixed with 27 random decoys drawn from the downloaded lists.
+            Google never sees a host or URL.
+  Skips     12 private or local hosts
+  Never     commands, paths, query strings, credentials, transcript text
+  Key       $ACTUALIS_GSB_KEY (set, not shown)
+```
+
+Private and local hosts are never looked up or sent. VirusTotal
+(`actualis-reputation virustotal`) is opt-in and sends hostnames in plain
+text. Both providers are free for non-commercial use only. Setup, what is
+sent, diagrams, accuracy and licensing: [docs/reputation.md](docs/reputation.md).
 
 ## Using it in CI
 
@@ -805,7 +843,7 @@ sitting in plaintext in your transcripts. Rotate anything live.
 The pattern is clean: **terminal-native agents write local rollouts, IDE forks are
 thin clients that keep everything server-side.** Supporting Cursor or Windsurf would
 mean network calls and OAuth against their APIs, which would cost this tool the three
-properties it's built on — no network, read-only, auditable in one sitting. That
+properties it's built on — no network in actualis itself, read-only, auditable in one sitting. That
 trade isn't worth making, so the scope is stated honestly instead: every agent with
 a shell on your machine.
 

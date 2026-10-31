@@ -22,7 +22,10 @@ from unittest import mock
 # Every variable that points actualis (or an agent) at a config or transcript
 # directory. The suite runs with each one inside a temp directory.
 AGENT_VARS = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "COPILOT_HOME", "GEMINI_CLI_HOME",
-              "QWEN_HOME", "QWEN_RUNTIME_DIR", "XDG_CONFIG_HOME")
+              "QWEN_HOME", "QWEN_RUNTIME_DIR", "XDG_CONFIG_HOME",
+              "XDG_CACHE_HOME", "ACTUALIS_REPUTATION_DIR", "LOCALAPPDATA")
+# Hosts a test may resolve or connect to; anything else is refused (see audit).
+_LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost", "0.0.0.0"})
 ORIGINAL_ENV = dict(os.environ)     # for tools that are not actualis (go), never for actualis
 REAL_HOME = None                    # set by _isolate_process
 TEMP_HOME = None
@@ -66,7 +69,10 @@ def _isolate_process():
         COPILOT_HOME=os.path.join(TEMP_HOME, ".copilot"),
         GEMINI_CLI_HOME=TEMP_HOME,
         QWEN_HOME=os.path.join(TEMP_HOME, ".qwen"),
-        QWEN_RUNTIME_DIR=os.path.join(TEMP_HOME, ".qwen"))
+        QWEN_RUNTIME_DIR=os.path.join(TEMP_HOME, ".qwen"),
+        XDG_CACHE_HOME=os.path.join(TEMP_HOME, ".cache"),
+        ACTUALIS_REPUTATION_DIR=os.path.join(TEMP_HOME, ".cache", "actualis", "reputation"),
+        LOCALAPPDATA=os.path.join(TEMP_HOME, "AppData", "Local"))
     os.chdir(TEMP_CWD)
 
     def norm(p):
@@ -86,6 +92,16 @@ def _isolate_process():
     project_file = norm(os.path.join(orig_cwd, ".actualis-suppressions"))
 
     def audit(event, args):
+        if event == "socket.getaddrinfo" and args:
+            if str(args[0]).lower() not in _LOOPBACK:
+                raise PermissionError(f"test isolation: DNS lookup of {args[0]}")
+            return
+        if event == "socket.connect" and len(args) > 1:
+            addr = args[1]
+            host = addr[0] if isinstance(addr, tuple) and addr else addr
+            if isinstance(host, str) and host.lower() not in _LOOPBACK:
+                raise PermissionError(f"test isolation: connect to {host}")
+            return
         if event not in ("open", "os.scandir", "os.listdir") or not args or args[0] is None:
             return
         try:

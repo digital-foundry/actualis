@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- `actualis-reputation`, an optional companion command and the only part of actualis that uses the network.
+  `update` downloads Google Safe Browsing threat lists; `confirm` checks local matches with 4-byte hash
+  prefixes mixed with decoys drawn from the downloaded lists; `virustotal` looks hostnames up on VirusTotal
+  (opt in; sends hostnames). Every run says what it will send, asks first (`--yes` in CI), shows ⊕🌐 while
+  a request is in flight, and records what it did (`--receipt`, `network-log.jsonl`). Keys come from
+  `ACTUALIS_GSB_KEY` / `ACTUALIS_VT_KEY` or `--key-command`, never an argument; the Safe Browsing key travels
+  in a header, never a URL. Private and local hosts are never looked up or sent. See docs/reputation.md.
+- `actualis --reputation`: matches the network inventory against the local reputation cache, offline.
+  New findings `reputation-listed` (high), `reputation-candidate`, `reputation-suspicious`,
+  `reputation-stale` (medium). `--reputation --fail-on` with no usable lists exits 2.
+- `--json`: `network.items[].reputation` and `network.reputation` (additive; schema_version stays 1).
+- `--self-check` reports when actualis-reputation last used the network.
+- `--explain reputation`.
+- Tray: a network badge while actualis-reputation runs.
+- Tray: when the Safe Browsing lists are more than a day old, the icon shows the amber update badge and the menu offers "Update Safe Browsing Lists (N days old)…". It opens a terminal running `actualis-reputation update`, where you see what is sent and confirm. The tray itself never downloads anything or holds a key. Credential warnings still take priority over the badge (#69).
+
+### Changed
+- The README says "actualis never uses the network. The optional `actualis-reputation` command does, only
+  when you run it, and tells you what it sends."
+
 ## 0.4.0 (2026-10-13)
 
 ### Upgrading from 0.3.0: what can change a gate

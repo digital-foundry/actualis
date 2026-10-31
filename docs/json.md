@@ -221,7 +221,7 @@ not parse (a script, `poetry add`, `npm exec`) gives no item.
 | `by_project[]` | per project, most items first: `project`, `items`, `unasked`; the sums equal `totals.items` and `totals.unasked` |
 | `hosts[]` | per host: `count`, `unasked`, `first_seen` (the earliest item `ts` by UTC instant; the string keeps that item's own offset), and `trusted` if any item from it matched the trust list |
 | `packages[]` | per `ecosystem` and `name`: `versions` seen, `pinned` (every install named an exact version: a full `MAJOR.MINOR.PATCH` for npm, crates and go, `==` for pypi, an `@sha256:` digest for images; for crates, `cargo add` is pinned only with `=1.2.3` and `cargo install --version 1.2.3` is exact; ranges, tags and prefixes are not pinned), `exec` (any install ran code), `count`, `unasked` |
-| `items[]` | one record per item (`package`, `version` and `alias` are redacted like `url` unless `--no-redact`): `kind`, `program`, `host`, `host_inferred`, `url`, `dest`, `source`, `ecosystem`, `package`, `version`, `pinned`, `exec`, `dynamic` (`true` when the URL or registry is built from a shell variable, or when curl/wget read their URLs from a file: `wget -i`, `curl -K`; a variable only in the path or query keeps the literal `host`, so `https://evil.example/$VER/x` has `host` `evil.example`, while `https://$HOST/x` has `host` `null`; an install from `--registry "$R"` or `-i "$IDX"` has `host` `null`, never the public default; also `true` when the host is written in a form that cannot be normalised (`host` `null`), and when the same command redirects the transfer through a proxy or another address, which also keeps it untrusted; `host` is normalised as curl resolves it: percent-decoded, IDNA, lower case, no trailing dot, an IPv4 address in any numeric form as a dotted quad), `alias` (the name an npm alias installs under, `x` in `x@npm:evil@1.0.0`, where `package` is `evil`; else `null`), `failed` (`null` when unknown), `approval`, `trusted`, `agent`, `project`, `session`, `call_id` (the tool call's id in the transcript, an opaque string, `null` when there is none), `ts`, `ioc` (`match`, `unresolved` or `null`; see `network.ioc`), `mode` (the permission-mode key `approval` was judged from, or `null`), `why` (the assistant's own words before the call: the last sentence, at most 160 characters, or `null`), `prompt` (the person's last real message before the turn, at most 160 characters; `null` unless `--with-prompts`), `transcript` (`root`, `file` relative to `root`, and the 1-based `line` of the record that made the call; `line` is `null` for a `--ci-log` array; `transcript` is `null` for an item not read from a file), `rewound` (see below) |
+| `items[]` | one record per item (`package`, `version` and `alias` are redacted like `url` unless `--no-redact`): `kind`, `program`, `host`, `host_inferred`, `url`, `dest`, `source`, `ecosystem`, `package`, `version`, `pinned`, `exec`, `dynamic` (`true` when the URL or registry is built from a shell variable, or when curl/wget read their URLs from a file: `wget -i`, `curl -K`; a variable only in the path or query keeps the literal `host`, so `https://evil.example/$VER/x` has `host` `evil.example`, while `https://$HOST/x` has `host` `null`; an install from `--registry "$R"` or `-i "$IDX"` has `host` `null`, never the public default; also `true` when the host is written in a form that cannot be normalised (`host` `null`), and when the same command redirects the transfer through a proxy or another address, which also keeps it untrusted; `host` is normalised as curl resolves it: percent-decoded, IDNA, lower case, no trailing dot, an IPv4 address in any numeric form as a dotted quad), `alias` (the name an npm alias installs under, `x` in `x@npm:evil@1.0.0`, where `package` is `evil`; else `null`), `failed` (`null` when unknown), `approval`, `trusted`, `agent`, `project`, `session`, `call_id` (the tool call's id in the transcript, an opaque string, `null` when there is none), `ts`, `ioc` (`match`, `unresolved` or `null`; see `network.ioc`), `reputation` (the offline host-reputation result, or `null` without `--reputation`; see [network.reputation](#networkreputation)), `mode` (the permission-mode key `approval` was judged from, or `null`), `why` (the assistant's own words before the call: the last sentence, at most 160 characters, or `null`), `prompt` (the person's last real message before the turn, at most 160 characters; `null` unless `--with-prompts`), `transcript` (`root`, `file` relative to `root`, and the 1-based `line` of the record that made the call; `line` is `null` for a `--ci-log` array; `transcript` is `null` for an item not read from a file), `rewound` (see below) |
 | `items_truncated` | `true` when `items` was cut at the cap |
 | `strict` | whether `--network-strict` was on |
 | `trust` | the trusted host or host-and-path entries in force |
@@ -314,6 +314,45 @@ The findings are `bash.flags[]` entries with the categories `network-ioc`
 (high) and `network-ioc-unresolved` (medium).
 
 Verify: `actualis --ioc f --json | jq '.network.ioc.totals'`
+
+## network.reputation
+
+The host-reputation result (see [reputation.md](reputation.md)). Everything here
+is additive under `schema_version` 1. Two places carry it: `network.items[].reputation`
+for each item, and `network.reputation` for the whole run. `network.reputation` is
+always an object; `enabled` is `false` without `--reputation`.
+
+**network.items[].reputation** is `null` without `--reputation`, else an object:
+
+| key | meaning |
+|---|---|
+| `state` | `none` (no local match), `candidate` (a local Safe Browsing prefix matched, not confirmed), `listed` (confirmed by Google within 30 minutes, or VirusTotal `malicious` at or above the threshold), `not-listed` (a fresh check found nothing), `suspicious` (VirusTotal: `1 <= malicious < threshold`, or `suspicious >= 1`), `unknown` (VirusTotal has never seen the host), `skipped` (a private or local host, never looked up) |
+| `provider` | `google-safe-browsing`, `virustotal` or `null` |
+| `threat_types[]` | Google threat types such as `MALWARE`, `SOCIAL_ENGINEERING`; empty for VirusTotal |
+| `checked_at` | when the deciding check was made, or `null` |
+| `advisory` | `"Advisory provided by Google"` for a `listed` or `candidate` Google result, else `null` (never set for VirusTotal) |
+
+**network.reputation**:
+
+| key | meaning |
+|---|---|
+| `enabled` | whether `--reputation` was given |
+| `lists_status` | `ok`, `absent` or `corrupt`; `null` when not enabled |
+| `provider_lists` | list name to the time it was fetched |
+| `lists_age_hours` | age of the oldest list, in whole hours, or `null` |
+| `stale` | `true` when the oldest list is over 7 days old |
+| `vt_results` | VirusTotal results loaded from `vt/results.json`, every one however old (a result over 7 days old is counted here but gives no verdict) |
+| `vt_status` | `ok`, `absent` or `corrupt` for `vt/results.json`; `null` when not enabled. `corrupt` makes `--fail-on` exit 2 |
+| `totals` | `checked`, `skipped`, `none`, `candidate`, `listed`, `not_listed`, `suspicious`, `unknown`: items by state |
+| `candidates[]` | `prefix_b64`, the 4-byte hash prefix a confirmation would send, and `expressions`, how many of a host's expressions matched. Prefixes only: `actualis-reputation confirm` reads these and never sees a host |
+| `advisory` | `text` and `url` of the Google advisory, or both `null` |
+| `network_last_used` | `at` and `provider` of the last `actualis-reputation` network run, or both `null` |
+
+The findings are `bash.flags[]` entries with the categories `reputation-listed`
+(high), `reputation-candidate`, `reputation-suspicious` and `reputation-stale`
+(medium).
+
+Verify: `actualis --network --reputation --json | jq '.reputation.totals'`
 
 ## Compatibility
 

@@ -6092,7 +6092,7 @@ def network_filter(fleet: "Fleet", host: str | None = None, package: str | None 
 
 NETWORK_ITEM_KEYS = ("kind", "program", "host", "host_inferred", "url", "dest", "source",
                      "ecosystem", "package", "version", "pinned", "exec", "dynamic", "alias",
-                     "failed", "approval", "trusted", "agent", "project", "session", "call_id", "ts", "ioc",
+                     "failed", "approval", "trusted", "agent", "project", "session", "call_id", "ts", "ioc", "reputation",
                      "mode", "why", "prompt", "transcript", "rewound")
 
 # why and prompt: what the assistant said before a call, and what the person
@@ -6249,8 +6249,37 @@ def network_json(fleet: "Fleet", raw: bool = False) -> dict:
         "trust_sources": [{"source": t["source"], "path": t.get("path"),
                            "sha256": t.get("sha256"), "entries": list(t["entries"])}
                           for t in fleet.network_trust_sources],
+        "reputation": reputation_json(fleet),
         "ioc": ioc_json(fleet, raw),
     }
+
+
+def reputation_json(fleet: "Fleet") -> dict:
+    """network.reputation. Always an object; enabled false without --reputation."""
+    data = fleet.reputation
+    out = {"enabled": data is not None, "lists_status": None, "provider_lists": {}, "lists_age_hours": None,
+           "stale": False, "vt_results": 0, "vt_status": None, "totals": dict(fleet.reputation_totals), "candidates": [],
+           "advisory": {"text": None, "url": None}, "network_last_used": {"at": None, "provider": None}}
+    if data is None:
+        return out
+    now = datetime.now(timezone.utc)
+    out["lists_status"] = data.status
+    out["provider_lists"] = {k: v["fetched_at"].isoformat(timespec="seconds")
+                             for k, v in sorted(data.state.items())}
+    if data.oldest:
+        out["lists_age_hours"] = max(0, int((now - data.oldest).total_seconds() // 3600))
+        out["stale"] = now - data.oldest > timedelta(days=REPUTATION_STALE_DAYS)
+    out["vt_results"] = len(data.vt)
+    out["vt_status"] = "corrupt" if data.vt_error else ("ok" if data.vt_present else "absent")
+    out["candidates"] = sorted(({"prefix_b64": base64.b64encode(p).decode(), "expressions": n}
+                                for p, n in fleet.reputation_candidates.items()),
+                               key=lambda c: c["prefix_b64"])
+    if data.lists:
+        out["advisory"] = {"text": GSB_ADVISORY, "url": GSB_ADVISORY_URL}
+    if data.last_network:
+        out["network_last_used"] = {"at": data.last_network.get("at"),
+                                    "provider": data.last_network.get("provider")}
+    return out
 
 
 def network_reconciles(n: dict) -> list[str]:
@@ -7528,6 +7557,519 @@ def ioc_json(fleet: "Fleet", raw: bool = False) -> dict:
             "matches_truncated": len(rows) > NETWORK_ITEMS_CAP}
 
 
+# ---------------------------------------------------------------------------
+# Host reputation (offline). actualis only READS the cache that the companion
+# command actualis-reputation writes (docs/reputation.md); nothing here can
+# open a socket, and --self-check keeps proving it.
+
+def reputation_dir() -> Path:
+    """Where actualis-reputation keeps its cache. Never created here."""
+    env = os.environ.get("ACTUALIS_REPUTATION_DIR")
+    if env:
+        return Path(env).expanduser()
+    if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
+        return Path(os.environ["LOCALAPPDATA"]) / "actualis" / "reputation"
+    base = os.environ.get("XDG_CACHE_HOME")
+    if not base:
+        try:
+            base = str(Path.home() / ".cache")
+        except RuntimeError:                 # no home directory at all
+            raise OSError("no home directory; set ACTUALIS_REPUTATION_DIR") from None
+    return Path(base) / "actualis" / "reputation"
+
+
+NET_MARK = "\u2295\U0001F310"       # circled plus, globe: on every line that reports network use, nowhere else
+# (escapes, not literals: the source stays readable as cp1252, which Windows tools default to)
+REPUTATION_LISTS = ("mw-4b", "se-4b", "uws-4b", "uwsa-4b", "pha-4b")
+REPUTATION_THREAT = {"mw-4b": "MALWARE", "se-4b": "SOCIAL_ENGINEERING", "uws-4b": "UNWANTED_SOFTWARE",
+                     "uwsa-4b": "UNWANTED_SOFTWARE", "pha-4b": "POTENTIALLY_HARMFUL_APPLICATION"}
+REPUTATION_THREAT_TEXT = {"MALWARE": "malware", "SOCIAL_ENGINEERING": "phishing (social engineering)",
+                          "UNWANTED_SOFTWARE": "unwanted software",
+                          "POTENTIALLY_HARMFUL_APPLICATION": "a potentially harmful application"}
+REPUTATION_CONFIRM_TTL = 30 * 60         # Google: warn only on a full-hash answer under 30 minutes old
+REPUTATION_STALE_DAYS = 7
+GSB_ADVISORY = "Advisory provided by Google"
+GSB_ADVISORY_URL = "https://developers.google.com/safe-browsing/v4/advisory"
+SB_HOST_SUFFIXES = 5                     # the exact host, then hosts from the last five labels
+SB_PATH_PREFIXES = 4                     # "/" and up to three directories below it
+_SB_IPV4 = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}")
+
+
+def reputation_skip(host: str) -> bool:
+    """Hosts never looked up and never sent anywhere: loopback, private,
+    link-local, IPv6 literals, single-label names and the local-only
+    suffixes. They are never on a public list, and naming them to a provider
+    would say which internal systems the agents touch."""
+    h = (host or "").lower().rstrip(".")
+    if not h or h.startswith("[") or "." not in h:
+        return True
+    if h.endswith((".internal", ".home.arpa", ".lan", ".localdomain", ".corp", ".home", ".intranet",
+                   ".private", ".test", ".invalid")):
+        return True
+    if _local_host(h):
+        return True
+    parts = h.split(".")
+    if len(parts) == 4 and all(p.isdigit() and len(p) <= 3 for p in parts):
+        a, b, c = int(parts[0]), int(parts[1]), int(parts[2])
+        return (a == 0 or (a == 100 and 64 <= b <= 127) or a >= 224
+                or (a == 192 and b == 0 and c in (0, 2)) or (a == 198 and b in (18, 19))
+                or (a == 198 and b == 51 and c == 100) or (a == 203 and b == 0 and c == 113))
+    return False
+
+
+def _sb_path_canon(path: str) -> str:
+    """Safe Browsing's path canonicalisation, minus the query (never hashed):
+    percent-decode until stable, resolve . and .., collapse //, re-escape
+    bytes <= 0x20, >= 0x7f, '#' and '%'."""
+    path = path.split("#", 1)[0].split("?", 1)[0] or "/"
+    raw = path.encode("utf-8", "surrogatepass")
+    for _ in range(8):                   # %2541 -> %41 -> A; bounded
+        nxt = _NET_PCT.sub(lambda m: bytes([int(m.group(1), 16)]), raw)
+        if nxt == raw:
+            break
+        raw = nxt
+    segs: list[bytes] = []
+    for seg in raw.split(b"/"):
+        if seg in (b"", b"."):
+            continue
+        if seg == b"..":
+            if segs:
+                segs.pop()
+            continue
+        segs.append(seg)
+    out = b"/" + b"/".join(segs)
+    if raw.endswith(b"/") and segs:
+        out += b"/"
+    return "".join(chr(b) if 0x20 < b < 0x7f and b not in (0x23, 0x25) else f"%{b:02X}" for b in out)
+
+
+def sb_expressions(host: str, path: str = "") -> list[str]:
+    """The host-suffix / path-prefix expressions Safe Browsing hashes for one
+    canonical host (and, when the inventory recorded one, a URL path)."""
+    host = host.lower().rstrip(".")
+    while ".." in host:
+        host = host.replace("..", ".")
+    hosts = [host]
+    if not _SB_IPV4.fullmatch(host):
+        tail = host.split(".")[-5:]
+        for k in range(len(tail) - 1):        # never the bare TLD
+            cand = ".".join(tail[k:])
+            if cand not in hosts:
+                hosts.append(cand)
+    hosts = hosts[:SB_HOST_SUFFIXES]
+    paths = ["/"]
+    if path and path != "/":
+        exact = _sb_path_canon(path)
+        dirs = exact.split("/")[1:-1]
+        paths = [exact] if exact != "/" else []
+        prefix = "/"
+        for d in [""] + dirs[:SB_PATH_PREFIXES - 1]:
+            prefix = prefix + d + "/" if d else prefix
+            if prefix not in paths:
+                paths.append(prefix)
+    return [h + p for h in hosts for p in paths]
+
+
+def sb_hash(expr: str) -> bytes:
+    return hashlib.sha256(expr.encode("utf-8")).digest()
+
+
+REPUTATION_FILE_MAX = 64 << 20           # a prefix list, or any cache file, past this is refused
+REPUTATION_LOG_TAIL = 64 << 10
+_REPUTATION_FILE_NAME = re.compile(r"[a-z0-9-]+\.[0-9a-f]{16}\.prefixes")
+
+
+class ReputationData:
+    """What the reputation cache holds, read once per run. status is "ok",
+    "absent" (never updated) or "corrupt" (a list failed its check: treated as
+    no lists, so a gate cannot pass on tampered data)."""
+
+    def __init__(self, directory: "Path | None" = None) -> None:
+        self.directory = directory
+        self.status = "absent"
+        self.error: str | None = None
+        self.lists: dict[str, bytes] = {}
+        self.state: dict[str, dict] = {}
+        self.oldest: datetime | None = None
+        self.confirmations: dict[bytes, dict] = {}
+        self.confirmations_error: str | None = None
+        self.vt: dict[str, dict] = {}
+        self.vt_threshold = 2
+        self.vt_error: str | None = None
+        self.vt_present = False
+        self.last_network: dict | None = None
+
+
+def _parse_utc(text: object) -> "datetime | None":
+    if not isinstance(text, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _read_cache_file(path: Path, limit: int = REPUTATION_FILE_MAX) -> "bytes | None":
+    """A cache file's bytes; None if absent. OSError for a symlink, a
+    non-regular file or one over `limit`."""
+    if os.path.islink(path):
+        raise OSError(f"{path.name} is a symlink; refusing it")
+    try:
+        fh = _open_regular(path, binary=True)
+    except FileNotFoundError:
+        return None
+    with fh:
+        data = fh.read(limit + 1)
+    if len(data) > limit:
+        raise OSError(f"{path.name} is over {limit >> 20} MiB")
+    return data
+
+
+def _b64_bytes(text: object, size: int | None = None) -> "bytes | None":
+    if not isinstance(text, str):
+        return None
+    try:
+        raw = base64.b64decode(text, validate=True)
+    except (ValueError, TypeError):
+        return None
+    return raw if size is None or len(raw) == size else None
+
+
+def _load_confirmations(path: Path) -> dict:
+    raw = _read_cache_file(path)
+    if raw is None:
+        return {}
+    doc = json.loads(raw)
+    if not isinstance(doc, dict) or doc.get("schema") != 1 or not isinstance(doc.get("entries"), list):
+        raise ValueError("confirmations.json: not schema 1")
+    out: dict[bytes, dict] = {}
+    for e in doc["entries"]:
+        if not isinstance(e, dict):
+            continue
+        p = _b64_bytes(e.get("prefix"), 4)
+        at, until = _parse_utc(e.get("confirmed_at")), _parse_utc(e.get("cache_until"))
+        if p is None or at is None or until is None or not isinstance(e.get("full_hashes"), list):
+            continue
+        hashes = []
+        for fh in e["full_hashes"]:
+            h = _b64_bytes(fh.get("hash"), 32) if isinstance(fh, dict) else None
+            types = fh.get("threat_types") if isinstance(fh, dict) else None
+            if h is None or not isinstance(types, list) or not all(isinstance(t, str) for t in types):
+                continue
+            hashes.append({"hash": h, "threat_types": sorted(set(types)), "canary": fh.get("canary") is True})
+        out[p] = {"full_hashes": hashes, "confirmed_at": at, "cache_until": until}
+    return out
+
+
+def _load_vt(path: Path, data: "ReputationData") -> None:
+    raw = _read_cache_file(path)
+    if raw is None:
+        return
+    data.vt_present = True
+    doc = json.loads(raw)
+    if not isinstance(doc, dict) or doc.get("schema") != 1 or not isinstance(doc.get("results"), list):
+        raise ValueError("vt/results.json: not schema 1")
+    t = doc.get("vt_threshold")
+    data.vt_threshold = t if isinstance(t, int) and not isinstance(t, bool) and 1 <= t <= 100 else 2
+    for r in doc["results"]:
+        if not isinstance(r, dict) or not isinstance(r.get("host"), str):
+            continue
+        at = _parse_utc(r.get("checked_at"))
+        stats = r.get("stats") if isinstance(r.get("stats"), dict) else {}
+        clean_stats = {k: v for k, v in stats.items()
+                       if k in ("malicious", "suspicious", "harmless", "undetected", "timeout")
+                       and isinstance(v, int) and not isinstance(v, bool) and v >= 0}
+        if at is None or r.get("status") not in ("found", "unknown"):
+            continue
+        data.vt[r["host"].lower()] = {"stats": clean_stats, "status": r["status"], "checked_at": at}
+
+
+def reputation_last_network(directory: "Path | None" = None) -> "dict | None":
+    """The newest valid line of network-log.jsonl, or None. Never raises."""
+    try:
+        path = (directory or reputation_dir()) / "network-log.jsonl"
+        raw = _read_cache_file(path)
+    except OSError:
+        return None
+    if not raw:
+        return None
+    for line in reversed(raw[-REPUTATION_LOG_TAIL:].decode("utf-8", "replace").splitlines()):
+        ok, rec = _json_line(line)
+        if ok and isinstance(rec, dict) and _parse_utc(rec.get("at")) and isinstance(rec.get("provider"), str):
+            return {"at": rec["at"], "provider": rec["provider"]}
+    return None
+
+
+REPUTATION_FLAG_CATEGORIES = ("reputation-listed", "reputation-candidate", "reputation-suspicious",
+                              "reputation-stale")
+_REPUTATION_RANK = {"listed": 5, "candidate": 4, "suspicious": 3, "not-listed": 2, "unknown": 1, "none": 0}
+
+
+def _reputation_zero_totals() -> dict:
+    return {k: 0 for k in ("checked", "skipped", "none", "candidate", "listed", "not_listed",
+                           "suspicious", "unknown")}
+
+
+def _prefix_in(blob: bytes, p: bytes) -> bool:
+    """Binary search over a sorted run of 4-byte records."""
+    lo, hi = 0, len(blob) // 4
+    while lo < hi:
+        mid = (lo + hi) // 2
+        v = blob[mid * 4:mid * 4 + 4]
+        if v < p:
+            lo = mid + 1
+        elif v > p:
+            hi = mid
+        else:
+            return True
+    return False
+
+
+def _confirmation_fresh(c: dict, now: datetime) -> bool:
+    at = c["confirmed_at"]
+    if at > now + timedelta(minutes=1):      # dated in the future: a bad clock or a tampered file
+        return False
+    return now < min(at + timedelta(seconds=REPUTATION_CONFIRM_TTL), c["cache_until"])
+
+
+def gsb_verdict(host: str, path: str, data: "ReputationData", now: datetime) -> dict:
+    out = {"state": "none", "threat_types": [], "checked_at": None, "candidates": {}}
+    hashes = [sb_hash(e) for e in sb_expressions(host, path)]
+    hits: dict[bytes, int] = {}
+    for h in hashes:
+        if any(_prefix_in(blob, h[:4]) for blob in data.lists.values()):
+            hits[h[:4]] = hits.get(h[:4], 0) + 1
+    if not hits:
+        return out
+    full = set(hashes)
+    types: set[str] = set()
+    all_fresh = True
+    for p, n in hits.items():
+        c = data.confirmations.get(p)
+        if c is None or not _confirmation_fresh(c, now):
+            all_fresh = False
+            out["candidates"][p] = n
+            continue
+        out["checked_at"] = max(filter(None, (out["checked_at"], c["confirmed_at"])))
+        for fh in c["full_hashes"]:
+            if fh["hash"] in full:
+                types.update(fh["threat_types"])
+    if types:
+        out["state"], out["threat_types"] = "listed", sorted(types)
+    elif all_fresh:
+        out["state"] = "not-listed"
+    else:
+        out["state"] = "candidate"
+    return out
+
+
+def vt_verdict(host: str, data: "ReputationData", now: datetime) -> "dict | None":
+    r = data.vt.get(host)
+    if r is None or now - r["checked_at"] > timedelta(days=REPUTATION_STALE_DAYS):
+        return None
+    m, s = r["stats"].get("malicious", 0), r["stats"].get("suspicious", 0)
+    if r["status"] == "unknown":
+        state = "unknown"
+    elif m >= data.vt_threshold:
+        state = "listed"
+    elif m or s:
+        state = "suspicious"
+    else:
+        state = "not-listed"
+    return {"state": state, "malicious": m, "suspicious": s, "threshold": data.vt_threshold,
+            "checked_at": r["checked_at"]}
+
+
+def _utc_hm(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def apply_reputation(fleet: "Fleet", data: "ReputationData | None", now: "datetime | None" = None) -> None:
+    """Check every non-refused item with a host against the local cache. One
+    flag per (category, provider:host); a stale list is one flag. Run once,
+    after apply_ioc. Never opens a socket."""
+    fleet.reputation = data
+    fleet.reputation_totals = totals = _reputation_zero_totals()
+    fleet.reputation_candidates = {}
+    for item in fleet.network:
+        item["reputation"] = None
+    if data is None:
+        return
+    now = now or datetime.now(timezone.utc)
+    memo: dict[tuple, tuple] = {}
+    groups: dict[tuple[str, str], dict] = {}
+    for item in fleet.network:
+        host = item.get("host")
+        if item.get("_refused") or not host:
+            continue
+        if reputation_skip(host):
+            item["reputation"] = {"state": "skipped", "provider": None, "threat_types": [],
+                                  "checked_at": None, "advisory": None}
+            totals["skipped"] += 1
+            continue
+        path = url_path(item["url"]) if item.get("url") else ""
+        key = (host, path)
+        if key not in memo:
+            g = gsb_verdict(host, path, data, now) if data.lists else None
+            memo[key] = (g, vt_verdict(host, data, now))
+        g, v = memo[key]
+        totals["checked"] += 1
+        if g:
+            for p, n in g["candidates"].items():
+                fleet.reputation_candidates[p] = max(fleet.reputation_candidates.get(p, 0), n)
+        best = None                              # (rank, provider, verdict)
+        if g:
+            best = (_REPUTATION_RANK[g["state"]], "google-safe-browsing", g)
+        if v and (best is None or _REPUTATION_RANK[v["state"]] > best[0]):
+            best = (_REPUTATION_RANK[v["state"]], "virustotal", v)
+        state = best[2]["state"] if best else "none"
+        provider = best[1] if best and state != "none" else None
+        google = provider == "google-safe-browsing"
+        checked = best[2]["checked_at"] if best else None
+        item["reputation"] = {"state": state, "provider": provider,
+                              "threat_types": list(best[2].get("threat_types", [])) if best else [],
+                              "checked_at": checked.isoformat(timespec="seconds") if checked else None,
+                              "advisory": GSB_ADVISORY if google and state in ("listed", "candidate") else None}
+        totals[state.replace("-", "_")] += 1
+        if state in ("listed", "candidate", "suspicious"):
+            category = {"listed": "reputation-listed", "candidate": "reputation-candidate",
+                        "suspicious": "reputation-suspicious"}[state]
+            gk = (category, f"{'gsb' if google else 'vt'}:{host}")
+            grp = groups.setdefault(gk, {"items": [], "verdict": best[2], "google": google, "host": host,
+                                         "types": set()})
+            grp["items"].append(item)
+            grp["types"].update(best[2].get("threat_types", ()))
+    for (category, key), grp in sorted(groups.items()):
+        items, v, host = grp["items"], grp["verdict"], grp["host"]
+        latest = max(items, key=lambda i: (_net_utc_key(i["ts"]), i["project"]))
+        n = f"{len(items)} download(s) via {latest['program']}"
+        if category == "reputation-listed" and grp["google"]:
+            what = " or ".join(REPUTATION_THREAT_TEXT.get(t, t.lower()) for t in sorted(grp["types"]))
+            evidence = (f"{host} is currently listed by Google Safe Browsing as suspected {what} "
+                        f"(checked {_utc_hm(v['checked_at'])}); {n}")
+        elif category == "reputation-listed":
+            evidence = (f"{host} flagged malicious by {v['malicious']} VirusTotal engines "
+                        f"(checked {_utc_hm(v['checked_at'])}); {n}")
+        elif category == "reputation-candidate":
+            evidence = (f"possible match for {host} in Google Safe Browsing lists, not confirmed; "
+                        f"run `actualis-reputation confirm`; {n}")
+        else:
+            evidence = (f"{host}: {v['malicious']} malicious and {v['suspicious']} suspicious VirusTotal "
+                        f"engines, below the threshold of {v['threshold']} (checked {_utc_hm(v['checked_at'])}); {n}")
+        advisory = category in ("reputation-listed", "reputation-candidate") and grp["google"]
+        _reputation_flag(fleet, "high" if category == "reputation-listed" else "med", category, key,
+                         latest, evidence, ". " + GSB_ADVISORY if advisory else "")
+    if data.oldest and now - data.oldest > timedelta(days=REPUTATION_STALE_DAYS):
+        days = (now - data.oldest).days
+        _reputation_flag(fleet, "med", "reputation-stale", "gsb-lists", None,
+                         f"Google Safe Browsing lists are {days} days old and can miss new threats; "
+                         f"run `actualis-reputation update`")
+
+
+def _reputation_flag(fleet: "Fleet", severity: str, category: str, key: str, latest: "dict | None",
+                     evidence: str, suffix: str = "") -> None:
+    """suffix (the Google advisory) is appended after the body is clipped, so
+    a long host cannot cut it off."""
+    fid = flag_id(severity, [category], key)
+    suppressed = fid in fleet.suppressions
+    if suppressed:
+        fleet.suppressed_flags += 1
+    fleet.flags.append({
+        "id": fid, "severity": severity, "categories": [category], "program": key,
+        "project": latest["project"] if latest else "", "when": latest["ts"] if latest else None,
+        "evidence": redact(clean(evidence))[:240 - len(suffix)] + suffix, "had_secret": False,
+        "suppressed": suppressed, "suppressed_reason": fleet.suppressions.get(fid, ""),
+    })
+
+
+def load_reputation(directory: "Path | None" = None) -> ReputationData:
+    """Read the cache, read-only. A bad list makes the whole set corrupt; bad
+    confirmations or VirusTotal files are ignored with a note (ignoring them
+    can only leave a host a candidate, never clear it)."""
+    root = directory or reputation_dir()
+    data = ReputationData(root)
+    data.last_network = reputation_last_network(root)
+    try:                                     # first: VirusTotal results count even with no Safe Browsing lists
+        _load_vt(root / "vt" / "results.json", data)
+    except (OSError, ValueError, RecursionError, TypeError, AttributeError) as exc:
+        data.vt, data.vt_error = {}, str(exc) or "nested too deeply"
+    gsb = root / "gsb"
+    try:
+        raw = _read_cache_file(gsb / "state.json")
+        if raw is None:
+            return data
+        doc = json.loads(raw)
+        if not isinstance(doc, dict) or doc.get("schema") != 1 or not isinstance(doc.get("lists"), list):
+            raise ValueError("state.json is not schema 1")
+        by_name = {e["name"]: e for e in doc["lists"] if isinstance(e, dict) and isinstance(e.get("name"), str)}
+        for name in REPUTATION_LISTS:
+            e = by_name.get(name)
+            if e is None:
+                raise ValueError(f"state.json has no {name} list")
+            fname, sha, count = e.get("file"), e.get("sha256"), e.get("prefix_count")
+            fetched = _parse_utc(e.get("fetched_at"))
+            if not (isinstance(fname, str) and _REPUTATION_FILE_NAME.fullmatch(fname)
+                    and isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha)
+                    and isinstance(count, int) and not isinstance(count, bool) and fetched):
+                raise ValueError(f"state.json: the {name} entry is malformed")
+            blob = _read_cache_file(gsb / fname)
+            if blob is None:
+                raise ValueError(f"{name}: {fname} is missing")
+            if len(blob) != 4 * count or hashlib.sha256(blob).hexdigest() != sha:
+                raise ValueError(f"{name}: checksum does not match")
+            if any(blob[i:i + 4] > blob[i + 4:i + 8] for i in range(0, len(blob) - 4, 4)):
+                raise ValueError(f"{name}: prefixes are not sorted")
+            if fetched > datetime.now(timezone.utc) + timedelta(days=1):
+                raise ValueError(f"{name}: fetched_at is in the future")
+            data.lists[name] = blob
+            data.state[name] = {"fetched_at": fetched, "next_update_at": _parse_utc(e.get("next_update_at")),
+                                "prefix_count": count, "version": e.get("version")}
+            data.oldest = fetched if data.oldest is None else min(data.oldest, fetched)
+    except (OSError, ValueError, RecursionError, TypeError, AttributeError) as exc:   # JSONDecodeError is a ValueError
+        data.status, data.error, data.lists, data.state = "corrupt", str(exc), {}, {}
+        return data
+    data.status = "ok"
+    try:
+        data.confirmations = _load_confirmations(gsb / "confirmations.json")
+    except (OSError, ValueError, RecursionError, TypeError, AttributeError) as exc:
+        data.confirmations_error = str(exc) or "nested too deeply"
+    return data
+
+
+def render_reputation(fleet: "Fleet", c: "C") -> None:
+    """The reputation block of the NETWORK section. A match is not network
+    use, so no NET_MARK here."""
+    data = fleet.reputation
+    if data is None:
+        return
+    t = fleet.reputation_totals
+    if data.status != "ok" and not data.vt:
+        print(f"  {c.yellow}reputation: no usable Safe Browsing lists ({data.status}); "
+              f"run actualis-reputation update{c.off}")
+        return
+    if data.oldest:
+        age_h = int((datetime.now(timezone.utc) - data.oldest).total_seconds() // 3600)
+        age = f"{age_h} h old" if age_h < 48 else f"{age_h // 24} days old"
+        head = f"reputation: Google Safe Browsing lists from {_utc_hm(data.oldest)}, {age}"
+    else:
+        head = "reputation: VirusTotal results only"
+    sus = f" \u00b7 {t['suspicious']} suspicious" if t["suspicious"] else ""
+    print(f"  {head} \u00b7 {t['listed']} listed \u00b7 {t['candidate']} candidate{sus}"
+          f" \u00b7 {t['checked']} checked \u00b7 {t['skipped']} private skipped")
+    shown = 0
+    for f in fleet.flags:
+        if not set(f["categories"]) & set(REPUTATION_FLAG_CATEGORIES) or shown >= IOC_ROWS_SHOWN:
+            continue
+        high = f["severity"] == "high"
+        color, mark = (c.red, "\u25b2") if high else (c.yellow, "?")
+        print(f"    {color}{mark}{c.off} {clip(f['evidence'], NET_VIEW_WIDTH - 6)}")
+        shown += 1
+    if data.lists and (t["listed"] or t["candidate"]):
+        print(f"  {c.dim}{GSB_ADVISORY}: {GSB_ADVISORY_URL}. Lists can be wrong both ways; "
+              f"see docs/reputation.md{c.off}")
+
+
 def render_ioc(fleet: "Fleet", c: "C", raw: bool = False) -> None:
     """The IOC block of NETWORK. Nothing without --ioc. Every printed field
     is cleaned; item fields come from the redacted public view."""
@@ -8518,6 +9060,9 @@ class Fleet:
         self.ioc: IocSet | None = None
         self.ioc_rows: list[dict] = []
         self.ioc_totals: dict = _ioc_zero_totals()
+        self.reputation: "ReputationData | None" = None
+        self.reputation_totals: dict = _reputation_zero_totals()
+        self.reputation_candidates: dict[bytes, int] = {}
         self._net_by_call: dict[str, list[int]] = {}
         self._git_remotes: dict[tuple[str, str], dict[str, str]] = {}   # per (agent, session)
         # Location-based secret id -> sha256 of every value seen under it, for
@@ -12141,6 +12686,37 @@ EXPLAIN: dict[str, dict[str, object]] = {
         ],
         "verify": "actualis --ioc f --json | jq '.network.ioc.totals'",
     },
+    "reputation": {
+        "measures": "Which hosts in the network inventory are on a reputation list (--reputation), offline.",
+        "formula": [
+            "Each public host is hashed into Safe Browsing expressions and its 4-byte",
+            "prefixes are looked up in the lists on disk. actualis never uses the",
+            "network; actualis-reputation (a separate command) downloads the lists.",
+            "",
+            "state  none        no prefix in any list",
+            "       candidate   a prefix matched; not confirmed. Medium finding.",
+            "       listed      a confirmation under 30 minutes old (and inside",
+            "                   Google's cache time) returned the host's full hash, or",
+            "                   VirusTotal malicious >= --vt-threshold. High finding.",
+            "       not-listed  a fresh check found nothing",
+            "       suspicious  VirusTotal: 1 <= malicious < threshold, or suspicious >= 1",
+            "       unknown     VirusTotal has never seen the host",
+            "       skipped     a private or local host, never looked up or sent",
+            "",
+            "Lists older than 7 days raise reputation-stale. With --fail-on, absent or",
+            "corrupt lists, or a corrupt VirusTotal file, exit 2 before scanning.",
+            "The cache is in $ACTUALIS_REPUTATION_DIR; else %LOCALAPPDATA%\\actualis\\reputation",
+            "on Windows; else $XDG_CACHE_HOME/actualis/reputation; else",
+            "~/.cache/actualis/reputation.",
+        ],
+        "assumes": [
+            "A listing is about now, not about when the agent reached the host.",
+            "Lists can be wrong both ways: no result is not proof of safety.",
+            "A Google result carries \"Advisory provided by Google\"; both providers",
+            "are for non-commercial use. See docs/reputation.md.",
+        ],
+        "verify": "actualis --network --reputation --json | jq '.reputation.totals'",
+    },
     "cache": {
         "measures": "Share of input context served from cache, and what that saved.",
         "formula": [
@@ -13028,6 +13604,7 @@ _GLYPH_FALLBACK = {
     # Sparkline levels, lowest to highest (written as escapes: see _BLOCKS).
     "\u2581": "_", "\u2582": ".", "\u2583": ":", "\u2584": "-",
     "\u2585": "=", "\u2586": "+", "\u2587": "*",
+    "\u2295": "[+", "\U0001F310": "net]",     # NET_MARK -> [+net]
 }
 _GLYPH_TABLE = str.maketrans(_GLYPH_FALLBACK)
 
@@ -13432,6 +14009,7 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False,
     if not t["items"]:
         print(f"  {c.dim}no downloads seen{c.off}")
         render_ioc(fleet, c, raw)              # an empty inventory is still an answer to --ioc
+        render_reputation(fleet, c)
         return
     share = f" ({t['unasked'] * 100 // t['items']}%)" if t["unasked"] else ""
     print(f"  {num(t['items'])} download{'' if t['items'] == 1 else 's'} · {c.yellow}{num(t['unasked'])} unasked{share}{c.off}"
@@ -13452,6 +14030,7 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False,
                 parts.append(f"--network-trust {count}")
         print(f"  {c.dim}trust: {' · '.join(parts)}{c.off}")
     render_ioc(fleet, c, raw)
+    render_reputation(fleet, c)
     items = fleet.network_items
     if filters:
         joined = " \u00b7 ".join(filters)
@@ -13737,7 +14316,23 @@ def _html_table(tid: str, cols: list[str], rows: list[list]) -> str:
             f'<tbody>{"".join(body)}</tbody></table></div>')
 
 
-def render_network_html(n: dict, *, filters: list[str], version: str, with_prompts: bool) -> str:
+def _net_html_reputation(n: dict, flags: "list[dict] | None") -> str:
+    r = n.get("reputation") or {}
+    if not r.get("enabled"):
+        return ""
+    rows = "".join(f"<li>{_h(f['evidence'])}</li>" for f in (flags or [])
+                   if set(f["categories"]) & set(REPUTATION_FLAG_CATEGORIES))
+    adv = r["advisory"]
+    foot = (f'<p class="dim"><a href="{_h(adv["url"])}">{_h(adv["text"])}</a>. Lists can be wrong both ways.</p>'
+            if adv["text"] else "")
+    t = r["totals"]
+    return (f'<section id="reputation"><h2>Reputation</h2><p>{t["listed"]} listed &middot; '
+            f'{t["candidate"]} candidate &middot; {t["checked"]} checked &middot; '
+            f'{t["skipped"]} private skipped</p><ul>{rows}</ul>{foot}</section>')
+
+
+def render_network_html(n: dict, *, filters: list[str], version: str, with_prompts: bool,
+                        flags: "list[dict] | None" = None) -> str:
     """The --network --html page. Every number on it is read from `n`, the
     object --network --json prints, which is also embedded verbatim."""
     t = n["totals"]
@@ -13779,6 +14374,7 @@ def render_network_html(n: dict, *, filters: list[str], version: str, with_promp
         out.append(f'<p class="bad">Network totals do not reconcile: {_h("; ".join(problems)[:200])}. '
                    "Do not trust these numbers.</p>")
     out.append(_net_html_ioc(n["ioc"]))
+    out.append(_net_html_reputation(n, flags))
     if not t["items"]:
         out.append("<p>No downloads were recorded"
                    + (" for these filters" if filters else "") + ".</p>")
@@ -15271,6 +15867,35 @@ JSON_SCHEMA: dict[str, str] = {
     "network.trust_sources[].path": "str|null",
     "network.trust_sources[].sha256": "str|null",
     "network.items[].ioc": "str|null",
+    "network.items[].reputation": "object|null",
+    "network.items[].reputation.state": "str",
+    "network.items[].reputation.provider": "str|null",
+    "network.items[].reputation.threat_types": "array",
+    "network.items[].reputation.threat_types[]": "str",
+    "network.items[].reputation.checked_at": "str|null",
+    "network.items[].reputation.advisory": "str|null",
+    "network.reputation.enabled": "bool",
+    "network.reputation.lists_status": "str|null",
+    "network.reputation.provider_lists.*": "str",
+    "network.reputation.lists_age_hours": "int|null",
+    "network.reputation.stale": "bool",
+    "network.reputation.vt_results": "int",
+    "network.reputation.vt_status": "str|null",
+    "network.reputation.totals.checked": "int",
+    "network.reputation.totals.skipped": "int",
+    "network.reputation.totals.none": "int",
+    "network.reputation.totals.candidate": "int",
+    "network.reputation.totals.listed": "int",
+    "network.reputation.totals.not_listed": "int",
+    "network.reputation.totals.suspicious": "int",
+    "network.reputation.totals.unknown": "int",
+    "network.reputation.candidates": "array",
+    "network.reputation.candidates[].prefix_b64": "str",
+    "network.reputation.candidates[].expressions": "int",
+    "network.reputation.advisory.text": "str|null",
+    "network.reputation.advisory.url": "str|null",
+    "network.reputation.network_last_used.at": "str|null",
+    "network.reputation.network_last_used.provider": "str|null",
     "network.ioc.enabled": "bool",
     "network.ioc.sources": "array",
     "network.ioc.sources[].path": "str",
@@ -15332,6 +15957,8 @@ JSON_SCHEMA.update({f"network.ioc.matches[].item.{k}": JSON_SCHEMA[f"network.ite
                     for k in NETWORK_ITEM_KEYS})
 JSON_SCHEMA.update({f"network.ioc.matches[].item.transcript.{k}": JSON_SCHEMA[f"network.items[].transcript.{k}"]
                     for k in ("root", "file", "line")})
+JSON_SCHEMA.update({f"network.ioc.matches[].item.reputation.{k}": JSON_SCHEMA[f"network.items[].reputation.{k}"]
+                    for k in ("state", "provider", "threat_types", "threat_types[]", "checked_at", "advisory")})
 
 
 def canonical_json(payload: dict) -> str:
@@ -15401,7 +16028,7 @@ REPORT_DIGEST_CLOCK_FINDINGS = frozenset({"AF013"})
 
 EXIT_OK = 0
 EXIT_CANNOT_RUN = 1
-EXIT_USAGE = 2        # argparse's, reserved rather than used
+EXIT_USAGE = 2        # argparse's, and --reputation --fail-on with no usable lists
 EXIT_FINDINGS = 3
 EXIT_SELF_CHECK_FAILED = 4   # --self-check: a privacy claim did not hold
 
@@ -15442,6 +16069,13 @@ def failing_findings(fleet: Fleet, level: str) -> list[str]:
         out.append(f"{len(ioc_hit)} known-bad download group(s) (IOC)")
     if want_any and ioc_unresolved:
         out.append(f"{len(ioc_unresolved)} unresolved IOC match group(s)")
+    rep = set(REPUTATION_FLAG_CATEGORIES)
+    rep_listed = [f for f in fleet.actionable_flags if "reputation-listed" in f["categories"]]
+    rep_med = [f for f in fleet.actionable_flags if rep & set(f["categories"]) - {"reputation-listed"}]
+    if want_high and rep_listed:
+        out.append(f"{len(rep_listed)} host(s) currently on a reputation list")
+    if want_any and rep_med:
+        out.append(f"{len(rep_med)} unconfirmed or suspicious reputation result(s), or stale lists")
 
     for finding in coach(fleet):
         # A finding that depends on today's date, not on the transcripts, must
@@ -15453,13 +16087,14 @@ def failing_findings(fleet: Fleet, level: str) -> list[str]:
             out.append(f"{finding.id} {finding.title}")
 
     if want_high:
-        fl = [f for f in fleet.actionable_flags if f["severity"] == "high" and "network-ioc" not in f["categories"]]
+        fl = [f for f in fleet.actionable_flags if f["severity"] == "high" and "network-ioc" not in f["categories"]
+              and not rep & set(f["categories"])]
         if fl:
             out.append(f"{len(fl)} high-severity shell command(s) flagged")
     if want_any:
         fl = [f for f in fleet.actionable_flags if f["severity"] == "med"]
         net = [f for f in fl if "network-unasked" in f["categories"]]
-        fl = [f for f in fl if not {"network-unasked", "network-ioc-unresolved"} & set(f["categories"])]
+        fl = [f for f in fl if not ({"network-unasked", "network-ioc-unresolved"} | rep) & set(f["categories"])]
         if fl:
             out.append(f"{len(fl)} medium-severity shell command(s) flagged")
         if net:
@@ -16056,6 +16691,16 @@ def self_check(c: C, days: int | None = 7, root: str | None = None,
            f"imports: {', '.join(imported) or 'none'}. "
            + ("Networking found: " + ", ".join(net_in_source) if net_in_source
               else "None of these can open a socket."))
+    try:
+        last = reputation_last_network()
+        log_path = reputation_dir() / "network-log.jsonl"
+    except OSError:
+        last, log_path = None, None
+    names = {"gsb": "Google Safe Browsing", "vt": "VirusTotal"}
+    result(True, f"{NET_MARK} network: actualis never uses it",
+           (f"actualis-reputation last used it for {names.get(last['provider'], last['provider'])} "
+            f"at {last['at']}, read from {log_path}." if last else
+            "actualis-reputation has never used it on this machine (no network-log.jsonl)."))
 
     # 2. Sample the transcripts, hash them, scan, hash again. The checks below
     #    need a corpus; the ones above and below them do not, and skipping the
@@ -17017,6 +17662,10 @@ def build_parser() -> argparse.ArgumentParser:
     net.add_argument("--ioc", metavar="FILE", action="append",
                      help="known-bad packages and hosts to match the network inventory against: the "
                           "actualis-ioc line format or OSV JSON/JSONL. Repeatable. Never read unless named.")
+    net.add_argument("--reputation", action="store_true",
+                     help="match the network inventory against the local host-reputation cache that "
+                          "actualis-reputation writes (Google Safe Browsing lists, VirusTotal results). "
+                          "Offline: actualis never uses the network")
     net.add_argument("--network-strict", action="store_true",
                      help="make every unasked download from an untrusted source a medium finding")
     net.add_argument("--host", metavar="HOST",
@@ -17137,8 +17786,10 @@ def main(argv: list[str] | None = None) -> int:
                          ("--coach", args.coach), ("--aisvs", args.aisvs)):
             if on:
                 ap.error(f"--network cannot be combined with {flag}.")
-    if args.ioc:
-        # These return before the IOC list is loaded.
+    for name, given in (("--ioc", bool(args.ioc)), ("--reputation", args.reputation)):
+        if not given:
+            continue
+        # These return before the list is loaded.
         for flag, on in (("--replay", args.replay), ("--agents", args.agents),
                          ("--why", args.why), ("--explain", args.explain is not None),
                          ("--suppress", args.suppress),
@@ -17146,13 +17797,14 @@ def main(argv: list[str] | None = None) -> int:
                          ("--self-check", args.self_check), ("--service", args.service),
                          ("--completions", args.completions)):
             if on:
-                ap.error(f"--ioc cannot be combined with {flag}: {flag} never reads it.")
-        # These views never show the IOC block; only the gate reads the matches.
+                ap.error(f"{name} cannot be combined with {flag}: {flag} never reads it.")
+        # These views never show the matches; only the gate reads them.
         for flag, on in (("--coach", args.coach), ("--aisvs", args.aisvs),
                          ("--share", args.share)):
             if on and not args.fail_on:
-                ap.error(f"--ioc cannot be combined with {flag} without --fail-on: "
-                         f"{flag} never shows IOC matches. Use --network --ioc, or "
+                shown = "IOC matches" if name == "--ioc" else "reputation results"
+                ap.error(f"{name} cannot be combined with {flag} without --fail-on: "
+                         f"{flag} never shows {shown}. Use --network {name}, or "
                          f"add --fail-on to gate on them.")
     for flag, on in (("--host", args.host), ("--package", args.package),
                      ("--session", args.session), ("--unasked", args.unasked)):
@@ -17197,6 +17849,10 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--ioc does not apply to --card; the card never shows downloads.")
     if args.ioc and (args.watch or args.mcp):
         ap.error("--ioc is not supported with --watch or --mcp yet.")
+    if args.reputation and args.card:
+        ap.error("--reputation does not apply to --card; the card never shows downloads.")
+    if args.reputation and (args.watch or args.mcp):
+        ap.error("--reputation is not supported with --watch or --mcp yet.")
     if args.card:
         for flag, on in (("--fail-on", args.fail_on), ("--diff", args.diff),
                          ("--why", args.why), ("--share", args.share),
@@ -17455,8 +18111,31 @@ def main(argv: list[str] | None = None) -> int:
     try:
         network_trust, trust_sources = load_network_trust_sources(args.network_trust)
         ioc = load_ioc(args.ioc) if args.ioc else None
+        reputation = load_reputation() if args.reputation else None
     except (ValueError, OSError) as exc:
         ap.error(str(exc))
+    if reputation is not None and reputation.status != "ok":
+        where = reputation.directory
+        if reputation.status == "absent":
+            msg = (f"actualis: --reputation: no Google Safe Browsing lists in {where}. Run "
+                   f"`actualis-reputation update` first (it uses the network; actualis never does).")
+        else:
+            msg = (f"actualis: --reputation: the lists in {where} failed their check "
+                   f"({clean(reputation.error or '')}). "
+                   f"Run `actualis-reputation update` to download them again.")
+        print(msg, file=sys.stderr)
+        if args.fail_on:
+            return EXIT_USAGE
+    if reputation is not None and reputation.vt_error:
+        print(f"actualis: --reputation: vt/results.json in {reputation.directory} is unreadable "
+              f"({clean(reputation.vt_error)}); VirusTotal verdicts are ignored. Run "
+              f"`actualis-reputation virustotal` to rebuild it.", file=sys.stderr)
+        if args.fail_on:
+            return EXIT_USAGE
+    if reputation is not None and reputation.confirmations_error:
+        print(f"actualis: --reputation: gsb/confirmations.json in {reputation.directory} is unreadable "
+              f"({clean(reputation.confirmations_error)}); matches stay candidates. Run "
+              f"`actualis-reputation confirm`.", file=sys.stderr)
 
     # --network shows only the inventory; --fail-on reads findings (--why
     # with --network is refused above).
@@ -17549,6 +18228,7 @@ def main(argv: list[str] | None = None) -> int:
         network_filter(fleet, args.host, args.package, args.session, args.unasked)
     apply_network_policy(fleet, network_trust, args.network_strict, trust_sources)
     apply_ioc(fleet, ioc)
+    apply_reputation(fleet, reputation)
 
     if baseline is not None:
         render_diff(_display_safe(diff_reports(baseline, to_json(fleet, raw=args.no_redact))),
@@ -17586,7 +18266,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.html:
         page = render_network_html(network_json(fleet, raw=args.no_redact),
                                    filters=network_filter_names(args), version=__version__,
-                                   with_prompts=args.with_prompts)
+                                   with_prompts=args.with_prompts, flags=fleet.flags)
         try:
             path = write_network_html(page, html_dir)
         except OSError as exc:
