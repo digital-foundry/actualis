@@ -226,7 +226,7 @@ class TestFixRound1(CompanionCase):
         self.assertIn("report file", str(cm.exception))
 
     def test_unimplemented_commands_are_a_usage_error(self):
-        for argv in (("confirm", "x.json"), ("virustotal", "x.json")):
+        for argv in (("virustotal", "x.json"),):
             code, _, err = self.cli(*argv)
             self.assertEqual(code, 2)
             self.assertIn("not implemented yet", err)
@@ -576,3 +576,100 @@ class TestTlsRefusesUntrustedCert(CompanionCase):
         with self.assertRaises(ar.NetError):
             http.get(ar.GSB_HOST, "/v5/hashLists:batchGet", sent={}, describe="x")
         self.assertEqual(hits, [])
+
+
+def net_json(path: Path, candidates=(), hosts=()) -> Path:
+    path.write_text(json.dumps({"hosts": [{"host": h, "count": 1} for h in hosts],
+                                "reputation": {"enabled": True, "candidates": [
+                                    {"prefix_b64": R.b64(R.prefix(e)), "expressions": 1} for e in candidates],
+                                    "totals": {"skipped": 2}}}))
+    return path
+
+
+class TestConfirm(CompanionCase):
+    def setUp(self):
+        super().setUp()
+        os.environ["ACTUALIS_GSB_KEY"] = FAKE_KEY
+        R.write_cache(self.rep, {"mw-4b": [R.prefix("evil.example/"), R.prefix("odd.example/")]})
+
+    def search(self, *full_hashes, cache="300s"):
+        return {"fullHashes": [{"fullHash": R.b64(R.full(e)),
+                                "fullHashDetails": [{"threatType": t, "attributes": attrs}]}
+                               for e, t, attrs in full_hashes], "cacheDuration": cache}
+
+    def test_sends_prefixes_and_decoys_never_hosts(self):
+        s = R.FakeProvider({"/v5/hashes:search": [(200, self.search(("evil.example/", "MALWARE", [])))]})
+        self.addCleanup(s.close)
+        nj = net_json(self.tmp / "n.json", ["evil.example/", "odd.example/"], hosts=["evil.example"])
+        code, _, err = self.cli("confirm", str(nj), "--yes", http_factory=s.factory)
+        self.assertEqual(code, 0, err)
+        q = s.requests[0]["query"]["hashPrefixes"]
+        self.assertEqual(len(q), 30)
+        self.assertIn(R.b64(R.prefix("evil.example/")), q)
+        self.assertNotIn("evil.example", json.dumps(s.requests))
+        self.assertIn("run actualis again within 30 minutes", err)
+        d = af.load_reputation(self.rep)
+        now = datetime.now(timezone.utc)
+        self.assertEqual(af.gsb_verdict("evil.example", "", d, now)["state"], "listed")
+        self.assertEqual(af.gsb_verdict("odd.example", "", d, now)["state"], "not-listed")
+
+    def test_decoy_hits_are_dropped(self):
+        decoy_answer = {"fullHashes": [{"fullHash": R.b64(b"\x01\x02\x03\x04" + b"\0" * 28),
+                                        "fullHashDetails": [{"threatType": "MALWARE"}]}], "cacheDuration": "300s"}
+        s = R.FakeProvider({"/v5/hashes:search": [(200, decoy_answer)]})
+        self.addCleanup(s.close)
+        nj = net_json(self.tmp / "n.json", ["evil.example/"])
+        self.cli("confirm", str(nj), "--yes", http_factory=s.factory)
+        conf = json.loads((self.rep / "gsb" / "confirmations.json").read_text())
+        self.assertEqual([e["prefix"] for e in conf["entries"]], [R.b64(R.prefix("evil.example/"))])
+        self.assertEqual(conf["entries"][0]["full_hashes"], [])
+
+    def test_canary_is_stored_as_not_enforceable(self):
+        s = R.FakeProvider({"/v5/hashes:search": [(200, self.search(("evil.example/", "MALWARE", ["CANARY"])))]})
+        self.addCleanup(s.close)
+        self.cli("confirm", str(net_json(self.tmp / "n.json", ["evil.example/"])), "--yes", http_factory=s.factory)
+        e = json.loads((self.rep / "gsb" / "confirmations.json").read_text())["entries"][0]
+        self.assertEqual((e["full_hashes"][0]["threat_types"], e["full_hashes"][0]["canary"]), ([], True))
+
+    def test_no_candidates_sends_nothing(self):
+        s = R.FakeProvider()
+        self.addCleanup(s.close)
+        code, _, err = self.cli("confirm", str(net_json(self.tmp / "n.json")), "--yes", http_factory=s.factory)
+        self.assertEqual((code, s.requests), (0, []))
+        self.assertIn("no candidates", err)
+
+    def test_report_without_reputation_is_a_usage_error(self):
+        p = self.tmp / "n.json"
+        p.write_text(json.dumps({"hosts": [], "reputation": {"enabled": False, "candidates": []}}))
+        code, _, err = self.cli("confirm", str(p), "--yes")
+        self.assertEqual(code, 2)
+        self.assertIn("--reputation", err)
+
+    def test_dry_run_lists_prefixes(self):
+        code, _, err = self.cli("confirm", str(net_json(self.tmp / "n.json", ["evil.example/"])), "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertIn(R.b64(R.prefix("evil.example/")), err)
+        self.assertIn("29 random decoys", err)
+
+    def test_many_candidates_are_chunked_under_1000(self):
+        cands = [f"h{i}.example/" for i in range(1500)]
+        s = R.FakeProvider({"/v5/hashes:search": [(200, {"cacheDuration": "300s"})]})
+        self.addCleanup(s.close)
+        self.cli("confirm", str(net_json(self.tmp / "n.json", cands)), "--yes", http_factory=s.factory)
+        self.assertEqual(len(s.requests), 2)
+        self.assertTrue(all(len(r["query"]["hashPrefixes"]) <= 1000 for r in s.requests))
+
+    def test_key_command_not_run_without_consent_possible(self):
+        nj = net_json(self.tmp / "n.json", ["evil.example/"])
+        with mock.patch.object(ar.subprocess, "run") as run:
+            code, _, err = self.cli("confirm", str(nj), "--key-command", "x")
+        self.assertEqual(code, 2)
+        self.assertIn("--yes", err)
+        run.assert_not_called()
+
+    def test_dry_run_reads_no_key(self):
+        nj = net_json(self.tmp / "n.json", ["evil.example/"])
+        with mock.patch.object(ar.subprocess, "run") as run:
+            code, _, _ = self.cli("confirm", str(nj), "--key-command", "x", "--dry-run")
+        self.assertEqual(code, 0)
+        run.assert_not_called()
