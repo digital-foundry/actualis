@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 (2026-10-31)
 
 ### Added
 - `actualis-reputation`, an optional companion command and the only part of actualis that uses the network.
