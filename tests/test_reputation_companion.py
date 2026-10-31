@@ -592,7 +592,7 @@ class TestConfirm(CompanionCase):
         os.environ["ACTUALIS_GSB_KEY"] = FAKE_KEY
         R.write_cache(self.rep, {"mw-4b": [R.prefix("evil.example/"), R.prefix("odd.example/")]})
 
-    def search(self, *full_hashes, cache="300s"):
+    def search(self, *full_hashes, cache="1800s"):
         return {"fullHashes": [{"fullHash": R.b64(R.full(e)),
                                 "fullHashDetails": [{"threatType": t, "attributes": attrs}]}
                                for e, t, attrs in full_hashes], "cacheDuration": cache}
@@ -673,3 +673,99 @@ class TestConfirm(CompanionCase):
             code, _, _ = self.cli("confirm", str(nj), "--key-command", "x", "--dry-run")
         self.assertEqual(code, 0)
         run.assert_not_called()
+
+    def test_decoys_are_list_prefixes_and_not_real(self):
+        pool = [bytes([i // 256, i % 256, 7, 9]) for i in range(300)]
+        R.write_cache(self.rep, {"mw-4b": [R.prefix("evil.example/"), R.prefix("odd.example/")] + pool[:150],
+                                 "se-4b": pool[150:]})
+        s = R.FakeProvider({"/v5/hashes:search": [(200, {"cacheDuration": "300s"})]})
+        self.addCleanup(s.close)
+        nj = net_json(self.tmp / "n.json", ["evil.example/", "odd.example/"])
+        self.cli("confirm", str(nj), "--yes", http_factory=s.factory)
+        q = [ar._b64(x) for x in s.requests[0]["query"]["hashPrefixes"]]
+        real = {R.prefix("evil.example/"), R.prefix("odd.example/")}
+        decoys = [p for p in q if p not in real]
+        self.assertEqual(len(q), len(set(q)))
+        self.assertEqual(len(decoys), 28)
+        self.assertTrue(all(p in set(pool) for p in decoys))
+
+    def test_make_decoys_falls_back_to_random_and_avoids_reals(self):
+        real = {b"\x00\x00\x00\x01"}
+        d = ar.make_decoys(real, 30, [b"\x00\x00\x00\x01\x00\x00\x00\x02"])
+        self.assertEqual(len(d), 29)
+        self.assertEqual(len(set(d)), 29)
+        self.assertNotIn(b"\x00\x00\x00\x01", d)
+        self.assertIn(b"\x00\x00\x00\x02", d)
+
+    def test_window_follows_cache_duration(self):
+        for cache, want in (("300s", "within 5 minutes"), ("1800s", "within 30 minutes"),
+                            ("86400s", "within 30 minutes"), ("45s", "within 45 seconds")):
+            s = R.FakeProvider({"/v5/hashes:search": [(200, {"cacheDuration": cache})]})
+            self.addCleanup(s.close)
+            _, _, err = self.cli("confirm", str(net_json(self.tmp / "n.json", ["evil.example/"])), "--yes",
+                                 http_factory=s.factory)
+            self.assertIn(want, err)
+
+    def test_missing_cache_duration_warns(self):
+        s = R.FakeProvider({"/v5/hashes:search": [(200, {})]})
+        self.addCleanup(s.close)
+        code, _, err = self.cli("confirm", str(net_json(self.tmp / "n.json", ["evil.example/"])), "--yes",
+                                http_factory=s.factory)
+        self.assertEqual(code, 0)
+        self.assertIn("Google gave no cache time; this result cannot be used to mark a host listed.", err)
+
+    def test_only_enforceable_threat_types(self):
+        s = R.FakeProvider({"/v5/hashes:search": [(200, {"cacheDuration": "300s", "fullHashes": [
+            {"fullHash": R.b64(R.full("evil.example/")), "fullHashDetails": [
+                {"threatType": "THREAT_TYPE_UNSPECIFIED"}, {"threatType": "SOMETHING_NEW"},
+                {"threatType": "SOCIAL_ENGINEERING"}]}]})]})
+        self.addCleanup(s.close)
+        self.cli("confirm", str(net_json(self.tmp / "n.json", ["evil.example/"])), "--yes", http_factory=s.factory)
+        e = json.loads((self.rep / "gsb" / "confirmations.json").read_text())["entries"][0]
+        self.assertEqual(e["full_hashes"][0]["threat_types"], ["SOCIAL_ENGINEERING"])
+
+    def test_mixed_enforceable_and_canary_is_listed(self):
+        s = R.FakeProvider({"/v5/hashes:search": [(200, {"cacheDuration": "1800s", "fullHashes": [
+            {"fullHash": R.b64(R.full("evil.example/")), "fullHashDetails": [
+                {"threatType": "MALWARE"}, {"threatType": "UNWANTED_SOFTWARE", "attributes": ["CANARY"]}]}]})]})
+        self.addCleanup(s.close)
+        self.cli("confirm", str(net_json(self.tmp / "n.json", ["evil.example/"])), "--yes", http_factory=s.factory)
+        h = json.loads((self.rep / "gsb" / "confirmations.json").read_text())["entries"][0]["full_hashes"][0]
+        self.assertEqual((h["threat_types"], h["canary"]), (["MALWARE"], True))
+        d = af.load_reputation(self.rep)
+        self.assertEqual(af.gsb_verdict("evil.example", "", d, datetime.now(timezone.utc))["state"], "listed")
+
+    def test_partial_failure_keeps_first_chunk_and_receipt(self):
+        cands = [f"h{i}.example/" for i in range(1500)]
+        s = R.FakeProvider({"/v5/hashes:search": [(200, {"cacheDuration": "300s"}), (500, {"error": "x"})]})
+        self.addCleanup(s.close)
+        rcp = self.tmp / "r.json"
+        code, _, err = self.cli("confirm", str(net_json(self.tmp / "n.json", cands)), "--yes",
+                                "--receipt", str(rcp), http_factory=s.factory)
+        self.assertEqual(code, 1, err)
+        conf = json.loads((self.rep / "gsb" / "confirmations.json").read_text())
+        self.assertEqual(len(conf["entries"]), 970)
+        self.assertEqual([r["status"] for r in json.loads(rcp.read_text())["requests"]], [200, 500])
+
+    def test_971_candidates_second_request_has_30_prefixes(self):
+        cands = [f"h{i}.example/" for i in range(971)]
+        s = R.FakeProvider({"/v5/hashes:search": [(200, {"cacheDuration": "300s"})]})
+        self.addCleanup(s.close)
+        self.cli("confirm", str(net_json(self.tmp / "n.json", cands)), "--yes", http_factory=s.factory)
+        self.assertEqual([len(r["query"]["hashPrefixes"]) for r in s.requests], [970, 30])
+
+    def test_all_chunked_entries_are_stored(self):
+        cands = [f"h{i}.example/" for i in range(1500)]
+        s = R.FakeProvider({"/v5/hashes:search": [(200, {"cacheDuration": "300s"})]})
+        self.addCleanup(s.close)
+        self.cli("confirm", str(net_json(self.tmp / "n.json", cands)), "--yes", http_factory=s.factory)
+        self.assertEqual(len(json.loads((self.rep / "gsb" / "confirmations.json").read_text())["entries"]), 1500)
+
+    def test_unreadable_old_confirmations_are_reported(self):
+        (self.rep / "gsb").mkdir(parents=True, exist_ok=True)
+        (self.rep / "gsb" / "confirmations.json").write_text("{not json")
+        s = R.FakeProvider({"/v5/hashes:search": [(200, {"cacheDuration": "300s"})]})
+        self.addCleanup(s.close)
+        _, _, err = self.cli("confirm", str(net_json(self.tmp / "n.json", ["evil.example/"])), "--yes",
+                             http_factory=s.factory)
+        self.assertIn("could not be read", err)

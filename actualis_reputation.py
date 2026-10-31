@@ -743,16 +743,45 @@ def _not_yet(args, ctx) -> int:                  # replaced in Tasks 7 and 8
 
 GSB_SEARCH_PATH = "/v5/hashes:search"
 DECOY_TOTAL = 30
-SEARCH_REAL_MAX = 970                            # + at least 30 decoys stays under Google's 1000
+SEARCH_REAL_MAX = 970                            # a request is topped up to 30 prefixes with decoys, so
+                                                 # it holds at most 970 real ones; a full chunk gets 0 decoys
+ENFORCEABLE = frozenset({"MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"})
 
 
-def make_decoys(real: "set[bytes]", total: int) -> "list[bytes]":
+def make_decoys(real: "set[bytes]", total: int, pool: "list[bytes] | None" = None,
+                avoid: "set[bytes] | None" = None) -> "list[bytes]":
+    """Decoy prefixes so that real + decoys reach `total`. They are drawn from
+    `pool` (the downloaded lists, as blobs of 4-byte records), so they look like
+    real list entries; random bytes only fill a shortfall. Never a real prefix
+    (`real`, or anything in `avoid`), never a duplicate."""
     out: "set[bytes]" = set()
-    while len(out) < max(0, total - len(real)):
+    need = max(0, total - len(real))
+    banned = set(real) | set(avoid or ())
+    n = sum(len(b) // 4 for b in pool or ())
+    rng = secrets.SystemRandom()
+    tries = 0
+    while len(out) < need and n and tries < need * 20 + 100:
+        tries += 1
+        i = rng.randrange(n)
+        for blob in pool or ():
+            if i < len(blob) // 4:
+                d = blob[4 * i:4 * i + 4]
+                break
+            i -= len(blob) // 4
+        if d not in banned and d not in out:
+            out.add(d)
+    while len(out) < need:
         d = secrets.token_bytes(4)
-        if d not in real:
+        if d not in banned and d not in out:
             out.add(d)
     return sorted(out)
+
+
+def _window(seconds: float) -> str:
+    s = int(seconds)
+    if s % 60 == 0:
+        return f"{s // 60} minute{'' if s == 60 else 's'}"
+    return f"{s} seconds"
 
 
 def _candidates(net: dict) -> "list[bytes]":
@@ -784,7 +813,7 @@ def cmd_confirm(args, ctx) -> int:
     plural = "" if len(real) == 1 else "s"
     disclose([("Provider", "Google Safe Browsing v5, hash-prefix lookup"),
               ("Sends", f"4-byte SHA-256 prefixes for {len(real)} candidate{plural}, "
-                        f"mixed with {sum(decoy_counts)} random decoys.\nGoogle never sees a host or URL."),
+                        f"mixed with {sum(decoy_counts)} random decoys drawn from the downloaded lists.\nGoogle never sees a host or URL."),
               ("Skips", f"{skipped} private or local hosts"),
               ("Never", "commands, paths, query strings, credentials, transcript text"),
               ("Key", "(not read: --dry-run)" if args.dry_run else
@@ -803,12 +832,18 @@ def cmd_confirm(args, ctx) -> int:
         return EXIT_OK
     now = ctx["now"]()
     entries: "dict[str, dict]" = {}
+    try:
+        pool = [b for b in af.load_reputation().lists.values() if b]
+    except (OSError, ValueError, RecursionError):
+        pool = []
+    window = float(af.REPUTATION_CONFIRM_TTL)
+    allreal = set(real)
     with NetSession("confirm", "gsb", scrub, receipt=args.receipt, out=out) as session:
         try:
             http = ctx["http_factory"](session)
             for chunk, nd in zip(chunks, decoy_counts):
                 mine = set(chunk)
-                sendable = chunk + make_decoys(mine, len(chunk) + nd)
+                sendable = chunk + make_decoys(mine, len(chunk) + nd, pool, allreal)
                 secrets.SystemRandom().shuffle(sendable)
                 status, body = http.get(
                     GSB_HOST, GSB_SEARCH_PATH, headers={"X-Goog-Api-Key": key},
@@ -823,7 +858,9 @@ def cmd_confirm(args, ctx) -> int:
                         raise ValueError
                 except (ValueError, AttributeError, RecursionError):
                     raise NetError("Safe Browsing sent a search response that is not JSON") from None
-                until = now + timedelta(seconds=parse_duration(doc.get("cacheDuration")))
+                cache_s = parse_duration(doc.get("cacheDuration"))
+                window = min(window, cache_s)
+                until = now + timedelta(seconds=cache_s)
                 by_prefix: "dict[bytes, list]" = {p: [] for p in chunk}
                 for fh in found:
                     try:
@@ -836,6 +873,8 @@ def cmd_confirm(args, ctx) -> int:
                     details = fh.get("fullHashDetails")
                     for det in details if isinstance(details, list) else []:
                         if not isinstance(det, dict) or not isinstance(det.get("threatType"), str):
+                            continue
+                        if det["threatType"] not in ENFORCEABLE:
                             continue
                         attrs = det.get("attributes")
                         attrs = {a for a in attrs if isinstance(a, str)} if isinstance(attrs, list) else set()
@@ -856,14 +895,17 @@ def cmd_confirm(args, ctx) -> int:
             raise
         finally:
             if entries:
-                _merge_confirmations(entries, now)
+                _merge_confirmations(entries, now, out)
     listed = sum(1 for e in entries.values() if any(fh["threat_types"] for fh in e["full_hashes"]))
-    out.write(f"{len(entries)} candidate(s) confirmed: {listed} listed; "
-              f"run actualis again within 30 minutes to see the result.\n")
+    if window > 0:
+        tail = f"run actualis again within {_window(window)} to see the result."
+    else:
+        tail = "Google gave no cache time; this result cannot be used to mark a host listed."
+    out.write(f"{len(entries)} candidate(s) confirmed: {listed} listed; {tail}\n")
     return EXIT_OK
 
 
-def _merge_confirmations(new: dict, now: datetime) -> None:
+def _merge_confirmations(new: dict, now: datetime, out) -> None:
     path = cache_root() / "gsb" / "confirmations.json"
     old = {}
     try:
@@ -875,8 +917,10 @@ def _merge_confirmations(new: dict, now: datetime) -> None:
                                      "threat_types": fh["threat_types"], "canary": fh["canary"]}
                                     for fh in e["full_hashes"]],
                     "confirmed_at": _iso(e["confirmed_at"]), "cache_until": _iso(e["cache_until"])}
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         old = {}
+        out.write("actualis-reputation: the earlier confirmations file could not be read; "
+                  "its entries were dropped\n")
     old.update(new)
     write_json(path, {"schema": 1, "entries": [old[k] for k in sorted(old)]})
 
