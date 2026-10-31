@@ -6249,8 +6249,36 @@ def network_json(fleet: "Fleet", raw: bool = False) -> dict:
         "trust_sources": [{"source": t["source"], "path": t.get("path"),
                            "sha256": t.get("sha256"), "entries": list(t["entries"])}
                           for t in fleet.network_trust_sources],
+        "reputation": reputation_json(fleet),
         "ioc": ioc_json(fleet, raw),
     }
+
+
+def reputation_json(fleet: "Fleet") -> dict:
+    """network.reputation. Always an object; enabled false without --reputation."""
+    data = fleet.reputation
+    out = {"enabled": data is not None, "lists_status": None, "provider_lists": {}, "lists_age_hours": None,
+           "stale": False, "vt_results": 0, "totals": dict(fleet.reputation_totals), "candidates": [],
+           "advisory": {"text": None, "url": None}, "network_last_used": {"at": None, "provider": None}}
+    if data is None:
+        return out
+    now = datetime.now(timezone.utc)
+    out["lists_status"] = data.status
+    out["provider_lists"] = {k: v["fetched_at"].isoformat(timespec="seconds")
+                             for k, v in sorted(data.state.items())}
+    if data.oldest:
+        out["lists_age_hours"] = max(0, int((now - data.oldest).total_seconds() // 3600))
+        out["stale"] = now - data.oldest > timedelta(days=REPUTATION_STALE_DAYS)
+    out["vt_results"] = len(data.vt)
+    out["candidates"] = sorted(({"prefix_b64": base64.b64encode(p).decode(), "expressions": n}
+                                for p, n in fleet.reputation_candidates.items()),
+                               key=lambda c: c["prefix_b64"])
+    if data.lists:
+        out["advisory"] = {"text": GSB_ADVISORY, "url": GSB_ADVISORY_URL}
+    if data.last_network:
+        out["network_last_used"] = {"at": data.last_network.get("at"),
+                                    "provider": data.last_network.get("provider")}
+    return out
 
 
 def network_reconciles(n: dict) -> list[str]:
@@ -7994,6 +8022,39 @@ def load_reputation(directory: "Path | None" = None) -> ReputationData:
     except (OSError, ValueError, RecursionError) as exc:
         data.confirmations_error = str(exc) or "nested too deeply"
     return data
+
+
+def render_reputation(fleet: "Fleet", c: "C") -> None:
+    """The reputation block of the NETWORK section. A match is not network
+    use, so no NET_MARK here."""
+    data = fleet.reputation
+    if data is None:
+        return
+    t = fleet.reputation_totals
+    if data.status != "ok" and not data.vt:
+        print(f"  {c.yellow}reputation: no usable Safe Browsing lists ({data.status}); "
+              f"run actualis-reputation update{c.off}")
+        return
+    if data.oldest:
+        age_h = int((datetime.now(timezone.utc) - data.oldest).total_seconds() // 3600)
+        age = f"{age_h} h old" if age_h < 48 else f"{age_h // 24} days old"
+        head = f"reputation: Google Safe Browsing lists from {_utc_hm(data.oldest)}, {age}"
+    else:
+        head = "reputation: VirusTotal results only"
+    sus = f" \u00b7 {t['suspicious']} suspicious" if t["suspicious"] else ""
+    print(f"  {head} \u00b7 {t['listed']} listed \u00b7 {t['candidate']} candidate{sus}"
+          f" \u00b7 {t['checked']} checked \u00b7 {t['skipped']} private skipped")
+    shown = 0
+    for f in fleet.flags:
+        if not set(f["categories"]) & set(REPUTATION_FLAG_CATEGORIES) or shown >= IOC_ROWS_SHOWN:
+            continue
+        high = f["severity"] == "high"
+        color, mark = (c.red, "\u25b2") if high else (c.yellow, "?")
+        print(f"    {color}{mark}{c.off} {clip(f['evidence'], NET_VIEW_WIDTH - 6)}")
+        shown += 1
+    if data.lists and (t["listed"] or t["candidate"]):
+        print(f"  {c.dim}{GSB_ADVISORY}: {GSB_ADVISORY_URL}. Lists can be wrong both ways; "
+              f"see docs/reputation.md{c.off}")
 
 
 def render_ioc(fleet: "Fleet", c: "C", raw: bool = False) -> None:
@@ -13904,6 +13965,7 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False,
     if not t["items"]:
         print(f"  {c.dim}no downloads seen{c.off}")
         render_ioc(fleet, c, raw)              # an empty inventory is still an answer to --ioc
+        render_reputation(fleet, c)
         return
     share = f" ({t['unasked'] * 100 // t['items']}%)" if t["unasked"] else ""
     print(f"  {num(t['items'])} download{'' if t['items'] == 1 else 's'} · {c.yellow}{num(t['unasked'])} unasked{share}{c.off}"
@@ -13924,6 +13986,7 @@ def render_network(fleet: Fleet, c: C, top: int, raw: bool = False,
                 parts.append(f"--network-trust {count}")
         print(f"  {c.dim}trust: {' · '.join(parts)}{c.off}")
     render_ioc(fleet, c, raw)
+    render_reputation(fleet, c)
     items = fleet.network_items
     if filters:
         joined = " \u00b7 ".join(filters)
@@ -14209,7 +14272,23 @@ def _html_table(tid: str, cols: list[str], rows: list[list]) -> str:
             f'<tbody>{"".join(body)}</tbody></table></div>')
 
 
-def render_network_html(n: dict, *, filters: list[str], version: str, with_prompts: bool) -> str:
+def _net_html_reputation(n: dict, flags: "list[dict] | None") -> str:
+    r = n.get("reputation") or {}
+    if not r.get("enabled"):
+        return ""
+    rows = "".join(f"<li>{_h(f['evidence'])}</li>" for f in (flags or [])
+                   if set(f["categories"]) & set(REPUTATION_FLAG_CATEGORIES))
+    adv = r["advisory"]
+    foot = (f'<p class="dim"><a href="{_h(adv["url"])}">{_h(adv["text"])}</a>. Lists can be wrong both ways.</p>'
+            if adv["text"] else "")
+    t = r["totals"]
+    return (f'<section id="reputation"><h2>Reputation</h2><p>{t["listed"]} listed &middot; '
+            f'{t["candidate"]} candidate &middot; {t["checked"]} checked &middot; '
+            f'{t["skipped"]} private skipped</p><ul>{rows}</ul>{foot}</section>')
+
+
+def render_network_html(n: dict, *, filters: list[str], version: str, with_prompts: bool,
+                        flags: "list[dict] | None" = None) -> str:
     """The --network --html page. Every number on it is read from `n`, the
     object --network --json prints, which is also embedded verbatim."""
     t = n["totals"]
@@ -14251,6 +14330,7 @@ def render_network_html(n: dict, *, filters: list[str], version: str, with_promp
         out.append(f'<p class="bad">Network totals do not reconcile: {_h("; ".join(problems)[:200])}. '
                    "Do not trust these numbers.</p>")
     out.append(_net_html_ioc(n["ioc"]))
+    out.append(_net_html_reputation(n, flags))
     if not t["items"]:
         out.append("<p>No downloads were recorded"
                    + (" for these filters" if filters else "") + ".</p>")
@@ -15744,6 +15824,33 @@ JSON_SCHEMA: dict[str, str] = {
     "network.trust_sources[].sha256": "str|null",
     "network.items[].ioc": "str|null",
     "network.items[].reputation": "object|null",
+    "network.items[].reputation.state": "str",
+    "network.items[].reputation.provider": "str|null",
+    "network.items[].reputation.threat_types": "array",
+    "network.items[].reputation.threat_types[]": "str",
+    "network.items[].reputation.checked_at": "str|null",
+    "network.items[].reputation.advisory": "str|null",
+    "network.reputation.enabled": "bool",
+    "network.reputation.lists_status": "str|null",
+    "network.reputation.provider_lists.*": "str",
+    "network.reputation.lists_age_hours": "int|null",
+    "network.reputation.stale": "bool",
+    "network.reputation.vt_results": "int",
+    "network.reputation.totals.checked": "int",
+    "network.reputation.totals.skipped": "int",
+    "network.reputation.totals.none": "int",
+    "network.reputation.totals.candidate": "int",
+    "network.reputation.totals.listed": "int",
+    "network.reputation.totals.not_listed": "int",
+    "network.reputation.totals.suspicious": "int",
+    "network.reputation.totals.unknown": "int",
+    "network.reputation.candidates": "array",
+    "network.reputation.candidates[].prefix_b64": "str",
+    "network.reputation.candidates[].expressions": "int",
+    "network.reputation.advisory.text": "str|null",
+    "network.reputation.advisory.url": "str|null",
+    "network.reputation.network_last_used.at": "str|null",
+    "network.reputation.network_last_used.provider": "str|null",
     "network.ioc.enabled": "bool",
     "network.ioc.sources": "array",
     "network.ioc.sources[].path": "str",
@@ -15805,6 +15912,8 @@ JSON_SCHEMA.update({f"network.ioc.matches[].item.{k}": JSON_SCHEMA[f"network.ite
                     for k in NETWORK_ITEM_KEYS})
 JSON_SCHEMA.update({f"network.ioc.matches[].item.transcript.{k}": JSON_SCHEMA[f"network.items[].transcript.{k}"]
                     for k in ("root", "file", "line")})
+JSON_SCHEMA.update({f"network.ioc.matches[].item.reputation.{k}": JSON_SCHEMA[f"network.items[].reputation.{k}"]
+                    for k in ("state", "provider", "threat_types", "threat_types[]", "checked_at", "advisory")})
 
 
 def canonical_json(payload: dict) -> str:
@@ -15874,7 +15983,7 @@ REPORT_DIGEST_CLOCK_FINDINGS = frozenset({"AF013"})
 
 EXIT_OK = 0
 EXIT_CANNOT_RUN = 1
-EXIT_USAGE = 2        # argparse's, reserved rather than used
+EXIT_USAGE = 2        # argparse's, and --reputation --fail-on with no usable lists
 EXIT_FINDINGS = 3
 EXIT_SELF_CHECK_FAILED = 4   # --self-check: a privacy claim did not hold
 
@@ -16537,6 +16646,16 @@ def self_check(c: C, days: int | None = 7, root: str | None = None,
            f"imports: {', '.join(imported) or 'none'}. "
            + ("Networking found: " + ", ".join(net_in_source) if net_in_source
               else "None of these can open a socket."))
+    try:
+        last = reputation_last_network()
+        log_path = reputation_dir() / "network-log.jsonl"
+    except OSError:
+        last, log_path = None, None
+    names = {"gsb": "Google Safe Browsing", "vt": "VirusTotal"}
+    result(True, f"{NET_MARK} network: actualis never uses it",
+           (f"actualis-reputation last used it for {names.get(last['provider'], last['provider'])} "
+            f"at {last['at']}, read from {log_path}." if last else
+            "actualis-reputation has never used it on this machine (no network-log.jsonl)."))
 
     # 2. Sample the transcripts, hash them, scan, hash again. The checks below
     #    need a corpus; the ones above and below them do not, and skipping the
@@ -17498,6 +17617,10 @@ def build_parser() -> argparse.ArgumentParser:
     net.add_argument("--ioc", metavar="FILE", action="append",
                      help="known-bad packages and hosts to match the network inventory against: the "
                           "actualis-ioc line format or OSV JSON/JSONL. Repeatable. Never read unless named.")
+    net.add_argument("--reputation", action="store_true",
+                     help="match the network inventory against the local host-reputation cache that "
+                          "actualis-reputation writes (Google Safe Browsing lists, VirusTotal results). "
+                          "Offline: actualis never uses the network")
     net.add_argument("--network-strict", action="store_true",
                      help="make every unasked download from an untrusted source a medium finding")
     net.add_argument("--host", metavar="HOST",
@@ -17618,8 +17741,10 @@ def main(argv: list[str] | None = None) -> int:
                          ("--coach", args.coach), ("--aisvs", args.aisvs)):
             if on:
                 ap.error(f"--network cannot be combined with {flag}.")
-    if args.ioc:
-        # These return before the IOC list is loaded.
+    for name, given in (("--ioc", bool(args.ioc)), ("--reputation", args.reputation)):
+        if not given:
+            continue
+        # These return before the list is loaded.
         for flag, on in (("--replay", args.replay), ("--agents", args.agents),
                          ("--why", args.why), ("--explain", args.explain is not None),
                          ("--suppress", args.suppress),
@@ -17627,13 +17752,14 @@ def main(argv: list[str] | None = None) -> int:
                          ("--self-check", args.self_check), ("--service", args.service),
                          ("--completions", args.completions)):
             if on:
-                ap.error(f"--ioc cannot be combined with {flag}: {flag} never reads it.")
-        # These views never show the IOC block; only the gate reads the matches.
+                ap.error(f"{name} cannot be combined with {flag}: {flag} never reads it.")
+        # These views never show the matches; only the gate reads them.
         for flag, on in (("--coach", args.coach), ("--aisvs", args.aisvs),
                          ("--share", args.share)):
             if on and not args.fail_on:
-                ap.error(f"--ioc cannot be combined with {flag} without --fail-on: "
-                         f"{flag} never shows IOC matches. Use --network --ioc, or "
+                shown = "IOC matches" if name == "--ioc" else "reputation results"
+                ap.error(f"{name} cannot be combined with {flag} without --fail-on: "
+                         f"{flag} never shows {shown}. Use --network {name}, or "
                          f"add --fail-on to gate on them.")
     for flag, on in (("--host", args.host), ("--package", args.package),
                      ("--session", args.session), ("--unasked", args.unasked)):
@@ -17678,6 +17804,10 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--ioc does not apply to --card; the card never shows downloads.")
     if args.ioc and (args.watch or args.mcp):
         ap.error("--ioc is not supported with --watch or --mcp yet.")
+    if args.reputation and args.card:
+        ap.error("--reputation does not apply to --card; the card never shows downloads.")
+    if args.reputation and (args.watch or args.mcp):
+        ap.error("--reputation is not supported with --watch or --mcp yet.")
     if args.card:
         for flag, on in (("--fail-on", args.fail_on), ("--diff", args.diff),
                          ("--why", args.why), ("--share", args.share),
@@ -17936,8 +18066,21 @@ def main(argv: list[str] | None = None) -> int:
     try:
         network_trust, trust_sources = load_network_trust_sources(args.network_trust)
         ioc = load_ioc(args.ioc) if args.ioc else None
+        reputation = load_reputation() if args.reputation else None
     except (ValueError, OSError) as exc:
         ap.error(str(exc))
+    if reputation is not None and reputation.status != "ok":
+        where = reputation.directory
+        if reputation.status == "absent":
+            msg = (f"actualis: --reputation: no Google Safe Browsing lists in {where}. Run "
+                   f"`actualis-reputation update` first (it uses the network; actualis never does).")
+        else:
+            msg = (f"actualis: --reputation: the lists in {where} failed their check "
+                   f"({clean(reputation.error or '')}). "
+                   f"Run `actualis-reputation update` to download them again.")
+        print(msg, file=sys.stderr)
+        if args.fail_on:
+            return EXIT_USAGE
 
     # --network shows only the inventory; --fail-on reads findings (--why
     # with --network is refused above).
@@ -18030,6 +18173,7 @@ def main(argv: list[str] | None = None) -> int:
         network_filter(fleet, args.host, args.package, args.session, args.unasked)
     apply_network_policy(fleet, network_trust, args.network_strict, trust_sources)
     apply_ioc(fleet, ioc)
+    apply_reputation(fleet, reputation)
 
     if baseline is not None:
         render_diff(_display_safe(diff_reports(baseline, to_json(fleet, raw=args.no_redact))),
@@ -18067,7 +18211,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.html:
         page = render_network_html(network_json(fleet, raw=args.no_redact),
                                    filters=network_filter_names(args), version=__version__,
-                                   with_prompts=args.with_prompts)
+                                   with_prompts=args.with_prompts, flags=fleet.flags)
         try:
             path = write_network_html(page, html_dir)
         except OSError as exc:

@@ -1324,6 +1324,21 @@ class TestJSONSchemaFreeze(unittest.TestCase):
             b"npm:evil@=1.0.0||=1.0.1 id=MAL-2025-1 label=wave1 from=2025-09-14 until=2025-09-17\n"
             b"npm:pending@=2.0.0\nhost:github.com/evil-org label=exfil\nrubygems:x\n"), ioc, 0, "iocs.txt")
         af.apply_ioc(f, ioc)
+        # --reputation, from an in-memory cache: a listed host (a.io), a
+        # candidate (x.io) and a recorded network use, so every str|null
+        # path under network.reputation is a string at least once.
+        rep = af.ReputationData()
+        rep.status = "ok"
+        a, x = af.sb_hash("a.io/"), af.sb_hash("x.io/")
+        rep.lists = {name: b"" for name in af.REPUTATION_LISTS}
+        rep.lists["mw-4b"] = b"".join(sorted([a[:4], x[:4]]))
+        rep.state = {name: {"fetched_at": ts, "next_update_at": ts, "prefix_count": 0, "version": None}
+                     for name in af.REPUTATION_LISTS}
+        rep.oldest = ts
+        rep.confirmations = {a[:4]: {"full_hashes": [{"hash": a, "threat_types": ["MALWARE"], "canary": False}],
+                                     "confirmed_at": ts, "cache_until": ts + timedelta(days=36500)}}
+        rep.last_network = {"at": ts.isoformat(), "provider": "gsb"}
+        af.apply_reputation(f, rep, ts + timedelta(minutes=1))
         return f
 
     def test_every_emitted_path_is_declared(self):

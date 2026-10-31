@@ -315,6 +315,21 @@ The findings are `bash.flags[]` entries with the categories `network-ioc`
 
 Verify: `actualis --ioc f --json | jq '.network.ioc.totals'`
 
+## network.reputation
+
+Always an object; `enabled` is `false` without `--reputation`. Each
+`items[].reputation` is `null` without the flag, else an object with `state`
+(`none`, `skipped`, `candidate`, `listed`, `not-listed`, `suspicious` or
+`unknown`), `provider`, `threat_types[]`, `checked_at` and `advisory` (the
+Google advisory text for a Google result, else `null`).
+
+Fields: `enabled`, `lists_status` (`ok`, `absent` or `corrupt`),
+`provider_lists` (list name to fetch time), `lists_age_hours`, `stale`,
+`vt_results`, `totals` (`checked`, `skipped`, `none`, `candidate`, `listed`,
+`not_listed`, `suspicious`, `unknown`), `candidates[]` (`prefix_b64`, the
+4-byte hash prefix a confirmation would send, and `expressions`), `advisory`
+(`text`, `url`) and `network_last_used` (`at`, `provider`).
+
 ## Compatibility
 
 `schema_version` is currently **1**. It describes the shape of this output and
