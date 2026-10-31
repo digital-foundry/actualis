@@ -135,11 +135,13 @@ class FakeProvider:
                 owner.requests.append({"path": u.path, "query": parse_qs(u.query),
                                        "headers": {k.lower(): v for k, v in self.headers.items()}})
                 answers = owner.routes.get(u.path) or [(404, {"error": "no route"})]
-                status, body = answers.pop(0) if len(answers) > 1 else answers[0]
+                status, body, *extra = answers.pop(0) if len(answers) > 1 else answers[0]
                 raw = body if isinstance(body, bytes) else json.dumps(body).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(raw)))
+                for k, v in (extra[0] if extra else {}).items():
+                    self.send_header(k, v)
                 self.end_headers()
                 self.wfile.write(raw)
 

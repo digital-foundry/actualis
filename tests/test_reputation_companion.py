@@ -293,6 +293,10 @@ class TestFixRound1(CompanionCase):
         self.assertTrue((self.rep / "in-flight.json").exists())
 
 
+def R_b64(text: str) -> bytes:
+    return __import__("base64").b64decode(text)
+
+
 def rice_lists(entries: dict) -> dict:
     """A hashLists:batchGet body with full (non-partial) lists, each list's
     prefixes Rice-encoded the way Google does, checksum included."""
@@ -312,6 +316,12 @@ class TestRice(unittest.TestCase):
         ps = sorted({R.prefix(f"h{i}.example/") for i in range(500)})
         hl = R.hash_list("mw-4b", ps)
         self.assertEqual(ar.apply_list_update(b"", hl), b"".join(ps))
+
+    def test_long_unary_run_decodes_but_overflow_raises(self):
+        first, k, n, data = R.rice_encode([5, 1005], 3)
+        self.assertEqual(ar.rice_decode(first, k, n, R_b64(data)), [5, 1005])
+        with self.assertRaises(ValueError):
+            ar.rice_decode(0xFFFFFF00, 3, 1, b"\xff" * 200)
 
     def test_rejects_truncated_and_out_of_range(self):
         with self.assertRaises(ValueError):
@@ -409,10 +419,93 @@ class TestUpdate(CompanionCase):
         self.assertIn("nothing sent", err)
 
     def test_redirect_is_not_followed(self):
-        s = self.serve((302, b""))
+        s = R.FakeProvider({"/v5/hashLists:batchGet": [(302, b"", {"Location": "/v5/other"})],
+                            "/v5/other": [(200, rice_lists({}))]})
+        self.addCleanup(s.close)
         code, _, err = self.cli("update", "--yes", http_factory=s.factory)
         self.assertEqual(code, 1)
-        self.assertEqual(len(s.requests), 1)
+        self.assertEqual([r["path"] for r in s.requests], ["/v5/hashLists:batchGet"])
+
+    def test_redirect_handler_refuses(self):
+        self.assertIsNone(ar._NoRedirect().redirect_request(None, None, 302, "", {}, "http://x/"))
+
+    def test_huge_wait_is_clamped(self):
+        body = rice_lists({})
+        for hl in body["hashLists"]:
+            hl["minimumWaitDuration"] = "1e300s"
+        s = self.serve(body)
+        code, _, err = self.cli("update", "--yes", http_factory=s.factory)
+        self.assertEqual(code, 0, err)
+        d = af.load_reputation(self.rep)
+        self.assertEqual(d.status, "ok", d.error)
+        limit = datetime.now(timezone.utc) + timedelta(hours=24, minutes=1)
+        for st in d.state.values():
+            self.assertLessEqual(st["next_update_at"], limit)
+        self.assertEqual(ar.parse_duration("1e12s"), 86400.0)
+
+    def test_bad_version_is_not_stored(self):
+        body = rice_lists({})
+        body["hashLists"][0]["version"] = {"x": 1}
+        s = self.serve(body)
+        code, _, err = self.cli("update", "--yes", http_factory=s.factory)
+        self.assertEqual(code, 0, err)
+        st = json.loads((self.rep / "gsb" / "state.json").read_text())
+        self.assertIsNone([e for e in st["lists"] if e["name"] == "mw-4b"][0]["version"])
+        self.assertIsNotNone([e for e in st["lists"] if e["name"] == "se-4b"][0]["version"])
+
+    def test_bad_status_line_is_a_runtime_error(self):
+        import socket
+        import threading
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        self.addCleanup(srv.close)
+
+        def serve():
+            c, _ = srv.accept()
+            c.recv(4096)
+            c.sendall(b"garbage\r\n\r\n")
+            c.close()
+        threading.Thread(target=serve, daemon=True).start()
+        session = ar.NetSession("update", "gsb", ar.Scrubber(), receipt=None, out=io.StringIO())
+        http = ar.Http(session, endpoints={ar.GSB_HOST: f"127.0.0.1:{srv.getsockname()[1]}"},
+                       scheme="http", proxies={})
+        with self.assertRaises(ar.NetError):
+            http.get(ar.GSB_HOST, "/x", sent={}, describe="x")
+
+    def test_scheme_is_restricted(self):
+        session = ar.NetSession("update", "gsb", ar.Scrubber(), receipt=None, out=io.StringIO())
+        with self.assertRaises(ValueError):
+            ar.Http(session, scheme="ftp")
+
+    def _snapshot(self):
+        return {str(p.relative_to(self.rep)): p.read_bytes() for p in sorted(self.rep.rglob("*"))
+                if p.is_file() and p.name not in ("network-log.jsonl", "in-flight.json")}
+
+    def test_failed_partial_update_leaves_cache_untouched(self):
+        old = sorted({R.prefix(f"o{i}.example/") for i in range(3)})
+        R.write_cache(self.rep, {"mw-4b": old}, fetched_at=datetime.now(timezone.utc) - timedelta(hours=2))
+        before = self._snapshot()
+        bad_removal = R.hash_list("mw-4b", [], removals=[9], partial=True, checksum_of=[])
+        wrong = R.hash_list("mw-4b", [R.prefix("n.example/")])
+        wrong["sha256Checksum"] = R.b64(b"\x00" * 32)
+        s = self.serve({"hashLists": [bad_removal] + [R.hash_list(n, [], partial=True, checksum_of=[])
+                                                      for n in R.LISTS[1:]]},
+                       {"hashLists": [wrong]})
+        code, _, err = self.cli("update", "--yes", http_factory=s.factory)
+        self.assertEqual(code, 1, err)
+        self.assertEqual(self._snapshot(), before)
+        self.assertEqual(af.load_reputation(self.rep).status, "ok")
+
+    def test_failed_request_is_receipted_and_logged(self):
+        s = self.serve((500, b"boom"))
+        receipt = self.tmp / "r.json"
+        code, _, _ = self.cli("update", "--yes", "--receipt", str(receipt), http_factory=s.factory)
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(receipt.read_text())["requests"][0]["status"], 500)
+        lines = (self.rep / "network-log.jsonl").read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0])["requests"], 1)
 
     def test_oversized_response_is_refused(self):
         s = self.serve((200, b"x" * 2048))

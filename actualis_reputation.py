@@ -46,6 +46,7 @@ PROVIDERS = {"gsb": ("Google Safe Browsing", GSB_HOST, "ACTUALIS_GSB_KEY"),
 MARK = af.NET_MARK
 LIST_RESPONSE_MAX = 64 << 20
 SMALL_RESPONSE_MAX = 1 << 20
+MAX_WAIT = 86400.0                                # a server-set refresh wait is clamped to 24 h
 REPORT_MAX = 256 << 20
 TIMEOUT = 30
 EXIT_OK, EXIT_RUNTIME, EXIT_USAGE = 0, 1, 2
@@ -430,6 +431,11 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+# http.client's base error, reached through urllib.request (which imports it), so
+# this module's import list stays unchanged. Covers BadStatusLine and friends.
+_HTTPException = urllib.request.http.client.HTTPException
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """A 3xx is returned as an error, never followed: a redirect could lead
     anywhere, and only the two provider hosts may be contacted."""
@@ -453,6 +459,8 @@ class Http:
     def __init__(self, session: NetSession, *, endpoints: "dict | None" = None,
                  context: "ssl.SSLContext | None" = None, scheme: str = "https",
                  proxies: "dict | None" = None) -> None:
+        if scheme not in ("https", "http"):
+            raise ValueError("scheme must be https or http")
         self.session = session
         self.endpoints = dict(endpoints or {GSB_HOST: GSB_HOST, VT_HOST: VT_HOST})
         self.context = context or ssl.create_default_context()
@@ -475,7 +483,7 @@ class Http:
         self.session.live(f"{describe} -> {host}")
         try:
             try:
-                # nosec B310: https to the two pinned provider hosts only (checked above), no redirects
+                # https to the two pinned provider hosts only (checked above), no redirects
                 with self.opener.open(req, timeout=TIMEOUT) as resp:  # nosec B310
                     status = resp.status
                     body = _read_capped(resp, limit)
@@ -485,7 +493,7 @@ class Http:
                     body = _read_capped(exc, SMALL_RESPONSE_MAX) if exc.fp else b""
                 finally:
                     exc.close()
-            except (urllib.error.URLError, OSError, ValueError) as exc:
+            except (urllib.error.URLError, OSError, ValueError, _HTTPException) as exc:
                 reason = getattr(exc, "reason", exc)
                 raise NetError(self.session.scrub(f"cannot reach {host}: {reason}")) from None
         finally:
@@ -515,7 +523,7 @@ def parse_duration(text: object) -> float:
         v = float(text[:-1])
     except ValueError:
         return 0.0
-    return v if math.isfinite(v) and v > 0 else 0.0
+    return min(v, MAX_WAIT) if math.isfinite(v) and v > 0 else 0.0
 
 
 def rice_decode(first_value: int, k: int, count: int, data: bytes) -> "list[int]":
@@ -539,8 +547,8 @@ def rice_decode(first_value: int, k: int, count: int, data: bytes) -> "list[int]
             if not bit:
                 break
             q += 1
-            if q > 32:
-                raise ValueError("quotient too long")
+            if v + (q << k) > 0xFFFFFFFF:          # bounds the loop: a longer run must overflow
+                raise ValueError("value overflows 32 bits")
         if pos + k > nbits:
             raise ValueError("encoded data ends early")
         r = 0
@@ -685,6 +693,18 @@ def cmd_update(args, ctx) -> int:
     return EXIT_OK
 
 
+def _clean_version(version: object) -> "str | None":
+    """The list version to store: a short base64 string, else None (which
+    forces a full fetch next time)."""
+    if not isinstance(version, str) or len(version) > 4096:
+        return None
+    try:
+        _b64(version)
+    except ValueError:
+        return None
+    return version
+
+
 def _commit_lists(data, state: dict, new: dict, now: datetime) -> None:
     """Write each changed list under a checksum name, then state.json last
     (the commit point), then remove list files nothing names."""
@@ -697,7 +717,7 @@ def _commit_lists(data, state: dict, new: dict, now: datetime) -> None:
             fname = f"{name}.{sha[:16]}.prefixes"
             write_atomic(gsb / fname, blob)
             wait = parse_duration(hl.get("minimumWaitDuration"))
-            entries.append({"name": name, "version": hl.get("version"), "sha256": sha, "file": fname,
+            entries.append({"name": name, "version": _clean_version(hl.get("version")), "sha256": sha, "file": fname,
                             "fetched_at": _iso(now), "next_update_at": _iso(now + timedelta(seconds=wait)),
                             "prefix_count": len(blob) // 4})
         else:
