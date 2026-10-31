@@ -6092,7 +6092,7 @@ def network_filter(fleet: "Fleet", host: str | None = None, package: str | None 
 
 NETWORK_ITEM_KEYS = ("kind", "program", "host", "host_inferred", "url", "dest", "source",
                      "ecosystem", "package", "version", "pinned", "exec", "dynamic", "alias",
-                     "failed", "approval", "trusted", "agent", "project", "session", "call_id", "ts", "ioc",
+                     "failed", "approval", "trusted", "agent", "project", "session", "call_id", "ts", "ioc", "reputation",
                      "mode", "why", "prompt", "transcript", "rewound")
 
 # why and prompt: what the assistant said before a call, and what the person
@@ -7760,6 +7760,183 @@ def reputation_last_network(directory: "Path | None" = None) -> "dict | None":
     return None
 
 
+REPUTATION_FLAG_CATEGORIES = ("reputation-listed", "reputation-candidate", "reputation-suspicious",
+                              "reputation-stale")
+_REPUTATION_RANK = {"listed": 5, "candidate": 4, "suspicious": 3, "not-listed": 2, "unknown": 1, "none": 0}
+
+
+def _reputation_zero_totals() -> dict:
+    return {k: 0 for k in ("checked", "skipped", "none", "candidate", "listed", "not_listed",
+                           "suspicious", "unknown")}
+
+
+def _prefix_in(blob: bytes, p: bytes) -> bool:
+    """Binary search over a sorted run of 4-byte records."""
+    lo, hi = 0, len(blob) // 4
+    while lo < hi:
+        mid = (lo + hi) // 2
+        v = blob[mid * 4:mid * 4 + 4]
+        if v < p:
+            lo = mid + 1
+        elif v > p:
+            hi = mid
+        else:
+            return True
+    return False
+
+
+def _confirmation_fresh(c: dict, now: datetime) -> bool:
+    at = c["confirmed_at"]
+    if at > now + timedelta(minutes=1):      # dated in the future: a bad clock or a tampered file
+        return False
+    return now < min(at + timedelta(seconds=REPUTATION_CONFIRM_TTL), c["cache_until"])
+
+
+def gsb_verdict(host: str, path: str, data: "ReputationData", now: datetime) -> dict:
+    out = {"state": "none", "threat_types": [], "checked_at": None, "candidates": {}}
+    hashes = [sb_hash(e) for e in sb_expressions(host, path)]
+    hits: dict[bytes, int] = {}
+    for h in hashes:
+        if any(_prefix_in(blob, h[:4]) for blob in data.lists.values()):
+            hits[h[:4]] = hits.get(h[:4], 0) + 1
+    if not hits:
+        return out
+    full = set(hashes)
+    types: set[str] = set()
+    all_fresh = True
+    for p, n in hits.items():
+        c = data.confirmations.get(p)
+        if c is None or not _confirmation_fresh(c, now):
+            all_fresh = False
+            out["candidates"][p] = n
+            continue
+        out["checked_at"] = max(filter(None, (out["checked_at"], c["confirmed_at"])))
+        for fh in c["full_hashes"]:
+            if fh["hash"] in full and not fh.get("canary"):
+                types.update(fh["threat_types"])
+    if types:
+        out["state"], out["threat_types"] = "listed", sorted(types)
+    elif all_fresh:
+        out["state"] = "not-listed"
+    else:
+        out["state"] = "candidate"
+    return out
+
+
+def vt_verdict(host: str, data: "ReputationData", now: datetime) -> "dict | None":
+    r = data.vt.get(host)
+    if r is None or now - r["checked_at"] > timedelta(days=REPUTATION_STALE_DAYS):
+        return None
+    m, s = r["stats"].get("malicious", 0), r["stats"].get("suspicious", 0)
+    if r["status"] == "unknown":
+        state = "unknown"
+    elif m >= data.vt_threshold:
+        state = "listed"
+    elif m or s:
+        state = "suspicious"
+    else:
+        state = "not-listed"
+    return {"state": state, "malicious": m, "suspicious": s, "threshold": data.vt_threshold,
+            "checked_at": r["checked_at"]}
+
+
+def _utc_hm(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def apply_reputation(fleet: "Fleet", data: "ReputationData | None", now: "datetime | None" = None) -> None:
+    """Check every non-refused item with a host against the local cache. One
+    flag per (category, provider:host); a stale list is one flag. Run once,
+    after apply_ioc. Never opens a socket."""
+    fleet.reputation = data
+    fleet.reputation_totals = totals = _reputation_zero_totals()
+    fleet.reputation_candidates = {}
+    for item in fleet.network:
+        item["reputation"] = None
+    if data is None:
+        return
+    now = now or datetime.now(timezone.utc)
+    memo: dict[tuple, tuple] = {}
+    groups: dict[tuple[str, str], dict] = {}
+    for item in fleet.network:
+        host = item.get("host")
+        if item.get("_refused") or not host:
+            continue
+        if reputation_skip(host):
+            item["reputation"] = {"state": "skipped", "provider": None, "threat_types": [],
+                                  "checked_at": None, "advisory": None}
+            totals["skipped"] += 1
+            continue
+        path = url_path(item["url"]) if item.get("url") else ""
+        key = (host, path)
+        if key not in memo:
+            g = gsb_verdict(host, path, data, now) if data.lists else None
+            memo[key] = (g, vt_verdict(host, data, now))
+        g, v = memo[key]
+        totals["checked"] += 1
+        if g:
+            for p, n in g["candidates"].items():
+                fleet.reputation_candidates[p] = max(fleet.reputation_candidates.get(p, 0), n)
+        best = None                              # (rank, provider, verdict)
+        if g:
+            best = (_REPUTATION_RANK[g["state"]], "google-safe-browsing", g)
+        if v and (best is None or _REPUTATION_RANK[v["state"]] > best[0]):
+            best = (_REPUTATION_RANK[v["state"]], "virustotal", v)
+        state = best[2]["state"] if best else "none"
+        provider = best[1] if best and state != "none" else None
+        google = provider == "google-safe-browsing"
+        checked = best[2]["checked_at"] if best else None
+        item["reputation"] = {"state": state, "provider": provider,
+                              "threat_types": list(best[2].get("threat_types", [])) if best else [],
+                              "checked_at": checked.isoformat(timespec="seconds") if checked else None,
+                              "advisory": GSB_ADVISORY if google and state in ("listed", "candidate") else None}
+        totals[state.replace("-", "_")] += 1
+        if state in ("listed", "candidate", "suspicious"):
+            category = {"listed": "reputation-listed", "candidate": "reputation-candidate",
+                        "suspicious": "reputation-suspicious"}[state]
+            gk = (category, f"{'gsb' if google else 'vt'}:{host}")
+            grp = groups.setdefault(gk, {"items": [], "verdict": best[2], "google": google, "host": host})
+            grp["items"].append(item)
+    for (category, key), grp in sorted(groups.items()):
+        items, v, host = grp["items"], grp["verdict"], grp["host"]
+        latest = max(items, key=lambda i: (_net_utc_key(i["ts"]), i["project"]))
+        n = f"{len(items)} download(s) via {latest['program']}"
+        if category == "reputation-listed" and grp["google"]:
+            what = " or ".join(REPUTATION_THREAT_TEXT.get(t, t.lower()) for t in v["threat_types"])
+            evidence = (f"{host} is currently listed by Google Safe Browsing as suspected {what} "
+                        f"(checked {_utc_hm(v['checked_at'])}); {n}. {GSB_ADVISORY}")
+        elif category == "reputation-listed":
+            evidence = (f"{host} flagged malicious by {v['malicious']} VirusTotal engines "
+                        f"(checked {_utc_hm(v['checked_at'])}); {n}")
+        elif category == "reputation-candidate":
+            evidence = (f"possible match for {host} in Google Safe Browsing lists, not confirmed; "
+                        f"run `actualis-reputation confirm`; {n}. {GSB_ADVISORY}")
+        else:
+            evidence = (f"{host}: {v['malicious']} malicious and {v['suspicious']} suspicious VirusTotal "
+                        f"engines, below the threshold of {v['threshold']} (checked {_utc_hm(v['checked_at'])}); {n}")
+        _reputation_flag(fleet, "high" if category == "reputation-listed" else "med", category, key,
+                         latest, evidence)
+    if data.oldest and now - data.oldest > timedelta(days=REPUTATION_STALE_DAYS):
+        days = (now - data.oldest).days
+        _reputation_flag(fleet, "med", "reputation-stale", "gsb-lists", None,
+                         f"Google Safe Browsing lists are {days} days old and can miss new threats; "
+                         f"run `actualis-reputation update`")
+
+
+def _reputation_flag(fleet: "Fleet", severity: str, category: str, key: str, latest: "dict | None",
+                     evidence: str) -> None:
+    fid = flag_id(severity, [category], key)
+    suppressed = fid in fleet.suppressions
+    if suppressed:
+        fleet.suppressed_flags += 1
+    fleet.flags.append({
+        "id": fid, "severity": severity, "categories": [category], "program": key,
+        "project": latest["project"] if latest else "", "when": latest["ts"] if latest else None,
+        "evidence": redact(clean(evidence))[:240], "had_secret": False, "suppressed": suppressed,
+        "suppressed_reason": fleet.suppressions.get(fid, ""),
+    })
+
+
 def load_reputation(directory: "Path | None" = None) -> ReputationData:
     """Read the cache, read-only. A bad list makes the whole set corrupt; bad
     confirmations or VirusTotal files are ignored with a note (ignoring them
@@ -8804,6 +8981,9 @@ class Fleet:
         self.ioc: IocSet | None = None
         self.ioc_rows: list[dict] = []
         self.ioc_totals: dict = _ioc_zero_totals()
+        self.reputation: "ReputationData | None" = None
+        self.reputation_totals: dict = _reputation_zero_totals()
+        self.reputation_candidates: dict[bytes, int] = {}
         self._net_by_call: dict[str, list[int]] = {}
         self._git_remotes: dict[tuple[str, str], dict[str, str]] = {}   # per (agent, session)
         # Location-based secret id -> sha256 of every value seen under it, for
@@ -15558,6 +15738,7 @@ JSON_SCHEMA: dict[str, str] = {
     "network.trust_sources[].path": "str|null",
     "network.trust_sources[].sha256": "str|null",
     "network.items[].ioc": "str|null",
+    "network.items[].reputation": "object|null",
     "network.ioc.enabled": "bool",
     "network.ioc.sources": "array",
     "network.ioc.sources[].path": "str",
@@ -15729,6 +15910,13 @@ def failing_findings(fleet: Fleet, level: str) -> list[str]:
         out.append(f"{len(ioc_hit)} known-bad download group(s) (IOC)")
     if want_any and ioc_unresolved:
         out.append(f"{len(ioc_unresolved)} unresolved IOC match group(s)")
+    rep = set(REPUTATION_FLAG_CATEGORIES)
+    rep_listed = [f for f in fleet.actionable_flags if "reputation-listed" in f["categories"]]
+    rep_med = [f for f in fleet.actionable_flags if rep & set(f["categories"]) - {"reputation-listed"}]
+    if want_high and rep_listed:
+        out.append(f"{len(rep_listed)} host(s) currently on a reputation list")
+    if want_any and rep_med:
+        out.append(f"{len(rep_med)} unconfirmed or suspicious reputation result(s), or stale lists")
 
     for finding in coach(fleet):
         # A finding that depends on today's date, not on the transcripts, must
@@ -15740,13 +15928,14 @@ def failing_findings(fleet: Fleet, level: str) -> list[str]:
             out.append(f"{finding.id} {finding.title}")
 
     if want_high:
-        fl = [f for f in fleet.actionable_flags if f["severity"] == "high" and "network-ioc" not in f["categories"]]
+        fl = [f for f in fleet.actionable_flags if f["severity"] == "high" and "network-ioc" not in f["categories"]
+              and not rep & set(f["categories"])]
         if fl:
             out.append(f"{len(fl)} high-severity shell command(s) flagged")
     if want_any:
         fl = [f for f in fleet.actionable_flags if f["severity"] == "med"]
         net = [f for f in fl if "network-unasked" in f["categories"]]
-        fl = [f for f in fl if not {"network-unasked", "network-ioc-unresolved"} & set(f["categories"])]
+        fl = [f for f in fl if not ({"network-unasked", "network-ioc-unresolved"} | rep) & set(f["categories"])]
         if fl:
             out.append(f"{len(fl)} medium-severity shell command(s) flagged")
         if net:

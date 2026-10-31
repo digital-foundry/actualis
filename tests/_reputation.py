@@ -60,7 +60,7 @@ def write_cache(root: Path, lists: dict | None = None, *, fetched_at: datetime |
 
 
 def confirmation(prefix_expr: str, *, listed=(), threat: str = "MALWARE", at: datetime | None = None,
-                 cache_s: int = 300, canary: bool = False) -> dict:
+                 cache_s: int = 1800, canary: bool = False) -> dict:
     """A confirmations.json entry for the prefix of `prefix_expr`. `listed`:
     expressions whose full hashes the provider returned for it."""
     at = at or datetime.now(timezone.utc)
