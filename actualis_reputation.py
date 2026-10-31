@@ -430,22 +430,291 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-class Http:                                      # replaced in Task 6
-    def __init__(self, session, **kw):
-        raise NetError("no network client yet")
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A 3xx is returned as an error, never followed: a redirect could lead
+    anywhere, and only the two provider hosts may be contacted."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
 
 
-def cmd_update(args, ctx) -> int:                # completed in Task 6
-    need_consent_possible(args, ctx)
-    disclose([("Provider", "Google Safe Browsing v5, list download"),
-              ("Sends", "nothing about your hosts: downloads list updates")], ctx["stderr"])
-    if not args.dry_run:
-        read_key("gsb", args.key_command, ctx["scrub"])
-    if not consent("Download Safe Browsing list updates from Google?", yes=args.yes, dry_run=args.dry_run,
-                   stdin=ctx["stdin"], out=ctx["stderr"]):
-        ctx["stderr"].write(f"{MARK} network used: nothing sent\n")
+def _read_capped(resp, limit: int) -> bytes:
+    data = resp.read(limit + 1)
+    if len(data) > limit:
+        raise NetError(f"the response is over {max(limit >> 20, 1)} MiB; refusing it")
+    return data
+
+
+class Http:
+    """HTTPS GETs to the two provider hosts and nothing else, with certificate
+    verification, no redirects, a timeout and a size cap. Each request is
+    shown while in flight and recorded for the receipt."""
+
+    def __init__(self, session: NetSession, *, endpoints: "dict | None" = None,
+                 context: "ssl.SSLContext | None" = None, scheme: str = "https",
+                 proxies: "dict | None" = None) -> None:
+        self.session = session
+        self.endpoints = dict(endpoints or {GSB_HOST: GSB_HOST, VT_HOST: VT_HOST})
+        self.context = context or ssl.create_default_context()
+        self.scheme = scheme
+        handlers = [_NoRedirect(), urllib.request.HTTPSHandler(context=self.context)]
+        if proxies is not None:                  # None: honour HTTPS_PROXY and the system settings
+            handlers.append(urllib.request.ProxyHandler(proxies))
+        self.opener = urllib.request.build_opener(*handlers)
+
+    def get(self, host: str, path: str, *, query=(), headers: "dict | None" = None,
+            limit: int = SMALL_RESPONSE_MAX, sent: dict, describe: str) -> "tuple[int, bytes]":
+        if host not in self.endpoints:
+            raise NetError(f"refusing to contact {host}: only {', '.join(sorted(self.endpoints))}")
+        url = f"{self.scheme}://{self.endpoints[host]}{path}"
+        if query:
+            url += "?" + urllib.parse.urlencode(list(query))
+        req = urllib.request.Request(url, method="GET", headers={
+            "User-Agent": f"actualis-reputation/{__version__}", "Accept": "application/json", **(headers or {})})
+        status, body = 0, b""
+        self.session.live(f"{describe} -> {host}")
+        try:
+            try:
+                # nosec B310: https to the two pinned provider hosts only (checked above), no redirects
+                with self.opener.open(req, timeout=TIMEOUT) as resp:  # nosec B310
+                    status = resp.status
+                    body = _read_capped(resp, limit)
+            except urllib.error.HTTPError as exc:
+                status = exc.code
+                try:
+                    body = _read_capped(exc, SMALL_RESPONSE_MAX) if exc.fp else b""
+                finally:
+                    exc.close()
+            except (urllib.error.URLError, OSError, ValueError) as exc:
+                reason = getattr(exc, "reason", exc)
+                raise NetError(self.session.scrub(f"cannot reach {host}: {reason}")) from None
+        finally:
+            self.session.live_done()
+            self.session.record({"method": "GET", "host": host, "path": path, "sent": sent,
+                                 "status": status, "bytes": len(body), "at": _iso(_now())})
+        return status, body
+
+
+GSB_BATCH_PATH = "/v5/hashLists:batchGet"
+
+
+def _b64(text: object) -> bytes:
+    if not isinstance(text, str):
+        raise ValueError("expected base64 text")
+    pad = "=" * (-len(text) % 4)
+    if "-" in text or "_" in text:
+        return base64.urlsafe_b64decode(text + pad)
+    return base64.b64decode(text + pad, validate=True)
+
+
+def parse_duration(text: object) -> float:
+    """A protobuf Duration ("3.5s") in seconds; 0.0 for anything else."""
+    if not isinstance(text, str) or not text.endswith("s") or len(text) > 32:
+        return 0.0
+    try:
+        v = float(text[:-1])
+    except ValueError:
+        return 0.0
+    return v if math.isfinite(v) and v > 0 else 0.0
+
+
+def rice_decode(first_value: int, k: int, count: int, data: bytes) -> "list[int]":
+    """Golomb-Rice deltas as Google encodes them: per entry a unary quotient
+    (1s ended by a 0) then k remainder bits, least significant bit first,
+    bytes little-endian; each value is the previous plus (q << k | r)."""
+    if not 0 <= first_value <= 0xFFFFFFFF:
+        raise ValueError("first value is not a uint32")
+    if count and not 3 <= k <= 30:
+        raise ValueError(f"rice parameter {k} is outside 3..30")
+    if count > len(data) * 8:
+        raise ValueError("more entries than encoded bits")
+    out, v, pos, nbits = [first_value], first_value, 0, len(data) * 8
+    for _ in range(count):
+        q = 0
+        while True:
+            if pos >= nbits:
+                raise ValueError("encoded data ends early")
+            bit = (data[pos >> 3] >> (pos & 7)) & 1
+            pos += 1
+            if not bit:
+                break
+            q += 1
+            if q > 32:
+                raise ValueError("quotient too long")
+        if pos + k > nbits:
+            raise ValueError("encoded data ends early")
+        r = 0
+        for i in range(k):
+            r |= ((data[pos >> 3] >> (pos & 7)) & 1) << i
+            pos += 1
+        v += (q << k) | r
+        if v > 0xFFFFFFFF:
+            raise ValueError("value overflows 32 bits")
+        out.append(v)
+    return out
+
+
+def _rice_field(obj: object) -> "list[int]":
+    if obj is None:
+        return []
+    if not isinstance(obj, dict):
+        raise ValueError("a Rice field is not an object")
+    try:
+        first = int(obj.get("firstValue") or 0)
+        k = int(obj.get("riceParameter") or 0)
+        n = int(obj.get("entriesCount") or 0)
+    except (TypeError, ValueError):
+        raise ValueError("a Rice field has a non-numeric parameter") from None
+    data = _b64(obj.get("encodedData") or "")
+    if n < 0:
+        raise ValueError("negative entry count")
+    return rice_decode(first, k, n, data)
+
+
+def apply_list_update(old: bytes, hl: dict) -> bytes:
+    """The new sorted list after one HashList: a full list replaces `old`; a
+    partial one removes by index, then adds. The caller checks the checksum."""
+    for wide in ("additionsEightBytes", "additionsSixteenBytes", "additionsThirtyTwoBytes"):
+        if wide in hl:
+            raise ValueError(f"{wide}: only 4-byte lists are supported")
+    partial = hl.get("partialUpdate") is True
+    entries = [old[i:i + 4] for i in range(0, len(old), 4)] if partial else []
+    if partial:
+        removals = _rice_field(hl.get("compressedRemovals"))
+        if removals:
+            drop = set(removals)
+            if max(drop) >= len(entries):
+                raise ValueError("a removal index is past the end of the list")
+            entries = [e for i, e in enumerate(entries) if i not in drop]
+    entries += [v.to_bytes(4, "big") for v in _rice_field(hl.get("additionsFourBytes"))]
+    entries.sort()
+    return b"".join(entries)
+
+
+def _verify(blob: bytes, hl: dict, old: bytes) -> bool:
+    if "sha256Checksum" not in hl:
+        # No checksum means no change was sent; the list must then be the old one.
+        return blob == old
+    return hashlib.sha256(blob).digest() == _b64(hl["sha256Checksum"])
+
+
+def _gsb_status(status: int, body: bytes) -> None:
+    if status == 200:
+        return
+    hint = {400: "the request was refused", 401: "the key was rejected",
+            403: "the key was rejected or the Safe Browsing API is not enabled for its project",
+            429: "quota reached; try again later"}
+    raise NetError(f"Safe Browsing answered HTTP {status}: {hint.get(status, 'server error')}")
+
+
+def _batch(http: Http, key: str, names: "list[str]", versions: dict, describe: str) -> "list[dict]":
+    query = [("names", n) for n in names] + [("version", versions[n]) for n in names if versions.get(n)]
+    status, body = http.get(GSB_HOST, GSB_BATCH_PATH, query=query, headers={"X-Goog-Api-Key": key},
+                            limit=LIST_RESPONSE_MAX, sent={"list_update": names}, describe=describe)
+    _gsb_status(status, body)
+    try:
+        lists = json.loads(body)["hashLists"]
+        if (not isinstance(lists, list) or len(lists) != len(names)
+                or not all(isinstance(h, dict) for h in lists)):
+            raise ValueError
+    except (ValueError, KeyError, TypeError, RecursionError):
+        raise NetError("Safe Browsing sent a response that is not a hash list") from None
+    return lists
+
+
+def _apply_checked(old: bytes, hl: dict) -> "bytes | None":
+    """The new list if it applies and matches its checksum, else None."""
+    try:
+        blob = apply_list_update(old, hl)
+        return blob if _verify(blob, hl, old) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def cmd_update(args, ctx) -> int:
+    out, scrub, now = ctx["stderr"], ctx["scrub"], ctx["now"]()
+    data = af.load_reputation()
+    state = data.state if data.status == "ok" else {}
+    due = [n for n in af.REPUTATION_LISTS
+           if n not in state or not state[n]["next_update_at"] or state[n]["next_update_at"] <= now]
+    if not due:
+        nxt = min(s["next_update_at"] for s in state.values())
+        out.write(f"lists are current (next refresh allowed at {_iso(nxt)}); no request sent\n")
         return EXIT_OK
+    first = not state
+    disclose([("Provider", "Google Safe Browsing v5, list download"),
+              ("Sends", "nothing about your hosts: downloads list updates"
+                        + (" (full lists on this first run)" if first else "")),
+              ("Never", "commands, paths, query strings, credentials, transcript text"),
+              ("Key", "(not read: --dry-run)" if args.dry_run else
+               ("--key-command (not shown)" if args.key_command else "$ACTUALIS_GSB_KEY (set, not shown)"))], out)
+    if args.dry_run:
+        out.write(f"would request: GET https://{GSB_HOST}{GSB_BATCH_PATH} for {', '.join(due)}\n")
+        out.write(f"{MARK} network used: nothing sent (--dry-run)\n")
+        return EXIT_OK
+    need_consent_possible(args, ctx)               # before any key command runs
+    key = read_key("gsb", args.key_command, scrub)
+    if not consent("Download Safe Browsing list updates from Google?", yes=args.yes, dry_run=False,
+                   stdin=ctx["stdin"], out=out):
+        out.write(f"{MARK} network used: nothing sent\n")
+        return EXIT_OK
+    versions = {n: state[n]["version"] for n in due if n in state and state[n].get("version")}
+    with NetSession("update", "gsb", scrub, receipt=args.receipt, out=out) as session:
+        try:
+            http = ctx["http_factory"](session)
+            new: "dict[str, tuple[bytes, dict]]" = {}
+            lists = _batch(http, key, due, versions, f"downloading {len(due)} list update(s)")
+            retry = []
+            for name, hl in zip(due, lists):
+                blob = _apply_checked(data.lists.get(name, b""), hl)
+                if blob is None:
+                    retry.append(name)
+                else:
+                    new[name] = (blob, hl)
+            if retry:
+                lists = _batch(http, key, retry, {}, f"checksum mismatch: downloading {len(retry)} full list(s)")
+                for name, hl in zip(retry, lists):
+                    blob = _apply_checked(b"", {**hl, "partialUpdate": False})
+                    if blob is None or "sha256Checksum" not in hl:
+                        raise NetError(f"{name}: the full list failed its checksum; nothing was written")
+                    new[name] = (blob, hl)
+            _commit_lists(data, state, new, now)
+        except (NetError, OSError) as exc:
+            session.fail(str(exc))
+            raise
     return EXIT_OK
+
+
+def _commit_lists(data, state: dict, new: dict, now: datetime) -> None:
+    """Write each changed list under a checksum name, then state.json last
+    (the commit point), then remove list files nothing names."""
+    gsb = cache_root() / "gsb"
+    entries = []
+    for name in af.REPUTATION_LISTS:
+        if name in new:
+            blob, hl = new[name]
+            sha = hashlib.sha256(blob).hexdigest()
+            fname = f"{name}.{sha[:16]}.prefixes"
+            write_atomic(gsb / fname, blob)
+            wait = parse_duration(hl.get("minimumWaitDuration"))
+            entries.append({"name": name, "version": hl.get("version"), "sha256": sha, "file": fname,
+                            "fetched_at": _iso(now), "next_update_at": _iso(now + timedelta(seconds=wait)),
+                            "prefix_count": len(blob) // 4})
+        else:
+            st = state[name]
+            sha = hashlib.sha256(data.lists[name]).hexdigest()
+            entries.append({"name": name, "version": st.get("version"), "sha256": sha,
+                            "file": f"{name}.{sha[:16]}.prefixes", "fetched_at": _iso(st["fetched_at"]),
+                            "next_update_at": _iso(st["next_update_at"]) if st["next_update_at"] else _iso(now),
+                            "prefix_count": st["prefix_count"]})
+    write_json(gsb / "state.json", {"schema": 1, "lists": entries})
+    keep = {e["file"] for e in entries}
+    for p in gsb.glob("*.prefixes"):
+        if p.name not in keep:
+            try:
+                p.unlink()
+            except OSError:
+                pass
 
 
 def _not_yet(args, ctx) -> int:                  # replaced in Tasks 7 and 8

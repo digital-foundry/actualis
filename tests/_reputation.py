@@ -80,6 +80,46 @@ def vt_result(host: str, malicious: int = 0, suspicious: int = 0, *, status: str
                       "undetected": 20, "timeout": 0}}
 
 
+def rice_encode(values: list, k: int) -> tuple:
+    """(first_value, rice_parameter, entries_count, encoded_data b64) for sorted uint32 values,
+    as Google's Local Database page describes: unary quotient then k remainder bits, LSB first."""
+    if not values:
+        return None
+    bits: list[int] = []
+    for prev, cur in zip(values, values[1:]):
+        d = cur - prev
+        q, r = d >> k, d & ((1 << k) - 1)
+        bits += [1] * q + [0]
+        bits += [(r >> i) & 1 for i in range(k)]
+    data = bytearray((len(bits) + 7) // 8)
+    for i, b in enumerate(bits):
+        data[i >> 3] |= b << (i & 7)
+    return values[0], k, len(values) - 1, b64(bytes(data))
+
+
+def _rice_obj(values: list, k: int = 28) -> dict | None:
+    enc = rice_encode(values, k)
+    if enc is None:
+        return None
+    first, k, n, data = enc
+    return {"firstValue": first, "riceParameter": k, "entriesCount": n, "encodedData": data}
+
+
+def hash_list(name: str, prefixes: list, *, removals=(), partial=False, checksum_of=None,
+              wait: str = "1800s") -> dict:
+    hl = {"name": name, "version": b64(f"{name}-v2".encode()), "partialUpdate": partial,
+          "minimumWaitDuration": wait}
+    adds = _rice_obj(sorted(int.from_bytes(p, "big") for p in prefixes))
+    if adds:
+        hl["additionsFourBytes"] = adds
+    rem = _rice_obj(sorted(removals), k=3)
+    if rem:
+        hl["compressedRemovals"] = rem
+    final = sorted(checksum_of if checksum_of is not None else prefixes)
+    hl["sha256Checksum"] = b64(hashlib.sha256(b"".join(final)).digest())
+    return hl
+
+
 class FakeProvider:
     """A local stand-in for both providers. routes: {path: [(status, body bytes|dict)]},
     answered in order (the last one repeats). Records (method, path, query, headers)."""
