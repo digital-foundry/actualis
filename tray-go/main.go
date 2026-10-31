@@ -91,6 +91,12 @@ var iconErrDark []byte
 //go:embed icons/error-light.png
 var iconErrLight []byte
 
+//go:embed icons/network-dark.png
+var iconNetDark []byte
+
+//go:embed icons/network-light.png
+var iconNetLight []byte
+
 // iconState remembers what is currently installed so the appearance watcher
 // can reinstall the same state in the other colourway.
 var iconState struct {
@@ -121,6 +127,13 @@ func barIsDark() bool {
 // dark reports whether the menu bar is dark, i.e. whether the light-ink
 // artwork is wanted.
 func setIcon(state string) {
+	netUse.Lock()
+	if netUse.active && state != "network" {
+		netUse.under = state
+		netUse.Unlock()
+		return
+	}
+	netUse.Unlock()
 	dark := barIsDark()
 	iconState.Lock()
 	iconState.name, iconState.dark, iconState.set = state, dark, true
@@ -139,6 +152,8 @@ func iconFor(state string, dark bool) []byte {
 		onDark, onLight = iconSyncDark, iconSyncLight
 	case "error":
 		onDark, onLight = iconErrDark, iconErrLight
+	case "network":
+		onDark, onLight = iconNetDark, iconNetLight
 	default:
 		onDark, onLight = iconIdleDark, iconIdleLight
 	}
@@ -550,7 +565,8 @@ func openBrowser(target string) {
 func (u *ui) onReady() {
 	setIcon("idle")
 	go watchAppearance()
-	systray.SetTooltip("Actualis — what actually ran")
+	go watchNetworkUse()
+	setTooltip("Actualis — what actually ran")
 
 	u.mHeader = systray.AddMenuItem("Loading…", "")
 	u.mHeader.Disable()
@@ -722,7 +738,7 @@ func (u *ui) render() {
 
 	if r.err != "" {
 		setIcon("error")
-		systray.SetTooltip("actualis: " + r.err)
+		setTooltip("actualis: " + r.err)
 		u.mHeader.SetTitle(r.err)
 		return
 	}
@@ -731,19 +747,19 @@ func (u *ui) render() {
 		setIcon("exposed")
 		// Only macOS and some Linux desktops show this; Windows ignores it.
 		systray.SetTitle(strconv.Itoa(r.critical))
-		systray.SetTooltip(fmt.Sprintf("Actualis — %d critical credential(s) exposed", r.critical))
+		setTooltip(fmt.Sprintf("Actualis — %d critical credential(s) exposed", r.critical))
 		u.mHeader.SetTitle(fmt.Sprintf("%d critical credential(s) exposed", r.critical))
 		show(u.mSub, fmt.Sprintf("%d worth rotating in total", r.rotatable))
 	} else if r.rotatable > 0 {
 		setIcon("monitoring")
 		systray.SetTitle("")
-		systray.SetTooltip(fmt.Sprintf("Actualis — %d credential(s) worth rotating", r.rotatable))
+		setTooltip(fmt.Sprintf("Actualis — %d credential(s) worth rotating", r.rotatable))
 		u.mHeader.SetTitle(fmt.Sprintf("%d credential(s) worth rotating", r.rotatable))
 		u.mSub.Hide()
 	} else {
 		setIcon("idle")
 		systray.SetTitle("")
-		systray.SetTooltip("Actualis — no critical credentials exposed")
+		setTooltip("Actualis — no critical credentials exposed")
 		u.mHeader.SetTitle("No critical credentials exposed")
 		u.mSub.Hide()
 	}

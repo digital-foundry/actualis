@@ -198,6 +198,27 @@ def a_mark(cap, cx, cy, ink, alpha=1.0):
     return legs + dash
 
 
+def network_badge(cap, cx, cy):
+    """NETWORK: a small amber globe in the lower-right corner with a "+" to
+    its upper left, shown while actualis-reputation is using the network. Sized
+    like the MONITORING dots; the stroke is 0.6 of the A's so it stays a badge.
+    Not on the sheet, so the geometry is ours."""
+    r = 0.17 * cap
+    w = STROKE * cap * 0.6 * 0.6   # 0.6 of the A's stroke is a 3px blob at this r
+    gx, gy = SW - r - 1.5, S - r - 1.5
+    # The meridian is a narrow ellipse, so the globe reads as a globe at 22pt.
+    rx = r * 0.5
+    meridian = lambda x, y: abs(math.hypot((x - gx) / rx, (y - gy) / r) - 1.0) <= w / (2.0 * rx)
+    # "+" above the globe, clear of the A's right leg, which crosses the
+    # space up and left of the globe.
+    px, py, a = gx - 1.5, gy - r - 5.0, 2.6
+    return [(ring(gx, gy, r - w / 2.0, w), AMBER, 1.0),
+            (meridian, AMBER, 1.0),
+            (seg(gx - r, gy, gx + r, gy, w), AMBER, 1.0),
+            (seg(px - a, py, px + a, py, w), AMBER, 1.0),
+            (seg(px, py - a, px, py + a, w), AMBER, 1.0)]
+
+
 def shapes_for(state, ink):
     # Composition centre. Held left of the canvas centre so the monitoring
     # dots and the update badge have room on the right without the A moving
@@ -244,6 +265,8 @@ def shapes_for(state, ink):
         bx = min(cx + UPD_X * cap, SW - r - 1.0)
         by = max(cy + UPD_Y * cap, r + 1.0)
         out += [(disc(bx, by, r), AMBER, 1.0)]
+    elif state == "network":
+        out += network_badge(cap, cx, cy)
     elif state == "muted":
         w = STROKE * STROKE_BOOST * cap
         h = w / 2.0
@@ -252,7 +275,7 @@ def shapes_for(state, ink):
     return out
 
 
-STATES = ["idle", "active", "monitoring", "exposed", "syncing", "update", "muted"]
+STATES = ["idle", "active", "monitoring", "exposed", "syncing", "update", "muted", "network"]
 
 
 def main():
