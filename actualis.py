@@ -7601,9 +7601,18 @@ def reputation_skip(host: str) -> bool:
     h = (host or "").lower().rstrip(".")
     if not h or h.startswith("[") or "." not in h:
         return True
-    if h.endswith((".internal", ".home.arpa", ".lan")):
+    if h.endswith((".internal", ".home.arpa", ".lan", ".localdomain", ".corp", ".home", ".intranet",
+                   ".private", ".test", ".invalid")):
         return True
-    return _local_host(h)
+    if _local_host(h):
+        return True
+    parts = h.split(".")
+    if len(parts) == 4 and all(p.isdigit() and len(p) <= 3 for p in parts):
+        a, b, c = int(parts[0]), int(parts[1]), int(parts[2])
+        return (a == 0 or (a == 100 and 64 <= b <= 127) or a >= 224
+                or (a == 192 and b == 0 and c in (0, 2)) or (a == 198 and b in (18, 19))
+                or (a == 198 and b == 51 and c == 100) or (a == 203 and b == 0 and c == 113))
+    return False
 
 
 def _sb_path_canon(path: str) -> str:

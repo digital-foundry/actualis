@@ -422,8 +422,8 @@ def build_parser() -> argparse.ArgumentParser:
     common(cf)
     vt = sub.add_parser("virustotal", allow_abbrev=False, help="look hostnames up on VirusTotal (sends hostnames)")
     vt.add_argument("report", metavar="NET.json", help="actualis --network --json output, or -")
-    vt.add_argument("--vt-threshold", type=_threshold, default=2, metavar="N",
-                    help="engines flagging malicious for a high finding (default 2)")
+    vt.add_argument("--vt-threshold", type=_threshold, default=None, metavar="N",
+                    help="engines flagging malicious for a high finding (default 2; kept from the last run)")
     common(vt)
     sub.add_parser("status", allow_abbrev=False, help="lists, ages, last network use; never networks")
     fg = sub.add_parser("forget", allow_abbrev=False, help="delete the reputation cache")
@@ -927,31 +927,39 @@ VT_RECHECK = timedelta(hours=24)
 VT_STAT_KEYS = ("malicious", "suspicious", "harmless", "undetected", "timeout")
 
 
-def _public_hosts(net: dict) -> "tuple[list[str], int]":
-    """Canonical public hostnames only: a name goes into a URL path, so anything
-    that is not already in canonical lower-case form is never sent."""
-    hosts, skipped = set(), 0
+def _public_hosts(net: dict) -> "tuple[list[str], int, int]":
+    """(sorted canonical public hostnames, private or local count, unusable-name
+    count). A name goes into a URL path, so only a canonical form is sent."""
+    hosts, private, unusable = set(), 0, 0
     for h in net.get("hosts") or []:
         name = h.get("host") if isinstance(h, dict) else None
         if not isinstance(name, str):
             continue
         canon = af._host_canon(name)
-        if canon is None or canon != name.lower() or af.reputation_skip(canon):
-            skipped += 1
-            continue
-        hosts.add(canon)
-    return sorted(hosts), skipped
+        if canon is None or canon != name.lower():
+            unusable += 1
+        elif af.reputation_skip(canon):
+            private += 1
+        else:
+            hosts.add(canon)
+    return sorted(hosts), private, unusable
 
 
-def _vt_doc() -> dict:
+def _vt_doc(out=None) -> dict:
     path = cache_root() / "vt" / "results.json"
     try:
         raw = af._read_cache_file(path)
         doc = json.loads(raw) if raw else None
     except (OSError, ValueError, RecursionError):
-        doc = None
-    if (not isinstance(doc, dict) or doc.get("schema") != 1 or not isinstance(doc.get("results"), list)
-            or not isinstance(doc.get("daily"), dict)):
+        doc = False
+    if (doc is not None and (not isinstance(doc, dict) or doc.get("schema") != 1
+                             or not isinstance(doc.get("results"), list)
+                             or not isinstance(doc.get("daily"), dict))):
+        doc = False
+    if doc is False and out is not None:
+        out.write("actualis-reputation: the earlier VirusTotal results file could not be read; "
+                  "its results and today's count were reset\n")
+    if not doc:
         doc = {"schema": 1, "vt_threshold": 2, "daily": {"date": "", "count": 0}, "results": []}
     return doc
 
@@ -959,17 +967,27 @@ def _vt_doc() -> dict:
 def _vt_stats(body: bytes) -> "dict | None":
     try:
         stats = json.loads(body)["data"]["attributes"]["last_analysis_stats"]
-        return {k: max(0, int(stats.get(k, 0))) for k in VT_STAT_KEYS}
+        if not isinstance(stats, dict):
+            return None
     except (ValueError, KeyError, TypeError, AttributeError, RecursionError):
         return None
+    clean = {}
+    for k in VT_STAT_KEYS:
+        v = stats.get(k, 0)
+        clean[k] = v if isinstance(v, int) and not isinstance(v, bool) and 0 <= v < (1 << 31) else 0
+    return clean
 
 
 def cmd_virustotal(args, ctx) -> int:
-    out, scrub, now, sleep = ctx["stderr"], ctx["scrub"], ctx["now"](), ctx["sleep"]
+    out, scrub, sleep = ctx["stderr"], ctx["scrub"], ctx["sleep"]
+    now = ctx["now"]()
     net = read_report(args.report, ctx["stdin"])
-    hosts, skipped = _public_hosts(net)
-    doc = _vt_doc()
+    hosts, private, unusable = _public_hosts(net)
+    doc = _vt_doc(out)
     results = {r["host"]: r for r in doc["results"] if isinstance(r, dict) and isinstance(r.get("host"), str)}
+    stored = doc.get("vt_threshold")
+    threshold = args.vt_threshold if args.vt_threshold is not None else (
+        stored if isinstance(stored, int) and not isinstance(stored, bool) and 1 <= stored <= 100 else 2)
     today = now.date().isoformat()
     count = doc["daily"].get("count", 0)
     used = count if doc["daily"].get("date") == today and isinstance(count, int) \
@@ -992,7 +1010,8 @@ def cmd_virustotal(args, ctx) -> int:
               ("Sends", f"{len(plan)} hostname{plural} in plain text to VirusTotal, "
                         f"which may keep them.\nFree tier: about {minutes} minute{'' if minutes == 1 else 's'} "
                         f"at {VT_PER_MINUTE} a minute."),
-              ("Skips", f"{skipped} private or local hosts, {len(hosts) - len(todo)} checked in the last 24 h"),
+              ("Skips", f"{private} private or local hosts, {unusable} unusable names, "
+                        f"{len(hosts) - len(todo)} checked in the last 24 h"),
               ("Never", "URLs, paths, commands, credentials, transcript text"),
               ("Key", "(not read: --dry-run)" if args.dry_run else
                ("--key-command (not shown)" if args.key_command else "$ACTUALIS_VT_KEY (set, not shown)"))], out)
@@ -1014,22 +1033,25 @@ def cmd_virustotal(args, ctx) -> int:
             for i, host in enumerate(plan):
                 if i:
                     sleep(60.0 / VT_PER_MINUTE)
+                at = ctx["now"]()
+                if at.date().isoformat() != today:      # the UTC day rolled over mid-run
+                    today, used = at.date().isoformat(), 0
+                used += 1                                # counted before the call: a timeout may still cost quota
                 kind = "ip_addresses" if af._SB_IPV4.fullmatch(host) else "domains"
                 status, body = http.get(VT_HOST, f"/api/v3/{kind}/{host}", headers={"x-apikey": key},
                                         sent={"hostnames": [host]}, describe=f"looking up {host}")
-                used += 1
                 if status == 429:
                     raise NetError(f"VirusTotal quota reached after {checked} of {len(plan)} hosts; "
                                    f"the rest can be checked later")
                 if status in (401, 403):
                     raise NetError(f"VirusTotal answered HTTP {status}: the key was rejected")
                 if status == 404:
-                    results[host] = {"host": host, "status": "unknown", "stats": {}, "checked_at": _iso(now)}
+                    results[host] = {"host": host, "status": "unknown", "stats": {}, "checked_at": _iso(at)}
                 elif status == 200:
                     stats = _vt_stats(body)
                     if stats is None:
                         raise NetError(f"VirusTotal sent a report for {host} that is not readable")
-                    results[host] = {"host": host, "status": "found", "stats": stats, "checked_at": _iso(now)}
+                    results[host] = {"host": host, "status": "found", "stats": stats, "checked_at": _iso(at)}
                 else:
                     raise NetError(f"VirusTotal answered HTTP {status} for {host}")
                 checked += 1
@@ -1037,9 +1059,14 @@ def cmd_virustotal(args, ctx) -> int:
             session.fail(str(exc))
             raise
         finally:
+            keep = {}
+            for h, r in results.items():
+                t = af._parse_utc(r.get("checked_at"))
+                if t is not None and ctx["now"]() - t < timedelta(days=7):
+                    keep[h] = r
             write_json(cache_root() / "vt" / "results.json",
-                       {"schema": 1, "vt_threshold": args.vt_threshold, "daily": {"date": today, "count": used},
-                        "results": [results[h] for h in sorted(results)]})
+                       {"schema": 1, "vt_threshold": threshold, "daily": {"date": today, "count": used},
+                        "results": [keep[h] for h in sorted(keep)]})
     out.write(f"{checked} host(s) checked on VirusTotal. Run actualis --network --reputation to see the result.\n")
     return EXIT_OK
 

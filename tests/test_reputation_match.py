@@ -70,6 +70,16 @@ class TestExpressions(unittest.TestCase):
         for h in ("evil.example", "8.8.8.8", "registry.npmjs.org"):
             self.assertFalse(af.reputation_skip(h), h)
 
+    def test_non_global_addresses_and_local_suffixes_are_skipped(self):
+        for h in ("0.1.2.3", "100.64.0.1", "100.127.255.254", "192.0.0.8", "192.0.2.5", "198.18.0.1",
+                  "198.19.255.1", "198.51.100.7", "203.0.113.9", "224.0.0.1", "239.1.1.1", "240.0.0.1",
+                  "255.255.255.255", "pc.localdomain", "a.corp", "a.home", "a.intranet", "a.private",
+                  "a.test", "a.invalid"):
+            self.assertTrue(af.reputation_skip(h), h)
+        for h in ("100.63.0.1", "100.128.0.1", "198.17.0.1", "198.20.0.1", "223.1.1.1", "192.0.1.1",
+                  "203.0.114.1", "a.example", "corp.example.com"):
+            self.assertFalse(af.reputation_skip(h), h)
+
     def test_mark_falls_back_to_ascii(self):
         self.assertEqual(af.NET_MARK.translate(af._GLYPH_TABLE), "[+net]")
 

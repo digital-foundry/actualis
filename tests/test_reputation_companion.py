@@ -803,6 +803,74 @@ class TestVirusTotal(CompanionCase):
         code, err, s = self.run_vt({}, ["a/b.example", "x.example/../y", "a b.example"])
         self.assertEqual((code, s.requests), (0, []))
 
+    def test_non_global_hosts_never_sent(self):
+        hosts = ["0.1.2.3", "100.64.0.1", "192.0.0.8", "192.0.2.5", "198.18.0.1", "198.51.100.7",
+                 "203.0.113.9", "224.0.0.1", "240.0.0.1", "255.255.255.255", "pc.localdomain", "a.corp",
+                 "a.home", "a.intranet", "a.private", "a.test", "a.invalid"]
+        code, err, s = self.run_vt({}, hosts)
+        self.assertEqual((code, s.requests), (0, []))
+
+    def test_threshold_is_kept_when_not_given(self):
+        r = {"/api/v3/domains/a.example": [(200, vt_body())], "/api/v3/domains/b.example": [(200, vt_body())]}
+        self.run_vt(r, ["a.example"], "--vt-threshold", "5")
+        self.run_vt(r, ["b.example"])
+        doc = json.loads((self.rep / "vt" / "results.json").read_text())
+        self.assertEqual(doc["vt_threshold"], 5)
+
+    def test_stats_accept_only_plain_non_negative_ints(self):
+        body = {"data": {"attributes": {"last_analysis_stats": {
+            "malicious": 1e999, "suspicious": True, "harmless": "5", "undetected": -3, "timeout": 7}}}}
+        raw = json.dumps(body).encode()
+        self.assertEqual(ar._vt_stats(raw), {"malicious": 0, "suspicious": 0, "harmless": 0,
+                                             "undetected": 0, "timeout": 7})
+
+    def test_403_5xx_and_unreadable_bodies_stop(self):
+        for status, body, word in ((403, {"error": {"message": FAKE_KEY}}, "rejected"),
+                                   (503, {"error": {}}, "HTTP 503"), (200, b"not json", "not readable"),
+                                   (200, {"data": []}, "not readable")):
+            code, err, s = self.run_vt({"/api/v3/domains/a.example": [(status, body)]}, ["a.example"])
+            self.assertEqual(code, 1, (status, err))
+            self.assertIn(word, err)
+            self.assertNotIn(FAKE_KEY, err)
+
+    def test_results_schema_and_pruning(self):
+        old = datetime.now(timezone.utc) - timedelta(days=8)
+        R.write_cache(self.rep, vt=[R.vt_result("old.example", 0, at=old)])
+        self.run_vt({"/api/v3/domains/a.example": [(200, vt_body(1))],
+                     "/api/v3/domains/b.example": [(404, {})]}, ["a.example", "b.example"])
+        doc = json.loads((self.rep / "vt" / "results.json").read_text())
+        self.assertEqual([r["host"] for r in doc["results"]], ["a.example", "b.example"])
+        self.assertEqual([r["status"] for r in doc["results"]], ["found", "unknown"])
+        for r in doc["results"]:
+            self.assertTrue(r["checked_at"].endswith("+00:00"))
+            datetime.fromisoformat(r["checked_at"])
+
+    def test_unreadable_results_file_is_reported(self):
+        (self.rep / "vt").mkdir(parents=True)
+        (self.rep / "vt" / "results.json").write_text("{nope")
+        code, err, s = self.run_vt({"/api/v3/domains/a.example": [(200, vt_body())]}, ["a.example"])
+        self.assertEqual(code, 0)
+        self.assertIn("could not be read; its results and today's count were reset", err)
+
+    def test_request_is_counted_even_when_it_fails(self):
+        self.run_vt({"/api/v3/domains/a.example": [(503, {})]}, ["a.example"])
+        doc = json.loads((self.rep / "vt" / "results.json").read_text())
+        self.assertEqual(doc["daily"]["count"], 1)
+
+    def test_day_rollover_resets_the_count(self):
+        t = [datetime(2026, 10, 30, 23, 58, tzinfo=timezone.utc)]
+        def clock():
+            v = t[0]
+            t[0] = v + timedelta(minutes=1)
+            return v
+        s = R.FakeProvider({"/api/v3/domains/a.example": [(200, vt_body())],
+                            "/api/v3/domains/b.example": [(200, vt_body())]})
+        self.addCleanup(s.close)
+        nj = net_json(self.tmp / "n.json", hosts=["a.example", "b.example"])
+        self.cli("virustotal", str(nj), "--yes", http_factory=s.factory, sleep=self.slept.append, now=clock)
+        doc = json.loads((self.rep / "vt" / "results.json").read_text())
+        self.assertEqual(doc["daily"], {"date": "2026-10-31", "count": 1})
+
     def test_throttled_to_four_a_minute(self):
         hosts = [f"h{i}.example" for i in range(6)]
         self.run_vt({f"/api/v3/domains/{h}": [(200, vt_body())] for h in hosts}, hosts)
@@ -824,15 +892,22 @@ class TestVirusTotal(CompanionCase):
         self.assertIn("a.example", af.load_reputation(self.rep).vt)
 
     def test_daily_budget_caps_the_run(self):
-        today = datetime.now(timezone.utc).date().isoformat()
+        fixed = datetime(2026, 10, 30, 12, 0, tzinfo=timezone.utc)
+        today = fixed.date().isoformat()
         (self.rep / "vt").mkdir(parents=True)
         (self.rep / "vt" / "results.json").write_text(json.dumps(
             {"schema": 1, "vt_threshold": 2, "daily": {"date": today, "count": ar.VT_DAILY - 1}, "results": []}))
-        code, err, s = self.run_vt({"/api/v3/domains/a.example": [(200, vt_body())]},
-                                   ["a.example", "b.example"])
+        s = R.FakeProvider({"/api/v3/domains/a.example": [(200, vt_body())]})
+        self.addCleanup(s.close)
+        nj = net_json(self.tmp / "n.json", hosts=["a.example", "b.example"])
+        self.cli("virustotal", str(nj), "--yes", http_factory=s.factory, sleep=self.slept.append,
+                 now=lambda: fixed)
         self.assertEqual([r["path"] for r in s.requests], ["/api/v3/domains/a.example"])
         self.assertEqual(json.loads((self.rep / "vt" / "results.json").read_text())["daily"]["count"], ar.VT_DAILY)
-        code, err, s = self.run_vt({}, ["b.example"])
+        s = R.FakeProvider()
+        self.addCleanup(s.close)
+        nj = net_json(self.tmp / "n.json", hosts=["b.example"])
+        code, _, err = self.cli("virustotal", str(nj), "--yes", http_factory=s.factory, now=lambda: fixed)
         self.assertEqual((code, s.requests), (0, []))
         self.assertIn("budget", err)
 
