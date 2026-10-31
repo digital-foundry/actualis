@@ -737,10 +737,6 @@ def _commit_lists(data, state: dict, new: dict, now: datetime) -> None:
                 pass
 
 
-def _not_yet(args, ctx) -> int:                  # replaced in Tasks 7 and 8
-    raise UsageError("not implemented yet")
-
-
 GSB_SEARCH_PATH = "/v5/hashes:search"
 DECOY_TOTAL = 30
 SEARCH_REAL_MAX = 970                            # a request is topped up to 30 prefixes with decoys, so
@@ -925,8 +921,131 @@ def _merge_confirmations(new: dict, now: datetime, out) -> None:
     write_json(path, {"schema": 1, "entries": [old[k] for k in sorted(old)]})
 
 
+VT_PER_MINUTE = 4
+VT_DAILY = 500
+VT_RECHECK = timedelta(hours=24)
+VT_STAT_KEYS = ("malicious", "suspicious", "harmless", "undetected", "timeout")
+
+
+def _public_hosts(net: dict) -> "tuple[list[str], int]":
+    """Canonical public hostnames only: a name goes into a URL path, so anything
+    that is not already in canonical lower-case form is never sent."""
+    hosts, skipped = set(), 0
+    for h in net.get("hosts") or []:
+        name = h.get("host") if isinstance(h, dict) else None
+        if not isinstance(name, str):
+            continue
+        canon = af._host_canon(name)
+        if canon is None or canon != name.lower() or af.reputation_skip(canon):
+            skipped += 1
+            continue
+        hosts.add(canon)
+    return sorted(hosts), skipped
+
+
+def _vt_doc() -> dict:
+    path = cache_root() / "vt" / "results.json"
+    try:
+        raw = af._read_cache_file(path)
+        doc = json.loads(raw) if raw else None
+    except (OSError, ValueError, RecursionError):
+        doc = None
+    if (not isinstance(doc, dict) or doc.get("schema") != 1 or not isinstance(doc.get("results"), list)
+            or not isinstance(doc.get("daily"), dict)):
+        doc = {"schema": 1, "vt_threshold": 2, "daily": {"date": "", "count": 0}, "results": []}
+    return doc
+
+
+def _vt_stats(body: bytes) -> "dict | None":
+    try:
+        stats = json.loads(body)["data"]["attributes"]["last_analysis_stats"]
+        return {k: max(0, int(stats.get(k, 0))) for k in VT_STAT_KEYS}
+    except (ValueError, KeyError, TypeError, AttributeError, RecursionError):
+        return None
+
+
+def cmd_virustotal(args, ctx) -> int:
+    out, scrub, now, sleep = ctx["stderr"], ctx["scrub"], ctx["now"](), ctx["sleep"]
+    net = read_report(args.report, ctx["stdin"])
+    hosts, skipped = _public_hosts(net)
+    doc = _vt_doc()
+    results = {r["host"]: r for r in doc["results"] if isinstance(r, dict) and isinstance(r.get("host"), str)}
+    today = now.date().isoformat()
+    count = doc["daily"].get("count", 0)
+    used = count if doc["daily"].get("date") == today and isinstance(count, int) \
+        and not isinstance(count, bool) and count >= 0 else 0
+    recent = set()
+    for h, r in results.items():
+        at = af._parse_utc(r.get("checked_at"))
+        if at is not None and timedelta(0) <= now - at < VT_RECHECK:
+            recent.add(h)
+    todo = [h for h in hosts if h not in recent]
+    plan = todo[:max(0, VT_DAILY - used)]
+    if not plan:
+        why = "no public hosts to look up" if not hosts else (
+            "every host was checked in the last 24 hours" if not todo else "today's VirusTotal budget is used up")
+        out.write(f"{why}; {MARK} network used: nothing sent\n")
+        return EXIT_OK
+    minutes = math.ceil(len(plan) / VT_PER_MINUTE)
+    plural = "" if len(plan) == 1 else "s"
+    disclose([("Provider", "VirusTotal v3, domain and IP reports"),
+              ("Sends", f"{len(plan)} hostname{plural} in plain text to VirusTotal, "
+                        f"which may keep them.\nFree tier: about {minutes} minute{'' if minutes == 1 else 's'} "
+                        f"at {VT_PER_MINUTE} a minute."),
+              ("Skips", f"{skipped} private or local hosts, {len(hosts) - len(todo)} checked in the last 24 h"),
+              ("Never", "URLs, paths, commands, credentials, transcript text"),
+              ("Key", "(not read: --dry-run)" if args.dry_run else
+               ("--key-command (not shown)" if args.key_command else "$ACTUALIS_VT_KEY (set, not shown)"))], out)
+    if args.dry_run:
+        for h in plan:
+            out.write(f"would send: {h}\n")
+        out.write(f"{MARK} network used: nothing sent (--dry-run)\n")
+        return EXIT_OK
+    need_consent_possible(args, ctx)               # before any key command runs
+    key = read_key("vt", args.key_command, scrub)
+    if not consent(f"Send {len(plan)} hostname{plural} to VirusTotal?", yes=args.yes,
+                   dry_run=False, stdin=ctx["stdin"], out=out):
+        out.write(f"{MARK} network used: nothing sent\n")
+        return EXIT_OK
+    checked = 0
+    with NetSession("virustotal", "vt", scrub, receipt=args.receipt, out=out) as session:
+        try:
+            http = ctx["http_factory"](session)
+            for i, host in enumerate(plan):
+                if i:
+                    sleep(60.0 / VT_PER_MINUTE)
+                kind = "ip_addresses" if af._SB_IPV4.fullmatch(host) else "domains"
+                status, body = http.get(VT_HOST, f"/api/v3/{kind}/{host}", headers={"x-apikey": key},
+                                        sent={"hostnames": [host]}, describe=f"looking up {host}")
+                used += 1
+                if status == 429:
+                    raise NetError(f"VirusTotal quota reached after {checked} of {len(plan)} hosts; "
+                                   f"the rest can be checked later")
+                if status in (401, 403):
+                    raise NetError(f"VirusTotal answered HTTP {status}: the key was rejected")
+                if status == 404:
+                    results[host] = {"host": host, "status": "unknown", "stats": {}, "checked_at": _iso(now)}
+                elif status == 200:
+                    stats = _vt_stats(body)
+                    if stats is None:
+                        raise NetError(f"VirusTotal sent a report for {host} that is not readable")
+                    results[host] = {"host": host, "status": "found", "stats": stats, "checked_at": _iso(now)}
+                else:
+                    raise NetError(f"VirusTotal answered HTTP {status} for {host}")
+                checked += 1
+        except NetError as exc:
+            session.fail(str(exc))
+            raise
+        finally:
+            write_json(cache_root() / "vt" / "results.json",
+                       {"schema": 1, "vt_threshold": args.vt_threshold, "daily": {"date": today, "count": used},
+                        "results": [results[h] for h in sorted(results)]})
+    out.write(f"{checked} host(s) checked on VirusTotal. Run actualis --network --reputation to see the result.\n")
+    return EXIT_OK
+
+
 COMMANDS = {"status": cmd_status, "forget": cmd_forget, "update": cmd_update,
-            "confirm": cmd_confirm, "virustotal": _not_yet}
+            "confirm": cmd_confirm, "virustotal": cmd_virustotal}
 
 
 def main(argv=None, *, http_factory=None, now=None, sleep=time.sleep, stdin=None, stdout=None,

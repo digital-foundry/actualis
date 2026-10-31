@@ -225,13 +225,6 @@ class TestFixRound1(CompanionCase):
             ar.read_report("-", io.StringIO("[1]"))
         self.assertIn("report file", str(cm.exception))
 
-    def test_unimplemented_commands_are_a_usage_error(self):
-        for argv in (("virustotal", "x.json"),):
-            code, _, err = self.cli(*argv)
-            self.assertEqual(code, 2)
-            self.assertIn("not implemented yet", err)
-            self.assertNotIn("Traceback", err)
-
     def test_key_command_not_run_when_consent_is_impossible(self):
         with mock.patch.object(ar.subprocess, "run") as run:
             code, _, err = self.cli("update", "--key-command", "x")
@@ -769,3 +762,106 @@ class TestConfirm(CompanionCase):
         _, _, err = self.cli("confirm", str(net_json(self.tmp / "n.json", ["evil.example/"])), "--yes",
                              http_factory=s.factory)
         self.assertIn("could not be read", err)
+
+
+def vt_body(m=0, s=0):
+    return {"data": {"attributes": {"last_analysis_stats": {"malicious": m, "suspicious": s, "harmless": 60,
+                                                             "undetected": 10, "timeout": 0}}}}
+
+
+class TestVirusTotal(CompanionCase):
+    def setUp(self):
+        super().setUp()
+        os.environ["ACTUALIS_VT_KEY"] = FAKE_KEY
+        self.slept = []
+
+    def run_vt(self, routes, hosts, *extra):
+        s = R.FakeProvider(routes)
+        self.addCleanup(s.close)
+        nj = net_json(self.tmp / "n.json", hosts=hosts)
+        code, out, err = self.cli("virustotal", str(nj), "--yes", *extra, http_factory=s.factory,
+                                  sleep=self.slept.append)
+        return code, err, s
+
+    def test_found_unknown_and_threshold(self):
+        code, err, s = self.run_vt({"/api/v3/domains/bad.example": [(200, vt_body(5))],
+                                    "/api/v3/domains/new.example": [(404, {"error": {"code": "NotFoundError"}})]},
+                                   ["bad.example", "new.example"], "--vt-threshold", "3")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(s.requests[0]["headers"]["x-apikey"], FAKE_KEY)
+        d = af.load_reputation(self.rep)
+        self.assertEqual(d.vt_threshold, 3)
+        self.assertEqual(d.vt["bad.example"]["stats"]["malicious"], 5)
+        self.assertEqual(d.vt["new.example"]["status"], "unknown")
+
+    def test_private_hosts_never_sent(self):
+        code, err, s = self.run_vt({}, ["10.0.0.1", "printer.local", "intranet", "db.internal"])
+        self.assertEqual((code, s.requests), (0, []))
+        self.assertIn("no public hosts", err)
+
+    def test_non_canonical_hosts_never_sent(self):
+        code, err, s = self.run_vt({}, ["a/b.example", "x.example/../y", "a b.example"])
+        self.assertEqual((code, s.requests), (0, []))
+
+    def test_throttled_to_four_a_minute(self):
+        hosts = [f"h{i}.example" for i in range(6)]
+        self.run_vt({f"/api/v3/domains/{h}": [(200, vt_body())] for h in hosts}, hosts)
+        self.assertEqual(self.slept, [15.0] * 5)
+
+    def test_429_stops_and_keeps_what_was_checked(self):
+        code, err, s = self.run_vt({"/api/v3/domains/a.example": [(200, vt_body())],
+                                    "/api/v3/domains/b.example": [(429, {"error": {"code": "QuotaExceededError"}})]},
+                                   ["a.example", "b.example", "c.example"])
+        self.assertEqual(code, 1)
+        self.assertIn("quota", err)
+        self.assertEqual(len(s.requests), 2)
+        self.assertIn("a.example", af.load_reputation(self.rep).vt)
+
+    def test_recently_checked_hosts_are_skipped(self):
+        R.write_cache(self.rep, vt=[R.vt_result("a.example", 0)])
+        code, err, s = self.run_vt({"/api/v3/domains/b.example": [(200, vt_body())]}, ["a.example", "b.example"])
+        self.assertEqual([r["path"] for r in s.requests], ["/api/v3/domains/b.example"])
+        self.assertIn("a.example", af.load_reputation(self.rep).vt)
+
+    def test_daily_budget_caps_the_run(self):
+        today = datetime.now(timezone.utc).date().isoformat()
+        (self.rep / "vt").mkdir(parents=True)
+        (self.rep / "vt" / "results.json").write_text(json.dumps(
+            {"schema": 1, "vt_threshold": 2, "daily": {"date": today, "count": ar.VT_DAILY - 1}, "results": []}))
+        code, err, s = self.run_vt({"/api/v3/domains/a.example": [(200, vt_body())]},
+                                   ["a.example", "b.example"])
+        self.assertEqual([r["path"] for r in s.requests], ["/api/v3/domains/a.example"])
+        self.assertEqual(json.loads((self.rep / "vt" / "results.json").read_text())["daily"]["count"], ar.VT_DAILY)
+        code, err, s = self.run_vt({}, ["b.example"])
+        self.assertEqual((code, s.requests), (0, []))
+        self.assertIn("budget", err)
+
+    def test_rejected_key_stops(self):
+        code, err, s = self.run_vt({"/api/v3/domains/a.example": [(401, {"error": {}})]}, ["a.example"])
+        self.assertEqual(code, 1)
+        self.assertIn("rejected", err)
+        self.assertNotIn(FAKE_KEY, err)
+
+    def test_dry_run_prints_hostnames_and_sends_nothing(self):
+        s = R.FakeProvider()
+        self.addCleanup(s.close)
+        os.environ.pop("ACTUALIS_VT_KEY")
+        with mock.patch.object(ar.subprocess, "run") as run:
+            code, _, err = self.cli("virustotal", str(net_json(self.tmp / "n.json", hosts=["bad.example"])),
+                                    "--dry-run", "--key-command", "x", http_factory=s.factory)
+        run.assert_not_called()
+        self.assertEqual((code, s.requests), (0, []))
+        self.assertIn("bad.example", err)
+        self.assertIn("in plain text to VirusTotal", err)
+
+    def test_key_command_not_run_without_a_terminal_or_yes(self):
+        nj = net_json(self.tmp / "n.json", hosts=["bad.example"])
+        with mock.patch.object(ar.subprocess, "run") as run:
+            code, _, err = self.cli("virustotal", str(nj), "--key-command", "x")
+        self.assertEqual(code, 2)
+        self.assertIn("--yes", err)
+        run.assert_not_called()
+
+    def test_ip_uses_the_ip_endpoint(self):
+        code, err, s = self.run_vt({"/api/v3/ip_addresses/8.8.8.8": [(200, vt_body())]}, ["8.8.8.8"])
+        self.assertEqual([r["path"] for r in s.requests], ["/api/v3/ip_addresses/8.8.8.8"])
