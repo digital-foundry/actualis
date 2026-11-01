@@ -27,6 +27,9 @@ Standard library only. Usage:
     python tools/pii-gate.py                 # whole tree, built-in detectors
     python tools/pii-gate.py --changed BASE  # only files changed since BASE
     python tools/pii-gate.py --full          # also the private terms list
+                                             # ($ACTUALIS_PII_TERMS, else
+                                             # ~/.config/actualis/pii-terms.txt,
+                                             # else 1Password)
 """
 from __future__ import annotations
 
@@ -45,6 +48,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ALLOW_FILE = ".pii-allow"
 TERMS_ENV = "ACTUALIS_PII_TERMS"
 TERMS_OP_REF = "op://Foundry Admin/actualis pii terms/notesPlain"
+TERMS_FILE = Path("actualis") / "pii-terms.txt"   # under $XDG_CONFIG_HOME or ~/.config
 
 # actualis.py is the detector corpus itself: its regexes and the shapes in its
 # docstrings would all match. The org-required gitleaks scan covers it.
@@ -317,13 +321,21 @@ def parse_terms(text: str) -> list[re.Pattern]:
     return terms
 
 
+def default_terms_file() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / TERMS_FILE
+
+
 def load_terms() -> list[re.Pattern]:
+    """The terms list, from the first of: the file named by ACTUALIS_PII_TERMS,
+    the default file if it exists, 1Password through a service-account token."""
     path = os.environ.get(TERMS_ENV)
+    if not path and default_terms_file().is_file():
+        path = str(default_terms_file())
     if path:
         try:
             return parse_terms(Path(path).read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            raise SystemExit(f"pii-gate: cannot read the file named by {TERMS_ENV}")
+            raise SystemExit(f"pii-gate: cannot read the terms file ({TERMS_ENV} or {TERMS_FILE})")
     if os.environ.get("OP_SERVICE_ACCOUNT_TOKEN"):
         try:
             res = subprocess.run(["op", "read", TERMS_OP_REF], capture_output=True,
@@ -333,7 +345,8 @@ def load_terms() -> list[re.Pattern]:
         if res.returncode == 0 and res.stdout.strip():
             return parse_terms(res.stdout)
         raise SystemExit("pii-gate: `op read` returned no terms list")
-    raise SystemExit(f"pii-gate: --full needs {TERMS_ENV} or OP_SERVICE_ACCOUNT_TOKEN")
+    raise SystemExit(f"pii-gate: --full needs {TERMS_ENV}, ~/.config/{TERMS_FILE.as_posix()} "
+                     "or OP_SERVICE_ACCOUNT_TOKEN")
 
 
 def tracked_files(root: Path, changed_base: "str | None") -> list[str]:

@@ -54,13 +54,14 @@ test:
 # The PII gate (tools/pii-gate.py, CONTRIBUTING.md). CI runs the built-in
 # detectors. pii-full adds the private terms list (names, places, employers),
 # which never lives in this repo: from the file named by ACTUALIS_PII_TERMS,
-# else from 1Password through the Foundry Admin service account. The token is
-# read from the login keychain and never printed.
+# else ~/.config/actualis/pii-terms.txt (under $XDG_CONFIG_HOME if set), else
+# from 1Password through the Foundry Admin service account. The token is read
+# from the login keychain, only when no file is found, and never printed.
 pii:
 	$(PYTHON) tools/pii-gate.py $(ARGS)
 
 pii-full:
-	@if [ -n "$$ACTUALIS_PII_TERMS" ]; then \
+	@if [ -n "$$ACTUALIS_PII_TERMS" ] || [ -f "$${XDG_CONFIG_HOME:-$$HOME/.config}/actualis/pii-terms.txt" ]; then \
 		$(PYTHON) tools/pii-gate.py --full $(ARGS); \
 	else \
 		OP_SERVICE_ACCOUNT_TOKEN="$$(security find-generic-password -s foundry-admin-op-sa -w)" \
