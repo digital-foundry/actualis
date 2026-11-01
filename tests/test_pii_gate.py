@@ -221,10 +221,30 @@ class CommandLine(unittest.TestCase):
         rc, out = self._run(["--root", d])
         self.assertEqual(rc, 2)
 
+    def test_full_mode_reads_the_default_file_and_the_variable_wins(self):
+        d = self._repo({"a.md": "notes from Morgan Beckett\n"})
+        cfg = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, cfg, ignore_errors=True)
+        (cfg / "actualis").mkdir()
+        (cfg / "actualis" / "pii-terms.txt").write_text("Morgan Beckett\n", encoding="utf-8")
+        base = {k: v for k, v in os.environ.items()
+                if k not in (pg.TERMS_ENV, "OP_SERVICE_ACCOUNT_TOKEN")}
+        rc, out = self._run(["--root", d, "--full"], env=dict(base, XDG_CONFIG_HOME=str(cfg)))
+        self.assertEqual(rc, 1)
+        self.assertIn("a.md:1: term", out)
+        other = cfg / "other.txt"
+        other.write_text("Quarry Lane\n", encoding="utf-8")
+        rc, out = self._run(["--root", d, "--full"],
+                            env=dict(base, XDG_CONFIG_HOME=str(cfg), **{pg.TERMS_ENV: str(other)}))
+        self.assertEqual(rc, 0, out)
+
     def test_full_mode_fails_closed_without_a_terms_list(self):
         d = self._repo({"a.md": "clean\n"})
+        empty = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, empty, ignore_errors=True)
         env = {k: v for k, v in os.environ.items()
                if k not in (pg.TERMS_ENV, "OP_SERVICE_ACCOUNT_TOKEN")}
+        env["XDG_CONFIG_HOME"] = empty
         rc, out = self._run(["--root", d, "--full"], env=env)
         self.assertEqual(rc, 2)
 
