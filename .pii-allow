@@ -26,13 +26,11 @@ pip@pypi.org # flag id tool@host, not a mailbox
 # Windows known-folder GUID (FOLDERID_System), a Microsoft constant.
 1AC14E77-02E7-4E5D-B744-2EB1AE5198B7 # Windows FOLDERID_System constant
 
-# Documentation and fixture credentials, all fabricated.
+# Documentation and fixture credentials, all fabricated. Demo-fleet values are
+# allowed inline (pii-ok) so they are not copied here.
 AKIAIOSFODNN7EXAMPLE # AWS's own documentation key
 vcp_notarealtokenjustafixture01 # self-describing fixture token
 npm_config_registry # npm environment variable name, not a token
-sk_live_00fictionalvalue0000 # demo-fleet fixture
-ghp_0000fictionalpat00000000 # demo-fleet fixture
-sk-ant-api03-0000fictionalkey0000 # demo-fleet fixture
 password # the literal placeholder in scheme://user:password@host examples
 06.06.06.06 # 6.6.6.6 written with leading zeros, IOC test
 ::ffff:606:606 # 6.6.6.6 as an IPv4-mapped IPv6 address, IOC test

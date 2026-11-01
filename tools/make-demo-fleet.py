@@ -22,10 +22,10 @@ SAFE = ["npm test -- --run", "go build ./...", "git rebase -i origin/main", "pyt
         "make lint", "docker compose up -d", "terraform plan", "rg TODO src/",
         "gh pr create --fill", "cargo clippy --all-targets"]
 # Invented credential shapes. None has ever been valid anywhere.
-LEAKY = ["export STRIPE_KEY=sk_live_00fictionalvalue0000",
-         "curl -H 'Authorization: Bearer ghp_0000fictionalpat00000000' https://api.example.invalid",
+LEAKY = ["export STRIPE_KEY=sk_live_00fictionalvalue0000",  # pii-ok: invented
+         "curl -H 'Authorization: Bearer ghp_0000fictionalpat00000000' https://api.example.invalid",  # pii-ok: invented
          "AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE aws s3 ls",
-         "echo 'sk-ant-api03-0000fictionalkey0000' >> .env"]
+         "echo 'sk-ant-api03-0000fictionalkey0000' >> .env"]  # pii-ok: invented
 RISKY = ["rm -rf ./build", "sudo systemctl restart orbital", "chmod 777 /tmp/cache"]
 
 COPILOT_MODELS = ("claude-sonnet-4.5", "gpt-5-mini")

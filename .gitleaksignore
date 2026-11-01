@@ -8,3 +8,5 @@
 # does not drown in findings that the project deliberately created.
 tests/test_actualis.py
 docs/secrets.md
+# The invented demo-fleet Stripe value, briefly copied into .pii-allow (#76).
+a8d24cdb4cc02685c09427ce537a94f818a73f63:.pii-allow:stripe-access-token:33
