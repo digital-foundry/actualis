@@ -108,5 +108,21 @@ class TestExpressionsAreComplete(unittest.TestCase):
                          len(COMPLETE.findall("x: ${{ inputs.version }}")))
 
 
+class TestMarketplaceMetadata(unittest.TestCase):
+    """GitHub Marketplace rejects a release whose action.yml breaks its rules."""
+
+    def test_listing_fields(self):
+        text = (ROOT / "action.yml").read_text(encoding="utf-8")
+        head = text[:text.index("inputs:")]
+        name = re.search(r'^name: "(.+)"$', head, re.M).group(1)
+        # A GitHub user named "actualis" exists, so the bare word is not unique.
+        self.assertNotEqual(name.strip().lower(), "actualis")
+        block = re.search(r"^description: >-\n((?:  .+\n)+)", head, re.M).group(1)
+        description = " ".join(line.strip() for line in block.splitlines())
+        self.assertLess(len(description), 125, description)
+        self.assertIn("  icon: ", head)
+        self.assertIn("  color: ", head)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
