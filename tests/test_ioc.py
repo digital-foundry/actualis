@@ -1342,11 +1342,11 @@ class TestDocsAndSelfCheck(unittest.TestCase):
 
 
 class TestVersion(unittest.TestCase):
-    def test_version_is_0_5_0_everywhere(self):
-        self.assertEqual(af.__version__, "0.5.0")
-        self.assertIn('version = "0.5.0"', (ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    def test_version_is_0_5_1_everywhere(self):
+        self.assertEqual(af.__version__, "0.5.1")
+        self.assertIn('version = "0.5.1"', (ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertRegex((ROOT / "CHANGELOG.md").read_text(encoding="utf-8"),
-                         r"(?m)^## 0\.5\.0 \((unreleased|\d{4}-\d\d-\d\d)\)$")
+                         r"(?m)^## 0\.5\.1 \((unreleased|\d{4}-\d\d-\d\d)\)$")
 
 
 class TestChangelog(unittest.TestCase):

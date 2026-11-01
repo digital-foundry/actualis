@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.1 (2026-11-01)
 
 ### Changed
 - The GitHub Action's `description` is now under GitHub Marketplace's 125-character limit, so a release can be
