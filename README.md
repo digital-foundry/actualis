@@ -735,6 +735,17 @@ exposing the path as its `execution_file` output.
     LOG: ${{ steps.claude.outputs.execution_file }}
 ```
 
+Or use the action from this repository, which installs actualis, runs the
+audit, writes the job summary and sets the outputs below:
+
+```yaml
+- uses: digital-foundry/actualis@v0.5.1
+  with:
+    execution-file: ${{ steps.claude.outputs.execution_file }}
+    version: "0.5.1"
+    fail-on: critical
+```
+
 The action's inputs:
 
 | input | default | meaning |

@@ -1,8 +1,7 @@
 name: "Actualis — audit what your coding agent actually did"
 description: >-
-  Read the execution log a Claude Code Action run leaves on the runner and
-  report exposed credentials, risky shell activity and cost. Local, read-only,
-  no network, no account.
+  Audit a Claude Code Action run: exposed credentials, risky shell commands and
+  cost. Local, read-only.
 author: "Digital Foundry Solutions, LLC"
 
 branding:

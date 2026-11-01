@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- The GitHub Action's `description` is now under GitHub Marketplace's 125-character limit, so a release can be
+  listed there. The README shows a `uses: digital-foundry/actualis@...` example.
+
 ## 0.5.0 (2026-10-31)
 
 ### Added
