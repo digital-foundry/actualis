@@ -80,6 +80,18 @@ class Detectors(unittest.TestCase):
         found = gate().scan_file("docs/a.md", "a\x0cb\nreach " + EMAIL + "\n")
         self.assertEqual(found, [(2, "email")])
 
+    def test_reserved_ranges_are_read_the_same_on_every_python(self):
+        """ipaddress's is_global differs across patch releases (macOS 3.9 in
+        CI disagreed with 3.9 locally); the gate uses its own range list."""
+        for v in ("0.1.2.3", "100.64.0.1", "100.127.255.254", "192.0.0.8", "192.0.2.5",
+                  "198.18.0.1", "198.19.255.1", "224.0.0.1", "240.0.0.1", "255.255.255.255",
+                  "::ffff:10.0.0.1", "2001:db8::1", "fd00::1", "fe80::1", "::1"):
+            with self.subTest(v=v):
+                self.assertTrue(pg._ip_ok(v))
+        for v in ("100.63.0.1", "100.128.0.1", "198.17.0.1", "198.20.0.1", "2600:1f18" + "::1"):
+            with self.subTest(v=v):
+                self.assertFalse(pg._ip_ok(v))
+
     def test_secret_is_not_checked_under_tests(self):
         self.assertEqual(hits(f"export GH={TOKEN}", in_tests=True), [])
 

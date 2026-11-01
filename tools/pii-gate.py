@@ -64,6 +64,16 @@ RESERVED_TLDS = {"example", "test", "invalid", "localhost", "local", "internal"}
 # Public resolvers every networking example uses; nobody's personal address.
 WELL_KNOWN_IPS = {"8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1", "9.9.9.9"}
 
+# Address ranges that belong to nobody (IANA special-purpose registries).
+# Spelled out rather than read from ipaddress's is_global/is_private, whose
+# answers differ across Python patch releases (3.9.x, 3.12.4, 3.13).
+NON_PERSONAL_NETS = [ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+    "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.88.99.0/24", "192.168.0.0/16",
+    "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+    "::/127", "64:ff9b::/96", "64:ff9b:1::/48", "100::/64", "2001::/23", "2001:db8::/32",
+    "3fff::/20", "fc00::/7", "fe80::/10", "ff00::/8")]
+
 HOME_RX = re.compile(r"(?:/users/|/home/|[a-z]:\\{1,2}users\\{1,2})([a-z0-9][a-z0-9._-]*)")
 # Bounded quantifiers and a lookbehind keep these linear on long unbroken
 # runs (base64, hex) that contain no match.
@@ -166,9 +176,10 @@ def _ip_ok(value: str) -> bool:
         ip = ipaddress.ip_address(value)
     except ValueError:
         return True        # not an address (a time like 12:34:56, a C++ scope)
-    # Private, loopback, CGNAT, documentation (RFC 5737), benchmarking,
-    # and reserved ranges are non-global; multicast is "global" but nobody's.
-    return value in WELL_KNOWN_IPS or not ip.is_global or ip.is_multicast
+    if getattr(ip, "ipv4_mapped", None):
+        ip = ip.ipv4_mapped     # ::ffff:6.6.6.6 is 6.6.6.6
+    return value in WELL_KNOWN_IPS or any(ip in net for net in NON_PERSONAL_NETS
+                                          if net.version == ip.version)
 
 
 def _phone_ok(value: str) -> bool:
