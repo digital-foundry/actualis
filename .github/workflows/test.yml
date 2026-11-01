@@ -102,6 +102,14 @@ jobs:
       - name: tests
         run: uv run --python ${{ matrix.python }} python -m unittest discover -s tests -v
 
+      # Built-in detectors only: the private terms list lives in 1Password and
+      # this public repo's runners get no secrets. `make pii-full` runs it
+      # locally before a release. The suite runs the gate too
+      # (test_this_repository_is_clean); this step shows its findings plainly.
+      - name: PII gate
+        if: matrix.os == 'ubuntu-latest'
+        run: uv run --python ${{ matrix.python }} python tools/pii-gate.py
+
       - name: exits cleanly with no transcripts
         shell: bash
         run: |

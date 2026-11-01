@@ -154,6 +154,51 @@ module needs that import (a test checks). Timing checks go through
 does not count), `assert_linear` for a growth check, and `budget()` for any
 ceiling within 20x of the measured time.
 
+## Personal data (`make pii`)
+
+The repo is public and the suite is built around agent transcripts, so test
+data, docs and examples must be synthetic. Never paste a real transcript, path,
+host, session id or address. The PII gate enforces this:
+
+```sh
+make pii          # built-in detectors; CI runs this
+make pii-full     # plus the private terms list; run before a release
+```
+
+It checks every git-tracked text file except `actualis.py` (the detector
+corpus; gitleaks covers it) and prints `path:line: detector`, never the value,
+so a failing CI log does not republish what it found. Detectors:
+
+| detector | fires on |
+|---|---|
+| `home-path` | `/Users/<name>`, `/home/<name>`, `C:\Users\<name>`, unless the name is a placeholder (`x`, `you`, `runner`, `someone`, ...) |
+| `email` | any address, except `example.*` and reserved TLDs (`.test`, `.invalid`, ...), `digitalfoundry.tech`, `noreply@anthropic.com`, `git@host:` remotes and URL userinfo |
+| `phone` | North American and E.164 numbers, except 555-0100 to 555-0199 |
+| `tailnet` | `*.ts.net` hosts |
+| `ip` | public IPv4 and IPv6 addresses; private, CGNAT, link-local, documentation (RFC 5737, `2001:db8::`), multicast and reserved ranges pass |
+| `uuid` | UUIDs that do not look hand-typed (mostly zeros, few distinct digits, repeated groups) |
+| `secret` | outside `tests/`: actualis's own token-prefix, Authorization-header and URL-password patterns |
+| `term` | `pii-full` only: the private list of names, places and employers, outside attribution lines (copyright, authors, Co-Authored-By) |
+| `decode` | text still changing after 8 rounds of HTML, percent and JSON unescaping |
+
+Matching runs on the raw line and on a canonical form: decoded, NFKC,
+invisible characters stripped, case-folded, Cyrillic and Greek look-alikes
+mapped to Latin. `&#x2F;Users&#x2F;` and `/Us\u0435rs/` are caught.
+
+**When it fires**, replace the value with synthetic data (`/Users/x`,
+`dev@example.com`, `192.0.2.7`, `(617) 555-0142`). If the value is genuinely
+not personal, allow it with a reason, either inline on the line
+(`# pii-ok: <reason>`) or as an entry in `.pii-allow`
+(`<exact value> # <reason>`). An entry without a reason fails the gate.
+
+**The private terms list** never lives in this repo. `make pii-full` reads it
+from the file named by `ACTUALIS_PII_TERMS`, or from the 1Password note
+`Foundry Admin / actualis pii terms` through the Foundry Admin service account.
+One term per line: a literal, matched as whole words case-insensitively with
+any spaces, hyphens or underscores between them, or a `/regex/` (always
+case-insensitive). A missing, empty or invalid list fails the gate (exit 2),
+and the error never names a term.
+
 ## Security scan (`make security`)
 
 ```sh
@@ -193,7 +238,8 @@ console summary:
   never a clean result; its stderr is printed below the line.
 - gitleaks and trufflehog skip the files whose job is to hold invented
   credential shapes: `tests/`, `tools/make-demo-fleet.py` and
-  `docs/superpowers/plans/` (`.gitleaks.toml`,
+  `docs/superpowers/plans/`, gone from the tree but still in the history
+  (`.gitleaks.toml`,
   `tools/security/trufflehog-exclude.txt`). They also skip `agentfleet.py`,
   actualis.py's name before the rename, so every revision of it in the history
   goes unscanned. The reason: it holds the redaction regexes for database URLs

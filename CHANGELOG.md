@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- A PII gate for this repository (`tools/pii-gate.py`, `make pii`, a CI step): it fails when tracked files
+  carry home paths with real user names, emails, phone numbers, tailnet hosts, public IPs, UUIDs that do not
+  look hand-typed, or credentials actualis recognises. It decodes and canonicalises before matching, and
+  reports `path:line: detector`, never the value. See CONTRIBUTING.md.
+
+### Changed
+- Design specs and implementation plans no longer live in this repository.
+
 ## 0.5.1 (2026-11-01)
 
 ### Changed

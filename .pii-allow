@@ -1,0 +1,37 @@
+# Values the PII gate (tools/pii-gate.py) lets through. One per line:
+#   <exact value> # <reason>
+# The value is compared as written and case-folded. Every entry needs a reason;
+# prefer an inline `pii-ok: <reason>` marker when the value is on one line only.
+
+# Tool@host flag ids in network tests: the tool name and the host it reached.
+npm@registry.npmjs.org # flag id tool@host, not a mailbox
+curl@evil.io # flag id tool@host, not a mailbox
+pip@pypi.org # flag id tool@host, not a mailbox
+
+# Invented addresses in IOC and reputation tests. 6.6.6.6 is the IOC fixture;
+# the others sit just outside a reserved range to test its boundary.
+6.6.6.6 # invented IOC address
+1.2.3.4 # placeholder address in a version-parsing test
+172.32.0.1 # one past 172.16.0.0/12, boundary test
+100.63.0.1 # one below 100.64.0.0/10, boundary test
+100.128.0.1 # one above 100.64.0.0/10, boundary test
+198.17.0.1 # one below 198.18.0.0/15, boundary test
+198.20.0.1 # one above 198.18.0.0/15, boundary test
+223.1.1.1 # public-range control value in a reputation test
+192.0.1.1 # one below 192.0.2.0/24, boundary test
+203.0.114.1 # one above 203.0.113.0/24, boundary test
+
+/home/jane # "Jane Doe", the placeholder name, in a systemd unit test
+
+# Windows known-folder GUID (FOLDERID_System), a Microsoft constant.
+1AC14E77-02E7-4E5D-B744-2EB1AE5198B7 # Windows FOLDERID_System constant
+
+# Documentation and fixture credentials, all fabricated. Demo-fleet values are
+# allowed inline (pii-ok) so they are not copied here.
+AKIAIOSFODNN7EXAMPLE # AWS's own documentation key
+vcp_notarealtokenjustafixture01 # self-describing fixture token
+npm_config_registry # npm environment variable name, not a token
+password # the literal placeholder in scheme://user:password@host examples
+06.06.06.06 # 6.6.6.6 written with leading zeros, IOC test
+::ffff:606:606 # 6.6.6.6 as an IPv4-mapped IPv6 address, IOC test
+08.1.1.1 # leading-zero host an IOC test feeds to the URL parser

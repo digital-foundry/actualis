@@ -6,7 +6,7 @@ PYTHON ?= python3
 ARGS   ?=
 
 .DEFAULT_GOAL := help
-.PHONY: help run network check install uninstall test security security-remote tray formula clean
+.PHONY: help run network check install uninstall test pii pii-full security security-remote tray formula clean
 
 help:
 	@echo "make run [ARGS='--days 30']  run the report from this checkout"
@@ -15,6 +15,8 @@ help:
 	@echo "make install                 install the 'actualis' command from this checkout (uv, else pipx)"
 	@echo "make uninstall               remove the installed command"
 	@echo "make test                    run the test suite"
+	@echo "make pii                     PII gate: personal data in tracked files (built-in detectors)"
+	@echo "make pii-full                PII gate plus the private terms list (before a release)"
 	@echo "make security [FUZZ_ITERATIONS=300]  Kali scanners + transcript fuzzer (needs Docker)"
 	@echo "make security-remote [SECURITY_HOST=mac-mini]  same scan, on the build server over SSH"
 	@echo "make tray                    build the tray app (needs Go)"
@@ -48,6 +50,22 @@ uninstall:
 
 test:
 	$(PYTHON) -m unittest discover -s tests
+
+# The PII gate (tools/pii-gate.py, CONTRIBUTING.md). CI runs the built-in
+# detectors. pii-full adds the private terms list (names, places, employers),
+# which never lives in this repo: from the file named by ACTUALIS_PII_TERMS,
+# else from 1Password through the Foundry Admin service account. The token is
+# read from the login keychain and never printed.
+pii:
+	$(PYTHON) tools/pii-gate.py $(ARGS)
+
+pii-full:
+	@if [ -n "$$ACTUALIS_PII_TERMS" ]; then \
+		$(PYTHON) tools/pii-gate.py --full $(ARGS); \
+	else \
+		OP_SERVICE_ACCOUNT_TOKEN="$$(security find-generic-password -s foundry-admin-op-sa -w)" \
+			$(PYTHON) tools/pii-gate.py --full $(ARGS); \
+	fi
 
 tray:
 	cd tray-go && go build -ldflags "-s -w" -o actualis-tray .
