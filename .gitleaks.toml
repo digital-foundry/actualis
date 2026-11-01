@@ -12,6 +12,8 @@ description = "invented credential fixtures"
 paths = [
   '''^tests/''',
   '''^tools/make-demo-fleet\.py$''',
+  # Implementation plans quoting those fixtures. They moved out of the tree on
+  # 2026-11-01 (#76) but the history still holds them.
   '''^docs/superpowers/plans/''',
   # actualis.py's name before the rename; its history holds the redaction
   # regexes for database URLs with passwords, which detectors read as secrets.
