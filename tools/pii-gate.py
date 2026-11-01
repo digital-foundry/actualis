@@ -223,7 +223,7 @@ class Gate:
             for m in PHONE_RX.finditer(text):
                 if not _phone_ok(m.group(0)) and not self._allowed(m.group(0)):
                     add("phone")
-            for m in (TAILNET_RX.finditer(low) if "ts.net" in low else ()):
+            for m in TAILNET_RX.finditer(low):
                 if not self._allowed(low[m.start():m.end()]):
                     add("tailnet")
             for m in IP_RX.finditer(text):
