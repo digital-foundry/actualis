@@ -192,8 +192,10 @@ not personal, allow it with a reason, either inline on the line
 (`<exact value> # <reason>`). An entry without a reason fails the gate.
 
 **The private terms list** never lives in this repo. `make pii-full` reads it
-from the file named by `ACTUALIS_PII_TERMS`, or from the 1Password note
-`Foundry Admin / actualis pii terms` through the Foundry Admin service account.
+from the first of: the file named by `ACTUALIS_PII_TERMS`;
+`~/.config/actualis/pii-terms.txt` (under `$XDG_CONFIG_HOME` if set), when it
+exists; the 1Password note `Foundry Admin / actualis pii terms` through the
+Foundry Admin service account. Keep the file private (`chmod 600`).
 One term per line: a literal, matched as whole words case-insensitively with
 any spaces, hyphens or underscores between them, or a `/regex/` (always
 case-insensitive). A missing, empty or invalid list fails the gate (exit 2),
