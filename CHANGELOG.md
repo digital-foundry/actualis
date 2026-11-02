@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 (2026-11-02)
 
 ### Added
 - A PII gate for this repository (`tools/pii-gate.py`, `make pii`, a CI step): it fails when tracked files
