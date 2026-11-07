@@ -6271,7 +6271,8 @@ def reputation_json(fleet: "Fleet") -> dict:
         out["stale"] = now - data.oldest > timedelta(days=REPUTATION_STALE_DAYS)
     out["vt_results"] = len(data.vt)
     out["vt_status"] = "corrupt" if data.vt_error else ("ok" if data.vt_present else "absent")
-    out["candidates"] = sorted(({"prefix_b64": base64.b64encode(p).decode(), "expressions": n}
+    out["candidates"] = sorted(({"prefix_b64": base64.b64encode(p).decode(), "expressions": n,
+                                 **assessment_of("reputation-candidate")}
                                 for p, n in fleet.reputation_candidates.items()),
                                key=lambda c: c["prefix_b64"])
     if data.lists:
@@ -7491,6 +7492,7 @@ def apply_ioc(fleet: "Fleet", ioc: IocSet | None) -> None:
             "evidence": redact(clean(evidence))[:240],
             "had_secret": False, "suppressed": suppressed,
             "suppressed_reason": fleet.suppressions.get(fid, ""),
+            **_ioc_assessment(verdict, first["reason"]),
         })
         for r in rows:
             r["flag_id"], r["suppressed"] = fid, suppressed
@@ -7548,6 +7550,7 @@ def ioc_json(fleet: "Fleet", raw: bool = False) -> dict:
         matches.append({
             "verdict": r["verdict"], "reason": r["reason"], "refused": r["refused"],
             "suppressed": r["suppressed"], "flag_id": r["flag_id"],
+            **_ioc_assessment(r["verdict"], r["reason"]),
             "refs": sorted({e.ref for e in r["entries"] if e.ref})[:IOC_REFS_CAP],
             "labels": sorted({e.label for e in r["entries"] if e.label})[:IOC_REFS_CAP],
             "entry": _ioc_entry_json(r["entries"][0]),
@@ -7964,13 +7967,14 @@ def apply_reputation(fleet: "Fleet", data: "ReputationData | None", now: "dateti
         days = (now - data.oldest).days
         _reputation_flag(fleet, "med", "reputation-stale", "gsb-lists", None,
                          f"Google Safe Browsing lists are {days} days old and can miss new threats; "
-                         f"run `actualis-reputation update`")
+                         f"run `actualis-reputation update`", missing=f"lists are {days} days old")
 
 
 def _reputation_flag(fleet: "Fleet", severity: str, category: str, key: str, latest: "dict | None",
-                     evidence: str, suffix: str = "") -> None:
+                     evidence: str, suffix: str = "", missing: "str | None" = None) -> None:
     """suffix (the Google advisory) is appended after the body is clipped, so
-    a long host cannot cut it off."""
+    a long host cannot cut it off. missing, when given, is the fact a
+    needs-validation flag lacks (see classify())."""
     fid = flag_id(severity, [category], key)
     suppressed = fid in fleet.suppressions
     if suppressed:
@@ -7980,6 +7984,8 @@ def _reputation_flag(fleet: "Fleet", severity: str, category: str, key: str, lat
         "project": latest["project"] if latest else "", "when": latest["ts"] if latest else None,
         "evidence": redact(clean(evidence))[:240 - len(suffix)] + suffix, "had_secret": False,
         "suppressed": suppressed, "suppressed_reason": fleet.suppressions.get(fid, ""),
+        **({"assessment": "needs-validation", "basis": "observed", "missing": missing}
+           if missing else {}),
     })
 
 
@@ -11063,6 +11069,113 @@ def coach(fleet: "Fleet") -> list[Finding]:
     return out
 
 
+# --------------------------------------------------------------------------
+# Assessments
+#
+# Every finding says whether it is confirmed or needs validation (and which
+# fact is missing), and whether it rests on what the transcript says
+# (observed) or on what actualis derived (inferred). One table, applied at
+# output time; a producer sets its own value only where it knows more than
+# the table (an IOC reason, a list's age). Severity is never touched.
+# --------------------------------------------------------------------------
+
+ASSESSMENTS = ("confirmed", "needs-validation")
+BASES = ("observed", "inferred")
+_CONFIRMED = ("confirmed", "observed", None)
+_PREFIX_ONLY = ("needs-validation", "observed",
+                "local hash-prefix match; run actualis-reputation confirm")
+
+# Flag category, "secret", or coach id -> (assessment, basis, missing).
+_ASSESSMENT: dict[str, tuple] = {
+    # The shell-audit rules: the command is in the transcript and a rule matched it.
+    **{cat: _CONFIRMED for _sev, cat, _rx in COMPILED_RULES},
+    "network-config": _CONFIRMED,
+    "network-unasked": _CONFIRMED,
+    "audit-config": _CONFIRMED,
+    "oversized-command": ("needs-validation", "observed",
+                          "command longer than what is read; the rest was not checked"),
+    "secret": _CONFIRMED,
+    "network-ioc": _CONFIRMED,
+    # apply_ioc sets the row's own reason text; this is the fallback.
+    "network-ioc-unresolved": ("needs-validation", "observed",
+                               _IOC_REASON_TEXT["version-unresolved"]),
+    "reputation-listed": _CONFIRMED,
+    "reputation-candidate": _PREFIX_ONLY,
+    "reputation-suspicious": ("needs-validation", "observed",
+                              "VirusTotal engines call it suspicious, none malicious; review the host"),
+    # apply_reputation sets "lists are N days old"; this is the fallback.
+    "reputation-stale": ("needs-validation", "observed", "lists are stale"),
+    "AF001": _CONFIRMED,
+    "AF002": ("confirmed", "inferred", None),
+    "AF003": _CONFIRMED,
+    "AF004": _CONFIRMED,
+    "AF005": _CONFIRMED,
+    "AF006": _CONFIRMED,
+    "AF007": _CONFIRMED,
+    "AF008": _CONFIRMED,
+    "AF009": _CONFIRMED,
+    "AF010": _CONFIRMED,
+    "AF011": ("needs-validation", "observed", "agent writes no shell records"),
+    "AF012": _CONFIRMED,
+    "AF013": _CONFIRMED,
+}
+_DEFAULT_ASSESSMENT = {"assessment": "confirmed", "basis": "observed", "missing": None}
+_AF_ID = re.compile(r"AF\d{3}")
+
+
+def assessment_of(key: object) -> dict:
+    """The three fields for one _ASSESSMENT key; the default triple for any other."""
+    entry = _ASSESSMENT.get(key) if isinstance(key, str) else None
+    if entry is None:
+        return dict(_DEFAULT_ASSESSMENT)
+    return {"assessment": entry[0], "basis": entry[1], "missing": entry[2]}
+
+
+def _ioc_assessment(verdict: object, reason: object) -> dict:
+    """An IOC row or flag: a match is confirmed; an unresolved one needs the
+    fact its reason names. A name read from a URL is inferred, not observed."""
+    if verdict == "match":
+        return dict(_DEFAULT_ASSESSMENT)
+    key = reason if isinstance(reason, str) else ""
+    return {"assessment": "needs-validation",
+            "basis": "inferred" if key == "name-from-url" else "observed",
+            "missing": _IOC_REASON_TEXT.get(key) or clean(key) or "could not check"}
+
+
+def classify(row: object) -> dict:
+    """assessment, basis and missing for a flag dict, a secret record, a coach
+    Finding, an IOC row or a reputation candidate. A producer-set value wins
+    over the table. An unknown shape is confirmed and observed: classify()
+    never raises, whatever it is handed."""
+    try:
+        if isinstance(row, Finding):
+            return assessment_of(row.id)
+        if not isinstance(row, dict):
+            return dict(_DEFAULT_ASSESSMENT)
+        if row.get("assessment") in ASSESSMENTS and row.get("basis") in BASES and "missing" in row:
+            return {"assessment": row["assessment"], "basis": row["basis"], "missing": row["missing"]}
+        if "verdict" in row and "reason" in row:
+            return _ioc_assessment(row["verdict"], row["reason"])
+        if "prefix_b64" in row:
+            return assessment_of("reputation-candidate")
+        cats = row.get("categories")
+        if isinstance(cats, list):
+            known = [assessment_of(c) for c in cats if isinstance(c, str) and c in _ASSESSMENT]
+            # A flag with several categories is as uncertain as its least certain one.
+            for a in known:
+                if a["assessment"] == "needs-validation":
+                    return a
+            return known[0] if known else dict(_DEFAULT_ASSESSMENT)
+        if "priority" in row and ("kinds" in row or "types" in row):
+            return assessment_of("secret")
+        fid = row.get("id")
+        if isinstance(fid, str) and _AF_ID.fullmatch(fid):
+            return assessment_of(fid)
+    except Exception:                        # noqa: BLE001 -- an unknown shape is never fatal
+        pass
+    return dict(_DEFAULT_ASSESSMENT)
+
+
 # --- comparing two runs -----------------------------------------------------
 
 # Severity vocabularies differ between the three entity families, so rank them
@@ -13391,7 +13504,7 @@ def _mcp_call(name: str, args: dict, cache: _MCPCache) -> dict:
     if name == "coach_findings":
         return {"findings": [{"id": x.id, "severity": x.severity, "title": x.title,
                               "evidence": x.evidence, "action": x.action,
-                              "impact": x.impact, "project": x.project}
+                              "impact": x.impact, "project": x.project, **classify(x)}
                              for x in coach(f)]}
 
     if name == "shell_audit":
@@ -15738,6 +15851,9 @@ JSON_SCHEMA: dict[str, str] = {
     "bash.flags[].when": "str|null",
     "bash.flags[].evidence": "str",
     "bash.flags[].had_secret": "bool",
+    "bash.flags[].assessment": "str",
+    "bash.flags[].basis": "str",
+    "bash.flags[].missing": "str|null",
     "coach": "array",
     "coach[].id": "str",
     "coach[].severity": "str",
@@ -15746,6 +15862,9 @@ JSON_SCHEMA: dict[str, str] = {
     "coach[].action": "str",
     "coach[].impact": "str|null",
     "coach[].project": "str",
+    "coach[].assessment": "str",
+    "coach[].basis": "str",
+    "coach[].missing": "str|null",
     "secret_exposures": "int",
     "suppressed_secrets": "int",
     "suppression_note": "str",
@@ -15762,6 +15881,9 @@ JSON_SCHEMA: dict[str, str] = {
     "secrets[].first_seen": "str",
     "secrets[].last_seen": "str",
     "secrets[].distinct_values": "int",
+    "secrets[].assessment": "str",
+    "secrets[].basis": "str",
+    "secrets[].missing": "str|null",
     "secret_projects.*": "int",
     "redacted": "bool",
     "permission_modes.*": "int",
@@ -15892,6 +16014,9 @@ JSON_SCHEMA: dict[str, str] = {
     "network.reputation.candidates": "array",
     "network.reputation.candidates[].prefix_b64": "str",
     "network.reputation.candidates[].expressions": "int",
+    "network.reputation.candidates[].assessment": "str",
+    "network.reputation.candidates[].basis": "str",
+    "network.reputation.candidates[].missing": "str|null",
     "network.reputation.advisory.text": "str|null",
     "network.reputation.advisory.url": "str|null",
     "network.reputation.network_last_used.at": "str|null",
@@ -15927,6 +16052,9 @@ JSON_SCHEMA: dict[str, str] = {
     "network.ioc.matches[].refused": "bool",
     "network.ioc.matches[].suppressed": "bool",
     "network.ioc.matches[].flag_id": "str|null",
+    "network.ioc.matches[].assessment": "str",
+    "network.ioc.matches[].basis": "str",
+    "network.ioc.matches[].missing": "str|null",
     "network.ioc.matches[].refs": "array",
     "network.ioc.matches[].refs[]": "str",
     "network.ioc.matches[].labels": "array",
@@ -16211,12 +16339,13 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
                 "high": sum(1 for f in fleet.actionable_flags if f["severity"] == "high"),
                 "medium": sum(1 for f in fleet.actionable_flags if f["severity"] == "med"),
             },
-            "flags": [{**f, "evidence": (f["evidence"] if raw else redact(f["evidence"]))[:240]}
+            "flags": [{**f, **classify(f),
+                       "evidence": (f["evidence"] if raw else redact(f["evidence"]))[:240]}
                       for f in fleet.flags],
         },
         "coach": [{"id": f.id, "severity": f.severity, "title": f.title,
                    "evidence": f.evidence, "action": f.action, "impact": f.impact,
-                   "project": f.project}
+                   "project": f.project, **classify(f)}
                   for f in coach(fleet)],
         "secret_exposures": fleet.secret_exposures,
         "suppressed_secrets": fleet.suppressed_secrets,
@@ -16230,7 +16359,7 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
              "projects": sorted(e["projects"]),
              "suppressed": bool(e.get("suppressed")),
              "suppressed_reason": e.get("suppressed_reason", ""),
-             "distinct_values": e.get("distinct_values", 1)}
+             "distinct_values": e.get("distinct_values", 1), **classify(e)}
             for fp, e in sorted(
                 fleet.secrets.items(),
                 key=lambda kv: ({"critical": 0, "high": 1, "low": 2}.get(kv[1]["priority"], 9),

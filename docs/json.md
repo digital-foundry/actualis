@@ -37,8 +37,8 @@ that and prints a warning to stderr (stdout stays pure JSON).
 | `by_project` | cost per project |
 | `by_day` | cost per calendar day (UTC date), ascending |
 | `tools` | tool-call counts, descending |
-| `bash` | `total`, `commands{}` (program name to count; a program name that is itself a credential, such as a pasted token run as a command, is counted as `(credential)`), `flag_counts{}`, `oversized_commands` (commands over 32 KB, each also a medium `oversized-command` flag), `flagged.high` and `flagged.medium` (the report's "flagged N high M medium": one per command, suppressed flags left out; `flag_counts` counts per category and includes suppressed flags), `flags[]`: `id`, `severity`, `categories[]`, `program`, `project`, `when` (null when undated), `evidence` (240 characters, redacted unless `--no-redact`), `had_secret` (the command also contained a credential), `suppressed` and `suppressed_reason` |
-| `coach` | findings: `id`, `severity`, `title`, `evidence`, `action`, `impact`, `project` (the project a per-project finding such as `AF002` or `AF006` is about, `""` for fleet-wide findings; `--diff` matches findings on `id` and `project`) |
+| `bash` | `total`, `commands{}` (program name to count; a program name that is itself a credential, such as a pasted token run as a command, is counted as `(credential)`), `flag_counts{}`, `oversized_commands` (commands over 32 KB, each also a medium `oversized-command` flag), `flagged.high` and `flagged.medium` (the report's "flagged N high M medium": one per command, suppressed flags left out; `flag_counts` counts per category and includes suppressed flags), `flags[]`: `id`, `severity`, `categories[]`, `program`, `project`, `when` (null when undated), `evidence` (240 characters, redacted unless `--no-redact`), `had_secret` (the command also contained a credential), `suppressed` and `suppressed_reason`, and the three [assessment](#assessments) fields |
+| `coach` | findings: `id`, `severity`, `title`, `evidence`, `action`, `impact`, `project` (the project a per-project finding such as `AF002` or `AF006` is about, `""` for fleet-wide findings; `--diff` matches findings on `id` and `project`), and the three [assessment](#assessments) fields |
 | `secrets` | array; see below |
 | `secret_exposures` | commands containing credential material |
 | `suppressed_secrets` | credential findings marked as false positives on this machine |
@@ -142,6 +142,25 @@ report says so rather than quoting an old number with a straight face.
 
 Refreshing the table is a deliberate, human-run step — see `tools/price-check.py`
 in the repository. The CLI will never fetch a price on your behalf.
+
+## Assessments
+
+Every row in `bash.flags[]` (suppressed ones included), `secrets[]`, `coach[]`,
+`network.ioc.matches[]` and `network.reputation.candidates[]`, and every MCP
+`coach_findings` row, carries three fields. Added in 0.7.0, additive under
+`schema_version` 1.
+
+| field | type | values |
+|---|---|---|
+| `assessment` | string | `confirmed`: the evidence is in the transcript and the check is decided. `needs-validation`: something the check needs is not in the transcript; `missing` says what |
+| `basis` | string | `observed`: read from the transcript. `inferred`: derived by actualis (AF002's cache-waste estimate, an npm name read from a URL) |
+| `missing` | string or null | the missing fact when `assessment` is `needs-validation`, never empty then; `null` when `confirmed` |
+
+The values come from one table, `_ASSESSMENT` in `actualis.py`, which docs/findings.md
+reproduces.
+Severity does not change with the assessment, and neither does `--fail-on`.
+`rejected` is never an `assessment` value. The IOC field `verdict`
+(`match` / `unresolved`) is a different thing and is unchanged.
 
 ## Verifying a report
 
@@ -569,7 +588,7 @@ claude mcp add actualis -- actualis --mcp
 | `fleet_summary` | window, spend (with `cost_usd_from_unpriced_models` and `unpriced_model_tokens` as in `--json`), cache hit rate, top projects, unsupervised share (`unsupervised_pct` over turns with a recorded mode, with `moded_commands` and `unmoded_commands`) |
 | `ticket_cost` | cost for one ticket, or the most expensive ones |
 | `exposed_secrets` | rotation list: priority, types, fingerprint, dates (`first_seen`/`last_seen` are `""` when unknown, as in `--json`), and `suppressed`/`suppressed_reason` per row. `worth_rotating` leaves out suppressed credentials, as the report does; `suppressed` counts them. `priority` must be `critical`, `high`, `low` or `all` |
-| `coach_findings` | `AF001`–`AF013` with evidence, actions and `project` (the project an AF002/AF006 row is about, else `""`) |
+| `coach_findings` | `AF001`–`AF013` with evidence, actions, `project` (the project an AF002/AF006 row is about, else `""`) and the three [assessment](#assessments) fields |
 | `shell_audit` | counts by category, permission modes, the subagent blind spot |
 | `explain` | how a figure is computed, what it assumes, how to verify it |
 | `verify_agents` | installed agent platforms and their signature status |
