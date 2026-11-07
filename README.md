@@ -525,6 +525,9 @@ claude plugin marketplace add digital-foundry/actualis
 claude plugin install actualis@actualis
 ```
 
+Or inside a Claude Code session: `/plugin marketplace add digital-foundry/actualis`, then
+`/plugin install actualis@actualis`.
+
 The skill never installs anything, never prints credential values, and only suggests `actualis-reputation`
 (the one part that uses the network); it does not run it.
 

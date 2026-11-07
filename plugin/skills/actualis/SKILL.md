@@ -46,7 +46,7 @@ for a human. `--json` is refused by some modes (`--bash`, `--coach`,
 ## Reporting
 
 - Lead with the answer, then list findings by id and severity
-  (critical, high, medium, low) with the project and when.
+  (critical, high, med, info) with the project and when.
 - Say what the numbers do not cover: "no match" for `--ioc` is not "not
   affected" (lockfile installs and postinstall hooks are out of sight).
 - Never paste credential values. actualis redacts them by default; do not
