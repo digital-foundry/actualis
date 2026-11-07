@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- A Claude Code plugin marketplace in this repository (`.claude-plugin/marketplace.json`, plugin in `plugin/`):
+  an `actualis` skill and an `/actualis` command that drive the installed CLI. Tests keep its version and
+  every flag it mentions in step with `actualis.py`.
+
 ## 0.6.0 (2026-11-02)
 
 ### Added
