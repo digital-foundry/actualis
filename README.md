@@ -514,6 +514,23 @@ counts. Never a secret value, and never raw command text.
 The scan is cached for the life of the process, since a large fleet takes about a
 minute to read.
 
+## Use it from Claude Code
+
+A Claude Code plugin adds an `actualis` skill (so your agent can answer "what did my agents cost?", "did a
+credential leak?", "was the bad version installed?" by running the CLI) and an `/actualis` command. Install
+the CLI first (`pipx install actualis` or `uv tool install actualis`), then:
+
+```sh
+claude plugin marketplace add digital-foundry/actualis
+claude plugin install actualis@actualis
+```
+
+Or inside a Claude Code session: `/plugin marketplace add digital-foundry/actualis`, then
+`/plugin install actualis@actualis`.
+
+The skill never installs anything, never prints credential values, and only suggests `actualis-reputation`
+(the one part that uses the network); it does not run it.
+
 ## Privacy
 
 Nothing leaves your machine. actualis itself makes no network calls, and has no telemetry, no analytics, no

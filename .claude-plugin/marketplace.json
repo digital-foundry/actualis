@@ -1,0 +1,12 @@
+{
+  "name": "actualis",
+  "owner": { "name": "Digital Foundry" },
+  "metadata": { "description": "Audit what your coding agents did, cost and exposed, from their own transcripts, locally." },
+  "plugins": [
+    {
+      "name": "actualis",
+      "source": "./plugin",
+      "description": "Ask your coding agent what agents did and cost, whether a credential leaked, or whether a bad package was installed, using the local actualis CLI."
+    }
+  ]
+}
