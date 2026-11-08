@@ -557,5 +557,221 @@ class TestAF014(HomeCase):
         self.assertIn("[AF014](#af014)", doc)
 
 
+class TestCoverageLedger(HomeCase):
+    """Task 4: coverage(fleet), in --json."""
+
+    def scanned(self):
+        f = af.Fleet()
+        f.scan(af.transcript_roots(), None, None, progress=False)
+        return f
+
+    def test_a_clean_run_is_complete(self):
+        path = self.claude(assistant("m1", recent(), command="git status"))
+        self.settings("{}")
+        cov = af.coverage(self.scanned())
+        self.assertEqual((cov["ok"], cov["gaps"]), (True, []))
+        self.assertEqual(cov["agents"], [{
+            "agent": "claude-code", "root_exists": True, "files_read": 1, "files_unreadable": 0,
+            "files_skipped_mtime": 0, "oldest": af._utc_date(path.stat().st_mtime),
+            "retention_days": 30, "retention_source": "default", "expiring_7d": 0}])
+        self.assertEqual([c["check"] for c in cov["checks"]], ["credentials", "shell", "records"])
+        creds = cov["checks"][0]
+        self.assertEqual((creds["examined"], creds["not_examined"], creds["why_not"]), (1, 0, {}))
+
+    def test_an_empty_fleet_never_raises(self):
+        cov = af.coverage(af.Fleet())
+        self.assertEqual((cov["ok"], cov["agents"], cov["gaps"]), (True, [], []))
+        f = af.Fleet()
+        f._root_seen("codex")
+        self.assertEqual(af.coverage(f)["gaps"], ["codex: no transcript file read"])
+
+    def test_an_agent_named_without_a_root_is_listed(self):
+        f = af.Fleet()
+        f.scope["agent"] = "codex"
+        [row] = af.coverage(f)["agents"]
+        self.assertEqual((row["agent"], row["root_exists"], row["retention_source"]),
+                         ("codex", False, "none"))
+        self.assertEqual(af.coverage(f)["gaps"], [])
+
+    def test_unreadable_and_oversized_commands_are_not_examined(self):
+        f = af.Fleet()
+        f.add_tool("p", "Bash", {"command": "$CMD"}, TS)
+        f.add_tool("p", "Bash", {"command": "echo " + "x" * (af.MAX_SCAN_TOTAL + 10)}, TS)
+        f.add_tool("p", "Bash", {"command": "git status"}, TS)
+        creds = af.coverage(f)["checks"][0]
+        self.assertEqual(creds, {"check": "credentials", "examined": 1, "not_examined": 2,
+                                 "why_not": {"unreadable-command": 1, "oversized": 1}})
+
+    def test_a_root_copy_has_unknown_retention(self):
+        self.settings('{"cleanupPeriodDays": 30}')
+        archive = self.home / "archive"
+        write_session(archive / "-home-dev-orbital", "s.jsonl", [assistant("m1", recent())])
+        code, out, err = run_main("--root", str(archive), "--json")
+        self.assertEqual(code, af.EXIT_OK, err)
+        [row] = json.loads(out)["coverage"]["agents"]
+        self.assertEqual((row["retention_days"], row["retention_source"]), (None, "unknown"))
+
+    def test_expiring_7d_is_outside_the_digest(self):
+        f = af.Fleet()
+        f._file_read("claude-code", "r", TS.timestamp())
+        payload = af.to_json(f)
+        payload["coverage"]["agents"][0]["expiring_7d"] += 5
+        self.assertEqual(af.report_digest(payload), payload["report_sha256"])
+        payload["coverage"]["agents"][0]["files_read"] += 1
+        self.assertNotEqual(af.report_digest(payload), payload["report_sha256"])
+
+    def test_every_coverage_path_is_declared(self):
+        self.claude(assistant("m1", recent(), command="npm install"),
+                    assistant("m2", recent(), command="curl -sO https://files.example/x"))
+        (self.projects / "-home-dev-orbital" / "broken.jsonl").mkdir()
+        ioc = self.home / "bad.ioc"
+        ioc.write_text("npm:left-pad\n", encoding="utf-8")
+        code, out, err = run_main("--json", "--ioc", str(ioc))
+        self.assertEqual(code, af.EXIT_OK, err)
+        payload = json.loads(out)
+        self.assertEqual(schema_drift(payload), [])
+        self.assertEqual([c["check"] for c in payload["coverage"]["checks"]],
+                         ["credentials", "shell", "records", "network", "ioc"])
+
+    def test_the_keys_are_documented(self):
+        doc = (ROOT / "docs" / "json.md").read_text(encoding="utf-8")
+        for word in ("## coverage", "`coverage`", "`retention_source`", "`expiring_7d`",
+                     "`files_skipped_mtime`", "exit 5", ".coverage.agents[].expiring_7d"):
+            self.assertIn(word, doc)
+
+
+class TestFailOnCoverage(HomeCase):
+    """Task 4: each gap, exit 5 with --fail-on-coverage, 0 without, and 3 first."""
+
+    def assertGap(self, argv, needle):
+        code, out, err = run_main(*argv, "--json")
+        self.assertEqual(code, af.EXIT_OK, err)
+        cov = json.loads(out)["coverage"]
+        self.assertFalse(cov["ok"])
+        self.assertTrue(any(needle in g for g in cov["gaps"]), cov["gaps"])
+        code, out2, err = run_main(*argv, "--json", "--fail-on-coverage")
+        self.assertEqual(code, af.EXIT_COVERAGE, err)
+        self.assertIn("actualis: FAIL at --fail-on-coverage", err)
+        self.assertIn(needle, err)
+        self.assertEqual(json.loads(out2)["coverage"], cov)      # the payload is unchanged
+
+    def test_gap_1_a_root_with_nothing_read(self):
+        self.claude(assistant("m1", recent()))
+        (self.home / ".codex" / "sessions").mkdir(parents=True)
+        self.assertGap([], "codex: no transcript file read")
+
+    def test_gap_1_names_what_the_window_left_out(self):
+        self.claude(assistant("m1", recent()))
+        old = recent(24 * 30)
+        write_session(self.home / ".codex" / "sessions" / "2026", "rollout-1.jsonl", ["{}"], mtime=old)
+        self.assertGap(["--days", "7"], "codex: no transcript file read (1 older than --days 7 skipped)")
+
+    def test_gap_2_an_unreadable_file(self):
+        self.claude(assistant("m1", recent()))
+        (self.projects / "-home-dev-orbital" / "broken.jsonl").mkdir()
+        self.assertGap([], "1 transcript file could not be read (claude-code)")
+
+    def test_gap_3_unparsable_lines_over_one_percent(self):
+        self.claude(assistant("m1", recent()), '{"usage": 1,')
+        self.assertGap([], "1 of 2 record lines could not be parsed (over 1%)")
+
+    def test_gap_4_days_past_retention(self):
+        self.settings('{"cleanupPeriodDays": 14}')
+        self.claude(assistant("m1", recent()))
+        self.assertGap(["--days", "30"], "asked for 30 days; Claude Code keeps 14")
+
+    def test_gap_4_keeping_nothing_is_a_gap_for_any_days(self):
+        self.settings('{"cleanupPeriodDays": 0}')
+        self.claude(assistant("m1", recent()))
+        # --days 2, not 1: recent() is an hour ago, which is yesterday in UTC
+        # during the first hour after midnight, and --days counts UTC days.
+        self.assertGap(["--days", "2"], "asked for 2 days; Claude Code keeps 0")
+
+    def test_gap_4_needs_days_within_retention_to_pass(self):
+        self.settings('{"cleanupPeriodDays": 14}')
+        self.claude(assistant("m1", recent()))
+        code, _, err = run_main("--json", "--days", "14", "--fail-on-coverage")
+        self.assertEqual(code, af.EXIT_OK, err)
+
+    def test_gap_5_downloads_the_ioc_list_cannot_check(self):
+        ioc = self.home / "bad.ioc"
+        ioc.write_text("npm:left-pad\n", encoding="utf-8")
+        self.claude(assistant("m1", recent(), command="npm install"))
+        self.assertGap(["--ioc", str(ioc)], "1 download could not be checked against the IOC list")
+
+    def test_gap_6_stale_reputation_lists(self):
+        import _reputation as R
+        R.write_cache(self.home / ".cache" / "actualis" / "reputation",
+                      fetched_at=datetime.now(timezone.utc) - timedelta(days=9))
+        self.claude(assistant("m1", recent(), command="curl -sO https://files.example/x"))
+        self.assertGap(["--reputation"], "reputation lists are 9 days old")
+
+    def test_no_gap_passes(self):
+        self.claude(assistant("m1", recent(), command="git status"))
+        code, _, err = run_main("--json", "--fail-on-coverage")
+        self.assertEqual(code, af.EXIT_OK, err)
+        self.assertIn("actualis: PASS at --fail-on-coverage", err)
+
+    def test_a_finding_and_a_gap_together_exit_3(self):
+        self.claude(assistant("m1", recent(), command="rm -rf /tmp/build"))
+        (self.home / ".codex" / "sessions").mkdir(parents=True)
+        code, _, err = run_main("--json", "--fail-on", "any", "--fail-on-coverage")
+        self.assertEqual(code, af.EXIT_FINDINGS, err)
+        self.assertIn("actualis: FAIL at --fail-on any", err)
+        self.assertIn("actualis: FAIL at --fail-on-coverage", err)
+
+    def test_cannot_run_still_wins(self):
+        self.projects.mkdir(parents=True)
+        code, _, _ = run_main("--fail-on-coverage")
+        self.assertEqual(code, af.EXIT_CANNOT_RUN)
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "needs POSIX permissions, as non-root")
+    def test_an_unlistable_root_is_a_gap_not_a_crash(self):
+        fx.write_sessions(self.home / ".copilot" / "session-state")
+        self.projects.mkdir(parents=True)
+        self.projects.chmod(0)
+        try:
+            code, out, err = run_main("--json")
+            alone, _, _ = run_main("--agent", "claude", "--fail-on-coverage")
+        finally:
+            self.projects.chmod(0o700)
+        self.assertEqual(code, af.EXIT_OK, err)
+        self.assertIn("cannot read", err)
+        self.assertIn("claude-code: no transcript file read", json.loads(out)["coverage"]["gaps"])
+        self.assertEqual(alone, af.EXIT_CANNOT_RUN)
+
+    def test_a_mode_without_the_gate_refuses_it(self):
+        for argv in (("--explain",), ("--agents",), ("--card",), ("--suppressions",)):
+            with self.subTest(argv=argv):
+                code, _, err = run_main(*argv, "--fail-on-coverage")
+                self.assertEqual(code, af.EXIT_USAGE)
+                self.assertIn("--fail-on-coverage", err)
+
+    def test_the_exit_codes_are_distinct_and_fixed(self):
+        self.assertEqual(af.EXIT_COVERAGE, 5)
+        self.assertEqual(len({af.EXIT_OK, af.EXIT_CANNOT_RUN, af.EXIT_USAGE, af.EXIT_FINDINGS,
+                              af.EXIT_SELF_CHECK_FAILED, af.EXIT_COVERAGE}), 6)
+
+
+class TestFailOnUnchanged(HomeCase):
+    """Task 4: --fail-on gives the same exit codes as before on the fixture corpus."""
+
+    def test_existing_exit_codes_are_unchanged(self):
+        state = fx.write_sessions(self.home / "state")
+        scan = ("--root", str(state), "--agent", "copilot", "--json")
+        for level in af.FAIL_ON_LEVELS:
+            with self.subTest(level=level):
+                code, _, err = run_main(*scan, "--fail-on", level)
+                self.assertEqual(code, af.EXIT_FINDINGS, err)        # session D's live key
+                code, _, err = run_main(*scan, "--fail-on", level, "--fail-on-coverage")
+                self.assertEqual(code, af.EXIT_FINDINGS, err)
+        code, _, err = run_main(*scan)
+        self.assertEqual(code, af.EXIT_OK, err)
+        self.claude(assistant("m1", recent(), command="git status"))
+        code, _, err = run_main("--json", "--fail-on", "any")
+        self.assertEqual(code, af.EXIT_OK, err)
+        self.assertNotIn("--fail-on-coverage", err)
+
+
 if __name__ == "__main__":
     unittest.main()

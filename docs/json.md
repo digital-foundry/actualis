@@ -58,6 +58,7 @@ that and prints a warning to stderr (stdout stays pure JSON).
 | `unknown_models` | models seen with no pricing entry, so priced by inference: the newest sibling in the model family, or else the most expensive rate on file for the provider (the global ceiling when the provider is unknown). Excludes those in `pricing.models_by_tier.unpriced`, which are not billed at all. A dated or alias id of a model in the table (`claude-sonnet-4-5-20250929`, `claude-sonnet-4@20250514`, `claude-opus-4-0`) is that model, priced from its own row, and is not listed here |
 | `unpriced_model_tokens` | model to token count, for Gemini CLI and Qwen Code models with no published rate (tier `unpriced`): `gemini-3-pro-preview`, `gemini-3.5-flash`, every Qwen model, and any model id those agents report that has no price. Their tokens are in `tokens`; their cost is not in `cost_usd` and is not estimated |
 | `aggregator_priced_models` | models priced from a third party because the vendor publishes no rate for that id |
+| `coverage` | what this run examined and what it could not, per agent and per check, and the gaps `--fail-on-coverage` fails on. See [coverage](#coverage) |
 
 ## Inferred cache TTL
 
@@ -162,12 +163,59 @@ Severity does not change with the assessment, and neither does `--fail-on`.
 `rejected` is never an `assessment` value. The IOC field `verdict`
 (`match` / `unresolved`) is a different thing and is unchanged.
 
+## coverage
+
+What the run could see. Added in 0.7.0, additive under `schema_version` 1.
+
+```json
+"coverage": {
+  "ok": false,
+  "agents": [
+    {"agent": "claude-code", "root_exists": true, "files_read": 412, "files_unreadable": 0,
+     "files_skipped_mtime": 1203, "oldest": "2026-10-08", "retention_days": 30,
+     "retention_source": "settings", "expiring_7d": 4}
+  ],
+  "checks": [
+    {"check": "credentials", "examined": 18222, "not_examined": 12,
+     "why_not": {"unreadable-command": 9, "oversized": 3}},
+    {"check": "reputation", "examined": 120, "not_examined": 0, "why_not": {}, "stale": true}
+  ],
+  "gaps": ["reputation lists are 9 days old"]
+}
+```
+
+| key | meaning |
+|---|---|
+| `ok` | `true` when `gaps` is empty |
+| `agents[]` | every agent whose transcript root exists, plus the `--agent` one when its root does not. `agent` (`claude-code`, `codex`, `copilot`, `gemini`, `qwen`), `root_exists`, `files_read` (read to the end), `files_unreadable` (failed `stat` or `open`: skipped and counted), `files_skipped_mtime` (left out by the `--days` prefilter, older than the window by mtime), `oldest` (UTC date of the oldest file read, by mtime, or `null`), `retention_days` (int or `null`), `retention_source`, `expiring_7d` |
+| `retention_source` | `settings` (`cleanupPeriodDays` in Claude Code's `settings.json`), `default` (the file read, the key absent: Claude Code's 30), `unknown` (no file, an unreadable one, not JSON, a value that is not an integer, or a directory Claude Code does not clean, such as a `--root` copy), `none` (the agent deletes nothing on its own: Codex) |
+| `expiring_7d` | transcript files whose mtime plus `retention_days` falls within the next 7 days, or already has (the agent deletes them at its next start); `0` when `retention_days` is `null`. Depends on the clock, so it is left out of `report_sha256` |
+| `checks[]` | `check`, `examined`, `not_examined` and `why_not` (reason to count, zero counts left out). `credentials` and `shell`: commands, with `unreadable-command` and `oversized` (`examined + not_examined` is `bash.total`). `records`: decoded transcript lines, with `unparsable-line`. `network` (only with `--network` or `--ioc`): items, with `unparsed-segment`. `ioc` (only with `--ioc`): downloads, with `lockfile`, `no-host` and `other`. `reputation` (only with `--reputation`): hosts checked, with `local-host` (private and local hosts, never looked up), and `stale` |
+| `gaps[]` | one sentence per gap, whether or not `--fail-on-coverage` was given |
+
+The gaps, each of which makes `--fail-on-coverage` exit 5:
+
+1. an agent's root exists and no transcript file was read in the window;
+2. a transcript file could not be read;
+3. unparsable lines are over 1% of the lines decoded;
+4. `--days N` reaches past what the agent keeps (`retention_source` `settings` or
+   `default`): "asked for 90 days; Claude Code keeps 30". `cleanupPeriodDays` 0
+   is this gap for any `--days`;
+5. with `--ioc`, a download could not be checked against the list;
+6. with `--reputation`, the lists are over 7 days old.
+
+Exit 3 (`--fail-on`) wins when both apply. Without `--fail-on-coverage` a gap
+never changes the exit code.
+
+Verify: `actualis --json | jq '.coverage'`
+
 ## Verifying a report
 
 Every report is content-addressed. `report_sha256` is the SHA-256 of the payload
-with five things removed, serialised canonically: the `report_sha256` key itself,
-`pricing.age_days`, `pricing.stale`, and the `AF013` and `AF014` entries in `coach`.
-The last four depend on today's date and not on the transcripts, so excluding them keeps
+with six things removed, serialised canonically: the `report_sha256` key itself,
+`pricing.age_days`, `pricing.stale`, `expiring_7d` in every `coverage.agents[]`
+row, and the `AF013` and `AF014` entries in `coach`. The last five depend on
+today's date and not on the transcripts, so excluding them keeps
 the same transcripts hashing the same tomorrow as today. A real change in
 the data still changes the hash. The report itself prints the first 16
 characters, so a screenshot can be checked against the payload it came from.
@@ -186,6 +234,8 @@ p = json.load(open("report.json"))
 claimed = p.pop("report_sha256")
 p["pricing"].pop("age_days")
 p["pricing"].pop("stale")
+for a in p["coverage"]["agents"]:
+    a.pop("expiring_7d")
 p["coach"] = [f for f in p["coach"] if f["id"] not in ("AF013", "AF014")]
 canonical = json.dumps(p, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 actual = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -199,7 +249,7 @@ Or in one line, if you have jq 1.7 or later and prefer not to run Python (jq 1.6
 and earlier re-format numbers, so `0.0` becomes `0` and the digest never matches):
 
 ```sh
-jq -Sc 'del(.report_sha256, .pricing.age_days, .pricing.stale) | .coach |= map(select(.id != "AF013" and .id != "AF014"))' report.json | tr -d '\n' | shasum -a 256
+jq -Sc 'del(.report_sha256, .pricing.age_days, .pricing.stale, .coverage.agents[].expiring_7d) | .coach |= map(select(.id != "AF013" and .id != "AF014"))' report.json | tr -d '\n' | shasum -a 256
 ```
 
 Three things about the canonical form, because they are the whole reason two

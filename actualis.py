@@ -9243,6 +9243,8 @@ class Fleet:
         self.lines_read = 0
         # fleet_retention(): read once per run, after the scan.
         self.retention: dict | None = None
+        # --network was given: coverage then lists the network check.
+        self.network_requested = False
 
     # -- ingest ------------------------------------------------------------
 
@@ -16238,6 +16240,25 @@ JSON_SCHEMA: dict[str, str] = {
     "unpriced_model_tokens.*": "int",
     "rewound_tool_calls": "int",
     "unsupported_records": "int",
+    "coverage.ok": "bool",
+    "coverage.agents": "array",
+    "coverage.agents[].agent": "str",
+    "coverage.agents[].root_exists": "bool",
+    "coverage.agents[].files_read": "int",
+    "coverage.agents[].files_unreadable": "int",
+    "coverage.agents[].files_skipped_mtime": "int",
+    "coverage.agents[].oldest": "str|null",
+    "coverage.agents[].retention_days": "int|null",
+    "coverage.agents[].retention_source": "str",
+    "coverage.agents[].expiring_7d": "int",
+    "coverage.checks": "array",
+    "coverage.checks[].check": "str",
+    "coverage.checks[].examined": "int",
+    "coverage.checks[].not_examined": "int",
+    "coverage.checks[].why_not.*": "int",
+    "coverage.checks[].stale": "bool",
+    "coverage.gaps": "array",
+    "coverage.gaps[]": "str",
 }
 
 # A matched item is shown exactly as network.items shows it.
@@ -16277,7 +16298,12 @@ def report_digest(payload: dict) -> str:
             path = prefix + k
             if path in REPORT_DIGEST_EXCLUDES:
                 continue
-            out[k] = keep(v, path + ".") if isinstance(v, dict) else v
+            if isinstance(v, dict):
+                out[k] = keep(v, path + ".")
+            elif isinstance(v, list):        # a[].b names b on every element
+                out[k] = [keep(x, path + "[].") if isinstance(x, dict) else x for x in v]
+            else:
+                out[k] = v
         return out
     body = keep(payload, "")
     if isinstance(body.get("coach"), list):
@@ -16290,8 +16316,10 @@ def report_digest(payload: dict) -> str:
     return hashlib.sha256(canonical_json(body).encode("utf-8", "surrogatepass")).hexdigest()
 
 
-# Dotted paths into the payload (a top-level key is a path of one part).
-REPORT_DIGEST_EXCLUDES = frozenset({"report_sha256", "pricing.age_days", "pricing.stale"})
+# Dotted paths into the payload (a top-level key is a path of one part; a[].b
+# is b on every element of the array a).
+REPORT_DIGEST_EXCLUDES = frozenset({"report_sha256", "pricing.age_days", "pricing.stale",
+                                    "coverage.agents[].expiring_7d"})
 # Coach findings whose presence depends on today's date, not on the transcripts:
 # the rate table's age (AF013) and transcripts about to expire (AF014).
 REPORT_DIGEST_CLOCK_FINDINGS = frozenset({"AF013", "AF014"})
@@ -16307,6 +16335,7 @@ REPORT_DIGEST_CLOCK_FINDINGS = frozenset({"AF013", "AF014"})
 #   2    a command line usage error -- argparse owns this one, not us
 #   3    findings at or above --fail-on
 #   4    --self-check: a check failed
+#   5    --fail-on-coverage: a coverage gap (3 wins when both apply)
 #   130  interrupted
 #
 # Findings are 3, not 1 and not 2. 1 already meant "could not run" before
@@ -16320,6 +16349,7 @@ EXIT_CANNOT_RUN = 1
 EXIT_USAGE = 2        # argparse's, and --reputation --fail-on with no usable lists
 EXIT_FINDINGS = 3
 EXIT_SELF_CHECK_FAILED = 4   # --self-check: a privacy claim did not hold
+EXIT_COVERAGE = 5     # --fail-on-coverage: the run could not see everything it was asked to
 
 # What each threshold includes. Ordered, so a lower threshold is a superset.
 FAIL_ON_LEVELS = ("critical", "high", "any")
@@ -16480,6 +16510,81 @@ def transcripts_expiring(fleet: Fleet) -> list[tuple[str, int, str, int]]:
     return [(row["agent"], row["expiring_7d"], _utc_date(first) or "?", row["retention_days"])
             for row, first in _coverage_agents(fleet)
             if row["expiring_7d"] and row["retention_days"] is not None]
+
+
+COVERAGE_UNPARSABLE_PCT = 1.0     # gap 3: unparsable lines over this share of lines decoded
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def _check(name: str, examined: int, why_not: dict) -> dict:
+    """One coverage.checks[] row; reasons with a zero count are left out."""
+    why = {k: int(v) for k, v in why_not.items() if v}
+    return {"check": name, "examined": max(int(examined), 0),
+            "not_examined": sum(why.values()), "why_not": why}
+
+
+def coverage(fleet: Fleet) -> dict:
+    """The coverage ledger: per agent and per check, what was examined, what
+    was not and why, and gaps[], one sentence per condition --fail-on-coverage
+    fails on (whether or not it was given). ok is gaps == [].
+
+    Everything it needs is on the fleet: scope.days and scope.agent, the
+    network, IOC and reputation state, and the scan counters. Never raises
+    on a fleet with no records."""
+    now = datetime.now(timezone.utc)
+    agents = [row for row, _first in _coverage_agents(fleet, now.timestamp())]
+    days = fleet.scope.get("days")
+    gaps: list[str] = []
+    for row in agents:
+        agent, label = row["agent"], _AGENT_LABEL.get(row["agent"], row["agent"])
+        if row["root_exists"] and row["files_read"] == 0:
+            skipped = row["files_skipped_mtime"]
+            gaps.append(f"{agent}: no transcript file read"
+                        + (f" ({skipped} older than --days {days} skipped)" if skipped and days else ""))
+        if row["files_unreadable"]:
+            gaps.append(f"{_plural(row['files_unreadable'], 'transcript file')} could not be read ({agent})")
+        keep = row["retention_days"]
+        if row["retention_source"] in ("settings", "default") and keep is not None \
+                and isinstance(days, int) and days > keep:
+            gaps.append(f"asked for {_plural(days, 'day')}; {label} keeps {keep}")
+    if fleet.unparsable_lines * 100 > fleet.lines_read * COVERAGE_UNPARSABLE_PCT:
+        gaps.append(f"{fleet.unparsable_lines:,} of {fleet.lines_read:,} record lines could not be "
+                    f"parsed (over {COVERAGE_UNPARSABLE_PCT:g}%)")
+
+    unreadable_other = max(fleet.unreadable - fleet.oversized_commands, 0)
+    shell_why = {"unreadable-command": unreadable_other, "oversized": fleet.oversized_commands}
+    checks = [_check("credentials", fleet.bash_total - fleet.unreadable, shell_why),
+              _check("shell", fleet.bash_total - fleet.unreadable, shell_why),
+              _check("records", fleet.lines_read - fleet.unparsable_lines,
+                     {"unparsable-line": fleet.unparsable_lines})]
+    if fleet.network_requested or fleet.ioc is not None:
+        checks.append(_check("network", len(fleet.network_items),
+                             {"unparsed-segment": fleet.network_unparsed}))
+    if fleet.ioc is not None:
+        nc = fleet.ioc_totals["items_not_checkable"]
+        row = _check("ioc", fleet.ioc_totals["items_checked"],
+                     {"lockfile": nc["lockfile"], "no-host": nc["no_host"], "other": nc["other"]})
+        checks.append(row)
+        if row["not_examined"]:
+            gaps.append(f"{_plural(row['not_examined'], 'download')} could not be checked "
+                        f"against the IOC list")
+    rep = fleet.reputation
+    if rep is not None:
+        stale = bool(rep.oldest and now - rep.oldest > timedelta(days=REPUTATION_STALE_DAYS))
+        t = fleet.reputation_totals
+        checks.append({**_check("reputation", t["checked"], {"local-host": t["skipped"]}),
+                       "stale": stale})
+        if stale:
+            gaps.append(f"reputation lists are {(now - rep.oldest).days} days old")
+    return {"ok": not gaps, "agents": agents, "checks": checks, "gaps": gaps}
+
+
+def failing_coverage(cov: dict) -> list[str]:
+    """The gaps that trip --fail-on-coverage: every one coverage() found."""
+    return list(cov["gaps"])
 
 
 def to_json(fleet: Fleet, raw: bool = False) -> dict:
@@ -16677,6 +16782,7 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
         "unpriced_model_tokens": dict(fleet.unpriced_tokens.most_common()),
         "rewound_tool_calls": fleet.rewound_tool_calls,
         "unsupported_records": fleet.unsupported_records,
+        "coverage": coverage(fleet),
     }
 
 
@@ -18038,6 +18144,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="exit 3 if any unsuppressed finding is at or above "
                          f"LEVEL ({', '.join(FAIL_ON_LEVELS)}); 2 is a usage error. "
                          "For gating a pipeline. Still changes nothing and blocks nothing.")
+    ap.add_argument("--fail-on-coverage", action="store_true",
+                    help="exit 5 on any coverage gap: an agent with no transcript read, unreadable "
+                         "files, over 1%% of lines unparsable, --days reaching past what the agent "
+                         "keeps, with --ioc downloads not checked, with --reputation stale lists. "
+                         "Exit 3 from --fail-on wins")
     net = ap.add_argument_group("Network")
     net.add_argument("--network", action="store_true",
                      help="print only the NETWORK section (with --ioc, the IOC block too). "
@@ -18113,8 +18224,10 @@ def main(argv: list[str] | None = None) -> int:
     make_output_printable(args.json)
 
     # Checked before anything runs, so a refused --suppress writes nothing.
-    # --fail-on is never silently ignored: these modes return before the gate.
-    if args.fail_on:
+    # Neither gate is ever silently ignored: these modes return before it.
+    for gate, wanted in (("--fail-on", args.fail_on), ("--fail-on-coverage", args.fail_on_coverage)):
+        if not wanted:
+            continue
         for flag, on in (("--diff", args.diff), ("--why", args.why),
                          ("--replay", args.replay), ("--watch", args.watch),
                          ("--mcp", args.mcp), ("--explain", args.explain is not None),
@@ -18123,7 +18236,7 @@ def main(argv: list[str] | None = None) -> int:
                          ("--self-check", args.self_check), ("--service", args.service),
                          ("--completions", args.completions)):
             if on:
-                ap.error(f"--fail-on cannot be combined with {flag}: "
+                ap.error(f"{gate} cannot be combined with {flag}: "
                          f"{flag} does not evaluate the gate.")
     # Nor is --json: these modes print text, or would print something else.
     if args.json:
@@ -18240,7 +18353,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.reputation and (args.watch or args.mcp):
         ap.error("--reputation is not supported with --watch or --mcp yet.")
     if args.card:
-        for flag, on in (("--fail-on", args.fail_on), ("--diff", args.diff),
+        for flag, on in (("--fail-on", args.fail_on),
+                         ("--fail-on-coverage", args.fail_on_coverage), ("--diff", args.diff),
                          ("--why", args.why), ("--share", args.share),
                          ("--watch", args.watch), ("--mcp", args.mcp),
                          ("--replay", args.replay),
@@ -18510,7 +18624,7 @@ def main(argv: list[str] | None = None) -> int:
                    f"({clean(reputation.error or '')}). "
                    f"Run `actualis-reputation update` to download them again.")
         print(msg, file=sys.stderr)
-        if args.fail_on:
+        if args.fail_on or args.fail_on_coverage:
             return EXIT_USAGE
     if reputation is not None and reputation.vt_error:
         print(f"actualis: --reputation: vt/results.json in {reputation.directory} is unreadable "
@@ -18525,9 +18639,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # --network shows only the inventory; --fail-on reads findings (--why
     # with --network is refused above).
-    fleet = Fleet(network_only=bool(args.network and not args.fail_on))
+    fleet = Fleet(network_only=bool(args.network and not (args.fail_on or args.fail_on_coverage)))
     fleet.scope = {"days": args.days or None, "project": clean(args.project or ""),
                    "agent": clean(args.agent or "all")}
+    fleet.network_requested = bool(args.network)
     fleet.with_prompts = args.with_prompts
     progress = not args.json and sys.stderr.isatty()
 
@@ -18648,8 +18763,11 @@ def main(argv: list[str] | None = None) -> int:
 
     # The verdict is decided before any output (R5): a reader that closes
     # stdout early must not turn a failing gate into a pass. _cli() reads it.
-    _PENDING_GATE[:] = [(args.fail_on, failing_findings(fleet, args.fail_on),
-                         _suppressed_count(fleet))] if args.fail_on else []
+    _PENDING_GATE[:] = [(args.fail_on,
+                         failing_findings(fleet, args.fail_on) if args.fail_on else [],
+                         _suppressed_count(fleet),
+                         failing_coverage(coverage(fleet)) if args.fail_on_coverage else None)
+                        ] if (args.fail_on or args.fail_on_coverage) else []
 
     if args.html:
         page = render_network_html(network_json(fleet, raw=args.no_redact),
@@ -18687,8 +18805,9 @@ def main(argv: list[str] | None = None) -> int:
     return EXIT_OK
 
 
-# (level, reasons, suppressed count) for the run in progress, set by main()
-# before it writes the report, so a closed stdout still gets the gate's code.
+# (level or None, reasons, suppressed count, coverage gaps or None) for the
+# run in progress, set by main() before it writes the report, so a closed
+# stdout still gets the gate's code.
 _PENDING_GATE: list = []
 
 
@@ -18707,18 +18826,27 @@ def _gate_verdict() -> int:
     has been reported, or reporting it has failed."""
     if not _PENDING_GATE:
         return EXIT_OK
-    level, reasons, suppressed = _PENDING_GATE[-1]
-    code = EXIT_FINDINGS if reasons else EXIT_OK
+    level, reasons, suppressed, *rest = _PENDING_GATE[-1]
+    gaps = rest[0] if rest else None
+    # Findings (3) win over coverage (5): an exposed credential is the first
+    # thing a failing pipeline must say.
+    code = EXIT_FINDINGS if reasons else EXIT_COVERAGE if gaps else EXIT_OK
     # stderr, so `--json` on stdout stays byte-identical and a pipeline can
     # capture the report and the verdict separately.
     try:
-        if reasons:
+        if level and reasons:
             print(f"actualis: FAIL at --fail-on {level}", file=sys.stderr)
             for r in reasons:
                 print(f"  - {_one_line(r)}", file=sys.stderr)
             print(f"  {suppressed} suppressed finding(s) were not counted.", file=sys.stderr)
-        else:
+        elif level:
             print(f"actualis: PASS at --fail-on {level}", file=sys.stderr)
+        if gaps:
+            print("actualis: FAIL at --fail-on-coverage", file=sys.stderr)
+            for g in gaps:
+                print(f"  - {_one_line(g)}", file=sys.stderr)
+        elif gaps is not None:
+            print("actualis: PASS at --fail-on-coverage", file=sys.stderr)
         sys.stderr.flush()
     except (OSError, ValueError):            # BrokenPipeError is an OSError
         _silence_stderr()

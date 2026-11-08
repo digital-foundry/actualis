@@ -1301,6 +1301,8 @@ class TestJSONSchemaFreeze(unittest.TestCase):
                         "totalDurationMs": 1000, "totalLines": 10, "status": "ok"}, ts)
         f.permission_modes["auto"] += 1
         f.denials["user-rejected"] += 1
+        # A scanned agent root, so the schema tests walk coverage.agents[] too.
+        f._file_read("claude-code", "fixture-root", ts.timestamp())
         # Real network data, so the schema tests walk the network paths too.
         f.suppressions = {}
         f.add_tool("proj", "Bash", {"command": "npm i y@1.0.0"}, ts, "default")
@@ -1428,6 +1430,8 @@ class TestReportDigest(unittest.TestCase):
         body = {k: v for k, v in payload.items() if k != "report_sha256"}
         body["pricing"] = {k: v for k, v in body["pricing"].items()
                            if k not in ("age_days", "stale")}
+        for a in body["coverage"]["agents"]:
+            a.pop("expiring_7d")
         body["coach"] = [f for f in body["coach"] if f["id"] not in ("AF013", "AF014")]
         canonical = json.dumps(body, sort_keys=True, separators=(",", ":"),
                                ensure_ascii=False)
