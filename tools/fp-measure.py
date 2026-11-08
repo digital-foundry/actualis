@@ -150,6 +150,9 @@ def main(argv: "list[str] | None" = None) -> int:
     ap.add_argument("--out", metavar="FILE", help="the sample file: new, mode 0600, never stdout")
     args = ap.parse_args(argv)
     out = None
+    if args.out and not args.sample:
+        print("fp-measure: --out needs --sample N", file=sys.stderr)
+        return 2
     if args.sample:
         if not args.out or args.out == "-":
             print("fp-measure: --sample needs --out FILE; the sample never goes to stdout",
@@ -160,8 +163,14 @@ def main(argv: "list[str] | None" = None) -> int:
             print("fp-measure: --out names a file that already exists; it is never overwritten",
                   file=sys.stderr)
             return 2
+    # A first scan warms the disk cache and is not timed; then each mode runs
+    # twice, alternating, and the faster run counts, so neither mode pays for
+    # a cold cache.
+    scan(args.days, False)
     on, t_on = scan(args.days, True)
     _off, t_off = scan(args.days, False)
+    t_on = min(t_on, scan(args.days, True)[1])
+    t_off = min(t_off, scan(args.days, False)[1])
     m = measure(on)
     report(m, len(on.commands), t_on, t_off)
     if out is not None:

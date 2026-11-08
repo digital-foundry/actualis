@@ -9152,6 +9152,42 @@ _HOME_OF = re.compile(r"^(?:/Users/[^/]+|/home/[^/]+|/root|[a-z]:/users/[^/]+)(?
 # A redirection token as the lexer leaves it: `>`, `>>`, `2>`, `&>`, or the
 # operator with its target attached (`>>~/notes.txt`).
 _REDIRECT_TOKEN = re.compile(r"^(?:\d{1,2}|&)?>>?(.*)$", re.S)
+# A redirection operator in a segment's unquoted text (see _unquoted_mask).
+_REDIRECT_OP = re.compile(r"(?:\d{1,2}|&)?>>?")
+# Classes whose match says nothing about the path a command acts on: `sudo`
+# alone is privilege, whatever follows it.
+_RETRY_NO_PATH = frozenset({"privilege", "audit"})
+
+
+def _unquoted_mask(seg: str) -> str:
+    """The segment with every quoted or escaped character replaced by '_',
+    same length: an operator found in it was written unquoted, so `'>'` and
+    `\\>` are data and `>` is a redirection."""
+    out = list(seg)
+    i, n, q = 0, len(seg), ""
+    while i < n:
+        ch = seg[i]
+        if q == "'":
+            if ch == "'":
+                q = ""
+            out[i] = "_"
+        elif q == '"':
+            if ch == "\\" and i + 1 < n:
+                out[i] = out[i + 1] = "_"
+                i += 1
+            elif ch == '"':
+                q = ""
+                out[i] = "_"
+            else:
+                out[i] = "_"
+        elif ch == "\\" and i + 1 < n:
+            out[i] = out[i + 1] = "_"
+            i += 1
+        elif ch in "'\"":
+            q = ch
+            out[i] = "_"
+        i += 1
+    return "".join(out)
 
 
 def _norm_path(p: str) -> str:
@@ -9243,13 +9279,18 @@ def write_targets(name: str, tool_input: dict) -> list[str]:
     out: list[str] = []
     # `>|` (clobber) holds a pipe character that _net_split would cut on.
     for seg in _net_split(cmd[:MAX_SCAN_TOTAL].replace(">|", ">"))[0][:WRITE_TARGETS_MAX]:
+        # Operators are found in the unquoted text only; the target is the
+        # next word, dequoted. `>&2` duplicates a descriptor and `>(…)` is a
+        # process substitution: neither names a file.
+        mask = _unquoted_mask(seg)
+        for m in _REDIRECT_OP.finditer(mask):
+            rest = seg[m.end():].lstrip(" \t")
+            if not rest or rest[0] in "&(>|;":
+                continue
+            nxt = _net_tokens(rest)
+            if nxt and nxt[0] and not nxt[0].startswith(("&", "(", ">")):
+                out.append(nxt[0])
         toks = _net_tokens(seg)
-        for i, tok in enumerate(toks):
-            m = _REDIRECT_TOKEN.match(tok)
-            if m:
-                t = m.group(1) or (toks[i + 1] if i + 1 < len(toks) else "")
-                if t and not t.startswith("&"):
-                    out.append(t)
         words, _via = _net_strip_prefixes(toks)
         if words and _net_base(words[0]).lower() == "tee":
             out.extend(w for w in words[1:] if not w.startswith("-") and not _REDIRECT_TOKEN.match(w))
@@ -9306,7 +9347,7 @@ def retry_keys(name: str, tool_input: dict, cwd: str | None, items: list,
     for h in hosts:
         keys.add(("fetch", h))
         keys.update((c, h) for c in categories if c in _RETRY_HOST_CLASSES)
-    path_classes = [c for c in categories if c not in _RETRY_HOST_CLASSES]
+    path_classes = [c for c in categories if c not in _RETRY_HOST_CLASSES and c not in _RETRY_NO_PATH]
     if cmd and path_classes:
         for arg in _first_args(cmd):
             t = resolve_target(arg, cwd, relative_ok=True)
@@ -9340,9 +9381,21 @@ def _inside(path: str, root: str) -> bool:
     return path == root or path.startswith(root if root == "/" else root + "/")
 
 
+def _same_program(a: dict, b: dict) -> bool:
+    """Two remembered calls by the same program. An agent's file-write tools
+    (Write, Edit, MultiEdit…) are one program: one permission covers them, so
+    moving from one to another after a refusal is not working around it."""
+    if a["name"].lower() in _FILE_WRITE_TOOLS and b["name"].lower() in _FILE_WRITE_TOOLS:
+        return True
+    return a["program"] == b["program"]
+
+
 def _target_shown(cls: str, target: str, home: str | None) -> str:
-    """A retry target for evidence: a host as is, a path shortened."""
-    return clean(target)[:120] if cls in _RETRY_HOST_CLASSES else _short_path(target, home)
+    """A retry target for evidence: the host alone (a URL's path segment can
+    hold a token), a path shortened."""
+    if cls in _RETRY_HOST_CLASSES:
+        return clean(target.split("/", 1)[0])[:120]
+    return _short_path(target, home)
 
 
 class Fleet:
@@ -10654,10 +10707,13 @@ class Fleet:
         })
 
     def _mark_refused(self, call: tuple[str, str] | None, call_id: str | None) -> None:
-        """The remembered call a refusal blocked: by call id, else the latest
-        call in this file with the same tool and command."""
+        """The remembered call a refusal blocked: by call id, else, when the
+        refusal carries no id, the latest call in this file with the same tool
+        and command."""
         entry = self._file_calls_by_id.get(str(call_id)) if call_id else None
-        if entry is None and call:
+        # An id that was not remembered (past RETRY_CALLS_MAX) marks nothing:
+        # falling back to the command could mark an earlier call instead.
+        if entry is None and call and not call_id:
             name, cmd = call
             cmd = (cmd or "")[:MAX_SCAN_LINE]
             entry = next((e for e in reversed(self._file_calls)
@@ -10676,7 +10732,7 @@ class Fleet:
             if not r["refused"]:
                 continue
             for c in calls[i + 1:]:
-                if c["refused"] or c["flagged"] or c["program"] == r["program"]:
+                if c["refused"] or c["flagged"] or _same_program(r, c):
                     continue
                 shared = r["keys"] & c["keys"]
                 if not shared:
@@ -13651,7 +13707,10 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "the URL's first path segment for a download, otherwise the path, read",
             "against the session's working directory. rm refused, then find",
             "-delete on the same directory, fires. The same program again does",
-            "not (a plain retry after approval), nor does a call itself refused.",
+            "not (a plain retry after approval), nor does a call itself refused;",
+            "an agent's file-write tools (Write, Edit, ...) count as one program,",
+            "and sudo alone is not an action on a path. Evidence shows a",
+            "download's host only, never its path.",
             "",
             "outside-root (med): a file-write tool's path, or a shell redirection",
             "(>, >>, >|, &>) or tee target, outside the session's working",

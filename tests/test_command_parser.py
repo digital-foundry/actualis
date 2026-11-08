@@ -309,8 +309,7 @@ class TestTargets(unittest.TestCase):
         self.assertEqual(af.retry_keys("Bash", bash(cmd), CWD, items, set()),
                          frozenset({("fetch", "x.io/tools")}))
         self.assertEqual(af.retry_keys("Bash", bash("sudo rm -rf ./build"), CWD, [], {"destructive", "privilege"}),
-                         frozenset({("destructive", "/home/dev/orbital/build"),
-                                    ("privilege", "/home/dev/orbital/build")}))
+                         frozenset({("destructive", "/home/dev/orbital/build")}))
         npm, _ = af.network_items_from_command("npm install left-pad", [])
         self.assertIn(("fetch", "registry.npmjs.org/left-pad"),
                       af.retry_keys("Bash", bash("npm install left-pad"), CWD, npm, set()))
@@ -397,7 +396,7 @@ class TestRetryAfterDeny(HomeCase):
                         t0 + timedelta(minutes=1))])
         [hit] = flags_of(f, "retry-after-deny")
         self.assertEqual(hit["program"], "WebFetch")
-        self.assertIn("reached x.io/tools", hit["evidence"])
+        self.assertTrue(hit["evidence"].endswith("reached x.io"), hit["evidence"])
 
     def test_a_refused_write_redone_through_the_shell_fires(self):
         t0 = recent(30)
@@ -697,6 +696,94 @@ class TestFpMeasure(HomeCase):
                 code, _out, _err = self.run_tool(*argv)
                 self.assertEqual(code, 2)
         self.assertEqual(path.read_text(encoding="utf-8"), "keep")
+
+class TestFinalReviewFixes(HomeCase):
+    """Final review of 0.8.0: quoted redirects, an agent's own edit tools,
+    privilege paths, secrets in URL segments, refusals past the cap."""
+
+    def test_a_quoted_redirect_word_is_not_a_write(self):
+        for cmd in ("grep -c '>' ~/data/seqs.fa", "git commit -m '>/etc/hosts entry fixed'",
+                    "echo '>>' out", "printf '%s\\n' '>' x", 'echo ">" /etc/x', "echo \\> /etc/x"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(af.write_targets("Bash", bash(cmd)), [])
+
+    def test_a_real_redirect_after_a_quoted_one_still_counts(self):
+        self.assertEqual(af.write_targets("Bash", bash("printf '%s' '>' > /etc/x")), ["/etc/x"])
+        self.assertEqual(af.write_targets("Bash", bash("echo a>'/etc/my file'")), ["/etc/my file"])
+
+    def test_process_substitution_is_not_a_target(self):
+        self.assertEqual(af.write_targets("Bash", bash("cat a > >(tee ../log)")), [])
+
+    def test_switching_between_edit_tools_is_not_a_retry(self):
+        t0 = recent(30)
+        f = self.claude_fleet([
+            claude_call("u1", "t1", "Write", {"file_path": "src/a.py", "content": "x"}, t0),
+            claude_refusal("u2", "t1", t0 + timedelta(seconds=5)),
+            claude_call("u3", "t2", "Edit", {"file_path": "src/a.py", "old_string": "a", "new_string": "b"},
+                        t0 + timedelta(minutes=1))])
+        self.assertEqual(flags_of(f, "retry-after-deny"), [])
+
+    def test_a_refused_write_redone_by_the_shell_still_fires(self):
+        t0 = recent(30)
+        f = self.claude_fleet([
+            claude_call("u1", "t1", "Write", {"file_path": "src/a.py", "content": "x"}, t0),
+            claude_refusal("u2", "t1", t0 + timedelta(seconds=5)),
+            claude_call("u3", "t2", "Bash", bash("echo x > src/a.py"), t0 + timedelta(minutes=1))])
+        self.assertEqual(len(flags_of(f, "retry-after-deny")), 1)
+
+    def test_a_read_only_sudo_after_a_refused_sudo_rm_is_not_a_retry(self):
+        t0 = recent(30)
+        f = self.claude_fleet([
+            claude_call("u1", "t1", "Bash", bash("sudo rm -rf /opt/app/cache"), t0),
+            claude_refusal("u2", "t1", t0 + timedelta(seconds=5)),
+            claude_call("u3", "t2", "Bash", bash("sudo ls -la /opt/app/cache"), t0 + timedelta(minutes=1))])
+        self.assertEqual(flags_of(f, "retry-after-deny"), [])
+
+    def test_a_url_path_segment_never_reaches_the_evidence(self):
+        tok = "bot123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"
+        t0 = recent(30)
+        f = self.claude_fleet([
+            claude_call("u1", "t1", "Bash", bash(f"curl -s https://api.telegram.org/{tok}/sendMessage"), t0),
+            claude_refusal("u2", "t1", t0 + timedelta(seconds=5)),
+            claude_call("u3", "t2", "Bash", bash(f"wget -qO- https://api.telegram.org/{tok}/getMe"),
+                        t0 + timedelta(minutes=1))])
+        [hit] = flags_of(f, "retry-after-deny")
+        self.assertIn("reached api.telegram.org", hit["evidence"])
+        self.assertNotIn("AAHd", hit["evidence"])
+        self.assertNotIn("bot123", hit["evidence"])
+
+    def test_a_refusal_for_a_call_past_the_cap_marks_nothing(self):
+        f = guard_fleet()
+        with mock.patch.object(af, "RETRY_CALLS_MAX", 2):
+            f.add_tool("p", "Bash", bash("rm -rf build"), TS, call_id="c1", agent="claude")
+            f.add_tool("p", "Bash", bash("find build -delete"), TS, call_id="c2", agent="claude")
+            f.add_tool("p", "Bash", bash("rm -rf build"), TS, call_id="c3", agent="claude")
+            f._record_refusal("user-rejected", "p", TS, ("Bash", "rm -rf build"), call_id="c3")
+            f._flush_retries()
+        self.assertEqual(flags_of(f, "retry-after-deny"), [])
+
+
+class TestFpMeasureTiming(TestFpMeasure):
+    """The cost lines are measured warm, both ways, and --out alone is refused."""
+
+    def test_a_warm_up_scan_comes_first_and_both_modes_repeat(self):
+        calls = []
+        real = self.tool.scan
+
+        def spy(days, guardrails):
+            calls.append(guardrails)
+            return real(days, guardrails)
+        with mock.patch.object(self.tool, "scan", spy):
+            code, _out, err = self.run_tool()
+        self.assertEqual(code, 0, err)
+        self.assertGreaterEqual(len(calls), 5)
+        self.assertGreaterEqual(calls[1:].count(True), 2)
+        self.assertGreaterEqual(calls[1:].count(False), 2)
+
+    def test_out_without_sample_is_refused(self):
+        code, _out, err = self.run_tool("--out", str(self.home / "s.txt"))
+        self.assertEqual(code, 2)
+        self.assertIn("--sample", err)
 
 
 if __name__ == "__main__":
