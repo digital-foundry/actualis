@@ -1074,7 +1074,7 @@ class TestCoverageDocs(unittest.TestCase):
 
     def test_the_changelog(self):
         text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        unreleased = text.split("## Unreleased", 1)[1].split("\n## ", 1)[0]
+        unreleased = text.split("## 0.7.0 (", 1)[1].split("\n## ", 1)[0]
         for needle in ("--fail-on-coverage", "AF014", "`assessment`", "`rejected`",
                        "cleanupPeriodDays", "--explain coverage"):
             self.assertIn(needle, unreleased)
