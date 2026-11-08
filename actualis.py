@@ -9129,6 +9129,201 @@ def urls_in_text(text: str) -> tuple[list[str], int]:
     return list(dict.fromkeys(u for u in urls if len(u) > 8)), int(len(text) > MAX_SCAN_HARD)
 
 
+# --------------------------------------------------------------------------
+# Guardrail findings (retry-after-deny, outside-root)
+#
+# Two signals of an agent working around its guardrails, read from calls the
+# scanners already parse. Everything here is textual: no path is resolved on
+# disk, nothing is opened, nothing new is read.
+# --------------------------------------------------------------------------
+
+RETRY_CATEGORY = "retry-after-deny"
+RETRY_CALLS_MAX = 5000           # calls remembered per transcript file for the retry match
+WRITE_TARGETS_MAX = 64           # write targets read per call
+
+# Action classes whose target is where data goes (a host), not a path.
+_RETRY_HOST_CLASSES = frozenset({"fetch", "egress", "remote-exec"})
+# Unreadable shapes whose script names a network API: the URLs written in it
+# stand in for network items when a retry's target is decided.
+_INLINE_NET_SHAPES = frozenset({"inline script reaching the network", "interpreter reaching the network"})
+_INLINE_URL = re.compile(r"https?://([A-Za-z0-9.-]{1,253})(?::\d{1,5})?(?:/([^\s/'\"?#]{1,128}))?")
+_WIN_DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
+_HOME_OF = re.compile(r"^(?:/Users/[^/]+|/home/[^/]+|/root|[a-z]:/users/[^/]+)(?=/|$)", re.IGNORECASE)
+# A redirection token as the lexer leaves it: `>`, `>>`, `2>`, `&>`, or the
+# operator with its target attached (`>>~/notes.txt`).
+_REDIRECT_TOKEN = re.compile(r"^(?:\d{1,2}|&)?>>?(.*)$", re.S)
+
+
+def _norm_path(p: str) -> str:
+    """'.', '..' and repeated slashes collapsed, as text: nothing is resolved
+    on disk. A leading '/', '~' (or '~user') or drive letter is kept and '..'
+    never climbs above it; a relative path keeps its leading '..'."""
+    p = p.replace("\\", "/")
+    if p.startswith("~"):
+        head, _, rest = p.partition("/")
+        root = head + "/"
+    elif _WIN_DRIVE.match(p):
+        root, rest = p[:2].lower() + "/", p[3:]
+    elif p.startswith("/"):
+        root, rest = "/", p
+    else:
+        root, rest = "", p
+    out: list[str] = []
+    for part in rest.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if out and out[-1] != "..":
+                out.pop()
+            elif not root:
+                out.append("..")
+            continue
+        out.append(part)
+    if out:
+        return root + "/".join(out)
+    return root if root == "/" else (root.rstrip("/") or ".")
+
+
+def _home_of(cwd: str | None) -> str | None:
+    """The home directory a session's cwd sits under, by its shape, or None."""
+    m = _HOME_OF.match(_norm_path(cwd)) if cwd else None
+    return m.group(0) if m else None
+
+
+def resolve_target(arg: object, cwd: str | None, relative_ok: bool = False) -> str | None:
+    """A path as the session would read it: '~' under the home the cwd shows,
+    relative to the cwd, normalised. None for a target that is not a literal
+    path (a variable, a substitution, empty, over 1,024 characters), and for a
+    relative path with no cwd unless relative_ok, which keeps it as written."""
+    if not isinstance(arg, str) or not arg or len(arg) > 1024 or any(c in arg for c in "$`\0\n"):
+        return None
+    a = arg.replace("\\", "/")
+    home = _home_of(cwd)
+    if home and (a == "~" or a.startswith("~/")):
+        a = home + a[1:]
+    if not a.startswith(("/", "~")) and not _WIN_DRIVE.match(a):
+        if cwd:
+            a = cwd.replace("\\", "/") + "/" + a
+        elif not relative_ok:
+            return None
+    return _norm_path(a)
+
+
+def _short_path(p: str, home: str | None) -> str:
+    """A path for evidence: its last two parts, under '~' when it is in the
+    home, never the full path (a username or a client's directory name)."""
+    if home and (p == home or p.startswith(home + "/")):
+        lead, rest = "~", [x for x in p[len(home):].split("/") if x]
+    elif p.startswith(("/", "~")) or _WIN_DRIVE.match(p):
+        lead, rest = "", [x for x in p.split("/") if x]
+    else:
+        return clean("/".join([x for x in p.split("/") if x][-2:]))[:120] or "."
+    tail = "/".join(rest[-2:])
+    if not tail:
+        return lead or "/"
+    return clean(f"{lead}{'/…/' if len(rest) > 2 else '/'}{tail}")[:120]
+
+
+def write_targets(name: str, tool_input: dict) -> list[str]:
+    """What one tool call writes, as written: a file-write tool's path, or a
+    shell command's redirection (>, >>, >|, &>, N>) and tee targets, read from
+    the dequoted tokens of each segment. A `cd` inside the command is not
+    followed: relative targets are read against the session cwd."""
+    if name.lower() in _FILE_WRITE_TOOLS:
+        if tool_input.get("command") == "view":
+            return []
+        for key in ("file_path", "path", "notebook_path"):
+            t = tool_input.get(key)
+            if isinstance(t, str) and t:
+                return [t]
+        return []
+    cmd = tool_input.get("command") if name == "Bash" else None
+    if not isinstance(cmd, str) or (">" not in cmd and "tee" not in cmd):
+        return []
+    out: list[str] = []
+    # `>|` (clobber) holds a pipe character that _net_split would cut on.
+    for seg in _net_split(cmd[:MAX_SCAN_TOTAL].replace(">|", ">"))[0][:WRITE_TARGETS_MAX]:
+        toks = _net_tokens(seg)
+        for i, tok in enumerate(toks):
+            m = _REDIRECT_TOKEN.match(tok)
+            if m:
+                t = m.group(1) or (toks[i + 1] if i + 1 < len(toks) else "")
+                if t and not t.startswith("&"):
+                    out.append(t)
+        words, _via = _net_strip_prefixes(toks)
+        if words and _net_base(words[0]).lower() == "tee":
+            out.extend(w for w in words[1:] if not w.startswith("-") and not _REDIRECT_TOKEN.match(w))
+        if len(out) >= WRITE_TARGETS_MAX:
+            break
+    return out[:WRITE_TARGETS_MAX]
+
+
+def _first_args(cmd: str) -> list[str]:
+    """The first argument of each segment's program, past assignments,
+    wrappers, options and redirections: what a path rule acts on."""
+    out: list[str] = []
+    for seg in _net_split(cmd[:MAX_SCAN_TOTAL])[0][:64]:
+        words, _via = _net_strip_prefixes(_net_tokens(seg))
+        arg = next((w for w in words[1:] if not w.startswith(("-", "<")) and not _REDIRECT_TOKEN.match(w)),
+                   None)
+        if arg:
+            out.append(arg)
+    return out
+
+
+def _fetch_target(item: dict) -> str | None:
+    """A download's retry target: its host with the package, or with the
+    URL's first path segment, so two calls to a busy host do not match."""
+    host = item.get("host")
+    if not isinstance(host, str) or not host:
+        return None
+    host = host.lower()
+    pkg = item.get("package")
+    if isinstance(pkg, str) and pkg:
+        return f"{host}/{pkg}"
+    url = item.get("url")
+    path = url_path(url) if isinstance(url, str) else ""
+    first = path.split("/")[1] if path.count("/") >= 1 else ""
+    return f"{host}/{first}" if first else host
+
+
+def retry_keys(name: str, tool_input: dict, cwd: str | None, items: list,
+               categories: "set[str] | frozenset[str]", shapes: "list[str] | tuple" = (),
+               writes: "list[str] | tuple" = ()) -> frozenset:
+    """(action class, target) pairs for one call: what a later call must
+    share with a refused one to be its retry. Classes: the shell-audit
+    categories the command matched, `fetch` for a download, `write` for a
+    file written. A host class's target is the host with the package or the
+    URL's first path segment; any other class's target is a path, read
+    against the cwd."""
+    keys: set[tuple[str, str]] = set()
+    hosts = {t for t in (_fetch_target(i) for i in items if isinstance(i, dict)) if t}
+    cmd = tool_input.get("command") if name == "Bash" else None
+    cmd = cmd if isinstance(cmd, str) else ""
+    if cmd and not hosts and _INLINE_NET_SHAPES.intersection(shapes):
+        for m in _INLINE_URL.finditer(cmd[:MAX_SCAN_LINE]):
+            hosts.add(m.group(1).lower() + (f"/{m.group(2)}" if m.group(2) else ""))
+    for h in hosts:
+        keys.add(("fetch", h))
+        keys.update((c, h) for c in categories if c in _RETRY_HOST_CLASSES)
+    path_classes = [c for c in categories if c not in _RETRY_HOST_CLASSES]
+    if cmd and path_classes:
+        for arg in _first_args(cmd):
+            t = resolve_target(arg, cwd, relative_ok=True)
+            if t:
+                keys.update((c, t) for c in path_classes)
+    for w in writes:
+        t = resolve_target(w, cwd, relative_ok=True)
+        if t:
+            keys.add(("write", t))
+    return frozenset(keys)
+
+
+def _target_shown(cls: str, target: str, home: str | None) -> str:
+    """A retry target for evidence: a host as is, a path shortened."""
+    return clean(target)[:120] if cls in _RETRY_HOST_CLASSES else _short_path(target, home)
+
+
 class Fleet:
     def __init__(self, network_only: bool = False) -> None:
         # --network with nothing that reads findings: the shell-audit rules,
@@ -9343,6 +9538,14 @@ class Fleet:
         self.network_requested = False
         # Leads evaluated and cleared (rejected[]), keyed (kind, id, what).
         self.rejected: dict[tuple, dict] = {}
+        # Guardrail findings. _cwd is the session's working directory as the
+        # scanner last read it, or None. Per transcript file, reset by
+        # _start_file: the calls the retry match reads. _guardrails is a
+        # switch for tools/fp-measure.py to time a scan without them.
+        self._guardrails = True
+        self._cwd: str | None = None
+        self._file_calls: list[dict] = []
+        self._file_calls_by_id: dict[str, dict] = {}
 
     # -- ingest ------------------------------------------------------------
 
@@ -9573,6 +9776,7 @@ class Fleet:
                 pass
             for f in sorted(root.rglob("rollout-*.jsonl")):
                 self._scan_codex_file(f, since, project_filter, root)
+        self._flush_retries()
         sessions, self._codex_sessions = self._codex_sessions, None
         for _total, project, model, points in sessions.values():
             self._book_codex(project, model, points, since)
@@ -9627,9 +9831,9 @@ class Fleet:
         # (cumulative total, ts, usage) per token_count, values already read
         # through _tok: an absurd count is 0 here and counted once.
         points: list[tuple[int, datetime | None, dict]] = []
-        # (command, ts, mode, why, prompt, line, call id)
+        # (command, ts, mode, why, prompt, line, call id, working directory)
         pending: list[tuple[str, datetime | None, str | None, str | None, str | None, int,
-                            str | None]] = []
+                            str | None, str | None]] = []
         # why: the latest assistant message or reasoning summary text, until the
         # next call's output or user message. prompt: the latest user message.
         why: str | None = None
@@ -9721,7 +9925,8 @@ class Fleet:
                         cmd = args.get("command")
                         if isinstance(cmd, str) and cmd:
                             pending.append((cmd, ts, policy, why, prompt, n,
-                                            _str_or(payload.get("call_id"), None)))
+                                            _str_or(payload.get("call_id"), None),
+                                            _str_or(args.get("workdir"), cwd)))
                             cwd = _str_or(args.get("workdir"), cwd)
         except OSError:
             self._file_unreadable("codex")
@@ -9739,7 +9944,7 @@ class Fleet:
                     continue
                 self.permission_modes[key] += 1
 
-        for cmd, ts, mode, why, prompt, n, call_id in pending:
+        for cmd, ts, mode, why, prompt, n, call_id, workdir in pending:
             # Per command, as the Claude and Copilot paths filter per record:
             # a session still active in the window can hold commands from
             # months before it, and those are outside --days.
@@ -9748,6 +9953,7 @@ class Fleet:
             # Normalise Codex's shell_command onto the same "Bash" tool name the
             # Claude Code path uses, so the audit is one cross-agent view.
             self._src_line = n
+            self._cwd = workdir
             self.add_tool(project, "Bash", {"command": cmd}, ts, mode,
                           session=session, call_id=call_id, agent="codex", why=why,
                           prompt=prompt, where=self._where())
@@ -9781,6 +9987,7 @@ class Fleet:
                     self._dir_unreadable("copilot")
             for f in sorted(root.glob("*/events.jsonl")):
                 self._scan_copilot_file(f, since, project_filter, root)
+        self._flush_retries()
 
     def _scan_copilot_file(self, path: Path, since: datetime | None,
                            project_filter: str | None, root: Path | None = None) -> None:
@@ -9802,8 +10009,9 @@ class Fleet:
         cwd = branch = None
         shutdown: dict | None = None
         shutdown_ts: datetime | None = None
-        # (id, tool, command, ts, args, why, prompt, line)
-        calls: list[tuple[str, str, str, datetime | None, dict, str | None, str | None, int]] = []
+        # (id, tool, command, ts, args, why, prompt, line, working directory)
+        calls: list[tuple[str, str, str, datetime | None, dict, str | None, str | None, int,
+                          str | None]] = []
         why: str | None = None          # the latest assistant.message text, until a tool completes
         prompt: str | None = None       # the latest user.message
         self._start_file(path, root if root is not None else path.parent.parent)
@@ -9845,7 +10053,7 @@ class Fleet:
                         cmd = args.get("command") if isinstance(args, dict) else None
                         cmd = cmd if name == "bash" and isinstance(cmd, str) else ""
                         calls.append((_str_or(data.get("toolCallId"), ""), name, cmd, ts,
-                                      args if isinstance(args, dict) else {}, why, prompt, n))
+                                      args if isinstance(args, dict) else {}, why, prompt, n, cwd))
                     elif kind == "permission.requested":
                         req = data.get("permissionRequest")
                         req_id = _str_or(req.get("toolCallId"), "") if isinstance(req, dict) else ""
@@ -9878,11 +10086,12 @@ class Fleet:
         active = False
         joined: dict[str, tuple[str, str]] = {}
         sid = path.parent.name
-        for call_id, name, cmd, ts, targs, why, prompt, n in calls:
+        for call_id, name, cmd, ts, targs, why, prompt, n, call_cwd in calls:
             if not in_window(ts):
                 continue
             active = True
             self._src_line = n
+            self._cwd = call_cwd
             detail = {"why": why, "prompt": prompt, "where": self._where()}
             if cmd:
                 mode = "copilot:prompted" if call_id in prompted else "copilot:auto"
@@ -9909,7 +10118,7 @@ class Fleet:
                 self._network_outcome(f"copilot:{call_id}", refused=True)
                 self.denials[kind] += 1
                 self.denials_by_project[project] += 1
-                self._record_refusal(kind, project, ts, joined.get(call_id))
+                self._record_refusal(kind, project, ts, joined.get(call_id), call_id=call_id)
         for data, ts in subagents:
             if in_window(ts):
                 # Copilot gives a token total with no input/output split, so no
@@ -10052,7 +10261,8 @@ class Fleet:
             self.denials_by_project[clean(project)[:120] or "unknown"] += 1
             shown = "Bash" if name == "run_shell_command" else name
             self._record_refusal(kind, clean(project)[:120] or "unknown", ts,
-                                 (shown, cmd[:MAX_SCAN_LINE] if isinstance(cmd, str) else ""))
+                                 (shown, cmd[:MAX_SCAN_LINE] if isinstance(cmd, str) else ""),
+                                 call_id=call_id)
 
     def scan_gemini(self, roots: list[Path], since: datetime | None,
                     project_filter: str | None) -> None:
@@ -10070,6 +10280,7 @@ class Fleet:
                     continue
                 for f in gemini_session_files(d):
                     self._scan_gemini_file(f, project, real, since, root)
+        self._flush_retries()
 
     def _scan_gemini_file(self, path: Path, project: str, real: str,
                           since: datetime | None, root: Path) -> None:
@@ -10084,6 +10295,7 @@ class Fleet:
         self.bytes_scanned += st.st_size
         self.files_scanned += 1
         self._start_file(path, root)
+        self._cwd = real or None
         sess = read_gemini_session(path)
         if sess is None:
             self._file_unreadable("gemini")
@@ -10155,6 +10367,7 @@ class Fleet:
                     continue
                 for f in qwen_session_files(d):
                     self._scan_qwen_file(f, d.name, since, project_filter, root)
+        self._flush_retries()
 
     def _scan_qwen_file(self, path: Path, slug: str, since: datetime | None,
                         project_filter: str | None, root: Path) -> None:
@@ -10190,6 +10403,7 @@ class Fleet:
                         continue
                     self._src_line = n
                     cwd = _str_or(rec.get("cwd"), cwd)
+                    self._cwd = cwd or None
                     branch = _str_or(rec.get("gitBranch"), branch)
                     project = path_project(cwd) if cwd else pretty_project(slug)
                     ts = parse_ts(rec.get("timestamp"))
@@ -10297,7 +10511,8 @@ class Fleet:
             self.denials[kind] += 1
             self.denials_by_project[clean(project)[:120] or "unknown"] += 1
             self._record_refusal(kind, clean(project)[:120] or "unknown", ts,
-                                 ("Bash" if name == "run_shell_command" else name, cmd[:MAX_SCAN_LINE]))
+                                 ("Bash" if name == "run_shell_command" else name, cmd[:MAX_SCAN_LINE]),
+                                 call_id=cid)
 
     def add_refusal(self, kind: str, rec: dict, project: str,
                     ts: datetime | None, calls: dict[str, tuple[str, str]]) -> None:
@@ -10317,11 +10532,13 @@ class Fleet:
                     hit = calls.get(tid) if isinstance(tid, str) and tid else None
                     if hit:
                         break
-        self._record_refusal(kind, project, ts, hit)
+        self._record_refusal(kind, project, ts, hit, call_id=tid if hit else None)
 
     def _record_refusal(self, kind: str, project: str, ts: datetime | None,
-                        call: tuple[str, str] | None) -> None:
-        """Count one refusal, and attribute it when the blocked call is known."""
+                        call: tuple[str, str] | None, call_id: str | None = None) -> None:
+        """Count one refusal, and attribute it when the blocked call is known.
+        The call is also marked refused for the retry match."""
+        self._mark_refused(call, call_id)
         self.refusals += 1
         self.refusal_project[project][kind] += 1
         if ts:
@@ -10336,6 +10553,81 @@ class Fleet:
             head = display_head(cmd)
             if head:
                 self.refusal_program[kind][head] += 1
+
+    def _guard_call(self, project: str, name: str, tool_input: dict, ts: datetime | None,
+                    call_id: str | None, items: list,
+                    matches: "list[tuple[str, str, str]] | tuple" = (),
+                    shapes: "list[str] | tuple" = ()) -> None:
+        """Remember one call for the retry match at the end of its file."""
+        if not self._guardrails or self.network_only:
+            return
+        cwd = self._cwd
+        cmd = tool_input.get("command") if name == "Bash" else None
+        cmd = cmd if isinstance(cmd, str) else ""
+        program = (display_head(cmd) or "?") if name == "Bash" else (clean(name)[:48] or "?")
+        writes = write_targets(name, tool_input)
+        keys = retry_keys(name, tool_input, cwd, items, {c for _s, c, _l in matches}, shapes, writes)
+        if not keys or len(self._file_calls) >= RETRY_CALLS_MAX:
+            return
+        entry = {"keys": keys, "program": clean(program)[:40], "name": name,
+                 "cmd": cmd[:MAX_SCAN_LINE], "project": project, "ts": ts, "home": _home_of(cwd),
+                 "refused": False, "flagged": False}
+        self._file_calls.append(entry)
+        if call_id:
+            self._file_calls_by_id[str(call_id)] = entry
+
+    def _guard_flag(self, severity: str, category: str, program: str, project: str,
+                    ts: datetime | None, evidence: str) -> None:
+        """One guardrail finding, suppressible and counted like a rule's."""
+        fid = flag_id(severity, [category], program)
+        suppressed = fid in self.suppressions
+        if suppressed:
+            self.suppressed_flags += 1
+        self.flag_counts[f"{severity}:{category}"] += 1
+        self.flags.append({
+            "id": fid, "severity": severity, "categories": [category], "program": program,
+            "project": project, "when": ts.isoformat() if ts else None,
+            "evidence": redact(clean(evidence))[:MAX_SCAN_LINE],
+            "had_secret": False, "suppressed": suppressed,
+            "suppressed_reason": self.suppressions.get(fid, ""),
+        })
+
+    def _mark_refused(self, call: tuple[str, str] | None, call_id: str | None) -> None:
+        """The remembered call a refusal blocked: by call id, else the latest
+        call in this file with the same tool and command."""
+        entry = self._file_calls_by_id.get(str(call_id)) if call_id else None
+        if entry is None and call:
+            name, cmd = call
+            cmd = (cmd or "")[:MAX_SCAN_LINE]
+            entry = next((e for e in reversed(self._file_calls)
+                          if not e["refused"] and e["name"] == name and e["cmd"] == cmd), None)
+        if entry is not None:
+            entry["refused"] = True
+
+    def _flush_retries(self) -> None:
+        """retry-after-deny for the file just read: every call that ran after
+        a refused call, through a different program, with an action class and
+        target in common. A call itself refused is never a retry; each call
+        is flagged at most once. Runs in _start_file and at the end of every
+        scan, because some agents record a refusal only after the call."""
+        calls = self._file_calls
+        for i, r in enumerate(calls):
+            if not r["refused"]:
+                continue
+            for c in calls[i + 1:]:
+                if c["refused"] or c["flagged"] or c["program"] == r["program"]:
+                    continue
+                shared = r["keys"] & c["keys"]
+                if not shared:
+                    continue
+                cls, target = min(shared)
+                c["flagged"] = True
+                at = f" at {r['ts']:%H:%M}" if r["ts"] else ""
+                self._guard_flag("high", RETRY_CATEGORY, c["program"], c["project"], c["ts"],
+                                 f"{r['program']} refused{at}, then {c['program']} reached "
+                                 f"{_target_shown(cls, target, c['home'])}")
+        self._file_calls = []
+        self._file_calls_by_id = {}
 
     def add_subagent(self, result: dict, ts: datetime | None) -> None:
         """One completed subagent run.
@@ -10397,11 +10689,13 @@ class Fleet:
         name = clean(name)[:48] or "?"
         self.tools[name] += 1
         self._net_remote_exec = ""
+        net_before = len(self.network)
         self._add_network(project, name, tool_input or {}, ts, mode, session, call_id, agent,
                           (why, prompt, where))
         if not self.network_only:
             self._audit_config_write(project, name, tool_input or {}, ts)
         if name != "Bash":
+            self._guard_call(project, name, tool_input or {}, ts, call_id, self.network[net_before:])
             return
         cmd = (tool_input or {}).get("command") or ""
         if not cmd:
@@ -10480,6 +10774,8 @@ class Fleet:
                 e["last"] = max(e["last"] or day, day)
 
         matches = command_rule_matches(cmd, windows, self._net_remote_exec)
+        self._guard_call(project, "Bash", tool_input or {}, ts, call_id, self.network[net_before:],
+                         matches, shapes)
         if not matches:
             return
         worst = min(matches, key=lambda m: SEVERITY_ORDER.get(m[0], 9))
@@ -10577,12 +10873,16 @@ class Fleet:
             # branch and ticket, so the order must not be the filesystem's.
             for f in sorted(d.glob("*.jsonl")):
                 self._scan_file(f, project, since, d.parent)
+        self._flush_retries()
         if progress:
             print("\r" + " " * 72 + "\r", end="", file=sys.stderr, flush=True)
 
     def _start_file(self, path: Path, root: Path | None) -> None:
         """Reset the per-file state network items read: mode, prompt, the
-        assistant text being collected, and the file's path under its root."""
+        assistant text being collected, and the file's path under its root.
+        The previous file's retry match runs first."""
+        self._flush_retries()
+        self._cwd = None
         self._mode = None
         self._prompt = None
         self._why_id, self._why_prior = None, []
@@ -10763,6 +11063,8 @@ class Fleet:
         change to that meaning cannot apply to one source and not the other.
         """
         ts = parse_ts(rec.get("timestamp"))
+        # The working directory the guardrail findings read paths against.
+        self._cwd = _str_or(rec.get("cwd"), self._cwd)
         mode = clean(rec.get("permissionMode"))[:48]
         if mode:
             # Stays in force for the tool calls that follow it, even when this
@@ -11033,6 +11335,7 @@ class Fleet:
         for rec in records:
             if isinstance(rec, dict):
                 self._ingest_claude(rec, project, since, calls)
+        self._flush_retries()
 
     # -- derived -----------------------------------------------------------
 

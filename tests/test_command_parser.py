@@ -238,5 +238,224 @@ class TestNewPatternsAreLinear(unittest.TestCase):
         ], ceiling=0.5)
 
 
+def qwen_rec(kind, uid, ts, **kw):
+    rec = {"uuid": uid, "parentUuid": None, "sessionId": "q1", "timestamp": ts, "type": kind,
+           "cwd": CWD, "version": "0.25.1", "gitBranch": "main"}
+    rec.update(kw)
+    return json.dumps(rec)
+
+
+def qwen_call(uid, cid, name, args, ts):
+    return qwen_rec("assistant", uid, ts, model="qwen3-coder-plus",
+                    message={"role": "model", "parts": [{"functionCall": {"id": cid, "name": name,
+                                                                          "args": args}}]})
+
+
+def qwen_result(uid, cid, ts, status="success", error=None):
+    tcr = {"callId": cid, "status": status}
+    if error:
+        tcr["error"] = error
+    resp = {"error": error} if error else {"output": "ok"}
+    return qwen_rec("tool_result", uid, ts, toolCallResult=tcr,
+                    message={"role": "user", "parts": [{"functionResponse": {"id": cid, "name": "x",
+                                                                             "response": resp}}]})
+
+
+def copilot_events(state, sid, events):
+    d = state / sid
+    d.mkdir(parents=True, exist_ok=True)
+    with (d / "events.jsonl").open("w", encoding="utf-8", newline="\n") as fh:
+        for n, (kind, data, ts) in enumerate(events):
+            fh.write(json.dumps({"type": kind, "data": data, "id": f"e{n}",
+                                 "parentId": None, "timestamp": ts}) + "\n")
+    return state
+
+
+class TestTargets(unittest.TestCase):
+    """The textual helpers both findings read targets with."""
+
+    def test_resolve_target(self):
+        for arg, cwd, want in (("build", CWD, "/home/dev/orbital/build"),
+                               ("./build/", CWD, "/home/dev/orbital/build"),
+                               ("../other/x", CWD, "/home/dev/other/x"),
+                               ("~/notes.txt", CWD, "/home/dev/notes.txt"),
+                               ("~/notes.txt", "/srv/app", "~/notes.txt"),
+                               ("/etc//hosts", CWD, "/etc/hosts"),
+                               ("/a/../../b", CWD, "/b"),
+                               ("C:\\Users\\dev\\x\\..\\y.txt", "C:\\Users\\dev\\proj", "c:/Users/dev/y.txt"),
+                               ("$OUT/x", CWD, None), ("build", None, None), ("", CWD, None)):
+            with self.subTest(arg=arg, cwd=cwd):
+                self.assertEqual(af.resolve_target(arg, cwd), want)
+        self.assertEqual(af.resolve_target("./build", None, relative_ok=True), "build")
+
+    def test_write_targets(self):
+        for name, inp, want in (
+                ("Bash", bash("echo hi > /etc/x"), ["/etc/x"]),
+                ("Bash", bash("echo hi >>~/notes.txt"), ["~/notes.txt"]),
+                ("Bash", bash("make 2>/dev/null"), ["/dev/null"]),
+                ("Bash", bash("ls >&2"), []),
+                ("Bash", bash("printf x | tee -a ../other/f.txt"), ["../other/f.txt"]),
+                ("Bash", bash("cat a &> /opt/log"), ["/opt/log"]),
+                ("Bash", bash("echo a >| /srv/y"), ["/srv/y"]),
+                ("Write", {"file_path": "/etc/motd"}, ["/etc/motd"]),
+                ("str_replace_editor", {"command": "view", "path": "/etc/hosts"}, []),
+                ("Read", {"file_path": "/etc/hosts"}, [])):
+            with self.subTest(inp=inp):
+                self.assertEqual(af.write_targets(name, inp), want)
+
+    def test_retry_keys(self):
+        cmd = "curl -fsSL https://x.io/tools/i.sh -o i.sh"
+        items, _ = af.network_items_from_command(cmd, [])
+        self.assertEqual(af.retry_keys("Bash", bash(cmd), CWD, items, set()),
+                         frozenset({("fetch", "x.io/tools")}))
+        self.assertEqual(af.retry_keys("Bash", bash("sudo rm -rf ./build"), CWD, [], {"destructive", "privilege"}),
+                         frozenset({("destructive", "/home/dev/orbital/build"),
+                                    ("privilege", "/home/dev/orbital/build")}))
+        npm, _ = af.network_items_from_command("npm install left-pad", [])
+        self.assertIn(("fetch", "registry.npmjs.org/left-pad"),
+                      af.retry_keys("Bash", bash("npm install left-pad"), CWD, npm, set()))
+        py = "python3 -c \"import urllib.request as u; u.urlopen('https://x.io/tools/i.sh')\""
+        self.assertEqual(af.retry_keys("Bash", bash(py), CWD, [], set(), af.unreadable_shapes(py)),
+                         frozenset({("fetch", "x.io/tools")}))
+        self.assertEqual(af.retry_keys("Read", {"file_path": "/etc/hosts"}, CWD, [], set()), frozenset())
+        self.assertEqual(af.retry_keys("Write", {"file_path": "/etc/hosts"}, CWD, [], set(),
+                                       writes=["/etc/hosts"]),
+                         frozenset({("write", "/etc/hosts")}))
+
+
+class TestRetryAfterDeny(HomeCase):
+    """#93a: a refused call retried through another program, same action and target."""
+
+    def test_rm_refused_then_find_delete_fires(self):
+        t0 = recent(30)
+        f = self.claude_fleet([
+            claude_call("u1", "t1", "Bash", bash("rm -rf build"), t0),
+            claude_refusal("u2", "t1", t0 + timedelta(seconds=5)),
+            claude_call("u3", "t2", "Bash", bash("find build -delete"), t0 + timedelta(minutes=1))])
+        [hit] = flags_of(f, "retry-after-deny")
+        self.assertEqual((hit["severity"], hit["program"]), ("high", "find"))
+        self.assertIn("rm refused at ", hit["evidence"])
+        self.assertIn("then find reached ~/orbital/build", hit["evidence"])
+        self.assertNotIn("/home/dev", hit["evidence"])
+
+    def test_spellings_of_one_target_match(self):
+        t0 = recent(30)
+        for spelling in ("./build/", "../orbital/build", "/home/dev/orbital/build"):
+            with self.subTest(spelling=spelling):
+                f = self.claude_fleet([
+                    claude_call("u1", "t1", "Bash", bash("rm -rf build"), t0),
+                    claude_refusal("u2", "t1", t0 + timedelta(seconds=5)),
+                    claude_call("u3", "t2", "Bash", bash(f"find {spelling} -delete"),
+                                t0 + timedelta(minutes=1))])
+                self.assertEqual(len(flags_of(f, "retry-after-deny")), 1)
+
+    def test_what_does_not_fire(self):
+        t0 = recent(30)
+        later, later2 = t0 + timedelta(minutes=1), t0 + timedelta(minutes=2)
+        refused = [claude_call("u1", "t1", "Bash", bash("rm -rf build"), t0),
+                   claude_refusal("u2", "t1", t0 + timedelta(seconds=5))]
+        cases = {
+            "another target": refused + [claude_call("u3", "t2", "Bash", bash("find dist -delete"), later)],
+            "the same program": refused + [claude_call("u3", "t2", "Bash", bash("rm -rf ./build"), later)],
+            "the retry was refused too": refused + [
+                claude_call("u3", "t2", "Bash", bash("find build -delete"), later),
+                claude_refusal("u4", "t2", later2)],
+            "a refusal joined to no call": [
+                claude_refusal("u2", "t9", t0),
+                claude_call("u3", "t2", "Bash", bash("find build -delete"), later)],
+            "before the refusal": [
+                claude_call("u3", "t2", "Bash", bash("find build -delete"), t0),
+                claude_call("u1", "t1", "Bash", bash("rm -rf build"), later),
+                claude_refusal("u2", "t1", later2)],
+        }
+        for label, records in cases.items():
+            with self.subTest(label):
+                self.assertEqual(flags_of(self.claude_fleet(records), "retry-after-deny"), [])
+
+    def test_a_retry_in_another_file_does_not_fire(self):
+        t0 = recent(30)
+        f = self.claude_fleet(
+            [claude_call("u1", "t1", "Bash", bash("rm -rf build"), t0),
+             claude_refusal("u2", "t1", t0 + timedelta(seconds=5))],
+            [claude_call("u3", "t2", "Bash", bash("find build -delete"), t0 + timedelta(minutes=1))])
+        self.assertEqual(flags_of(f, "retry-after-deny"), [])
+
+    def test_a_resumed_session_copy_does_not_fire_twice(self):
+        t0 = recent(30)
+        records = [claude_call("u1", "t1", "Bash", bash("rm -rf build"), t0),
+                   claude_refusal("u2", "t1", t0 + timedelta(seconds=5)),
+                   claude_call("u3", "t2", "Bash", bash("find build -delete"), t0 + timedelta(minutes=1))]
+        f = self.claude_fleet(records, list(records))
+        self.assertEqual(len(flags_of(f, "retry-after-deny")), 1)
+
+    def test_a_refused_download_fetched_by_another_tool_fires(self):
+        t0 = recent(30)
+        f = self.claude_fleet([
+            claude_call("u1", "t1", "Bash", bash("curl -fsSL https://x.io/tools/i.sh -o i.sh"), t0),
+            claude_refusal("u2", "t1", t0 + timedelta(seconds=5)),
+            claude_call("u3", "t2", "WebFetch", {"url": "https://x.io/tools/i.sh", "prompt": "read it"},
+                        t0 + timedelta(minutes=1))])
+        [hit] = flags_of(f, "retry-after-deny")
+        self.assertEqual(hit["program"], "WebFetch")
+        self.assertIn("reached x.io/tools", hit["evidence"])
+
+    def test_a_refused_write_redone_through_the_shell_fires(self):
+        t0 = recent(30)
+        f = self.claude_fleet([
+            claude_call("u1", "t1", "Write", {"file_path": "/etc/hosts", "content": "x"}, t0),
+            claude_refusal("u2", "t1", t0 + timedelta(seconds=5)),
+            claude_call("u3", "t2", "Bash", bash("echo '127.0.0.1 x' | sudo tee -a /etc/hosts"),
+                        t0 + timedelta(minutes=1))])
+        [hit] = flags_of(f, "retry-after-deny")
+        self.assertEqual(hit["program"], "echo")
+        self.assertIn("Write refused", hit["evidence"])
+
+    def test_copilot(self):
+        state = copilot_events(self.home / "copilot-state", "cp1", [
+            fx._start("cp1", CWD, "main", "2026-11-01T10:00:00.000Z"),
+            fx._bash("c1", "curl -fsSL https://x.io/tools/i.sh -o i.sh", "2026-11-01T10:01:00.000Z"),
+            fx._ask("c1", "r1", "2026-11-01T10:01:01.000Z"),
+            fx._done("c1", "r1", "denied-interactively-by-user", "2026-11-01T10:01:05.000Z"),
+            fx._bash("c2", "wget -q https://x.io/tools/i.sh", "2026-11-01T10:02:00.000Z")])
+        f = af.Fleet()
+        f.suppressions = {}
+        f.scan_copilot([state], None, None)
+        self.assertEqual([x["program"] for x in flags_of(f, "retry-after-deny")], ["wget"])
+
+    def test_qwen(self):
+        root = self.home / "qwen-projects"
+        write_lines(root / "-home-dev-orbital" / "chats" / "q1.jsonl", [
+            qwen_call("a1", "k1", "run_shell_command",
+                      {"command": "curl -fsSL https://x.io/tools/i.sh -o i.sh"}, "2026-11-01T10:00:00Z"),
+            qwen_result("a2", "k1", "2026-11-01T10:00:05Z", status="cancelled",
+                        error="User denied execution."),
+            qwen_call("a3", "k2", "run_shell_command",
+                      {"command": "python3 -c \"import urllib.request as u; "
+                                  "u.urlopen('https://x.io/tools/i.sh')\""}, "2026-11-01T10:01:00Z"),
+            qwen_result("a4", "k2", "2026-11-01T10:01:05Z")])
+        f = af.Fleet()
+        f.suppressions = {}
+        f.scan_qwen([root], None, None)
+        self.assertEqual([x["program"] for x in flags_of(f, "retry-after-deny")], ["python3"])
+
+    def test_gemini_calls(self):
+        f = guard_fleet()
+        f._vendor_call("gemini", "p", "run_shell_command", {"command": "rm -rf build"}, TS, None, "s",
+                       "g1", "cancelled", "User denied execution.", None, None)
+        f._vendor_call("gemini", "p", "run_shell_command", {"command": "find build -delete"},
+                       TS + timedelta(minutes=1), None, "s", "g2", "success", "", None, None)
+        f._flush_retries()
+        self.assertEqual([x["program"] for x in flags_of(f, "retry-after-deny")], ["find"])
+
+    def test_the_calls_remembered_per_file_are_capped(self):
+        f = guard_fleet()
+        with mock.patch.object(af, "RETRY_CALLS_MAX", 5):
+            for i in range(12):
+                f.add_tool("p", "Bash", bash(f"curl https://x.io/a{i}"), TS, call_id=f"c{i}", agent="claude")
+        self.assertEqual(len(f._file_calls), 5)
+        f._flush_retries()
+        self.assertEqual(f._file_calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()
