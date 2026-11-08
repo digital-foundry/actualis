@@ -9163,6 +9163,17 @@ class Fleet:
         self.roots: list[Path] = []
         self.files_scanned = 0
         self.bytes_scanned = 0
+        # Coverage. Per agent whose transcript root this run scanned: files
+        # read, files that could not be opened (once dropped without a word),
+        # files the --days mtime prefilter left out, the oldest mtime read,
+        # and every mtime seen (read or skipped) keyed by root, which the
+        # retention horizon needs. See _root_seen and coverage().
+        self.agent_roots: dict[str, dict] = {}
+        self.files_unreadable = 0
+        self.files_skipped_mtime = 0
+        # Lines handed to the JSON decoder: the denominator unparsable_lines
+        # is a share of. Claude lines the prefilter skips are not decoded.
+        self.lines_read = 0
 
     # -- ingest ------------------------------------------------------------
 
@@ -9386,6 +9397,8 @@ class Fleet:
         # under the same session id, cumulative totals included. Each session
         # id is priced once, from the token_count totals of all its files.
         self._codex_sessions = {}
+        if roots:
+            self._root_seen("codex")
         for root in roots:
             for f in sorted(root.rglob("rollout-*.jsonl")):
                 self._scan_codex_file(f, since, project_filter, root)
@@ -9430,8 +9443,10 @@ class Fleet:
         try:
             st = path.stat()
         except OSError:
+            self._file_unreadable("codex")
             return
         if since is not None and st.st_mtime < (since.timestamp() - 3600):
+            self._file_skipped("codex", root, st.st_mtime)
             return
         self.bytes_scanned += st.st_size
         self.files_scanned += 1
@@ -9456,6 +9471,7 @@ class Fleet:
         try:
             with _open_regular(path) as fh:
                 for n, line in enumerate(fh, 1):
+                    self.lines_read += 1
                     ok, rec = _json_line(line)
                     if not ok:
                         self.unparsable_lines += 1
@@ -9537,7 +9553,9 @@ class Fleet:
                                             _str_or(payload.get("call_id"), None)))
                             cwd = _str_or(args.get("workdir"), cwd)
         except OSError:
+            self._file_unreadable("codex")
             return
+        self._file_read("codex", root, st.st_mtime)
 
         project = pretty_project(cwd.lstrip("/").replace("/", "-")) if cwd else "unknown"
         if project_filter and project_filter.lower() not in project.lower():
@@ -9580,6 +9598,8 @@ class Fleet:
 
     def scan_copilot(self, roots: list[Path], since: datetime | None,
                      project_filter: str | None) -> None:
+        if roots:
+            self._root_seen("copilot")
         for root in roots:
             for f in sorted(root.glob("*/events.jsonl")):
                 self._scan_copilot_file(f, since, project_filter, root)
@@ -9592,8 +9612,11 @@ class Fleet:
         try:
             st = path.stat()
         except OSError:
+            self._file_unreadable("copilot")
             return
         if since is not None and st.st_mtime < (since.timestamp() - 3600):
+            self._file_skipped("copilot", root if root is not None else path.parent.parent,
+                               st.st_mtime)
             return
         self.bytes_scanned += st.st_size
         self.files_scanned += 1
@@ -9613,6 +9636,7 @@ class Fleet:
         try:
             with _open_regular(path) as fh:
                 for n, line in enumerate(fh, 1):
+                    self.lines_read += 1
                     ok, rec = _json_line(line)
                     if not ok:
                         self.unparsable_lines += 1
@@ -9662,7 +9686,9 @@ class Fleet:
                     elif kind == "session.shutdown":
                         shutdown, shutdown_ts = data, ts
         except OSError:
+            self._file_unreadable("copilot")
             return
+        self._file_read("copilot", root if root is not None else path.parent.parent, st.st_mtime)
 
         project = pretty_project(cwd.lstrip("/").replace("/", "-")) if cwd else "copilot"
         if project_filter and project_filter.lower() not in project.lower():
@@ -9852,6 +9878,8 @@ class Fleet:
 
     def scan_gemini(self, roots: list[Path], since: datetime | None,
                     project_filter: str | None) -> None:
+        if roots:
+            self._root_seen("gemini")
         for root in roots:
             registry = gemini_registry(root)
             for d in _project_dirs(root):
@@ -9867,15 +9895,21 @@ class Fleet:
         try:
             st = path.stat()
         except OSError:
+            self._file_unreadable("gemini")
             return
         if since is not None and st.st_mtime < (since.timestamp() - 3600):
+            self._file_skipped("gemini", root, st.st_mtime)
             return
         self.bytes_scanned += st.st_size
         self.files_scanned += 1
         self._start_file(path, root)
         sess = read_gemini_session(path)
         if sess is None:
+            self._file_unreadable("gemini")
             return
+        self._file_read("gemini", root, st.st_mtime)
+        # Records, not lines: a message rewritten several times is read once.
+        self.lines_read += len(sess["messages"]) + sess["unparsable"] + sess["unsupported"]
         self.unparsable_lines += sess["unparsable"]
         self.unsupported_records += sess["unsupported"]
         meta = sess["meta"]
@@ -9931,6 +9965,8 @@ class Fleet:
 
     def scan_qwen(self, roots: list[Path], since: datetime | None,
                   project_filter: str | None) -> None:
+        if roots:
+            self._root_seen("qwen")
         for root in roots:
             for d in _project_dirs(root):
                 for f in qwen_session_files(d):
@@ -9944,8 +9980,10 @@ class Fleet:
         try:
             st = path.stat()
         except OSError:
+            self._file_unreadable("qwen")
             return
         if since is not None and st.st_mtime < (since.timestamp() - 3600):
+            self._file_skipped("qwen", root, st.st_mtime)
             return
         self.bytes_scanned += st.st_size
         self.files_scanned += 1
@@ -9959,6 +9997,7 @@ class Fleet:
         try:
             with _open_regular(path) as fh:
                 for n, line in enumerate(fh, 1):
+                    self.lines_read += 1
                     ok, rec = _json_line(line)
                     if not ok:
                         self.unparsable_lines += 1
@@ -10034,7 +10073,9 @@ class Fleet:
                         why = None
                         self._qwen_result(rec, parts, calls)
         except OSError:
+            self._file_unreadable("qwen")
             return
+        self._file_read("qwen", root, st.st_mtime)
         if active:
             self.agents_seen.add("qwen")
 
@@ -10325,6 +10366,7 @@ class Fleet:
         if not roots:
             return
         self.roots.extend(roots)
+        self._root_seen("claude-code")
         dirs: list[Path] = []
         for r in roots:
             try:
@@ -10365,17 +10407,45 @@ class Fleet:
     def _where(self) -> dict:
         return {"root": self._src_root, "file": self._src_file, "line": self._src_line}
 
+    def _root_seen(self, agent: str) -> dict:
+        """The coverage row of an agent whose transcript root this run scans."""
+        return self.agent_roots.setdefault(agent, {
+            "exists": True, "files_read": 0, "files_unreadable": 0,
+            "files_skipped_mtime": 0, "oldest_mtime": None, "mtimes": {}})
+
+    def _file_unreadable(self, agent: str) -> None:
+        """A transcript file that failed stat or open: skipped, as always, and now counted."""
+        self._root_seen(agent)["files_unreadable"] += 1
+        self.files_unreadable += 1
+
+    def _file_skipped(self, agent: str, root: "Path | str | None", mtime: float) -> None:
+        """A file the --days prefilter left out: older than the window by mtime."""
+        row = self._root_seen(agent)
+        row["files_skipped_mtime"] += 1
+        row["mtimes"].setdefault("" if root is None else str(root), []).append(mtime)
+        self.files_skipped_mtime += 1
+
+    def _file_read(self, agent: str, root: "Path | str | None", mtime: float) -> None:
+        """A file read to its end."""
+        row = self._root_seen(agent)
+        row["files_read"] += 1
+        row["mtimes"].setdefault("" if root is None else str(root), []).append(mtime)
+        if row["oldest_mtime"] is None or mtime < row["oldest_mtime"]:
+            row["oldest_mtime"] = mtime
+
     def _scan_file(self, path: Path, project: str, since: datetime | None,
                    root: Path | None = None) -> None:
         try:
             st = path.stat()
             size = st.st_size
         except OSError:
+            self._file_unreadable("claude-code")
             return
         # A file not written since the cutoff cannot hold a record after it.
         # An hour of slack absorbs clock skew and copied timestamps. On a real
         # fleet this turns --days 1 from reading 1,784 files into reading 7.
         if since is not None and st.st_mtime < (since.timestamp() - 3600):
+            self._file_skipped("claude-code", root, st.st_mtime)
             return
         self.files_scanned += 1
         self.bytes_scanned += size
@@ -10402,6 +10472,7 @@ class Fleet:
                     if not counts and not said and '"is_error":true' not in line \
                             and '"is_error": true' not in line:
                         continue
+                    self.lines_read += 1
                     ok, rec = _json_line(line)
                     if not ok:
                         self.unparsable_lines += 1
@@ -10418,7 +10489,9 @@ class Fleet:
                         if not (since and ts and ts < since):
                             self._network_results(rec)
         except OSError:
+            self._file_unreadable("claude-code")
             return
+        self._file_read("claude-code", root, st.st_mtime)
 
     def _audit_config_write(self, project: str, name: str, tool_input: dict,
                             ts: datetime | None) -> None:
@@ -10721,9 +10794,11 @@ class Fleet:
         because a real fleet is thousands of files; one execution log is a
         single document that must be parsed whole regardless.
         """
+        self._root_seen("claude-code")
         try:
             st = path.stat()
         except OSError:
+            self._file_unreadable("claude-code")
             return
         self.files_scanned += 1
         self.bytes_scanned += st.st_size
@@ -10731,9 +10806,12 @@ class Fleet:
             with _open_regular(path) as fh:
                 records = json.load(fh)
         except (OSError, json.JSONDecodeError, ValueError, RecursionError):
+            self._file_unreadable("claude-code")
             return
         if not isinstance(records, list):
+            self._file_unreadable("claude-code")
             return
+        self._file_read("claude-code", path.parent, st.st_mtime)
         self._start_file(path, path.parent)     # one JSON array: no line numbers
         calls: dict[str, tuple[str, str]] = {}
         for rec in records:

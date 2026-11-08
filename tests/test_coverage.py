@@ -303,5 +303,79 @@ class TestAssessments(unittest.TestCase):
             self.assertIn(word, doc)
 
 
+class TestCoverageCounters(HomeCase):
+    """Task 2: files read, unreadable and skipped, per agent, and lines decoded."""
+
+    def test_claude_files_read_unreadable_and_skipped(self):
+        proj = self.projects / "-home-dev-orbital"
+        good = write_session(proj, "a.jsonl", [assistant("m1", recent()),
+                                               '{"type": "summary"}', '{"usage": 1,'])
+        old = recent(24 * 30)
+        write_session(proj, "old.jsonl", [assistant("m0", old)], mtime=old)
+        (proj / "broken.jsonl").mkdir()                  # stat works, open does not
+        f = af.Fleet()
+        f.scan([self.projects], af.window_start(7), None, progress=False)
+        row = f.agent_roots["claude-code"]
+        self.assertEqual((row["files_read"], row["files_unreadable"], row["files_skipped_mtime"]),
+                         (1, 1, 1))
+        self.assertEqual((f.files_unreadable, f.files_skipped_mtime), (1, 1))
+        self.assertEqual(f.lines_read, 2)                # the summary line is never decoded
+        self.assertEqual(f.unparsable_lines, 1)
+        self.assertEqual(row["oldest_mtime"], good.stat().st_mtime)
+        self.assertEqual(sorted(len(v) for v in row["mtimes"].values()), [2])
+        self.assertEqual(f.files_scanned, 2)              # unchanged: past the prefilter, opened or not
+
+    def test_every_agent_counts_a_file_it_cannot_open(self):
+        codex = self.home / "codex"
+        (codex / "2026" / "rollout-1.jsonl").mkdir(parents=True)
+        copilot = self.home / "copilot"
+        (copilot / "sid" / "events.jsonl").mkdir(parents=True)
+        log = self.home / "ci-log.json"
+        log.mkdir()
+        f = af.Fleet()
+        f.scan_codex([codex], None, None)
+        f.scan_copilot([copilot], None, None)
+        f.scan_execution_log(log, "ci", None)
+        self.assertEqual({a: r["files_unreadable"] for a, r in f.agent_roots.items()},
+                         {"codex": 1, "copilot": 1, "claude-code": 1})
+        self.assertEqual(f.files_unreadable, 3)
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "needs POSIX permissions, as non-root")
+    def test_a_file_without_read_permission_is_counted_not_dropped(self):
+        qwen = self.home / "qwen" / "projects"
+        gemini = self.home / "gemini" / "tmp"
+        paths = [write_session(qwen / "-home-dev-orbital" / "chats", "s.jsonl", ['{"type": "user"}']),
+                 write_session(gemini / "orbital" / "chats", "session-1.jsonl", ['{"sessionId": "x"}'])]
+        for p in paths:
+            p.chmod(0)
+        try:
+            f = af.Fleet()
+            f.scan_qwen([qwen], None, None)
+            f.scan_gemini([gemini], None, None)
+        finally:
+            for p in paths:
+                p.chmod(0o600)
+        self.assertEqual(f.agent_roots["qwen"]["files_unreadable"], 1)
+        self.assertEqual(f.agent_roots["gemini"]["files_unreadable"], 1)
+        self.assertEqual(f.agent_roots["qwen"]["files_read"], 0)
+
+    def test_a_root_with_no_files_is_still_a_root(self):
+        empty = self.home / "sessions"
+        empty.mkdir()
+        f = af.Fleet()
+        f.scan_codex([empty], None, None)
+        self.assertEqual(f.agent_roots["codex"]["files_read"], 0)
+        self.assertTrue(f.agent_roots["codex"]["exists"])
+        f.scan_copilot([], None, None)
+        self.assertNotIn("copilot", f.agent_roots)
+
+    def test_a_ci_log_is_one_file_read(self):
+        log = self.home / "claude-execution-output.json"
+        log.write_text("[" + assistant("m1", recent()) + "]", encoding="utf-8")
+        f = af.Fleet()
+        f.scan_execution_log(log, "ci", None)
+        self.assertEqual(f.agent_roots["claude-code"]["files_read"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
