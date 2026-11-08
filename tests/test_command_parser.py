@@ -638,5 +638,66 @@ class TestContract(unittest.TestCase):
             self.assertIn(needle, unreleased)
 
 
+def load_measure():
+    spec = importlib.util.spec_from_file_location("fp_measure", ROOT / "tools" / "fp-measure.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestFpMeasure(HomeCase):
+    """tools/fp-measure.py: counts on stdout, never a command, path or host."""
+
+    MARK = "zqmarker7"
+
+    def setUp(self):
+        super().setUp()
+        self.tool = load_measure()
+        t0 = recent(30)
+        m = self.MARK
+        write_lines(self.projects / "-home-dev-orbital" / "s0.jsonl", [
+            claude_call("u1", "t1", "Bash", bash(f"rm -rf {m}"), t0),
+            claude_refusal("u2", "t1", t0 + timedelta(seconds=5)),
+            claude_call("u3", "t2", "Bash", bash(f"find {m} -delete"), t0 + timedelta(minutes=1)),
+            claude_call("u4", "t3", "Bash", bash(f"echo {m} | base64 -d | sh"), t0 + timedelta(minutes=2)),
+            claude_call("u5", "t4", "Bash", bash(f"X=1 $C {m}"), t0 + timedelta(minutes=3)),
+            claude_call("u6", "t5", "Write", {"file_path": f"/etc/{m}.conf", "content": "x"},
+                        t0 + timedelta(minutes=4))])
+
+    def run_tool(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = self.tool.main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_stdout_is_counts_only(self):
+        code, out, err = self.run_tool()
+        self.assertEqual(code, 0, err)
+        self.assertNotIn(self.MARK, out + err)
+        for needle in ("commands audited", "unreadable", "retry-after-deny", "outside-root",
+                       "decodes data into a shell", "runs a variable after assignments", "of audit time"):
+            self.assertIn(needle, out)
+
+    def test_the_sample_goes_to_a_new_private_file(self):
+        path = self.home / "sample.txt"
+        code, out, err = self.run_tool("--sample", "5", "--out", str(path))
+        self.assertEqual(code, 0, err)
+        self.assertNotIn(self.MARK, out + err)
+        body = path.read_text(encoding="utf-8")
+        self.assertIn(self.MARK, body)
+        self.assertIn("retry-after-deny\t", body)
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_it_refuses_stdout_and_an_existing_file(self):
+        path = self.home / "exists.txt"
+        path.write_text("keep", encoding="utf-8")
+        for argv in (("--sample", "5", "--out", "-"), ("--sample", "5", "--out", str(path)), ("--sample", "5")):
+            with self.subTest(argv=argv):
+                code, _out, _err = self.run_tool(*argv)
+                self.assertEqual(code, 2)
+        self.assertEqual(path.read_text(encoding="utf-8"), "keep")
+
+
 if __name__ == "__main__":
     unittest.main()
