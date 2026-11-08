@@ -3,6 +3,22 @@
 ## Unreleased
 
 ### Added
+- Coverage: the report ends with a Coverage line, complete or the gaps, and `--json` carries `coverage`:
+  per agent the files read, unreadable and skipped by `--days`, the oldest file read and how long the agent
+  keeps transcripts; per check what was examined and what was not, and why. Transcript files that could not
+  be opened, once dropped silently, are counted. Unparsable lines are printed when there are any.
+- `--fail-on-coverage`: exit 5 on any coverage gap. Exit 3 from `--fail-on` wins; without the option gaps
+  never change the exit code, and `--fail-on` results and exit codes are unchanged.
+- Every finding in `--json` and the MCP `coach_findings` result has `assessment` (`confirmed` or
+  `needs-validation`), `basis` (`observed` or `inferred`) and `missing`. Needs-validation findings print the
+  missing fact in the report.
+- `assumptions` (every number derived or assumed rather than read, with its volume) and `rejected` with
+  `rejected_total` (IOC name matches outside the version range, placeholder credentials, reputation candidates
+  a fresh check cleared). `--verbose` prints the rejected leads in the text report.
+- Transcript retention: Claude Code's `cleanupPeriodDays` is read from its `settings.json` (one key, listed by
+  `--self-check`). AF014 (info) warns when transcripts are deleted within 7 days; like AF013 it is left out of
+  `report_sha256` and `--fail-on`, and so is `coverage.agents[].expiring_7d`.
+- `--explain coverage`; `--diff` reports assessment changes and coverage gaps that appeared or cleared.
 - A Claude Code plugin marketplace in this repository (`.claude-plugin/marketplace.json`, plugin in `plugin/`):
   an `actualis` skill and an `/actualis` command that drive the installed CLI. Tests keep its version and
   every flag it mentions in step with `actualis.py`.

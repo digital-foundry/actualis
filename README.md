@@ -203,6 +203,7 @@ actualis --agent codex    # one agent only (claude | codex | copilot | gemini | 
 | `--root DIR` | read one specific transcript directory instead of discovering them |
 | `--ci-log FILE` | audit a Claude Code Action execution log on a CI runner, instead of discovering transcript directories. The log is the only input: not with `--root`, `--project`, `--replay` or an `--agent` other than `claude`, and only the scanning modes read it (not `--watch`, `--mcp`, `--explain`, `--agents`, `--suppress`, `--suppressions`, `--self-check`, `--service` or `--completions`) |
 | `--bash` | shell audit only |
+| `--verbose` | text report: also list the leads actualis checked and cleared (an IOC entry whose version range excludes what was installed, a placeholder credential, a reputation candidate a fresh check cleared), at most 20 lines. Only the text report and `--bash` take it |
 | `--coach` | findings and actions only |
 | `--aisvs` | which OWASP AISVS controls your transcripts show are **not** holding |
 | `--share` | postable summary with nothing identifying in it |
@@ -218,7 +219,8 @@ actualis --agent codex    # one agent only (claude | codex | copilot | gemini | 
 | `--suppress ID` | mark a finding as a false positive on this machine (it stays counted) |
 | `--reason TEXT` | why that suppression is correct, recorded for review. Only with `--suppress`; one line, so a newline or other control character is refused |
 | `--suppressions` | list current suppressions and where they are read from |
-| `--fail-on LEVEL` | exit 3 if any unsuppressed finding is at or above `critical`, `high` or `any`. For gating a pipeline. A mode that cannot evaluate the gate (`--diff`, `--why`, `--replay`, `--watch`, `--mcp`, `--explain`, `--agents`, `--suppress`, `--suppressions`, `--self-check`, `--service`, `--completions`) refuses it with exit 2. AF013 (rate-table age) is reported but never counted |
+| `--fail-on LEVEL` | exit 3 if any unsuppressed finding is at or above `critical`, `high` or `any`. For gating a pipeline. A mode that cannot evaluate the gate (`--diff`, `--why`, `--replay`, `--watch`, `--mcp`, `--explain`, `--agents`, `--suppress`, `--suppressions`, `--self-check`, `--service`, `--completions`) refuses it with exit 2. AF013 (rate-table age) and AF014 (transcripts about to expire) are reported but never counted |
+| `--fail-on-coverage` | exit 5 if the run could not see everything it was asked to: an agent whose transcript directory exists but had nothing read, unreadable transcript files, over 1% of lines unparsable, `--days` reaching past what the agent keeps, with `--ioc` downloads that could not be checked, with `--reputation` stale lists. Exit 3 from `--fail-on` wins when both apply. Refused by the same modes as `--fail-on` |
 | `--network` | print only the NETWORK section, with the IOC block when `--ioc` is given. `--network --json` emits only the `network` object (no `schema_version`). Not with `--share`, `--card`, `--bash`, `--coach`, `--aisvs`, `--diff`, `--replay`, `--watch` or `--mcp` |
 | `--network-trust HOST[/PATH],...` | trusted download sources for `--network-strict` (repeatable). Also read from `./.actualis-network-trust`, one per line; the report prints that file's path and sha256 because the agent can write it |
 | `--network-strict` | make every unasked download from an untrusted source a medium finding, so `--fail-on any` and the suppressions file apply. `--coach`, `--aisvs` and `--share` never show network findings, so they take it (and `--network-trust`) only with `--fail-on`; modes that never scan refuse both |
@@ -535,8 +537,9 @@ The skill never installs anything, never prints credential values, and only sugg
 
 Nothing leaves your machine. actualis itself makes no network calls, and has no telemetry, no analytics, no
 config file, no writes. (The optional `actualis-reputation` companion is the one exception, only when you run it;
-see [Optional: host reputation](#optional-host-reputation-uses-the-network).) It opens files under `~/.claude/projects` read-only and
-prints to stdout. The whole program is one readable file; if you're about to point
+see [Optional: host reputation](#optional-host-reputation-uses-the-network).) It opens files under `~/.claude/projects` read-only, reads one key
+(`cleanupPeriodDays`, how long Claude Code keeps transcripts) from Claude Code's
+`settings.json` and keeps nothing else from it, and prints to stdout. The whole program is one readable file; if you're about to point
 a tool at your session history, you should be able to audit it in a sitting, so it
 was written to be read.
 
@@ -680,6 +683,39 @@ Private and local hosts are never looked up or sent. VirusTotal
 text. Both providers are free for non-commercial use only. Setup, what is
 sent, diagrams, accuracy and licensing: [docs/reputation.md](docs/reputation.md).
 
+## Coverage: what the report could see
+
+A clean report used to look the same whether actualis read everything or could
+not look. Now the report ends with one line that says which:
+
+```
+Coverage   complete · claude-code from 2026-10-08 (keeps 30d) · codex from 2026-09-01
+```
+
+or, when something was out of reach:
+
+```
+Coverage   2 gaps
+    ! reputation lists are 9 days old
+    ! 3 transcript files could not be read (claude-code)
+```
+
+A gap is one of: an agent whose transcript directory exists but had nothing
+read in the window, a transcript file that could not be opened, more than 1% of
+lines that would not parse, `--days` reaching further back than the agent keeps
+transcripts ("asked for 90 days; Claude Code keeps 30"), downloads `--ioc` could
+not check, and reputation lists over 7 days old. `--json` carries the same
+ledger per agent and per check as `coverage`, with `assumptions` (every number
+derived rather than read) and `rejected` (leads checked and cleared, which
+`--verbose` prints); see [docs/json.md](docs/json.md#coverage).
+
+Every finding also says whether it is `confirmed` or `needs-validation`, and
+what is missing when it needs validation ([docs/findings.md](docs/findings.md#assessments)).
+
+How far back the data goes depends on the agent. Claude Code deletes
+transcripts older than `cleanupPeriodDays` (default 30) in its `settings.json`;
+actualis reads that one key, and AF014 warns a week before sessions go.
+
 ## Using it in CI
 
 An exit code is the smallest possible integration, and it fits the read-only
@@ -696,6 +732,7 @@ actualis --days 7 --fail-on critical
 | `2` | a usage error: a bad flag, a flag combination the tool cannot honour, or an unusable `--ioc` or trust file |
 | `3` | findings at or above `--fail-on` |
 | `4` | `--self-check`: a check failed |
+| `5` | `--fail-on-coverage`: a coverage gap (`3` wins when both apply) |
 | `130` | interrupted |
 
 Findings are **3**, not 1 and not 2. `1` already meant "could not run", and `2`
@@ -723,14 +760,25 @@ a malformed `--suppress` id, an unknown `--why` id or `--explain` topic, and a
 The verdict is decided before the report is written, so a reader that closes
 the pipe early (`| head`, or `2>&1 | head -1`, which closes stderr mid-verdict)
 still gets exit `3` from a failing gate. AF013 (the
-rate table's age) depends on today's date, not on your transcripts, so it is
-never counted toward `--fail-on`.
+rate table's age) and AF014 (transcripts about to expire) depend on today's
+date, not on your transcripts, so they are never counted toward `--fail-on`.
 
 The verdict goes to **stderr**, so `--json` on stdout stays byte-identical and a
 pipeline can capture the report and the outcome separately:
 
 ```sh
 actualis --json --fail-on high > report.json || echo "gate failed"
+```
+
+A pass means nothing at or above the threshold was found in what was read. To
+fail when the run could not read everything it was asked to (a transcript file
+it could not open, `--days` past what the agent keeps, downloads the IOC list
+could not check), add `--fail-on-coverage`: any gap exits `5`, findings at
+`--fail-on` still exit `3` first, and the stderr verdict lists the gaps. Without
+it, gaps are reported and never change the exit code.
+
+```sh
+actualis --days 7 --fail-on high --fail-on-coverage
 ```
 
 ### Auditing an agent that ran *in* CI

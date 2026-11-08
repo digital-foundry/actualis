@@ -26,6 +26,32 @@ user, and it is why the thresholds below are mostly relative rather than absolut
 | [AF011](#af011) | high | ≥10% of shell activity happened inside subagents |
 | [AF012](#af012) | critical | a scan of ≥500 Claude Code messages collapsed zero repeated records |
 | [AF013](#af013) | high / info | the rate table has not been checked in over 90 days |
+| [AF014](#af014) | info | Claude Code deletes transcripts within 7 days (`cleanupPeriodDays`) |
+
+## Assessments
+
+Every finding, coach finding or shell-audit flag, carries an `assessment`
+(`confirmed` or `needs-validation`), a `basis` (`observed`: read from the
+transcript, or `inferred`: derived by actualis) and, when it needs
+validation, `missing`: the fact the check lacked. Severity does not change
+with it, and neither does `--fail-on`. Leads actualis checked and cleared are
+not findings; they are listed in `rejected` in `--json` (`--verbose` prints them).
+
+| finding | assessment | basis | missing |
+|---|---|---|---|
+| shell-audit rules, `network-config`, `network-unasked`, `audit-config` | confirmed | observed | |
+| `oversized-command` | needs-validation | observed | command longer than what is read; the rest was not checked |
+| credentials (`secrets[]`) | confirmed | observed | |
+| `network-ioc` | confirmed | observed | |
+| `network-ioc-unresolved` | needs-validation | observed (inferred for reason `name-from-url`) | the IOC reason: version not resolved, undecidable, private registry, name from URL, … |
+| `reputation-listed` | confirmed | observed | |
+| `reputation-candidate` | needs-validation | observed | local hash-prefix match; run actualis-reputation confirm |
+| `reputation-suspicious` | needs-validation | observed | VirusTotal engines call it suspicious, none malicious; review the host |
+| `reputation-stale` | needs-validation | observed | lists are N days old |
+| AF001, AF003–AF010, AF012, AF013 | confirmed | observed | |
+| AF002 | confirmed | inferred | |
+| AF011 | needs-validation | observed | agent writes no shell records |
+| AF014 | confirmed | inferred | |
 
 ## Network findings
 
@@ -201,3 +227,29 @@ python3 tools/price-check.py --fetch
 That tool reports drift for a human to adjudicate. It deliberately does not
 parse prices and never writes one: a silently mis-parsed rate would carry the
 authority of a checked one.
+
+## AF014
+
+**Transcripts are about to expire.** Claude Code deletes transcripts older than
+`cleanupPeriodDays` (default 30) from its user settings when it starts. This
+fires when at least one transcript file's modification time plus that period
+falls within the next 7 days, or has already passed (the file goes the next
+time Claude Code starts). Once a transcript is gone nothing can audit it, so
+the report says so while the files are still there.
+
+`info`. The evidence names how many files, the date of the oldest, and the
+period in force. Archive them, run `actualis --watch`, or raise
+`cleanupPeriodDays` in `~/.claude/settings.json` (or
+`$CLAUDE_CONFIG_DIR/settings.json`).
+
+It applies only to the directory Claude Code itself cleans
+(`~/.claude/projects`, or `$CLAUDE_CONFIG_DIR/projects`); a copy read with
+`--root` never fires it. Like AF013 it depends on today's date, so it is left
+out of `report_sha256` and never counts toward `--fail-on`.
+
+Check it directly:
+
+```sh
+actualis --json | jq '.coach[] | select(.id == "AF014")'
+jq '.cleanupPeriodDays' ~/.claude/settings.json
+```

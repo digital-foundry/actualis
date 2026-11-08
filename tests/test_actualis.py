@@ -1301,6 +1301,8 @@ class TestJSONSchemaFreeze(unittest.TestCase):
                         "totalDurationMs": 1000, "totalLines": 10, "status": "ok"}, ts)
         f.permission_modes["auto"] += 1
         f.denials["user-rejected"] += 1
+        # A scanned agent root, so the schema tests walk coverage.agents[] too.
+        f._file_read("claude-code", "fixture-root", ts.timestamp())
         # Real network data, so the schema tests walk the network paths too.
         f.suppressions = {}
         f.add_tool("proj", "Bash", {"command": "npm i y@1.0.0"}, ts, "default")
@@ -1314,6 +1316,7 @@ class TestJSONSchemaFreeze(unittest.TestCase):
         f.add_tool("proj", "Bash", {"command": "npm i pending"}, ts, "auto")
         f.add_tool("proj", "Bash", {"command": "git clone https://github.com/evil-org/r"}, ts, "auto")
         f.add_tool("proj", "Bash", {"command": "npm i evil@1.0.1"}, ts, "default", call_id="t-refused")
+        f.add_tool("proj", "Bash", {"command": "npm i evil@2.0.0"}, ts, "auto")   # cleared: rejected[]
         f._network_outcome("claude:t-refused", refused=True)
         af.apply_network_policy(f, af.parse_trust(["pypi.org"]), strict=True,
                                 sources=[{"source": "flag", "entries": ["pypi.org"]}])
@@ -1428,7 +1431,9 @@ class TestReportDigest(unittest.TestCase):
         body = {k: v for k, v in payload.items() if k != "report_sha256"}
         body["pricing"] = {k: v for k, v in body["pricing"].items()
                            if k not in ("age_days", "stale")}
-        body["coach"] = [f for f in body["coach"] if f["id"] != "AF013"]
+        for a in body["coverage"]["agents"]:
+            a.pop("expiring_7d")
+        body["coach"] = [f for f in body["coach"] if f["id"] not in ("AF013", "AF014")]
         canonical = json.dumps(body, sort_keys=True, separators=(",", ":"),
                                ensure_ascii=False)
         import hashlib

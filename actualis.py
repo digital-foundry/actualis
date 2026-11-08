@@ -2172,15 +2172,17 @@ def _priority_for_name(name: str) -> str:
     return "critical" if _CRITICAL_NAMES.search(name) else "high"
 
 
-def classify_secrets(cmd: str, value_digests: dict[str, set[str]] | None = None
-                     ) -> list[tuple[str, str, str]]:
+def classify_secrets(cmd: str, value_digests: dict[str, set[str]] | None = None,
+                     rejected: list[str] | None = None) -> list[tuple[str, str, str]]:
     """Return [(priority, type, sha256[:8])] for each distinct secret in a command.
 
     The secret value is hashed immediately and never retained. For an id taken
     from where a password appears rather than from its value, `value_digests`,
     when given, receives id -> {sha256(value)}, so the caller can tell how many
     different passwords one id stands for. The caller keeps those digests in
-    memory only and never emits them.
+    memory only and never emits them. `rejected`, when given, receives the type
+    of each credential-shaped token that failed the shape check (a placeholder,
+    a vendor's published example): the type only, never the value.
     """
     # The same text redact() masks: stripped characters out first, so a token
     # split by one is counted as the token it shows as.
@@ -2195,6 +2197,8 @@ def classify_secrets(cmd: str, value_digests: dict[str, set[str]] | None = None
     def add(priority: str, kind: str, value: str, fp: str | None = None,
             span: tuple[int, int] | None = None) -> None:
         if _looks_like_placeholder(value) or is_vendor_example(value):
+            if rejected is not None:
+                rejected.append(kind)
             return
         if span is not None:
             if fp and any(legacy[span[0]:span[1]]):
@@ -6271,7 +6275,8 @@ def reputation_json(fleet: "Fleet") -> dict:
         out["stale"] = now - data.oldest > timedelta(days=REPUTATION_STALE_DAYS)
     out["vt_results"] = len(data.vt)
     out["vt_status"] = "corrupt" if data.vt_error else ("ok" if data.vt_present else "absent")
-    out["candidates"] = sorted(({"prefix_b64": base64.b64encode(p).decode(), "expressions": n}
+    out["candidates"] = sorted(({"prefix_b64": base64.b64encode(p).decode(), "expressions": n,
+                                 **assessment_of("reputation-candidate")}
                                 for p, n in fleet.reputation_candidates.items()),
                                key=lambda c: c["prefix_b64"])
     if data.lists:
@@ -7323,7 +7328,7 @@ def match_ioc(item: dict, ioc: IocSet) -> tuple | None:
     all the entries at that strength, by (source, line). The trust list is
     never consulted."""
     hits: list[tuple[str, str, IocEntry, str]] = []
-    clean_hit = False
+    cleared: list[tuple[IocEntry, str]] = []      # (entry, key): a listed name, version outside
     eco = item.get("ecosystem")
     if item["kind"] == "install" and eco in IOC_CHECKABLE and item.get("package"):
         for name, version in _ioc_resolved(item):
@@ -7341,7 +7346,7 @@ def match_ioc(item: dict, ioc: IocSet) -> tuple | None:
                         except Exception:        # noqa: BLE001 -- fail closed: undecidable, never clean
                             inside = None
                         if inside is False:
-                            clean_hit = True
+                            cleared.append((e, f"{eco}:{listed}@{redact(version)}"))
                             continue
                         verdict, reason = (("match", "version-in-spec") if inside
                                            else ("unresolved", "module-prefix" if prefix else "undecidable"))
@@ -7358,7 +7363,12 @@ def match_ioc(item: dict, ioc: IocSet) -> tuple | None:
             if _host_path_match(e.host, e.path, item, e.exact_host, ioc=True):
                 hits.append(("match", "host", e, f"host:{'=' if e.exact_host else ''}{e.host}{e.path}"))
     if not hits:
-        return ("clean", None, [], None, False) if clean_hit else None
+        if not cleared:
+            return None
+        # Every listed name's version fell outside: the entries that cleared
+        # it, by (source, line), and the first one's key (rejected[]).
+        cleared.sort(key=lambda c: (c[0].source, c[0].line or 0))
+        return "clean", None, [c[0] for c in cleared], cleared[0][1], False
     best = max(_IOC_RANK[h[0]] for h in hits)
     top = sorted((h for h in hits if _IOC_RANK[h[0]] == best),
                  key=lambda h: (h[2].source, h[2].line or 0))
@@ -7446,6 +7456,8 @@ def apply_ioc(fleet: "Fleet", ioc: IocSet | None) -> None:
         totals["undecidable"] += 1 if undecided and not refused else 0
         if verdict == "clean":
             totals["clean_name_matches"] += 0 if refused else 1
+            if not refused:
+                _ioc_reject(fleet, ioc, key, matched[0], item)
             continue
         row = {"verdict": verdict, "reason": reason, "refused": refused, "entries": matched,
                "item": item, "key": key, "flag_id": None, "suppressed": False}
@@ -7491,9 +7503,21 @@ def apply_ioc(fleet: "Fleet", ioc: IocSet | None) -> None:
             "evidence": redact(clean(evidence))[:240],
             "had_secret": False, "suppressed": suppressed,
             "suppressed_reason": fleet.suppressions.get(fid, ""),
+            **_ioc_assessment(verdict, first["reason"]),
         })
         for r in rows:
             r["flag_id"], r["suppressed"] = fid, suppressed
+
+
+def _ioc_reject(fleet: "Fleet", ioc: IocSet, key: str, entry: IocEntry, item: dict) -> None:
+    """rejected[]: an installed item whose name an entry lists and whose exact
+    version is outside the entry's range."""
+    name, _, version = key.rpartition("@")
+    listed = name.split(":", 1)[1] if ":" in name else name
+    path = ioc.sources[entry.source]["path"] if 0 <= entry.source < len(ioc.sources) else ""
+    source = (Path(path).name + (f":{entry.line}" if entry.line else "")) if path else ""
+    fleet._reject("ioc", name, f"{listed} {version}", f"{version} is outside {entry.spec_text}",
+                  source, item.get("ts"))
 
 
 IOC_ROWS_SHOWN = 50
@@ -7548,6 +7572,7 @@ def ioc_json(fleet: "Fleet", raw: bool = False) -> dict:
         matches.append({
             "verdict": r["verdict"], "reason": r["reason"], "refused": r["refused"],
             "suppressed": r["suppressed"], "flag_id": r["flag_id"],
+            **_ioc_assessment(r["verdict"], r["reason"]),
             "refs": sorted({e.ref for e in r["entries"] if e.ref})[:IOC_REFS_CAP],
             "labels": sorted({e.label for e in r["entries"] if e.label})[:IOC_REFS_CAP],
             "entry": _ioc_entry_json(r["entries"][0]),
@@ -7915,6 +7940,10 @@ def apply_reputation(fleet: "Fleet", data: "ReputationData | None", now: "dateti
             memo[key] = (g, vt_verdict(host, data, now))
         g, v = memo[key]
         totals["checked"] += 1
+        if g and g["state"] == "not-listed" and g["checked_at"]:
+            fleet._reject("reputation", f"gsb:{host}", host,
+                          f"confirmed not listed at {_utc_hm(g['checked_at'])}",
+                          "gsb/confirmations.json", item.get("ts"))
         if g:
             for p, n in g["candidates"].items():
                 fleet.reputation_candidates[p] = max(fleet.reputation_candidates.get(p, 0), n)
@@ -7964,13 +7993,14 @@ def apply_reputation(fleet: "Fleet", data: "ReputationData | None", now: "dateti
         days = (now - data.oldest).days
         _reputation_flag(fleet, "med", "reputation-stale", "gsb-lists", None,
                          f"Google Safe Browsing lists are {days} days old and can miss new threats; "
-                         f"run `actualis-reputation update`")
+                         f"run `actualis-reputation update`", missing=f"lists are {days} days old")
 
 
 def _reputation_flag(fleet: "Fleet", severity: str, category: str, key: str, latest: "dict | None",
-                     evidence: str, suffix: str = "") -> None:
+                     evidence: str, suffix: str = "", missing: "str | None" = None) -> None:
     """suffix (the Google advisory) is appended after the body is clipped, so
-    a long host cannot cut it off."""
+    a long host cannot cut it off. missing, when given, is the fact a
+    needs-validation flag lacks (see classify())."""
     fid = flag_id(severity, [category], key)
     suppressed = fid in fleet.suppressions
     if suppressed:
@@ -7980,6 +8010,8 @@ def _reputation_flag(fleet: "Fleet", severity: str, category: str, key: str, lat
         "project": latest["project"] if latest else "", "when": latest["ts"] if latest else None,
         "evidence": redact(clean(evidence))[:240 - len(suffix)] + suffix, "had_secret": False,
         "suppressed": suppressed, "suppressed_reason": fleet.suppressions.get(fid, ""),
+        **({"assessment": "needs-validation", "basis": "observed", "missing": missing}
+           if missing else {}),
     })
 
 
@@ -8064,6 +8096,9 @@ def render_reputation(fleet: "Fleet", c: "C") -> None:
         high = f["severity"] == "high"
         color, mark = (c.red, "\u25b2") if high else (c.yellow, "?")
         print(f"    {color}{mark}{c.off} {clip(f['evidence'], NET_VIEW_WIDTH - 6)}")
+        missing = classify(f)["missing"]
+        if missing:
+            print(f"      {c.dim}needs validation: {missing}{c.off}")
         shown += 1
     if data.lists and (t["listed"] or t["candidate"]):
         print(f"  {c.dim}{GSB_ADVISORY}: {GSB_ADVISORY_URL}. Lists can be wrong both ways; "
@@ -8427,6 +8462,73 @@ def transcript_roots() -> list[Path]:
     return seen
 
 
+# Claude Code deletes transcripts older than cleanupPeriodDays (default 30)
+# when it starts. One key is read from its user settings so the report can say
+# how far back the evidence goes, and warn before it goes (AF014).
+CLAUDE_DEFAULT_RETENTION_DAYS = 30
+SETTINGS_MAX = 1 << 20              # characters of settings.json read; a larger file is not read
+_UNKNOWN_RETENTION = {"retention_days": None, "retention_source": "unknown"}
+
+
+def claude_config_dir() -> Path:
+    """Claude Code's config directory: $CLAUDE_CONFIG_DIR (its first entry;
+    transcript_roots() reads them all), else ~/.claude."""
+    env = os.environ.get("CLAUDE_CONFIG_DIR") or ""
+    first = next((part for part in env.split(os.pathsep) if part), "")
+    return Path(first).expanduser() if first else Path.home() / ".claude"
+
+
+def claude_settings_path() -> Path:
+    """The one file actualis reads outside the transcript roots."""
+    return claude_config_dir() / "settings.json"
+
+
+def _claude_retention() -> dict:
+    """cleanupPeriodDays from Claude Code's settings.json. An int >= 0:
+    settings. The file read and the key absent: Claude Code's default, 30.
+    Anything else (no file, not a regular file, unreadable, over SETTINGS_MAX,
+    not JSON, not an object, a value that is not an int): unknown. Nothing
+    else in the file is kept. Never written, never raises."""
+    try:
+        with _open_regular(claude_settings_path()) as fh:
+            text = fh.read(SETTINGS_MAX + 1)
+    except (OSError, RuntimeError, ValueError):     # RuntimeError: no home directory
+        return dict(_UNKNOWN_RETENTION)
+    if len(text) > SETTINGS_MAX:
+        return dict(_UNKNOWN_RETENTION)
+    ok, doc = _json_line(text)
+    if not ok or not isinstance(doc, dict):
+        return dict(_UNKNOWN_RETENTION)
+    if "cleanupPeriodDays" not in doc:
+        return {"retention_days": CLAUDE_DEFAULT_RETENTION_DAYS, "retention_source": "default"}
+    days = doc["cleanupPeriodDays"]
+    if isinstance(days, bool) or not isinstance(days, int) or days < 0:
+        return dict(_UNKNOWN_RETENTION)
+    # Past a century the date arithmetic overflows: the cap --days has too.
+    return {"retention_days": min(days, MAX_DAYS), "retention_source": "settings"}
+
+
+def read_retention(read_settings: bool = True) -> dict[str, dict]:
+    """Per agent: retention_days and retention_source. Codex documents no
+    automatic deletion (none); Copilot CLI, Gemini CLI and Qwen Code are
+    unknown until a fixture-backed reading exists. read_settings=False skips
+    the file (no Claude Code root was scanned, so nothing needs it)."""
+    return {"claude-code": _claude_retention() if read_settings else dict(_UNKNOWN_RETENTION),
+            "codex": {"retention_days": None, "retention_source": "none"},
+            "copilot": dict(_UNKNOWN_RETENTION),
+            "gemini": dict(_UNKNOWN_RETENTION),
+            "qwen": dict(_UNKNOWN_RETENTION)}
+
+
+def fleet_retention(fleet: "Fleet") -> dict[str, dict]:
+    """read_retention() once per fleet, and only when a Claude Code root was scanned."""
+    if "claude-code" not in fleet.agent_roots:
+        return read_retention(read_settings=False)
+    if fleet.retention is None:
+        fleet.retention = read_retention()
+    return fleet.retention
+
+
 def pretty_project(slug: str) -> str:
     """Turn a path-slug directory name into something readable."""
     s = slug.lstrip("-")
@@ -8682,6 +8784,26 @@ def _agent_root(root: Path, agent: str) -> Path:
     ~/.qwen) or the directory of project directories (tmp, projects)."""
     sub = root / ("tmp" if agent == "gemini" else "projects")
     return sub if sub.is_dir() else root
+
+
+def _listable(d: Path) -> bool:
+    """Whether d can be listed. pathlib's glob() and rglob() skip a directory
+    they cannot open without a word; coverage counts it instead."""
+    try:
+        with os.scandir(d):
+            return True
+    except OSError:
+        return False
+
+
+def _chats_listable(d: Path) -> bool:
+    """A Gemini or Qwen project directory and its chats/ can both be listed."""
+    chats = d / "chats"
+    try:
+        has_chats = chats.exists()
+    except OSError:
+        has_chats = False
+    return _listable(d) and (not has_chats or _listable(chats))
 
 
 def _project_dirs(root: Path) -> list[Path]:
@@ -9157,6 +9279,24 @@ class Fleet:
         self.roots: list[Path] = []
         self.files_scanned = 0
         self.bytes_scanned = 0
+        # Coverage. Per agent whose transcript root this run scanned: files
+        # read, files that could not be opened (once dropped without a word),
+        # files the --days mtime prefilter left out, the oldest mtime read,
+        # and every mtime seen (read or skipped) keyed by root, which the
+        # retention horizon needs. See _root_seen and coverage().
+        self.agent_roots: dict[str, dict] = {}
+        self.files_unreadable = 0
+        self.dirs_unreadable = 0
+        self.files_skipped_mtime = 0
+        # Lines handed to the JSON decoder: the denominator unparsable_lines
+        # is a share of. Claude lines the prefilter skips are not decoded.
+        self.lines_read = 0
+        # fleet_retention(): read once per run, after the scan.
+        self.retention: dict | None = None
+        # --network was given: coverage then lists the network check.
+        self.network_requested = False
+        # Leads evaluated and cleared (rejected[]), keyed (kind, id, what).
+        self.rejected: dict[tuple, dict] = {}
 
     # -- ingest ------------------------------------------------------------
 
@@ -9380,7 +9520,11 @@ class Fleet:
         # under the same session id, cumulative totals included. Each session
         # id is priced once, from the token_count totals of all its files.
         self._codex_sessions = {}
+        if roots:
+            self._root_seen("codex")
         for root in roots:
+            for _ in os.walk(root, onerror=lambda _exc: self._dir_unreadable("codex")):
+                pass
             for f in sorted(root.rglob("rollout-*.jsonl")):
                 self._scan_codex_file(f, since, project_filter, root)
         sessions, self._codex_sessions = self._codex_sessions, None
@@ -9424,8 +9568,10 @@ class Fleet:
         try:
             st = path.stat()
         except OSError:
+            self._file_unreadable("codex")
             return
         if since is not None and st.st_mtime < (since.timestamp() - 3600):
+            self._file_skipped("codex", root, st.st_mtime)
             return
         self.bytes_scanned += st.st_size
         self.files_scanned += 1
@@ -9450,6 +9596,7 @@ class Fleet:
         try:
             with _open_regular(path) as fh:
                 for n, line in enumerate(fh, 1):
+                    self.lines_read += 1
                     ok, rec = _json_line(line)
                     if not ok:
                         self.unparsable_lines += 1
@@ -9531,7 +9678,9 @@ class Fleet:
                                             _str_or(payload.get("call_id"), None)))
                             cwd = _str_or(args.get("workdir"), cwd)
         except OSError:
+            self._file_unreadable("codex")
             return
+        self._file_read("codex", root, st.st_mtime)
 
         project = pretty_project(cwd.lstrip("/").replace("/", "-")) if cwd else "unknown"
         if project_filter and project_filter.lower() not in project.lower():
@@ -9574,7 +9723,16 @@ class Fleet:
 
     def scan_copilot(self, roots: list[Path], since: datetime | None,
                      project_filter: str | None) -> None:
+        if roots:
+            self._root_seen("copilot")
         for root in roots:
+            try:
+                session_dirs = [d for d in root.iterdir() if d.is_dir()]
+            except OSError:
+                session_dirs = []
+            for d in session_dirs:
+                if not _listable(d):
+                    self._dir_unreadable("copilot")
             for f in sorted(root.glob("*/events.jsonl")):
                 self._scan_copilot_file(f, since, project_filter, root)
 
@@ -9586,8 +9744,11 @@ class Fleet:
         try:
             st = path.stat()
         except OSError:
+            self._file_unreadable("copilot")
             return
         if since is not None and st.st_mtime < (since.timestamp() - 3600):
+            self._file_skipped("copilot", root if root is not None else path.parent.parent,
+                               st.st_mtime)
             return
         self.bytes_scanned += st.st_size
         self.files_scanned += 1
@@ -9607,6 +9768,7 @@ class Fleet:
         try:
             with _open_regular(path) as fh:
                 for n, line in enumerate(fh, 1):
+                    self.lines_read += 1
                     ok, rec = _json_line(line)
                     if not ok:
                         self.unparsable_lines += 1
@@ -9656,7 +9818,9 @@ class Fleet:
                     elif kind == "session.shutdown":
                         shutdown, shutdown_ts = data, ts
         except OSError:
+            self._file_unreadable("copilot")
             return
+        self._file_read("copilot", root if root is not None else path.parent.parent, st.st_mtime)
 
         project = pretty_project(cwd.lstrip("/").replace("/", "-")) if cwd else "copilot"
         if project_filter and project_filter.lower() not in project.lower():
@@ -9846,12 +10010,17 @@ class Fleet:
 
     def scan_gemini(self, roots: list[Path], since: datetime | None,
                     project_filter: str | None) -> None:
+        if roots:
+            self._root_seen("gemini")
         for root in roots:
             registry = gemini_registry(root)
             for d in _project_dirs(root):
                 real = gemini_project_root(d, registry)
                 project = path_project(real) if real else pretty_project(d.name)
                 if project_filter and project_filter.lower() not in project.lower():
+                    continue
+                if not _chats_listable(d):
+                    self._dir_unreadable("gemini")
                     continue
                 for f in gemini_session_files(d):
                     self._scan_gemini_file(f, project, real, since, root)
@@ -9861,15 +10030,21 @@ class Fleet:
         try:
             st = path.stat()
         except OSError:
+            self._file_unreadable("gemini")
             return
         if since is not None and st.st_mtime < (since.timestamp() - 3600):
+            self._file_skipped("gemini", root, st.st_mtime)
             return
         self.bytes_scanned += st.st_size
         self.files_scanned += 1
         self._start_file(path, root)
         sess = read_gemini_session(path)
         if sess is None:
+            self._file_unreadable("gemini")
             return
+        self._file_read("gemini", root, st.st_mtime)
+        # Records, not lines: a message rewritten several times is read once.
+        self.lines_read += len(sess["messages"]) + sess["unparsable"] + sess["unsupported"]
         self.unparsable_lines += sess["unparsable"]
         self.unsupported_records += sess["unsupported"]
         meta = sess["meta"]
@@ -9925,8 +10100,13 @@ class Fleet:
 
     def scan_qwen(self, roots: list[Path], since: datetime | None,
                   project_filter: str | None) -> None:
+        if roots:
+            self._root_seen("qwen")
         for root in roots:
             for d in _project_dirs(root):
+                if not _chats_listable(d):
+                    self._dir_unreadable("qwen")
+                    continue
                 for f in qwen_session_files(d):
                     self._scan_qwen_file(f, d.name, since, project_filter, root)
 
@@ -9938,8 +10118,10 @@ class Fleet:
         try:
             st = path.stat()
         except OSError:
+            self._file_unreadable("qwen")
             return
         if since is not None and st.st_mtime < (since.timestamp() - 3600):
+            self._file_skipped("qwen", root, st.st_mtime)
             return
         self.bytes_scanned += st.st_size
         self.files_scanned += 1
@@ -9953,6 +10135,7 @@ class Fleet:
         try:
             with _open_regular(path) as fh:
                 for n, line in enumerate(fh, 1):
+                    self.lines_read += 1
                     ok, rec = _json_line(line)
                     if not ok:
                         self.unparsable_lines += 1
@@ -10028,7 +10211,9 @@ class Fleet:
                         why = None
                         self._qwen_result(rec, parts, calls)
         except OSError:
+            self._file_unreadable("qwen")
             return
+        self._file_read("qwen", root, st.st_mtime)
         if active:
             self.agents_seen.add("qwen")
 
@@ -10212,11 +10397,15 @@ class Fleet:
         _rank = {"critical": 0, "high": 1, "low": 2}
         found_secrets: list[tuple[str, str, str]] = []
         seen_fp: set[str] = set()
+        dropped: list[str] = []
         for w in windows:                    # one secret seen in two windows is one
-            for item in classify_secrets(w, self._location_values):
+            for item in classify_secrets(w, self._location_values, dropped):
                 if item[2] not in seen_fp:
                     seen_fp.add(item[2])
                     found_secrets.append(item)
+        for kind in sorted(set(dropped)):
+            self._reject("secret", f"secret:{kind}", f"{kind} in {project}",
+                         f"failed the {kind} shape check", self._source_text(), ts)
         for priority, kind, fp in found_secrets:
             e = self.secrets.setdefault(fp, {
                 "priority": priority, "kinds": set(), "uses": 0,
@@ -10319,6 +10508,7 @@ class Fleet:
         if not roots:
             return
         self.roots.extend(roots)
+        self._root_seen("claude-code")
         dirs: list[Path] = []
         for r in roots:
             try:
@@ -10334,6 +10524,9 @@ class Fleet:
             if progress:
                 print(f"\r  scanning {i}/{len(dirs)}  {project[:48]:<48}",
                       end="", file=sys.stderr, flush=True)
+            if not _listable(d):
+                self._dir_unreadable("claude-code")
+                continue
             # Sorted: which copy of a repeated message is kept decides its day,
             # branch and ticket, so the order must not be the filesystem's.
             for f in sorted(d.glob("*.jsonl")):
@@ -10359,17 +10552,70 @@ class Fleet:
     def _where(self) -> dict:
         return {"root": self._src_root, "file": self._src_file, "line": self._src_line}
 
+    def _root_seen(self, agent: str) -> dict:
+        """The coverage row of an agent whose transcript root this run scans."""
+        return self.agent_roots.setdefault(agent, {
+            "exists": True, "files_read": 0, "files_unreadable": 0, "dirs_unreadable": 0,
+            "files_skipped_mtime": 0, "oldest_mtime": None, "mtimes": {}})
+
+    def _file_unreadable(self, agent: str) -> None:
+        """A transcript file that failed stat or open: skipped, as always, and now counted."""
+        self._root_seen(agent)["files_unreadable"] += 1
+        self.files_unreadable += 1
+
+    def _dir_unreadable(self, agent: str) -> None:
+        """A project or session directory that could not be listed: what is
+        inside it was never seen, so it is counted, not passed over."""
+        self._root_seen(agent)["dirs_unreadable"] += 1
+        self.dirs_unreadable += 1
+
+    def _file_skipped(self, agent: str, root: "Path | str | None", mtime: float) -> None:
+        """A file the --days prefilter left out: older than the window by mtime."""
+        row = self._root_seen(agent)
+        row["files_skipped_mtime"] += 1
+        row["mtimes"].setdefault("" if root is None else str(root), []).append(mtime)
+        self.files_skipped_mtime += 1
+
+    def _file_read(self, agent: str, root: "Path | str | None", mtime: float) -> None:
+        """A file read to its end."""
+        row = self._root_seen(agent)
+        row["files_read"] += 1
+        row["mtimes"].setdefault("" if root is None else str(root), []).append(mtime)
+        if row["oldest_mtime"] is None or mtime < row["oldest_mtime"]:
+            row["oldest_mtime"] = mtime
+
+    def _source_text(self) -> str:
+        """file:line of the record being read, for a rejected[] row."""
+        if not self._src_file:
+            return ""
+        return f"{self._src_file}:{self._src_line}" if self._src_line else self._src_file
+
+    def _reject(self, kind: str, rid: str, what: str, why: str, source: str,
+                when: "datetime | str | None") -> None:
+        """A lead actualis evaluated and cleared: one rejected[] row per
+        (kind, id, what), the newest sighting kept. Never a credential value."""
+        if isinstance(when, datetime):
+            key = when.astimezone(timezone.utc).isoformat()
+        else:
+            key = _net_utc_key(when) if isinstance(when, str) else ""
+        cur = self.rejected.get((kind, rid, what))
+        if cur is None or key > cur["_when"]:
+            self.rejected[(kind, rid, what)] = {"kind": kind, "id": rid, "what": what,
+                                                "why_cleared": why, "source": source, "_when": key}
+
     def _scan_file(self, path: Path, project: str, since: datetime | None,
                    root: Path | None = None) -> None:
         try:
             st = path.stat()
             size = st.st_size
         except OSError:
+            self._file_unreadable("claude-code")
             return
         # A file not written since the cutoff cannot hold a record after it.
         # An hour of slack absorbs clock skew and copied timestamps. On a real
         # fleet this turns --days 1 from reading 1,784 files into reading 7.
         if since is not None and st.st_mtime < (since.timestamp() - 3600):
+            self._file_skipped("claude-code", root, st.st_mtime)
             return
         self.files_scanned += 1
         self.bytes_scanned += size
@@ -10396,6 +10642,7 @@ class Fleet:
                     if not counts and not said and '"is_error":true' not in line \
                             and '"is_error": true' not in line:
                         continue
+                    self.lines_read += 1
                     ok, rec = _json_line(line)
                     if not ok:
                         self.unparsable_lines += 1
@@ -10412,7 +10659,9 @@ class Fleet:
                         if not (since and ts and ts < since):
                             self._network_results(rec)
         except OSError:
+            self._file_unreadable("claude-code")
             return
+        self._file_read("claude-code", root, st.st_mtime)
 
     def _audit_config_write(self, project: str, name: str, tool_input: dict,
                             ts: datetime | None) -> None:
@@ -10715,9 +10964,11 @@ class Fleet:
         because a real fleet is thousands of files; one execution log is a
         single document that must be parsed whole regardless.
         """
+        self._root_seen("claude-code")
         try:
             st = path.stat()
         except OSError:
+            self._file_unreadable("claude-code")
             return
         self.files_scanned += 1
         self.bytes_scanned += st.st_size
@@ -10725,9 +10976,12 @@ class Fleet:
             with _open_regular(path) as fh:
                 records = json.load(fh)
         except (OSError, json.JSONDecodeError, ValueError, RecursionError):
+            self._file_unreadable("claude-code")
             return
         if not isinstance(records, list):
+            self._file_unreadable("claude-code")
             return
+        self._file_read("claude-code", path.parent, st.st_mtime)
         self._start_file(path, path.parent)     # one JSON array: no line numbers
         calls: dict[str, tuple[str, str]] = {}
         for rec in records:
@@ -11058,9 +11312,129 @@ def coach(fleet: "Fleet") -> list[Finding]:
             "Re-check the provider pages, or run `python3 tools/price-check.py --fetch` "
             "from a checkout. Every cost figure here inherits this age."))
 
+    # --- AF014 transcripts are about to expire -----------------------------
+    # Claude Code deletes transcripts past cleanupPeriodDays when it starts.
+    # Once they are gone nothing here can show them again, so say so while
+    # they can still be kept. Depends on today's date, like AF013.
+    for agent, n, first, keep in transcripts_expiring(fleet):
+        out.append(Finding(
+            "AF014", "info", "Transcripts are about to expire",
+            f"{n} session(s) from {first} are deleted within {COVERAGE_EXPIRY_DAYS} days "
+            f"({_AGENT_LABEL.get(agent, agent)} keeps {keep} days).",
+            "Archive them, run `actualis --watch`, or raise cleanupPeriodDays in "
+            "Claude Code's settings.json."))
+
     order = {"critical": 0, "high": 1, "info": 2}
     out.sort(key=lambda f: order.get(f.severity, 9))
     return out
+
+
+# --------------------------------------------------------------------------
+# Assessments
+#
+# Every finding says whether it is confirmed or needs validation (and which
+# fact is missing), and whether it rests on what the transcript says
+# (observed) or on what actualis derived (inferred). One table, applied at
+# output time; a producer sets its own value only where it knows more than
+# the table (an IOC reason, a list's age). Severity is never touched.
+# --------------------------------------------------------------------------
+
+ASSESSMENTS = ("confirmed", "needs-validation")
+BASES = ("observed", "inferred")
+_CONFIRMED = ("confirmed", "observed", None)
+_PREFIX_ONLY = ("needs-validation", "observed",
+                "local hash-prefix match; run actualis-reputation confirm")
+
+# Flag category, "secret", or coach id -> (assessment, basis, missing).
+_ASSESSMENT: dict[str, tuple] = {
+    # The shell-audit rules: the command is in the transcript and a rule matched it.
+    **{cat: _CONFIRMED for _sev, cat, _rx in COMPILED_RULES},
+    "network-config": _CONFIRMED,
+    "network-unasked": _CONFIRMED,
+    "audit-config": _CONFIRMED,
+    "oversized-command": ("needs-validation", "observed",
+                          "command longer than what is read; the rest was not checked"),
+    "secret": _CONFIRMED,
+    "network-ioc": _CONFIRMED,
+    # apply_ioc sets the row's own reason text; this is the fallback.
+    "network-ioc-unresolved": ("needs-validation", "observed",
+                               _IOC_REASON_TEXT["version-unresolved"]),
+    "reputation-listed": _CONFIRMED,
+    "reputation-candidate": _PREFIX_ONLY,
+    "reputation-suspicious": ("needs-validation", "observed",
+                              "VirusTotal engines call it suspicious, none malicious; review the host"),
+    # apply_reputation sets "lists are N days old"; this is the fallback.
+    "reputation-stale": ("needs-validation", "observed", "lists are stale"),
+    "AF001": _CONFIRMED,
+    "AF002": ("confirmed", "inferred", None),
+    "AF003": _CONFIRMED,
+    "AF004": _CONFIRMED,
+    "AF005": _CONFIRMED,
+    "AF006": _CONFIRMED,
+    "AF007": _CONFIRMED,
+    "AF008": _CONFIRMED,
+    "AF009": _CONFIRMED,
+    "AF010": _CONFIRMED,
+    "AF011": ("needs-validation", "observed", "agent writes no shell records"),
+    "AF012": _CONFIRMED,
+    "AF013": _CONFIRMED,
+    "AF014": ("confirmed", "inferred", None),
+}
+_DEFAULT_ASSESSMENT = {"assessment": "confirmed", "basis": "observed", "missing": None}
+_AF_ID = re.compile(r"AF\d{3}")
+
+
+def assessment_of(key: object) -> dict:
+    """The three fields for one _ASSESSMENT key; the default triple for any other."""
+    entry = _ASSESSMENT.get(key) if isinstance(key, str) else None
+    if entry is None:
+        return dict(_DEFAULT_ASSESSMENT)
+    return {"assessment": entry[0], "basis": entry[1], "missing": entry[2]}
+
+
+def _ioc_assessment(verdict: object, reason: object) -> dict:
+    """An IOC row or flag: a match is confirmed; an unresolved one needs the
+    fact its reason names. A name read from a URL is inferred, not observed."""
+    if verdict == "match":
+        return dict(_DEFAULT_ASSESSMENT)
+    key = reason if isinstance(reason, str) else ""
+    return {"assessment": "needs-validation",
+            "basis": "inferred" if key == "name-from-url" else "observed",
+            "missing": _IOC_REASON_TEXT.get(key) or clean(key) or "could not check"}
+
+
+def classify(row: object) -> dict:
+    """assessment, basis and missing for a flag dict, a secret record, a coach
+    Finding, an IOC row or a reputation candidate. A producer-set value wins
+    over the table. An unknown shape is confirmed and observed: classify()
+    never raises, whatever it is handed."""
+    try:
+        if isinstance(row, Finding):
+            return assessment_of(row.id)
+        if not isinstance(row, dict):
+            return dict(_DEFAULT_ASSESSMENT)
+        if row.get("assessment") in ASSESSMENTS and row.get("basis") in BASES and "missing" in row:
+            return {"assessment": row["assessment"], "basis": row["basis"], "missing": row["missing"]}
+        if "verdict" in row and "reason" in row:
+            return _ioc_assessment(row["verdict"], row["reason"])
+        if "prefix_b64" in row:
+            return assessment_of("reputation-candidate")
+        cats = row.get("categories")
+        if isinstance(cats, list):
+            known = [assessment_of(c) for c in cats if isinstance(c, str) and c in _ASSESSMENT]
+            # A flag with several categories is as uncertain as its least certain one.
+            for a in known:
+                if a["assessment"] == "needs-validation":
+                    return a
+            return known[0] if known else dict(_DEFAULT_ASSESSMENT)
+        if "priority" in row and ("kinds" in row or "types" in row):
+            return assessment_of("secret")
+        fid = row.get("id")
+        if isinstance(fid, str) and _AF_ID.fullmatch(fid):
+            return assessment_of(fid)
+    except Exception:                        # noqa: BLE001 -- an unknown shape is never fatal
+        pass
+    return dict(_DEFAULT_ASSESSMENT)
 
 
 # --- comparing two runs -----------------------------------------------------
@@ -11142,11 +11516,18 @@ def _baseline_problem(data: dict) -> str:
         obj("bash", bash),
         obj("scope", data.get("scope")),
         obj("scanned", scanned),
-        rows("secrets", data.get("secrets"), ("id", "priority"), ("types", "projects")),
-        rows("coach", data.get("coach"), ("id", "severity", "title", "project", "evidence"), ()),
+        rows("secrets", data.get("secrets"), ("id", "priority", "assessment"), ("types", "projects")),
+        rows("coach", data.get("coach"),
+             ("id", "severity", "title", "project", "evidence", "assessment"), ()),
         rows("bash.flags", bash.get("flags") if isinstance(bash, dict) else None,
-             ("id", "severity", "program"), ("categories",)),
+             ("id", "severity", "program", "assessment"), ("categories",)),
+        obj("coverage", data.get("coverage")),
     ]
+    cov = data.get("coverage")
+    if isinstance(cov, dict):
+        g = cov.get("gaps")
+        if g is not None and not (isinstance(g, list) and all(isinstance(x, str) for x in g)):
+            checks.append("coverage.gaps is not an array of strings")
     for key in ("cost_usd", "messages"):
         v = data.get(key)
         if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
@@ -11206,6 +11587,7 @@ def _flag_kinds(payload: dict) -> dict[str, dict]:
             cur = out.setdefault(fid, {"id": fid, "severity": r.get("severity", ""),
                                        "program": r.get("program", ""),
                                        "categories": r.get("categories") or [],
+                                       "assessment": r.get("assessment"),
                                        "count": 0})
             cur["count"] += 1
     return out
@@ -11224,10 +11606,13 @@ def diff_reports(old: dict, new: dict) -> dict:
     for name, o, n, sev_key, noun in families:
         appeared = [n[k] for k in n if k not in o]
         resolved = [o[k] for k in o if k not in n]
-        worse, better, moved = [], [], []
+        worse, better, moved, assessed = [], [], [], []
         for k in n:
             if k not in o:
                 continue
+            oa, na = o[k].get("assessment"), n[k].get("assessment")
+            if isinstance(oa, str) and isinstance(na, str) and oa != na:
+                assessed.append((o[k], n[k]))     # needs-validation -> confirmed, or back
             ro, rn = _rank(o[k].get(sev_key, "")), _rank(n[k].get(sev_key, ""))
             if rn > ro:
                 worse.append((o[k], n[k]))
@@ -11237,7 +11622,8 @@ def diff_reports(old: dict, new: dict) -> dict:
                 moved.append((o[k], n[k]))
         out["families"][name] = {"noun": noun, "sev_key": sev_key,
                                  "appeared": appeared, "resolved": resolved,
-                                 "worse": worse, "better": better, "moved": moved}
+                                 "worse": worse, "better": better, "moved": moved,
+                                 "assessed": assessed}
     for key in ("cost_usd", "messages"):
         ov, nv = old.get(key), new.get(key)
         if isinstance(ov, (int, float)) and isinstance(nv, (int, float)):
@@ -11247,7 +11633,19 @@ def diff_reports(old: dict, new: dict) -> dict:
     out["windows"] = (ow.get("from"), ow.get("to"), nw.get("from"), nw.get("to"))
     out["digests"] = (old.get("report_sha256"), new.get("report_sha256"))
     out["scope"] = _scope_differences(old, new)
+    out["coverage"] = _coverage_changes(old, new)
     return out
+
+
+def _coverage_changes(old: dict, new: dict) -> "tuple[list[str], list[str]] | None":
+    """(gaps that appeared, gaps that cleared); None when either report has
+    no coverage object, as a baseline from before 0.7.0 has not."""
+    oc, nc = old.get("coverage"), new.get("coverage")
+    if not (isinstance(oc, dict) and isinstance(nc, dict)):
+        return None
+    og, ng = ([g for g in (x if isinstance(x, list) else []) if isinstance(g, str)]
+              for x in (oc.get("gaps"), nc.get("gaps")))
+    return [g for g in ng if g not in og], [g for g in og if g not in ng]
 
 
 def _scope_differences(old: dict, new: dict) -> list[tuple[str, object, object]]:
@@ -11335,6 +11733,10 @@ def render_diff(d: dict, c: C) -> None:
             sev = _txt(rn.get(sk, ""))
             rows.append((_rank(sev), "better", sev, _label(rn, family),
                          f"was {_txt(ro.get(sk, ''))}"))
+        for ro, rn in blk.get("assessed", []):
+            sev = _txt(rn.get(sk, ""))
+            rows.append((_rank(sev), "assessed", sev, _label(rn, family),
+                         f"{_txt(ro.get('assessment'))} → {_txt(rn.get('assessment'))}"))
         for ro, rn in blk["moved"]:
             delta = rn["count"] - ro.get("count", 0)
             sev = _txt(rn.get(sk, ""))
@@ -11351,13 +11753,22 @@ def render_diff(d: dict, c: C) -> None:
                    else c.ok if kind in ("gone", "better")
                    else c.yellow if kind in ("new", "worse") else c.dim)
             mark = {"new": "+", "gone": "-", "worse": "^", "better": "v",
-                    "count": "~"}[kind]
+                    "count": "~", "assessed": "*"}[kind]
             tail = f"  {c.dim}{note}{c.off}" if note else ""
             print(f"    {col}{mark}{c.off} {sev:<8} {label}{tail}")
         if dropped > 0:
             # Never truncate silently: a hidden row reads as "nothing there".
             print(f"    {c.dim}... and {dropped} more, lowest severity first. "
                   f"Compare the saved payloads directly to see every row.{c.off}")
+
+    gaps = d.get("coverage")
+    if gaps and (gaps[0] or gaps[1]):
+        changed = True
+        print(f"\n  {c.bold}coverage gaps{c.off}")
+        for g in gaps[0]:
+            print(f"    {c.yellow}+{c.off} {_txt(g)}")
+        for g in gaps[1]:
+            print(f"    {c.ok}-{c.off} {_txt(g)}")
 
     if not changed:
         if d["totals"] and all(ov == nv for ov, nv in d["totals"].values()):
@@ -11600,6 +12011,9 @@ def render_coach(findings: list[Finding], c: C) -> None:
         print(f"\n  {col}{f.id}{c.off}  {c.bold}{f.title}{c.off}")
         for line in _wrap(f.evidence, 84):
             print(f"        {line}")
+        missing = classify(f)["missing"]
+        if missing:
+            print(f"        {c.yellow}needs validation:{c.off} {missing}")
         if f.impact:
             print(f"        {c.yellow}{f.impact}{c.off}")
         for line in _wrap("→ " + f.action, 84):
@@ -12127,7 +12541,7 @@ def vendor_gaps(vendor: str) -> list[tuple[str, str]]:
 
 # Every id coach() can emit; --why rejects anything else as a usage error.
 # Defined before EXPLAIN, whose coach text quotes the range from it.
-COACH_FINDING_IDS = tuple(f"AF{n:03d}" for n in range(1, 14))
+COACH_FINDING_IDS = tuple(f"AF{n:03d}" for n in range(1, 15))
 
 
 EXPLAIN: dict[str, dict[str, object]] = {
@@ -12821,6 +13235,28 @@ EXPLAIN: dict[str, dict[str, object]] = {
         ],
         "verify": "actualis --why AF002   # the threshold and your actual values",
     },
+    "coverage": {
+        "measures": "What this run examined, what it could not, and why: per agent and per check.",
+        "formula": [
+            "agents: per agent whose transcript directory exists, the files read, the",
+            "files that could not be opened, the files --days left out by mtime, the",
+            "oldest file read, and how long the agent keeps transcripts (Claude Code:",
+            "cleanupPeriodDays in settings.json, default 30; Codex: until removed).",
+            "checks: examined and not examined, with the reason for every count.",
+            "gaps: an agent with nothing read, an unreadable file, over 1% unparsable",
+            "lines, --days past what the agent keeps, downloads --ioc could not check,",
+            "reputation lists over 7 days old.",
+            "",
+            "--fail-on-coverage makes any gap exit 5. --fail-on findings (exit 3) win",
+            "when both apply; without --fail-on-coverage a gap never changes the exit code.",
+        ],
+        "assumes": [
+            "Complete means nothing this tool knows how to read was skipped. A session",
+            "the agent never wrote down, or one already deleted, is invisible here.",
+            "settings.json is read for one key; nothing else in it is kept or printed.",
+        ],
+        "verify": "actualis --json | jq '.coverage'",
+    },
     "agents": {
         "measures": "Whether installed agent binaries are what they claim to be.",
         "formula": [
@@ -13391,7 +13827,7 @@ def _mcp_call(name: str, args: dict, cache: _MCPCache) -> dict:
     if name == "coach_findings":
         return {"findings": [{"id": x.id, "severity": x.severity, "title": x.title,
                               "evidence": x.evidence, "action": x.action,
-                              "impact": x.impact, "project": x.project}
+                              "impact": x.impact, "project": x.project, **classify(x)}
                              for x in coach(f)]}
 
     if name == "shell_audit":
@@ -14530,8 +14966,57 @@ def _display_view(fleet: "Fleet") -> "Fleet":
     return view
 
 
+REJECTED_SHOWN = 20          # --verbose: rejected[] rows the text report lists
+
+
+def render_assumptions(rows: list[dict], c: C) -> None:
+    """assumptions(), once, in the caveats block."""
+    if not rows:
+        return
+    print(f"\n  {c.yellow}▲{c.off} derived or assumed, not read "
+          f"{c.dim}(actualis --json | jq .assumptions){c.off}")
+    for a in rows:
+        unit, value = next(iter(a["volume"].items()))
+        amount = money(value) if unit == "usd" else f"{num(value)} {unit}"
+        print(f"    {a['kind']:<22} {amount:>18}  {c.dim}{_one_line(a['basis'])}{c.off}")
+
+
+def render_coverage(cov: dict, fleet: Fleet, c: C) -> None:
+    """The Coverage line after the caveats: complete, or every gap."""
+    if cov["ok"]:
+        parts = ["complete"]
+        for a in cov["agents"]:
+            seg = f"{a['agent']} from {a['oldest']}" if a["oldest"] else f"{a['agent']} nothing read"
+            if a["retention_days"] is not None:
+                seg += f" (keeps {a['retention_days']}d)"
+            parts.append(seg)
+        print(f"\n  Coverage   {' · '.join(parts)}")
+    else:
+        n = len(cov["gaps"])
+        print(f"\n  {c.yellow}Coverage   {n} gap{'' if n == 1 else 's'}{c.off}")
+        for g in cov["gaps"]:
+            print(f"    {c.yellow}!{c.off} {_one_line(g)}")
+    if fleet.unparsable_lines:
+        print(f"  {c.dim}           {num(fleet.unparsable_lines)} unparsable line(s) skipped, "
+              f"of {num(fleet.lines_read)} decoded{c.off}")
+
+
+def render_rejected(fleet: Fleet, c: C, raw: bool = False) -> None:
+    """--verbose: the leads checked and cleared, at most REJECTED_SHOWN lines."""
+    rows = rejected_json(fleet, raw)
+    total = len(fleet.rejected)
+    print(f"\n  Checked and cleared  {c.dim}{num(total)} lead(s) evaluated and dropped{c.off}")
+    for r in rows[:REJECTED_SHOWN]:
+        print(f"    {r['kind']:<10} {clip(r['what'], 34):<34} {c.dim}{r['why_cleared']}"
+              + (f"  {r['source']}" if r["source"] else "") + c.off)
+    more = total - min(len(rows), REJECTED_SHOWN)
+    if more > 0:
+        print(f"    {c.dim}… and {num(more)} more (actualis --json | jq .rejected){c.off}")
+
+
 def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
-           network_only: bool = False, network_filters: list[str] | None = None) -> None:
+           network_only: bool = False, network_filters: list[str] | None = None,
+           verbose: bool = False) -> None:
     if network_only:
         # --network: the NETWORK section and the redaction note, nothing else.
         render_network(fleet, c, top, raw, network_filters)
@@ -14923,6 +15408,11 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
               f"list: {', '.join(fleet.aggregator_models)}")
         print(f"    {c.dim}The rate is probably right; nobody authoritative has "
               f"published it.{c.off}")
+
+    render_assumptions(assumptions(fleet), c)
+    render_coverage(coverage(fleet), fleet, c)
+    if verbose:
+        render_rejected(fleet, c, raw)
 
     print()
     print(f"{c.dim}  Ask how any of this was computed:  actualis --explain")
@@ -15738,6 +16228,9 @@ JSON_SCHEMA: dict[str, str] = {
     "bash.flags[].when": "str|null",
     "bash.flags[].evidence": "str",
     "bash.flags[].had_secret": "bool",
+    "bash.flags[].assessment": "str",
+    "bash.flags[].basis": "str",
+    "bash.flags[].missing": "str|null",
     "coach": "array",
     "coach[].id": "str",
     "coach[].severity": "str",
@@ -15746,6 +16239,9 @@ JSON_SCHEMA: dict[str, str] = {
     "coach[].action": "str",
     "coach[].impact": "str|null",
     "coach[].project": "str",
+    "coach[].assessment": "str",
+    "coach[].basis": "str",
+    "coach[].missing": "str|null",
     "secret_exposures": "int",
     "suppressed_secrets": "int",
     "suppression_note": "str",
@@ -15762,6 +16258,9 @@ JSON_SCHEMA: dict[str, str] = {
     "secrets[].first_seen": "str",
     "secrets[].last_seen": "str",
     "secrets[].distinct_values": "int",
+    "secrets[].assessment": "str",
+    "secrets[].basis": "str",
+    "secrets[].missing": "str|null",
     "secret_projects.*": "int",
     "redacted": "bool",
     "permission_modes.*": "int",
@@ -15892,6 +16391,9 @@ JSON_SCHEMA: dict[str, str] = {
     "network.reputation.candidates": "array",
     "network.reputation.candidates[].prefix_b64": "str",
     "network.reputation.candidates[].expressions": "int",
+    "network.reputation.candidates[].assessment": "str",
+    "network.reputation.candidates[].basis": "str",
+    "network.reputation.candidates[].missing": "str|null",
     "network.reputation.advisory.text": "str|null",
     "network.reputation.advisory.url": "str|null",
     "network.reputation.network_last_used.at": "str|null",
@@ -15927,6 +16429,9 @@ JSON_SCHEMA: dict[str, str] = {
     "network.ioc.matches[].refused": "bool",
     "network.ioc.matches[].suppressed": "bool",
     "network.ioc.matches[].flag_id": "str|null",
+    "network.ioc.matches[].assessment": "str",
+    "network.ioc.matches[].basis": "str",
+    "network.ioc.matches[].missing": "str|null",
     "network.ioc.matches[].refs": "array",
     "network.ioc.matches[].refs[]": "str",
     "network.ioc.matches[].labels": "array",
@@ -15950,6 +16455,41 @@ JSON_SCHEMA: dict[str, str] = {
     "unpriced_model_tokens.*": "int",
     "rewound_tool_calls": "int",
     "unsupported_records": "int",
+    "coverage.ok": "bool",
+    "coverage.agents": "array",
+    "coverage.agents[].agent": "str",
+    "coverage.agents[].root_exists": "bool",
+    "coverage.agents[].files_read": "int",
+    "coverage.agents[].files_unreadable": "int",
+    "coverage.agents[].dirs_unreadable": "int",
+    "coverage.agents[].files_skipped_mtime": "int",
+    "coverage.agents[].oldest": "str|null",
+    "coverage.agents[].retention_days": "int|null",
+    "coverage.agents[].retention_source": "str",
+    "coverage.agents[].expiring_7d": "int",
+    "coverage.checks": "array",
+    "coverage.checks[].check": "str",
+    "coverage.checks[].examined": "int",
+    "coverage.checks[].not_examined": "int",
+    "coverage.checks[].why_not.*": "int",
+    "coverage.checks[].stale": "bool",
+    "coverage.gaps": "array",
+    "coverage.gaps[]": "str",
+    "assumptions": "array",
+    "assumptions[].path": "str",
+    "assumptions[].kind": "str",
+    "assumptions[].basis": "str",
+    "assumptions[].volume.tokens": "int",
+    "assumptions[].volume.usd": "float",
+    "assumptions[].volume.items": "int",
+    "assumptions[].volume.days": "int",
+    "rejected": "array",
+    "rejected[].kind": "str",
+    "rejected[].id": "str",
+    "rejected[].what": "str",
+    "rejected[].why_cleared": "str",
+    "rejected[].source": "str",
+    "rejected_total": "int",
 }
 
 # A matched item is shown exactly as network.items shows it.
@@ -15978,7 +16518,7 @@ def report_digest(payload: dict) -> str:
 
     Self-referential by construction otherwise: the hash cannot cover a field
     whose value is the hash. The same goes for pricing.age_days, pricing.stale
-    and finding AF013, which change as days pass over unchanged transcripts. The
+    and findings AF013 and AF014, which change as days pass over unchanged transcripts. The
     digest then answers "did the evidence change", not "what day is it".
     REPORT_DIGEST_EXCLUDES and REPORT_DIGEST_CLOCK_FINDINGS name all of it in one
     place so the emitter and any verifier cannot disagree.
@@ -15989,7 +16529,12 @@ def report_digest(payload: dict) -> str:
             path = prefix + k
             if path in REPORT_DIGEST_EXCLUDES:
                 continue
-            out[k] = keep(v, path + ".") if isinstance(v, dict) else v
+            if isinstance(v, dict):
+                out[k] = keep(v, path + ".")
+            elif isinstance(v, list):        # a[].b names b on every element
+                out[k] = [keep(x, path + "[].") if isinstance(x, dict) else x for x in v]
+            else:
+                out[k] = v
         return out
     body = keep(payload, "")
     if isinstance(body.get("coach"), list):
@@ -16002,10 +16547,13 @@ def report_digest(payload: dict) -> str:
     return hashlib.sha256(canonical_json(body).encode("utf-8", "surrogatepass")).hexdigest()
 
 
-# Dotted paths into the payload (a top-level key is a path of one part).
-REPORT_DIGEST_EXCLUDES = frozenset({"report_sha256", "pricing.age_days", "pricing.stale"})
-# Coach findings whose presence depends on today's date, not on the transcripts.
-REPORT_DIGEST_CLOCK_FINDINGS = frozenset({"AF013"})
+# Dotted paths into the payload (a top-level key is a path of one part; a[].b
+# is b on every element of the array a).
+REPORT_DIGEST_EXCLUDES = frozenset({"report_sha256", "pricing.age_days", "pricing.stale",
+                                    "coverage.agents[].expiring_7d"})
+# Coach findings whose presence depends on today's date, not on the transcripts:
+# the rate table's age (AF013) and transcripts about to expire (AF014).
+REPORT_DIGEST_CLOCK_FINDINGS = frozenset({"AF013", "AF014"})
 
 # --------------------------------------------------------------------------
 # Exit codes
@@ -16018,6 +16566,7 @@ REPORT_DIGEST_CLOCK_FINDINGS = frozenset({"AF013"})
 #   2    a command line usage error -- argparse owns this one, not us
 #   3    findings at or above --fail-on
 #   4    --self-check: a check failed
+#   5    --fail-on-coverage: a coverage gap (3 wins when both apply)
 #   130  interrupted
 #
 # Findings are 3, not 1 and not 2. 1 already meant "could not run" before
@@ -16031,6 +16580,7 @@ EXIT_CANNOT_RUN = 1
 EXIT_USAGE = 2        # argparse's, and --reputation --fail-on with no usable lists
 EXIT_FINDINGS = 3
 EXIT_SELF_CHECK_FAILED = 4   # --self-check: a privacy claim did not hold
+EXIT_COVERAGE = 5     # --fail-on-coverage: the run could not see everything it was asked to
 
 # What each threshold includes. Ordered, so a lower threshold is a superset.
 FAIL_ON_LEVELS = ("critical", "high", "any")
@@ -16099,6 +16649,244 @@ def failing_findings(fleet: Fleet, level: str) -> list[str]:
             out.append(f"{len(fl)} medium-severity shell command(s) flagged")
         if net:
             out.append(f"{len(net)} unasked download group(s) from untrusted sources")
+    return out
+
+
+# --------------------------------------------------------------------------
+# Coverage: what a run could see
+#
+# "No findings" and "could not look" used to print the same way. These read
+# the counters the scan keeps (Fleet._file_read and friends, unparsable_lines,
+# the network and IOC totals) at output time; no producer feeds them.
+# --------------------------------------------------------------------------
+
+COVERAGE_AGENTS = ("claude-code", "codex", "copilot", "gemini", "qwen")
+_AGENT_FOR_CHOICE = {"claude": "claude-code", "codex": "codex", "copilot": "copilot",
+                     "gemini": "gemini", "qwen": "qwen"}
+_AGENT_LABEL = {"claude-code": "Claude Code", "codex": "Codex", "copilot": "Copilot CLI",
+                "gemini": "Gemini CLI", "qwen": "Qwen Code"}
+COVERAGE_EXPIRY_DAYS = 7          # how far ahead AF014 and expiring_7d look
+
+
+def _utc_date(ts: "float | None") -> "str | None":
+    """YYYY-MM-DD (UTC) of a file mtime; None for none, or one out of range."""
+    if ts is None:
+        return None
+    try:
+        return datetime.fromtimestamp(ts, timezone.utc).date().isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _managed_claude_roots(fleet: Fleet) -> set[str]:
+    """The scanned roots Claude Code itself cleans: <config dir>/projects, the
+    one whose settings.json read_retention() reads. A --root copy or archive,
+    a second $CLAUDE_CONFIG_DIR entry, or a --ci-log file is not one, so its
+    retention is unknown and AF014 never fires for it."""
+    try:
+        want = (claude_config_dir() / "projects").resolve()
+    except (OSError, RuntimeError):
+        return set()
+    out: set[str] = set()
+    for r in fleet.roots:
+        try:
+            if Path(r).resolve() == want:
+                out.add(str(r))
+        except (OSError, RuntimeError):
+            continue
+    return out
+
+
+def _coverage_agents(fleet: Fleet, now: "float | None" = None) -> list[tuple[dict, "float | None"]]:
+    """(coverage.agents[] row, mtime of its oldest expiring file) for every
+    agent whose root this run scanned, then the --agent one if its root was
+    not found. A file expires when mtime + retention falls within the next
+    COVERAGE_EXPIRY_DAYS, or already has (Claude Code deletes it at its next
+    start). A file dated in the future is not counted."""
+    now = datetime.now(timezone.utc).timestamp() if now is None else now
+    retention = fleet_retention(fleet)
+    managed = _managed_claude_roots(fleet) if "claude-code" in fleet.agent_roots else set()
+    names = [a for a in COVERAGE_AGENTS if a in fleet.agent_roots]
+    named = _AGENT_FOR_CHOICE.get(str(fleet.scope.get("agent") or ""))
+    if named and named not in names:
+        names.append(named)
+    horizon = now + COVERAGE_EXPIRY_DAYS * 86400
+    out: list[tuple[dict, "float | None"]] = []
+    for agent in names:
+        row = fleet.agent_roots.get(agent)
+        ret = dict(retention.get(agent) or _UNKNOWN_RETENTION)
+        if agent == "claude-code" and not managed:
+            ret = dict(_UNKNOWN_RETENTION)
+        days = ret["retention_days"]
+        hits: list[float] = []
+        if row is not None and days is not None:
+            for root, mtimes in row["mtimes"].items():
+                if agent == "claude-code" and root not in managed:
+                    continue
+                hits += [m for m in mtimes if m <= now and m + days * 86400 < horizon]
+        out.append(({"agent": agent, "root_exists": row is not None,
+                     "files_read": row["files_read"] if row else 0,
+                     "files_unreadable": row["files_unreadable"] if row else 0,
+                     "dirs_unreadable": row.get("dirs_unreadable", 0) if row else 0,
+                     "files_skipped_mtime": row["files_skipped_mtime"] if row else 0,
+                     "oldest": _utc_date(row["oldest_mtime"]) if row else None,
+                     "retention_days": days, "retention_source": ret["retention_source"],
+                     "expiring_7d": len(hits)},
+                    min(hits) if hits else None))
+    return out
+
+
+def transcripts_expiring(fleet: Fleet) -> list[tuple[str, int, str, int]]:
+    """(agent, files, date of the oldest, days kept) for each agent that
+    deletes transcripts within COVERAGE_EXPIRY_DAYS (AF014)."""
+    return [(row["agent"], row["expiring_7d"], _utc_date(first) or "?", row["retention_days"])
+            for row, first in _coverage_agents(fleet)
+            if row["expiring_7d"] and row["retention_days"] is not None]
+
+
+COVERAGE_UNPARSABLE_PCT = 1.0     # gap 3: unparsable lines over this share of lines decoded
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def _check(name: str, examined: int, why_not: dict) -> dict:
+    """One coverage.checks[] row; reasons with a zero count are left out."""
+    why = {k: int(v) for k, v in why_not.items() if v}
+    return {"check": name, "examined": max(int(examined), 0),
+            "not_examined": sum(why.values()), "why_not": why}
+
+
+def coverage(fleet: Fleet) -> dict:
+    """The coverage ledger: per agent and per check, what was examined, what
+    was not and why, and gaps[], one sentence per condition --fail-on-coverage
+    fails on (whether or not it was given). ok is gaps == [].
+
+    Everything it needs is on the fleet: scope.days and scope.agent, the
+    network, IOC and reputation state, and the scan counters. Never raises
+    on a fleet with no records."""
+    now = datetime.now(timezone.utc)
+    agents = [row for row, _first in _coverage_agents(fleet, now.timestamp())]
+    days = fleet.scope.get("days")
+    gaps: list[str] = []
+    for row in agents:
+        agent, label = row["agent"], _AGENT_LABEL.get(row["agent"], row["agent"])
+        # --project is scope: an agent that keeps no such project read nothing
+        # because there was nothing to read, which is not a gap. What it could
+        # not open or list still is.
+        if row["root_exists"] and row["files_read"] == 0 and not fleet.scope.get("project"):
+            skipped = row["files_skipped_mtime"]
+            gaps.append(f"{agent}: no transcript file read"
+                        + (f" ({skipped} older than --days {days} skipped)" if skipped and days else ""))
+        if row["files_unreadable"]:
+            gaps.append(f"{_plural(row['files_unreadable'], 'transcript file')} could not be read ({agent})")
+        if row["dirs_unreadable"]:
+            n = row["dirs_unreadable"]
+            gaps.append(f"{n} project director{'y' if n == 1 else 'ies'} could not be listed ({agent})")
+        keep = row["retention_days"]
+        if row["retention_source"] in ("settings", "default") and keep is not None \
+                and isinstance(days, int) and days > keep:
+            gaps.append(f"asked for {_plural(days, 'day')}; {label} keeps {keep}")
+    if fleet.unparsable_lines * 100 > fleet.lines_read * COVERAGE_UNPARSABLE_PCT:
+        gaps.append(f"{fleet.unparsable_lines:,} of {fleet.lines_read:,} record lines could not be "
+                    f"parsed (over {COVERAGE_UNPARSABLE_PCT:g}%)")
+
+    unreadable_other = max(fleet.unreadable - fleet.oversized_commands, 0)
+    shell_why = {"unreadable-command": unreadable_other, "oversized": fleet.oversized_commands}
+    checks = [_check("credentials", fleet.bash_total - fleet.unreadable, shell_why),
+              _check("shell", fleet.bash_total - fleet.unreadable, shell_why),
+              _check("records", fleet.lines_read - fleet.unparsable_lines,
+                     {"unparsable-line": fleet.unparsable_lines})]
+    if fleet.network_requested or fleet.ioc is not None:
+        checks.append(_check("network", len(fleet.network_items),
+                             {"unparsed-segment": fleet.network_unparsed}))
+    if fleet.ioc is not None:
+        nc = fleet.ioc_totals["items_not_checkable"]
+        row = _check("ioc", fleet.ioc_totals["items_checked"],
+                     {"lockfile": nc["lockfile"], "no-host": nc["no_host"], "other": nc["other"]})
+        checks.append(row)
+        if row["not_examined"]:
+            gaps.append(f"{_plural(row['not_examined'], 'download')} could not be checked "
+                        f"against the IOC list")
+    rep = fleet.reputation
+    if rep is not None:
+        stale = bool(rep.oldest and now - rep.oldest > timedelta(days=REPUTATION_STALE_DAYS))
+        t = fleet.reputation_totals
+        checks.append({**_check("reputation", t["checked"], {"local-host": t["skipped"]}),
+                       "stale": stale})
+        if stale:
+            gaps.append(f"reputation lists are {(now - rep.oldest).days} days old")
+    return {"ok": not gaps, "agents": agents, "checks": checks, "gaps": gaps}
+
+
+def failing_coverage(cov: dict) -> list[str]:
+    """The gaps that trip --fail-on-coverage: every one coverage() found."""
+    return list(cov["gaps"])
+
+
+_TIER_BASIS = {VENDOR_DOC: "priced from provider docs, not the price list",
+               AGGREGATOR: "priced from a third party, not the vendor",
+               FAMILY: "priced from a sibling model in the same family",
+               DEFAULT: "priced at the provider's most expensive known rate",
+               UNPRICED: "no published rate"}
+
+
+def assumptions(fleet: Fleet) -> list[dict]:
+    """Every number derived or assumed rather than read, once, with its
+    volume. Built from the markers the report already keeps; they stay where
+    they are. Empty for a fleet with nothing assumed."""
+    out: list[dict] = []
+
+    def add(path: str, kind: str, basis: str, unit: str, value) -> None:
+        out.append({"path": path, "kind": kind, "basis": basis, "volume": {unit: value}})
+
+    assumed = int(fleet.tokens.get("cache_w_assumed", 0))
+    if assumed:
+        add("tokens.cache_w_assumed", "cache-ttl-assumed-1h",
+            "record omits the 1h/5m split; priced at the 1h rate", "tokens", assumed)
+    for tier in RATE_TIERS:
+        usd = fleet.cost_by_tier.get(tier, 0.0)
+        if tier != VENDOR and usd > 0:
+            add(f"pricing.cost_by_tier.{tier}", f"price-tier-{tier}", _TIER_BASIS.get(tier, tier),
+                "usd", float(round(usd, 4)))
+    unpriced = sum(fleet.unpriced_tokens.values())
+    if unpriced:
+        add("unpriced_model_tokens", "model-unpriced",
+            "no published rate: tokens counted, cost not", "tokens", int(unpriced))
+    inferred = sum(1 for i in fleet.network_items if i.get("host_inferred"))
+    if inferred:
+        add("network.items[].host_inferred", "host-inferred",
+            "the command named no host; the registry default is assumed", "items", inferred)
+    if fleet.sub_cost_floor > 0:
+        add("subagents.cost_floor_usd", "subagent-cost-floor",
+            "only each run's final message is recorded; a lower bound", "usd",
+            float(round(fleet.sub_cost_floor, 4)))
+    span, active = fleet.span_dates, fleet.active_days
+    if span and active != span:
+        add("window.active_days", "rate-active-days",
+            f"rates divide by {active} active day(s), not the {span} calendar dates the "
+            f"window covers", "days", active)
+    return out
+
+
+REJECTED_CAP = 200
+
+
+def rejected_json(fleet: Fleet, raw: bool = False) -> list[dict]:
+    """rejected[]: leads evaluated and cleared, newest first, at most
+    REJECTED_CAP; rejected_total counts every one. A package name and version
+    is redacted unless raw, as network.packages is; a secret row holds only a
+    type and a project, and a reputation row a host."""
+    rows = sorted(fleet.rejected.values(), key=lambda r: (r["kind"], r["id"], r["what"]))
+    rows.sort(key=lambda r: r["_when"], reverse=True)
+    out = []
+    for r in rows[:REJECTED_CAP]:
+        row = {k: clean(r[k]) for k in ("kind", "id", "what", "why_cleared", "source")}
+        if not raw and r["kind"] == "ioc":
+            row.update(id=redact(row["id"]), what=redact(row["what"]),
+                       why_cleared=redact(row["why_cleared"]))
+        out.append(row)
     return out
 
 
@@ -16211,12 +16999,13 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
                 "high": sum(1 for f in fleet.actionable_flags if f["severity"] == "high"),
                 "medium": sum(1 for f in fleet.actionable_flags if f["severity"] == "med"),
             },
-            "flags": [{**f, "evidence": (f["evidence"] if raw else redact(f["evidence"]))[:240]}
+            "flags": [{**f, **classify(f),
+                       "evidence": (f["evidence"] if raw else redact(f["evidence"]))[:240]}
                       for f in fleet.flags],
         },
         "coach": [{"id": f.id, "severity": f.severity, "title": f.title,
                    "evidence": f.evidence, "action": f.action, "impact": f.impact,
-                   "project": f.project}
+                   "project": f.project, **classify(f)}
                   for f in coach(fleet)],
         "secret_exposures": fleet.secret_exposures,
         "suppressed_secrets": fleet.suppressed_secrets,
@@ -16230,7 +17019,7 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
              "projects": sorted(e["projects"]),
              "suppressed": bool(e.get("suppressed")),
              "suppressed_reason": e.get("suppressed_reason", ""),
-             "distinct_values": e.get("distinct_values", 1)}
+             "distinct_values": e.get("distinct_values", 1), **classify(e)}
             for fp, e in sorted(
                 fleet.secrets.items(),
                 key=lambda kv: ({"critical": 0, "high": 1, "low": 2}.get(kv[1]["priority"], 9),
@@ -16296,6 +17085,10 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
         "unpriced_model_tokens": dict(fleet.unpriced_tokens.most_common()),
         "rewound_tool_calls": fleet.rewound_tool_calls,
         "unsupported_records": fleet.unsupported_records,
+        "coverage": coverage(fleet),
+        "assumptions": assumptions(fleet),
+        "rejected": rejected_json(fleet, raw),
+        "rejected_total": len(fleet.rejected),
     }
 
 
@@ -16678,6 +17471,11 @@ def self_check(c: C, days: int | None = 7, root: str | None = None,
     if roots:
         result(True, "the only directories this run reads",
                "; ".join(str(r) for r in roots))
+    if agent in ("all", "claude"):
+        result(True, "one file read outside the transcript roots",
+               f"{claude_settings_path()}, one key: cleanupPeriodDays, how long Claude Code "
+               "keeps transcripts. Nothing else in the file is kept or printed, and it is "
+               "never written.")
 
     # 1. What this build imports at all. Read from the source, so it describes
     #    the shipped file rather than whatever is loaded right now.
@@ -17612,6 +18410,8 @@ def build_parser() -> argparse.ArgumentParser:
     # refused rather than dropped; main() fills in 12 after that check.
     ap.add_argument("--top", type=_top_arg, default=None, metavar="N",
                     help="text report: projects to list, 1 or more (default 12)")
+    ap.add_argument("--verbose", action="store_true",
+                    help="text report: also list the leads actualis checked and cleared")
     ap.add_argument("--bash", action="store_true", help="shell audit only")
     ap.add_argument("--coach", action="store_true", help="coaching findings only")
     ap.add_argument("--aisvs", action="store_true",
@@ -17652,6 +18452,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="exit 3 if any unsuppressed finding is at or above "
                          f"LEVEL ({', '.join(FAIL_ON_LEVELS)}); 2 is a usage error. "
                          "For gating a pipeline. Still changes nothing and blocks nothing.")
+    ap.add_argument("--fail-on-coverage", action="store_true",
+                    help="exit 5 on any coverage gap: an agent with no transcript read, unreadable "
+                         "files, over 1%% of lines unparsable, --days reaching past what the agent "
+                         "keeps, with --ioc downloads not checked, with --reputation stale lists. "
+                         "Exit 3 from --fail-on wins")
     net = ap.add_argument_group("Network")
     net.add_argument("--network", action="store_true",
                      help="print only the NETWORK section (with --ioc, the IOC block too). "
@@ -17727,8 +18532,10 @@ def main(argv: list[str] | None = None) -> int:
     make_output_printable(args.json)
 
     # Checked before anything runs, so a refused --suppress writes nothing.
-    # --fail-on is never silently ignored: these modes return before the gate.
-    if args.fail_on:
+    # Neither gate is ever silently ignored: these modes return before it.
+    for gate, wanted in (("--fail-on", args.fail_on), ("--fail-on-coverage", args.fail_on_coverage)):
+        if not wanted:
+            continue
         for flag, on in (("--diff", args.diff), ("--why", args.why),
                          ("--replay", args.replay), ("--watch", args.watch),
                          ("--mcp", args.mcp), ("--explain", args.explain is not None),
@@ -17737,7 +18544,7 @@ def main(argv: list[str] | None = None) -> int:
                          ("--self-check", args.self_check), ("--service", args.service),
                          ("--completions", args.completions)):
             if on:
-                ap.error(f"--fail-on cannot be combined with {flag}: "
+                ap.error(f"{gate} cannot be combined with {flag}: "
                          f"{flag} does not evaluate the gate.")
     # Nor is --json: these modes print text, or would print something else.
     if args.json:
@@ -17854,7 +18661,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.reputation and (args.watch or args.mcp):
         ap.error("--reputation is not supported with --watch or --mcp yet.")
     if args.card:
-        for flag, on in (("--fail-on", args.fail_on), ("--diff", args.diff),
+        for flag, on in (("--fail-on", args.fail_on),
+                         ("--fail-on-coverage", args.fail_on_coverage), ("--diff", args.diff),
                          ("--why", args.why), ("--share", args.share),
                          ("--watch", args.watch), ("--mcp", args.mcp),
                          ("--replay", args.replay),
@@ -17912,6 +18720,13 @@ def main(argv: list[str] | None = None) -> int:
                      f"lists top projects.")
     else:
         args.top = 12
+    if args.verbose:
+        off = mode if mode not in (None, "--bash") else \
+            "--json" if args.json else "--html" if args.html else \
+            "--network" if args.network else None
+        if off:
+            ap.error(f"--verbose cannot be combined with {off}: only the text report "
+                     f"lists the leads it checked and cleared.")
     if args.interval is None:
         args.interval = 4.0
     # mode -> the scope flags it honours. Modes not listed (the scanning
@@ -18124,7 +18939,7 @@ def main(argv: list[str] | None = None) -> int:
                    f"({clean(reputation.error or '')}). "
                    f"Run `actualis-reputation update` to download them again.")
         print(msg, file=sys.stderr)
-        if args.fail_on:
+        if args.fail_on or args.fail_on_coverage:
             return EXIT_USAGE
     if reputation is not None and reputation.vt_error:
         print(f"actualis: --reputation: vt/results.json in {reputation.directory} is unreadable "
@@ -18139,9 +18954,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # --network shows only the inventory; --fail-on reads findings (--why
     # with --network is refused above).
-    fleet = Fleet(network_only=bool(args.network and not args.fail_on))
+    fleet = Fleet(network_only=bool(args.network and not (args.fail_on or args.fail_on_coverage)))
     fleet.scope = {"days": args.days or None, "project": clean(args.project or ""),
                    "agent": clean(args.agent or "all")}
+    fleet.network_requested = bool(args.network)
     fleet.with_prompts = args.with_prompts
     progress = not args.json and sys.stderr.isatty()
 
@@ -18229,6 +19045,8 @@ def main(argv: list[str] | None = None) -> int:
     apply_network_policy(fleet, network_trust, args.network_strict, trust_sources)
     apply_ioc(fleet, ioc)
     apply_reputation(fleet, reputation)
+    # Once per run, before the terminal view copies the fleet (AF014, coverage).
+    fleet_retention(fleet)
 
     if baseline is not None:
         render_diff(_display_safe(diff_reports(baseline, to_json(fleet, raw=args.no_redact))),
@@ -18260,8 +19078,11 @@ def main(argv: list[str] | None = None) -> int:
 
     # The verdict is decided before any output (R5): a reader that closes
     # stdout early must not turn a failing gate into a pass. _cli() reads it.
-    _PENDING_GATE[:] = [(args.fail_on, failing_findings(fleet, args.fail_on),
-                         _suppressed_count(fleet))] if args.fail_on else []
+    _PENDING_GATE[:] = [(args.fail_on,
+                         failing_findings(fleet, args.fail_on) if args.fail_on else [],
+                         _suppressed_count(fleet),
+                         failing_coverage(coverage(fleet)) if args.fail_on_coverage else None)
+                        ] if (args.fail_on or args.fail_on_coverage) else []
 
     if args.html:
         page = render_network_html(network_json(fleet, raw=args.no_redact),
@@ -18292,15 +19113,17 @@ def main(argv: list[str] | None = None) -> int:
         render_coach(coach(view), C(use_color()))
     else:
         render(view, C(use_color()), bash_only=args.bash, top=args.top, raw=args.no_redact,
-               network_only=args.network, network_filters=network_filter_names(args))
+               network_only=args.network, network_filters=network_filter_names(args),
+               verbose=args.verbose)
 
     if _PENDING_GATE:
         return _gate_verdict()
     return EXIT_OK
 
 
-# (level, reasons, suppressed count) for the run in progress, set by main()
-# before it writes the report, so a closed stdout still gets the gate's code.
+# (level or None, reasons, suppressed count, coverage gaps or None) for the
+# run in progress, set by main() before it writes the report, so a closed
+# stdout still gets the gate's code.
 _PENDING_GATE: list = []
 
 
@@ -18319,18 +19142,27 @@ def _gate_verdict() -> int:
     has been reported, or reporting it has failed."""
     if not _PENDING_GATE:
         return EXIT_OK
-    level, reasons, suppressed = _PENDING_GATE[-1]
-    code = EXIT_FINDINGS if reasons else EXIT_OK
+    level, reasons, suppressed, *rest = _PENDING_GATE[-1]
+    gaps = rest[0] if rest else None
+    # Findings (3) win over coverage (5): an exposed credential is the first
+    # thing a failing pipeline must say.
+    code = EXIT_FINDINGS if reasons else EXIT_COVERAGE if gaps else EXIT_OK
     # stderr, so `--json` on stdout stays byte-identical and a pipeline can
     # capture the report and the verdict separately.
     try:
-        if reasons:
+        if level and reasons:
             print(f"actualis: FAIL at --fail-on {level}", file=sys.stderr)
             for r in reasons:
                 print(f"  - {_one_line(r)}", file=sys.stderr)
             print(f"  {suppressed} suppressed finding(s) were not counted.", file=sys.stderr)
-        else:
+        elif level:
             print(f"actualis: PASS at --fail-on {level}", file=sys.stderr)
+        if gaps:
+            print("actualis: FAIL at --fail-on-coverage", file=sys.stderr)
+            for g in gaps:
+                print(f"  - {_one_line(g)}", file=sys.stderr)
+        elif gaps is not None:
+            print("actualis: PASS at --fail-on-coverage", file=sys.stderr)
         sys.stderr.flush()
     except (OSError, ValueError):            # BrokenPipeError is an OSError
         _silence_stderr()

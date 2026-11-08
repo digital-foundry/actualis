@@ -37,8 +37,8 @@ that and prints a warning to stderr (stdout stays pure JSON).
 | `by_project` | cost per project |
 | `by_day` | cost per calendar day (UTC date), ascending |
 | `tools` | tool-call counts, descending |
-| `bash` | `total`, `commands{}` (program name to count; a program name that is itself a credential, such as a pasted token run as a command, is counted as `(credential)`), `flag_counts{}`, `oversized_commands` (commands over 32 KB, each also a medium `oversized-command` flag), `flagged.high` and `flagged.medium` (the report's "flagged N high M medium": one per command, suppressed flags left out; `flag_counts` counts per category and includes suppressed flags), `flags[]`: `id`, `severity`, `categories[]`, `program`, `project`, `when` (null when undated), `evidence` (240 characters, redacted unless `--no-redact`), `had_secret` (the command also contained a credential), `suppressed` and `suppressed_reason` |
-| `coach` | findings: `id`, `severity`, `title`, `evidence`, `action`, `impact`, `project` (the project a per-project finding such as `AF002` or `AF006` is about, `""` for fleet-wide findings; `--diff` matches findings on `id` and `project`) |
+| `bash` | `total`, `commands{}` (program name to count; a program name that is itself a credential, such as a pasted token run as a command, is counted as `(credential)`), `flag_counts{}`, `oversized_commands` (commands over 32 KB, each also a medium `oversized-command` flag), `flagged.high` and `flagged.medium` (the report's "flagged N high M medium": one per command, suppressed flags left out; `flag_counts` counts per category and includes suppressed flags), `flags[]`: `id`, `severity`, `categories[]`, `program`, `project`, `when` (null when undated), `evidence` (240 characters, redacted unless `--no-redact`), `had_secret` (the command also contained a credential), `suppressed` and `suppressed_reason`, and the three [assessment](#assessments) fields |
+| `coach` | findings: `id`, `severity`, `title`, `evidence`, `action`, `impact`, `project` (the project a per-project finding such as `AF002` or `AF006` is about, `""` for fleet-wide findings; `--diff` matches findings on `id` and `project`), and the three [assessment](#assessments) fields |
 | `secrets` | array; see below |
 | `secret_exposures` | commands containing credential material |
 | `suppressed_secrets` | credential findings marked as false positives on this machine |
@@ -58,6 +58,10 @@ that and prints a warning to stderr (stdout stays pure JSON).
 | `unknown_models` | models seen with no pricing entry, so priced by inference: the newest sibling in the model family, or else the most expensive rate on file for the provider (the global ceiling when the provider is unknown). Excludes those in `pricing.models_by_tier.unpriced`, which are not billed at all. A dated or alias id of a model in the table (`claude-sonnet-4-5-20250929`, `claude-sonnet-4@20250514`, `claude-opus-4-0`) is that model, priced from its own row, and is not listed here |
 | `unpriced_model_tokens` | model to token count, for Gemini CLI and Qwen Code models with no published rate (tier `unpriced`): `gemini-3-pro-preview`, `gemini-3.5-flash`, every Qwen model, and any model id those agents report that has no price. Their tokens are in `tokens`; their cost is not in `cost_usd` and is not estimated |
 | `aggregator_priced_models` | models priced from a third party because the vendor publishes no rate for that id |
+| `coverage` | what this run examined and what it could not, per agent and per check, and the gaps `--fail-on-coverage` fails on. See [coverage](#coverage) |
+| `assumptions` | every number actualis derived or assumed rather than read, once, with its volume. See [assumptions](#assumptions) |
+| `rejected` | leads actualis evaluated and cleared, newest first, at most 200. See [rejected](#rejected) |
+| `rejected_total` | how many leads were cleared, uncapped |
 
 ## Inferred cache TTL
 
@@ -143,12 +147,122 @@ report says so rather than quoting an old number with a straight face.
 Refreshing the table is a deliberate, human-run step — see `tools/price-check.py`
 in the repository. The CLI will never fetch a price on your behalf.
 
+## Assessments
+
+Every row in `bash.flags[]` (suppressed ones included), `secrets[]`, `coach[]`,
+`network.ioc.matches[]` and `network.reputation.candidates[]`, and every MCP
+`coach_findings` row, carries three fields. Added in 0.7.0, additive under
+`schema_version` 1.
+
+| field | type | values |
+|---|---|---|
+| `assessment` | string | `confirmed`: the evidence is in the transcript and the check is decided. `needs-validation`: something the check needs is not in the transcript; `missing` says what |
+| `basis` | string | `observed`: read from the transcript. `inferred`: derived by actualis (AF002's cache-waste estimate, an npm name read from a URL) |
+| `missing` | string or null | the missing fact when `assessment` is `needs-validation`, never empty then; `null` when `confirmed` |
+
+The values come from one table, `_ASSESSMENT` in `actualis.py`, which docs/findings.md
+reproduces.
+Severity does not change with the assessment, and neither does `--fail-on`.
+`rejected` is never an `assessment` value. The IOC field `verdict`
+(`match` / `unresolved`) is a different thing and is unchanged.
+
+## coverage
+
+What the run could see. Added in 0.7.0, additive under `schema_version` 1.
+
+```json
+"coverage": {
+  "ok": false,
+  "agents": [
+    {"agent": "claude-code", "root_exists": true, "files_read": 412, "files_unreadable": 0,
+     "files_skipped_mtime": 1203, "oldest": "2026-10-08", "retention_days": 30,
+     "retention_source": "settings", "expiring_7d": 4}
+  ],
+  "checks": [
+    {"check": "credentials", "examined": 18222, "not_examined": 12,
+     "why_not": {"unreadable-command": 9, "oversized": 3}},
+    {"check": "reputation", "examined": 120, "not_examined": 0, "why_not": {}, "stale": true}
+  ],
+  "gaps": ["reputation lists are 9 days old"]
+}
+```
+
+| key | meaning |
+|---|---|
+| `ok` | `true` when `gaps` is empty |
+| `agents[]` | every agent whose transcript root exists, plus the `--agent` one when its root does not. `agent` (`claude-code`, `codex`, `copilot`, `gemini`, `qwen`), `root_exists`, `files_read` (read to the end), `files_unreadable` (failed `stat` or `open`: skipped and counted), `dirs_unreadable` (project or session directories that could not be listed: their files were never seen), `files_skipped_mtime` (left out by the `--days` prefilter, older than the window by mtime), `oldest` (UTC date of the oldest file read, by mtime, or `null`), `retention_days` (int or `null`), `retention_source`, `expiring_7d` |
+| `retention_source` | `settings` (`cleanupPeriodDays` in Claude Code's `settings.json`), `default` (the file read, the key absent: Claude Code's 30), `unknown` (no file, an unreadable one, not JSON, a value that is not an integer, or a directory Claude Code does not clean, such as a `--root` copy), `none` (the agent deletes nothing on its own: Codex) |
+| `expiring_7d` | transcript files whose mtime plus `retention_days` falls within the next 7 days, or already has (the agent deletes them at its next start); `0` when `retention_days` is `null`. Depends on the clock, so it is left out of `report_sha256` |
+| `checks[]` | `check`, `examined`, `not_examined` and `why_not` (reason to count, zero counts left out). `credentials` and `shell`: commands, with `unreadable-command` and `oversized` (`examined + not_examined` is `bash.total`). `records`: decoded transcript lines, with `unparsable-line`. `network` (only with `--network` or `--ioc`): items, with `unparsed-segment`. `ioc` (only with `--ioc`): downloads, with `lockfile`, `no-host` and `other`. `reputation` (only with `--reputation`): hosts checked, with `local-host` (private and local hosts, never looked up), and `stale` |
+| `gaps[]` | one sentence per gap, whether or not `--fail-on-coverage` was given |
+
+The gaps, each of which makes `--fail-on-coverage` exit 5:
+
+1. an agent's root exists and no transcript file was read in the window;
+2. a transcript file could not be read;
+3. unparsable lines are over 1% of the lines decoded;
+4. `--days N` reaches past what the agent keeps (`retention_source` `settings` or
+   `default`): "asked for 90 days; Claude Code keeps 30". `cleanupPeriodDays` 0
+   is this gap for any `--days`;
+5. with `--ioc`, a download could not be checked against the list;
+6. with `--reputation`, the lists are over 7 days old.
+
+Exit 3 (`--fail-on`) wins when both apply. Without `--fail-on-coverage` a gap
+never changes the exit code.
+
+Verify: `actualis --json | jq '.coverage'`
+
+## assumptions
+
+Every number actualis derived or assumed rather than read, listed once. The
+markers stay where they are; this list is built from them. Added in 0.7.0.
+
+```json
+{"path": "tokens.cache_w_assumed", "kind": "cache-ttl-assumed-1h",
+ "basis": "record omits the 1h/5m split; priced at the 1h rate", "volume": {"tokens": 1834000}}
+```
+
+| `kind` | from (`path`) | `volume` |
+|---|---|---|
+| `cache-ttl-assumed-1h` | `tokens.cache_w_assumed` | `tokens` |
+| `price-tier-<tier>`, every tier but `vendor` | `pricing.cost_by_tier.<tier>` | `usd` |
+| `model-unpriced` | `unpriced_model_tokens` | `tokens` |
+| `host-inferred` | `network.items[].host_inferred` | `items` |
+| `subagent-cost-floor` | `subagents.cost_floor_usd` | `usd` |
+| `rate-active-days` | `window.active_days`, when it differs from the calendar dates covered | `days` |
+
+`basis` says in words what was assumed. `volume` has exactly one key. Models
+priced by inference (`unknown_models`) appear as `price-tier-family` or
+`price-tier-default`.
+
+## rejected
+
+Leads actualis evaluated and cleared. `suppressed` is different: a suppressed
+finding is still a finding someone chose to hold back. Added in 0.7.0.
+
+```json
+{"kind": "ioc", "id": "npm:left-pad", "what": "left-pad 1.4.2",
+ "why_cleared": "1.4.2 is outside <1.4.0", "source": "osv-malicious.jsonl:812"}
+```
+
+| `kind` | the lead | `why_cleared` | `source` |
+|---|---|---|---|
+| `ioc` | an installed item whose name an IOC entry lists and whose exact version is outside the entry's range | `<version> is outside <spec>` | the IOC file's name and line |
+| `reputation` | a local hash-prefix candidate that `actualis-reputation confirm` cleared within the cache window | `confirmed not listed at <time>` | `gsb/confirmations.json` |
+| `secret` | a credential-shaped token that failed the shape check (a placeholder, a vendor's published example) | `failed the <type> shape check` | the transcript file and line |
+
+A secret row names the type and the project (`what`), never the value. One
+row per `kind`, `id` and `what`, the newest sighting kept; rows are newest
+first and capped at 200, and `rejected_total` is the uncapped count. Redacted
+unless `--no-redact`. `--verbose` prints them in the text report.
+
 ## Verifying a report
 
 Every report is content-addressed. `report_sha256` is the SHA-256 of the payload
-with four things removed, serialised canonically: the `report_sha256` key itself,
-`pricing.age_days`, `pricing.stale`, and the `AF013` entry in `coach`. The last
-three depend on today's date and not on the transcripts, so excluding them keeps
+with six things removed, serialised canonically: the `report_sha256` key itself,
+`pricing.age_days`, `pricing.stale`, `expiring_7d` in every `coverage.agents[]`
+row, and the `AF013` and `AF014` entries in `coach`. The last five depend on
+today's date and not on the transcripts, so excluding them keeps
 the same transcripts hashing the same tomorrow as today. A real change in
 the data still changes the hash. The report itself prints the first 16
 characters, so a screenshot can be checked against the payload it came from.
@@ -167,7 +281,9 @@ p = json.load(open("report.json"))
 claimed = p.pop("report_sha256")
 p["pricing"].pop("age_days")
 p["pricing"].pop("stale")
-p["coach"] = [f for f in p["coach"] if f["id"] != "AF013"]
+for a in p["coverage"]["agents"]:
+    a.pop("expiring_7d")
+p["coach"] = [f for f in p["coach"] if f["id"] not in ("AF013", "AF014")]
 canonical = json.dumps(p, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 actual = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 print("claimed:", claimed)
@@ -180,7 +296,7 @@ Or in one line, if you have jq 1.7 or later and prefer not to run Python (jq 1.6
 and earlier re-format numbers, so `0.0` becomes `0` and the digest never matches):
 
 ```sh
-jq -Sc 'del(.report_sha256, .pricing.age_days, .pricing.stale) | .coach |= map(select(.id != "AF013"))' report.json | tr -d '\n' | shasum -a 256
+jq -Sc 'del(.report_sha256, .pricing.age_days, .pricing.stale, .coverage.agents[].expiring_7d) | .coach |= map(select(.id != "AF013" and .id != "AF014"))' report.json | tr -d '\n' | shasum -a 256
 ```
 
 Three things about the canonical form, because they are the whole reason two
@@ -569,7 +685,7 @@ claude mcp add actualis -- actualis --mcp
 | `fleet_summary` | window, spend (with `cost_usd_from_unpriced_models` and `unpriced_model_tokens` as in `--json`), cache hit rate, top projects, unsupervised share (`unsupervised_pct` over turns with a recorded mode, with `moded_commands` and `unmoded_commands`) |
 | `ticket_cost` | cost for one ticket, or the most expensive ones |
 | `exposed_secrets` | rotation list: priority, types, fingerprint, dates (`first_seen`/`last_seen` are `""` when unknown, as in `--json`), and `suppressed`/`suppressed_reason` per row. `worth_rotating` leaves out suppressed credentials, as the report does; `suppressed` counts them. `priority` must be `critical`, `high`, `low` or `all` |
-| `coach_findings` | `AF001`–`AF013` with evidence, actions and `project` (the project an AF002/AF006 row is about, else `""`) |
+| `coach_findings` | `AF001`–`AF014` with evidence, actions, `project` (the project an AF002/AF006 row is about, else `""`) and the three [assessment](#assessments) fields |
 | `shell_audit` | counts by category, permission modes, the subagent blind spot |
 | `explain` | how a figure is computed, what it assumes, how to verify it |
 | `verify_agents` | installed agent platforms and their signature status |
