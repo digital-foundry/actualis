@@ -457,5 +457,136 @@ class TestRetryAfterDeny(HomeCase):
         self.assertEqual(f._file_calls, [])
 
 
+class TestOutsideRoot(unittest.TestCase):
+    """#93b: a write outside the session's working directory."""
+
+    def test_targets_outside_the_root_fire(self):
+        for name, inp, shown in (
+                ("Write", {"file_path": "/etc/motd", "content": "x"}, "/etc/motd"),
+                ("Edit", {"file_path": "../other-repo/src/a.py", "old_string": "a", "new_string": "b"},
+                 "~/…/src/a.py"),
+                ("Bash", bash("echo x >> ~/notes.txt"), "~/notes.txt"),
+                ("Bash", bash("printf x | tee -a /srv/shared/log.txt"), "/…/shared/log.txt"),
+                ("Bash", bash("cat a &> /opt/out.log"), "/opt/out.log"),
+                ("Bash", bash("echo a >| /var/www/index.html"), "/…/www/index.html")):
+            with self.subTest(inp=inp):
+                f = guard_fleet()
+                f.add_tool("p", name, inp, TS)
+                [hit] = flags_of(f, "outside-root")
+                self.assertEqual(hit["severity"], "med")
+                self.assertIn(f"wrote {shown} outside orbital", hit["evidence"])
+
+    def test_what_does_not_fire(self):
+        for name, inp in (("Write", {"file_path": "/home/dev/orbital/src/a.py"}),
+                          ("Write", {"file_path": "src/a.py"}),
+                          ("Bash", bash("echo x > build/out.txt")),
+                          ("Bash", bash("make 2>/dev/null")),
+                          ("Bash", bash("echo x > /tmp/scratch.txt")),
+                          ("Bash", bash("echo x > /private/var/folders/ab/T/x")),
+                          ("Bash", bash("echo x > $TMPDIR/x")),
+                          ("Write", {"file_path": "~/.claude/settings.json"}),
+                          ("Write", {"file_path": "/home/dev/.codex/config.toml"}),
+                          ("Bash", bash("echo x > \"$OUT\"")),
+                          ("Bash", bash("ls >&2")),
+                          ("str_replace_editor", {"command": "view", "path": "/etc/hosts"})):
+            with self.subTest(inp=inp):
+                f = guard_fleet()
+                f.add_tool("p", name, inp, TS)
+                self.assertEqual(flags_of(f, "outside-root"), [])
+
+    def test_quoted_redirect_characters_are_not_writes(self):
+        for cmd in ("echo \"a > /etc/b\"", "grep -n '>> /etc/x' notes.md", "git commit -m 'x > /etc/y'"):
+            with self.subTest(cmd=cmd):
+                f = guard_fleet()
+                f.add_tool("p", "Bash", bash(cmd), TS)
+                self.assertEqual(flags_of(f, "outside-root"), [])
+
+    def test_windows_paths(self):
+        cwd = "C:\\Users\\dev\\proj"
+        for target, fires in (("C:\\Users\\dev\\proj\\src\\a.py", False),
+                              ("src\\b.py", False),
+                              ("C:\\Windows\\System32\\drivers\\etc\\hosts", True),
+                              ("C:\\Users\\dev\\AppData\\Local\\Temp\\x.txt", False)):
+            with self.subTest(target=target):
+                f = guard_fleet(cwd)
+                f.add_tool("p", "Write", {"file_path": target, "content": "x"}, TS)
+                self.assertEqual(len(flags_of(f, "outside-root")), int(fires))
+
+    def test_one_flag_per_target_per_file(self):
+        f = guard_fleet()
+        f.add_tool("p", "Bash", bash("echo a >> /etc/motd"), TS)
+        f.add_tool("p", "Bash", bash("echo b >> /etc/motd"), TS)
+        self.assertEqual(len(flags_of(f, "outside-root")), 1)
+        f._start_file(Path("t.jsonl"), Path("."))
+        f._cwd = CWD
+        f.add_tool("p", "Bash", bash("echo c >> /etc/motd"), TS)
+        self.assertEqual(len(flags_of(f, "outside-root")), 2)
+
+    def test_no_cwd_is_counted_never_flagged(self):
+        f = guard_fleet(cwd=None)
+        f.add_tool("p", "Write", {"file_path": "/etc/motd"}, TS)
+        f.add_tool("p", "Bash", bash("echo x > \"$OUT\""), TS)
+        self.assertEqual(flags_of(f, "outside-root"), [])
+        row = next(c for c in af.coverage(f)["checks"] if c["check"] == "writes")
+        self.assertEqual((row["examined"], row["why_not"]), (0, {"no-cwd": 1, "unresolved": 1}))
+
+    def test_the_writes_check_counts_what_was_read(self):
+        f = guard_fleet()
+        f.add_tool("p", "Write", {"file_path": "src/a.py"}, TS)
+        f.add_tool("p", "Bash", bash("echo x > /etc/motd"), TS)
+        row = next(c for c in af.coverage(f)["checks"] if c["check"] == "writes")
+        self.assertEqual((row["examined"], row["not_examined"]), (2, 0))
+        self.assertTrue(af.coverage(f)["ok"])
+
+
+class TestOutsideRootPerAgent(HomeCase):
+    """Each scanner hands the session's working directory to the check."""
+
+    def test_claude(self):
+        f = self.claude_fleet([claude_call("u1", "t1", "Write", {"file_path": "/etc/motd", "content": "x"},
+                                           recent())])
+        self.assertEqual(len(flags_of(f, "outside-root")), 1)
+
+    def test_codex_reads_each_command_against_its_workdir(self):
+        root = self.home / "codex-sessions"
+        ts = iso(recent())
+
+        def call(cid, cmd, workdir):
+            return json.dumps({"timestamp": ts, "type": "response_item", "payload": {
+                "type": "function_call", "name": "shell_command", "call_id": cid,
+                "arguments": json.dumps({"command": cmd, "workdir": workdir})}})
+
+        write_lines(root / "2026" / "11" / "rollout-1.jsonl", [
+            json.dumps({"timestamp": ts, "type": "session_meta", "payload": {"id": "cx1", "cwd": CWD}}),
+            call("k1", "echo x > /srv/elsewhere/notes.txt", "/srv/elsewhere"),
+            call("k2", "echo y > /etc/motd", CWD)])
+        f = af.Fleet()
+        f.suppressions = {}
+        f.scan_codex([root], None, None)
+        hits = flags_of(f, "outside-root")
+        self.assertEqual(len(hits), 1, hits)
+        self.assertIn("/etc/motd", hits[0]["evidence"])
+
+    def test_copilot(self):
+        state = copilot_events(self.home / "copilot-state", "cp2", [
+            fx._start("cp2", CWD, "main", "2026-11-01T10:00:00.000Z"),
+            fx._bash("c1", "echo '127.0.0.1 x' >> /etc/hosts", "2026-11-01T10:01:00.000Z")])
+        f = af.Fleet()
+        f.suppressions = {}
+        f.scan_copilot([state], None, None)
+        self.assertEqual(len(flags_of(f, "outside-root")), 1)
+
+    def test_qwen(self):
+        root = self.home / "qwen-projects"
+        write_lines(root / "-home-dev-orbital" / "chats" / "q2.jsonl", [
+            qwen_call("a1", "k1", "write_file", {"file_path": "/etc/motd", "content": "x"},
+                      "2026-11-01T10:00:00Z"),
+            qwen_result("a2", "k1", "2026-11-01T10:00:05Z")])
+        f = af.Fleet()
+        f.suppressions = {}
+        f.scan_qwen([root], None, None)
+        self.assertEqual(len(flags_of(f, "outside-root")), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

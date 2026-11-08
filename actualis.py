@@ -9319,6 +9319,27 @@ def retry_keys(name: str, tool_input: dict, cwd: str | None, items: list,
     return frozenset(keys)
 
 
+OUTSIDE_ROOT_CATEGORY = "outside-root"
+# Never outside-root: temp and device paths, and the agents' own config
+# directories (writes there are a separate question).
+_WRITE_EXCLUDED = re.compile(
+    r"^(?:/tmp|/private/tmp|/var/tmp|/private/var/tmp|/var/folders|/private/var/folders|/dev)(?:/|$)"
+    r"|^[a-z]:/(?:windows/temp|users/[^/]+/appdata/local/temp)(?:/|$)", re.IGNORECASE)
+_AGENT_CONFIG_DIR = re.compile(
+    r"^(?:~|/Users/[^/]+|/home/[^/]+|/root|[a-z]:/users/[^/]+)/\.(?:claude|codex|gemini|qwen|copilot)(?:/|$)",
+    re.IGNORECASE)
+_TMPDIR_VAR = re.compile(r"^\$(?:TMPDIR|\{TMPDIR\})(?:/|$)")
+
+
+def _inside(path: str, root: str) -> bool:
+    """Whether a normalised path is the root or under it; Windows paths
+    compare without case."""
+    if _WIN_DRIVE.match(root) or _WIN_DRIVE.match(path):
+        path, root = path.lower(), root.lower()
+    root = root.rstrip("/") or "/"
+    return path == root or path.startswith(root if root == "/" else root + "/")
+
+
 def _target_shown(cls: str, target: str, home: str | None) -> str:
     """A retry target for evidence: a host as is, a path shortened."""
     return clean(target)[:120] if cls in _RETRY_HOST_CLASSES else _short_path(target, home)
@@ -9546,6 +9567,12 @@ class Fleet:
         self._cwd: str | None = None
         self._file_calls: list[dict] = []
         self._file_calls_by_id: dict[str, dict] = {}
+        # outside-root: targets already flagged in this file, and what the
+        # coverage check `writes` reports.
+        self._outside_seen: set[str] = set()
+        self.writes_examined = 0
+        self.writes_no_cwd = 0
+        self.writes_unresolved = 0
 
     # -- ingest ------------------------------------------------------------
 
@@ -10558,7 +10585,8 @@ class Fleet:
                     call_id: str | None, items: list,
                     matches: "list[tuple[str, str, str]] | tuple" = (),
                     shapes: "list[str] | tuple" = ()) -> None:
-        """Remember one call for the retry match at the end of its file."""
+        """Check what one call writes against the session root, and remember
+        the call for the retry match at the end of its file."""
         if not self._guardrails or self.network_only:
             return
         cwd = self._cwd
@@ -10566,6 +10594,8 @@ class Fleet:
         cmd = cmd if isinstance(cmd, str) else ""
         program = (display_head(cmd) or "?") if name == "Bash" else (clean(name)[:48] or "?")
         writes = write_targets(name, tool_input)
+        if writes:
+            self._check_writes(project, program, writes, cwd, ts)
         keys = retry_keys(name, tool_input, cwd, items, {c for _s, c, _l in matches}, shapes, writes)
         if not keys or len(self._file_calls) >= RETRY_CALLS_MAX:
             return
@@ -10575,6 +10605,37 @@ class Fleet:
         self._file_calls.append(entry)
         if call_id:
             self._file_calls_by_id[str(call_id)] = entry
+
+    def _check_writes(self, project: str, program: str, targets: list[str], cwd: str | None,
+                      ts: datetime | None) -> None:
+        """outside-root: each literal write target outside the session's cwd,
+        once per target per file. /dev is not a write; temp directories and
+        the agents' config directories are left out; a variable target is
+        counted unresolved, and a session with no cwd no-cwd, never flagged."""
+        root = resolve_target(cwd, None) if cwd else None
+        home = _home_of(cwd)
+        for t in dict.fromkeys(targets):
+            raw = t.replace("\\", "/")
+            if raw.startswith("/dev/") or _TMPDIR_VAR.match(raw):
+                continue
+            if "$" in raw or "`" in raw:
+                self.writes_unresolved += 1
+                continue
+            if root is None:
+                self.writes_no_cwd += 1
+                continue
+            p = resolve_target(t, cwd)
+            if p is None:
+                self.writes_unresolved += 1
+                continue
+            self.writes_examined += 1
+            if _inside(p, root) or _WRITE_EXCLUDED.match(p) or _AGENT_CONFIG_DIR.match(p) \
+                    or p in self._outside_seen:
+                continue
+            self._outside_seen.add(p)
+            where = clean(root.rstrip("/").rsplit("/", 1)[-1])[:60] or "/"
+            self._guard_flag("med", OUTSIDE_ROOT_CATEGORY, clean(program)[:40], project, ts,
+                             f"{program} wrote {_short_path(p, home)} outside {where}")
 
     def _guard_flag(self, severity: str, category: str, program: str, project: str,
                     ts: datetime | None, evidence: str) -> None:
@@ -10883,6 +10944,7 @@ class Fleet:
         The previous file's retry match runs first."""
         self._flush_retries()
         self._cwd = None
+        self._outside_seen = set()
         self._mode = None
         self._prompt = None
         self._why_id, self._why_prior = None, []
@@ -17148,7 +17210,10 @@ def coverage(fleet: Fleet) -> dict:
     checks = [_check("credentials", fleet.bash_total - fleet.unreadable, shell_why),
               _check("shell", fleet.bash_total - fleet.unreadable, shell_why),
               _check("records", fleet.lines_read - fleet.unparsable_lines,
-                     {"unparsable-line": fleet.unparsable_lines})]
+                     {"unparsable-line": fleet.unparsable_lines}),
+              # Write targets read against the session's working directory (outside-root).
+              _check("writes", fleet.writes_examined,
+                     {"no-cwd": fleet.writes_no_cwd, "unresolved": fleet.writes_unresolved})]
     if fleet.network_requested or fleet.ioc is not None:
         checks.append(_check("network", len(fleet.network_items),
                              {"unparsed-segment": fleet.network_unparsed}))

@@ -579,7 +579,7 @@ class TestCoverageLedger(HomeCase):
             "agent": "claude-code", "root_exists": True, "files_read": 1, "files_unreadable": 0,
             "dirs_unreadable": 0, "files_skipped_mtime": 0, "oldest": af._utc_date(path.stat().st_mtime),
             "retention_days": 30, "retention_source": "default", "expiring_7d": 0}])
-        self.assertEqual([c["check"] for c in cov["checks"]], ["credentials", "shell", "records"])
+        self.assertEqual([c["check"] for c in cov["checks"]], ["credentials", "shell", "records", "writes"])
         creds = cov["checks"][0]
         self.assertEqual((creds["examined"], creds["not_examined"], creds["why_not"]), (1, 0, {}))
 
@@ -636,7 +636,7 @@ class TestCoverageLedger(HomeCase):
         payload = json.loads(out)
         self.assertEqual(schema_drift(payload), [])
         self.assertEqual([c["check"] for c in payload["coverage"]["checks"]],
-                         ["credentials", "shell", "records", "network", "ioc"])
+                         ["credentials", "shell", "records", "writes", "network", "ioc"])
 
     def test_the_keys_are_documented(self):
         doc = (ROOT / "docs" / "json.md").read_text(encoding="utf-8")
