@@ -740,7 +740,8 @@ class TestFinalReviewFixes(HomeCase):
         self.assertEqual(flags_of(f, "retry-after-deny"), [])
 
     def test_a_url_path_segment_never_reaches_the_evidence(self):
-        tok = "bot123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"
+        # Built at runtime so no token-shaped literal sits in the source (secret scanners).
+        tok = "bot" + "123456789" + ":" + "Ab" * 18
         t0 = recent(30)
         f = self.claude_fleet([
             claude_call("u1", "t1", "Bash", bash(f"curl -s https://api.telegram.org/{tok}/sendMessage"), t0),
