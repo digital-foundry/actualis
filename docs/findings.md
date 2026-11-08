@@ -28,6 +28,31 @@ user, and it is why the thresholds below are mostly relative rather than absolut
 | [AF013](#af013) | high / info | the rate table has not been checked in over 90 days |
 | [AF014](#af014) | info | Claude Code deletes transcripts within 7 days (`cleanupPeriodDays`) |
 
+## Assessments
+
+Every finding, coach finding or shell-audit flag, carries an `assessment`
+(`confirmed` or `needs-validation`), a `basis` (`observed`: read from the
+transcript, or `inferred`: derived by actualis) and, when it needs
+validation, `missing`: the fact the check lacked. Severity does not change
+with it, and neither does `--fail-on`. Leads actualis checked and cleared are
+not findings; they are listed in `rejected` in `--json` (`--verbose` prints them).
+
+| finding | assessment | basis | missing |
+|---|---|---|---|
+| shell-audit rules, `network-config`, `network-unasked`, `audit-config` | confirmed | observed | |
+| `oversized-command` | needs-validation | observed | command longer than what is read; the rest was not checked |
+| credentials (`secrets[]`) | confirmed | observed | |
+| `network-ioc` | confirmed | observed | |
+| `network-ioc-unresolved` | needs-validation | observed (inferred for reason `name-from-url`) | the IOC reason: version not resolved, undecidable, private registry, name from URL, … |
+| `reputation-listed` | confirmed | observed | |
+| `reputation-candidate` | needs-validation | observed | local hash-prefix match; run actualis-reputation confirm |
+| `reputation-suspicious` | needs-validation | observed | VirusTotal engines call it suspicious, none malicious; review the host |
+| `reputation-stale` | needs-validation | observed | lists are N days old |
+| AF001, AF003–AF010, AF012, AF013 | confirmed | observed | |
+| AF002 | confirmed | inferred | |
+| AF011 | needs-validation | observed | agent writes no shell records |
+| AF014 | confirmed | inferred | |
+
 ## Network findings
 
 Shell-audit findings (`bash.flags[]`) raised from the network inventory. Each

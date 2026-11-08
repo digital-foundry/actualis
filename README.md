@@ -683,6 +683,39 @@ Private and local hosts are never looked up or sent. VirusTotal
 text. Both providers are free for non-commercial use only. Setup, what is
 sent, diagrams, accuracy and licensing: [docs/reputation.md](docs/reputation.md).
 
+## Coverage: what the report could see
+
+A clean report used to look the same whether actualis read everything or could
+not look. Now the report ends with one line that says which:
+
+```
+Coverage   complete · claude-code from 2026-10-08 (keeps 30d) · codex from 2026-09-01
+```
+
+or, when something was out of reach:
+
+```
+Coverage   2 gaps
+    ! reputation lists are 9 days old
+    ! 3 transcript files could not be read (claude-code)
+```
+
+A gap is one of: an agent whose transcript directory exists but had nothing
+read in the window, a transcript file that could not be opened, more than 1% of
+lines that would not parse, `--days` reaching further back than the agent keeps
+transcripts ("asked for 90 days; Claude Code keeps 30"), downloads `--ioc` could
+not check, and reputation lists over 7 days old. `--json` carries the same
+ledger per agent and per check as `coverage`, with `assumptions` (every number
+derived rather than read) and `rejected` (leads checked and cleared, which
+`--verbose` prints); see [docs/json.md](docs/json.md#coverage).
+
+Every finding also says whether it is `confirmed` or `needs-validation`, and
+what is missing when it needs validation ([docs/findings.md](docs/findings.md#assessments)).
+
+How far back the data goes depends on the agent. Claude Code deletes
+transcripts older than `cleanupPeriodDays` (default 30) in its `settings.json`;
+actualis reads that one key, and AF014 warns a week before sessions go.
+
 ## Using it in CI
 
 An exit code is the smallest possible integration, and it fits the read-only
@@ -699,6 +732,7 @@ actualis --days 7 --fail-on critical
 | `2` | a usage error: a bad flag, a flag combination the tool cannot honour, or an unusable `--ioc` or trust file |
 | `3` | findings at or above `--fail-on` |
 | `4` | `--self-check`: a check failed |
+| `5` | `--fail-on-coverage`: a coverage gap (`3` wins when both apply) |
 | `130` | interrupted |
 
 Findings are **3**, not 1 and not 2. `1` already meant "could not run", and `2`
@@ -734,6 +768,17 @@ pipeline can capture the report and the outcome separately:
 
 ```sh
 actualis --json --fail-on high > report.json || echo "gate failed"
+```
+
+A pass means nothing at or above the threshold was found in what was read. To
+fail when the run could not read everything it was asked to (a transcript file
+it could not open, `--days` past what the agent keeps, downloads the IOC list
+could not check), add `--fail-on-coverage`: any gap exits `5`, findings at
+`--fail-on` still exit `3` first, and the stderr verdict lists the gaps. Without
+it, gaps are reported and never change the exit code.
+
+```sh
+actualis --days 7 --fail-on high --fail-on-coverage
 ```
 
 ### Auditing an agent that ran *in* CI

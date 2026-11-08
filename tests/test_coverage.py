@@ -1050,5 +1050,31 @@ class TestDiffAssessmentsAndCoverage(unittest.TestCase):
         self.assertIn("coverage.gaps", str(cm.exception))
 
 
+class TestCoverageDocs(unittest.TestCase):
+    """Task 7: the README, docs/findings.md and the CHANGELOG say all of it."""
+
+    def test_the_readme(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        for needle in ("## Coverage: what the report could see", "`--fail-on-coverage`",
+                       "| `5` | `--fail-on-coverage`", "cleanupPeriodDays", "`--verbose`",
+                       "actualis --days 7 --fail-on high --fail-on-coverage"):
+            self.assertIn(needle, readme)
+
+    def test_findings_md_has_the_assessment_table(self):
+        doc = (ROOT / "docs" / "findings.md").read_text(encoding="utf-8")
+        self.assertIn("## Assessments", doc)
+        for key, (assessment, basis, missing) in af._ASSESSMENT.items():
+            if missing and key not in ("network-ioc-unresolved", "reputation-stale"):
+                with self.subTest(key=key):
+                    self.assertIn(missing, doc)
+
+    def test_the_changelog(self):
+        text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        unreleased = text.split("## Unreleased", 1)[1].split("\n## ", 1)[0]
+        for needle in ("--fail-on-coverage", "AF014", "`assessment`", "`rejected`",
+                       "cleanupPeriodDays", "--explain coverage"):
+            self.assertIn(needle, unreleased)
+
+
 if __name__ == "__main__":
     unittest.main()
