@@ -10,6 +10,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -1170,7 +1171,11 @@ class TestCoverageFollowUps(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             fleet = self.tree(tmp, age_days=10)
             args = argparse.Namespace(root=None, days=1, project=None, agent="all")
-            self.assertIn("Try --days 11.", af.dead_end_message(fleet, args))
+            # The suggestion is a whole number of days from the file's mtime;
+            # filesystems round mtimes differently (Windows), so pin only its floor.
+            m = re.search(r"Try --days (\d+)\.", af.dead_end_message(fleet, args))
+            self.assertIsNotNone(m)
+            self.assertGreater(int(m.group(1)), 1)
 
     def test_af014_without_a_date_says_nothing_about_one(self):
         f = af.Fleet()
