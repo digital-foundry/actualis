@@ -445,6 +445,14 @@ def pricing_age_days(today: datetime | None = None) -> int:
 
 Rule = tuple[str, str, str]  # (severity, category, regex)
 
+# A payload decoded and handed to a shell (`echo … | base64 -d | sh`): what runs
+# is not in the transcript at all. Options, arguments and blanks are bounded and
+# blanks are spaces or tabs only, so the scan is linear and stays on one line.
+# -D is macOS's spelling; the rules ignore case.
+_B64_TO_SHELL = (r"\bbase64[ \t]{1,64}(?:-[A-Za-z-]{1,16}[ \t]{1,64}){0,4}?(?:-d|--decode)\b"
+                 r"(?:[ \t]{1,64}[^\s|;&]{1,256}){0,4}?[ \t]{0,64}\|[ \t]{0,16}"
+                 r"(?:sudo[ \t]{1,16})?(?:ba|z|k|da)?sh\b")
+
 BASH_RULES: list[Rule] = [
     # --- destructive filesystem ---
     # Combined (-rf, -fr) or split (-r -f, --recursive --force) flags, after up
@@ -485,6 +493,7 @@ BASH_RULES: list[Rule] = [
                                  r"(?!\s+-(?:c|e|m|p)\b)"),
     ("med",  "remote-exec",      r"\bnpx\s+(-y\s+)?https?://"),
     ("med",  "remote-exec",      r"\bpip\s+install\b[^|;\n]{0,512}\bhttps?://"),
+    ("high", "remote-exec",      _B64_TO_SHELL),
 
     # --- credential and secret access ---
     ("high", "credentials",      r"(cat|less|more|head|tail|strings|cp|scp|base64)\b[^|;\n]{0,512}"
@@ -558,6 +567,7 @@ RULE_PREFILTERS: list[tuple[str, ...] | None] = [
     ("curl", "wget"),                                   # ... | python
     ("npx",),
     ("pip",),
+    ("base64",),                                        # base64 -d | sh
     (".env", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", ".pem", ".p12", "credentials", ".netrc", ".npmrc", ".pypirc"),
     ("find-generic-password", "find-internet-password"),
     ("env",),                                           # printenv | env
@@ -598,6 +608,7 @@ _RULE_REQUIRES_BY_PATTERN: dict[str, tuple[str, ...]] = {
     r"\bgit\s+push\b[^|;\n]{0,512}\s(--force|-f)\b": ("-f",),
     r"\b(psql|mysql|mongosh)\b[^|;\n]{0,512}-c\b": ("-c",),
     r"\bpip\s+install\b[^|;\n]{0,512}\bhttps?://": ("http",),
+    _B64_TO_SHELL: ("|",),
 }
 RULE_REQUIRES: list[tuple[str, ...] | None] = [_RULE_REQUIRES_BY_PATTERN.get(p) for _s, _c, p in BASH_RULES]
 # Rules anchored at the line start (`^…`) are linear on a whole line of any
@@ -659,6 +670,23 @@ UNREADABLE_SHAPES = (
     ("inline script reaching the network",
      re.compile(r"(?m)^(?=[^\n]*?\b(?:python[0-9.]*|node|perl)\s+(?:-\S+\s+){0,8}?-[ce]\s)"
                 r"(?=[^\n]*(?:\b(?:urllib|requests|fetch|http\.client|socket)|LWP)\b)")),
+    # `X=1 ${C} …`: the program is a variable behind assignments. At most 8
+    # assignments, each value and blank run bounded, so each start is bounded.
+    ("runs a variable after assignments",
+     re.compile(r"(?:^|[|&;(])\s*(?:[A-Za-z_][A-Za-z0-9_]{0,63}=[^\s|&;]{0,256}[ \t]{1,64}){1,8}"
+                r"[\"']?\$[A-Za-z_{]")),
+    # Interpreters the inline-script row above does not cover, when the script
+    # names a network API: ruby, bun, php, and node's require('http(s)').
+    ("interpreter reaching the network",
+     re.compile(r"(?m)^(?:(?=[^\n]*?(?:\b(?:ruby|bun)\s+(?:-\S+\s+){0,8}?-e|\bphp\s+(?:-\S+\s+){0,8}?-r)\s)"
+                r"(?=[^\n]*(?:\bopen-uri\b|Net::HTTP|\bfile_get_contents\b|\bcurl_exec\b|\bfsockopen\b"
+                r"|\bfetch\b|\brequire\(\s*[\"'](?:node:)?https?[\"']))"
+                r"|(?=[^\n]*?\bnode\s+(?:-\S+\s+){0,8}?-[ep]\s)"
+                r"(?=[^\n]*\brequire\(\s*[\"'](?:node:)?https?[\"']))")),
+    # exec(…b64decode(…)): the code that runs is encoded in the command.
+    ("inline script running decoded code",
+     re.compile(r"(?m)^(?=[^\n]*?\b(?:exec|eval)\s*\()(?=[^\n]*?\bb64decode\b)")),
+    ("decodes data into a shell", re.compile(_B64_TO_SHELL, re.IGNORECASE)),
 )
 
 # Lowercase literals per UNREADABLE_SHAPES row, as RULE_PREFILTERS is per rule.
@@ -672,6 +700,10 @@ SHAPE_PREFILTERS: list[tuple[str, ...] | None] = [
     ("$'",),                                            # ANSI-C quoting
     ("$(", "`"),                                        # pipes a substitution to a shell
     ("urllib", "requests", "fetch", "http.client", "socket", "lwp"),
+    ("$",),                                             # runs a variable after assignments
+    ("ruby", "bun", "php", "node"),                     # interpreter reaching the network
+    ("b64decode",),                                     # inline script running decoded code
+    ("base64",),                                        # decodes data into a shell
 ]
 
 
