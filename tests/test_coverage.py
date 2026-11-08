@@ -466,7 +466,9 @@ class TestRetention(HomeCase):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             af.self_check(af.C(False), days=1)
-        out = buf.getvalue()
+        # The report wraps at 80 columns; a long temp path (Windows) moves the
+        # break, so compare with the line breaks folded to spaces.
+        out = " ".join(buf.getvalue().split())
         self.assertIn(str(af.claude_settings_path()), out)
         self.assertIn("one key", out)
 
