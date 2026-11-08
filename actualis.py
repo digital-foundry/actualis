@@ -8786,6 +8786,26 @@ def _agent_root(root: Path, agent: str) -> Path:
     return sub if sub.is_dir() else root
 
 
+def _listable(d: Path) -> bool:
+    """Whether d can be listed. pathlib's glob() and rglob() skip a directory
+    they cannot open without a word; coverage counts it instead."""
+    try:
+        with os.scandir(d):
+            return True
+    except OSError:
+        return False
+
+
+def _chats_listable(d: Path) -> bool:
+    """A Gemini or Qwen project directory and its chats/ can both be listed."""
+    chats = d / "chats"
+    try:
+        has_chats = chats.exists()
+    except OSError:
+        has_chats = False
+    return _listable(d) and (not has_chats or _listable(chats))
+
+
 def _project_dirs(root: Path) -> list[Path]:
     """Per-project directories under a Gemini tmp or Qwen projects root. A
     root that is itself one project (it holds chats/) is that project."""
@@ -9266,6 +9286,7 @@ class Fleet:
         # retention horizon needs. See _root_seen and coverage().
         self.agent_roots: dict[str, dict] = {}
         self.files_unreadable = 0
+        self.dirs_unreadable = 0
         self.files_skipped_mtime = 0
         # Lines handed to the JSON decoder: the denominator unparsable_lines
         # is a share of. Claude lines the prefilter skips are not decoded.
@@ -9502,6 +9523,8 @@ class Fleet:
         if roots:
             self._root_seen("codex")
         for root in roots:
+            for _ in os.walk(root, onerror=lambda _exc: self._dir_unreadable("codex")):
+                pass
             for f in sorted(root.rglob("rollout-*.jsonl")):
                 self._scan_codex_file(f, since, project_filter, root)
         sessions, self._codex_sessions = self._codex_sessions, None
@@ -9703,6 +9726,13 @@ class Fleet:
         if roots:
             self._root_seen("copilot")
         for root in roots:
+            try:
+                session_dirs = [d for d in root.iterdir() if d.is_dir()]
+            except OSError:
+                session_dirs = []
+            for d in session_dirs:
+                if not _listable(d):
+                    self._dir_unreadable("copilot")
             for f in sorted(root.glob("*/events.jsonl")):
                 self._scan_copilot_file(f, since, project_filter, root)
 
@@ -9989,6 +10019,9 @@ class Fleet:
                 project = path_project(real) if real else pretty_project(d.name)
                 if project_filter and project_filter.lower() not in project.lower():
                     continue
+                if not _chats_listable(d):
+                    self._dir_unreadable("gemini")
+                    continue
                 for f in gemini_session_files(d):
                     self._scan_gemini_file(f, project, real, since, root)
 
@@ -10071,6 +10104,9 @@ class Fleet:
             self._root_seen("qwen")
         for root in roots:
             for d in _project_dirs(root):
+                if not _chats_listable(d):
+                    self._dir_unreadable("qwen")
+                    continue
                 for f in qwen_session_files(d):
                     self._scan_qwen_file(f, d.name, since, project_filter, root)
 
@@ -10488,6 +10524,9 @@ class Fleet:
             if progress:
                 print(f"\r  scanning {i}/{len(dirs)}  {project[:48]:<48}",
                       end="", file=sys.stderr, flush=True)
+            if not _listable(d):
+                self._dir_unreadable("claude-code")
+                continue
             # Sorted: which copy of a repeated message is kept decides its day,
             # branch and ticket, so the order must not be the filesystem's.
             for f in sorted(d.glob("*.jsonl")):
@@ -10516,13 +10555,19 @@ class Fleet:
     def _root_seen(self, agent: str) -> dict:
         """The coverage row of an agent whose transcript root this run scans."""
         return self.agent_roots.setdefault(agent, {
-            "exists": True, "files_read": 0, "files_unreadable": 0,
+            "exists": True, "files_read": 0, "files_unreadable": 0, "dirs_unreadable": 0,
             "files_skipped_mtime": 0, "oldest_mtime": None, "mtimes": {}})
 
     def _file_unreadable(self, agent: str) -> None:
         """A transcript file that failed stat or open: skipped, as always, and now counted."""
         self._root_seen(agent)["files_unreadable"] += 1
         self.files_unreadable += 1
+
+    def _dir_unreadable(self, agent: str) -> None:
+        """A project or session directory that could not be listed: what is
+        inside it was never seen, so it is counted, not passed over."""
+        self._root_seen(agent)["dirs_unreadable"] += 1
+        self.dirs_unreadable += 1
 
     def _file_skipped(self, agent: str, root: "Path | str | None", mtime: float) -> None:
         """A file the --days prefilter left out: older than the window by mtime."""
@@ -16416,6 +16461,7 @@ JSON_SCHEMA: dict[str, str] = {
     "coverage.agents[].root_exists": "bool",
     "coverage.agents[].files_read": "int",
     "coverage.agents[].files_unreadable": "int",
+    "coverage.agents[].dirs_unreadable": "int",
     "coverage.agents[].files_skipped_mtime": "int",
     "coverage.agents[].oldest": "str|null",
     "coverage.agents[].retention_days": "int|null",
@@ -16681,6 +16727,7 @@ def _coverage_agents(fleet: Fleet, now: "float | None" = None) -> list[tuple[dic
         out.append(({"agent": agent, "root_exists": row is not None,
                      "files_read": row["files_read"] if row else 0,
                      "files_unreadable": row["files_unreadable"] if row else 0,
+                     "dirs_unreadable": row.get("dirs_unreadable", 0) if row else 0,
                      "files_skipped_mtime": row["files_skipped_mtime"] if row else 0,
                      "oldest": _utc_date(row["oldest_mtime"]) if row else None,
                      "retention_days": days, "retention_source": ret["retention_source"],
@@ -16725,12 +16772,18 @@ def coverage(fleet: Fleet) -> dict:
     gaps: list[str] = []
     for row in agents:
         agent, label = row["agent"], _AGENT_LABEL.get(row["agent"], row["agent"])
-        if row["root_exists"] and row["files_read"] == 0:
+        # --project is scope: an agent that keeps no such project read nothing
+        # because there was nothing to read, which is not a gap. What it could
+        # not open or list still is.
+        if row["root_exists"] and row["files_read"] == 0 and not fleet.scope.get("project"):
             skipped = row["files_skipped_mtime"]
             gaps.append(f"{agent}: no transcript file read"
                         + (f" ({skipped} older than --days {days} skipped)" if skipped and days else ""))
         if row["files_unreadable"]:
             gaps.append(f"{_plural(row['files_unreadable'], 'transcript file')} could not be read ({agent})")
+        if row["dirs_unreadable"]:
+            n = row["dirs_unreadable"]
+            gaps.append(f"{n} project director{'y' if n == 1 else 'ies'} could not be listed ({agent})")
         keep = row["retention_days"]
         if row["retention_source"] in ("settings", "default") and keep is not None \
                 and isinstance(days, int) and days > keep:

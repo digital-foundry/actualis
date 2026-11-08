@@ -572,7 +572,7 @@ class TestCoverageLedger(HomeCase):
         self.assertEqual((cov["ok"], cov["gaps"]), (True, []))
         self.assertEqual(cov["agents"], [{
             "agent": "claude-code", "root_exists": True, "files_read": 1, "files_unreadable": 0,
-            "files_skipped_mtime": 0, "oldest": af._utc_date(path.stat().st_mtime),
+            "dirs_unreadable": 0, "files_skipped_mtime": 0, "oldest": af._utc_date(path.stat().st_mtime),
             "retention_days": 30, "retention_source": "default", "expiring_7d": 0}])
         self.assertEqual([c["check"] for c in cov["checks"]], ["credentials", "shell", "records"])
         creds = cov["checks"][0]
@@ -1074,6 +1074,62 @@ class TestCoverageDocs(unittest.TestCase):
         for needle in ("--fail-on-coverage", "AF014", "`assessment`", "`rejected`",
                        "cleanupPeriodDays", "--explain coverage"):
             self.assertIn(needle, unreleased)
+
+
+class TestFinalReviewFixes(HomeCase):
+    """Final review: --project is scope, not a gap; a project directory that
+    cannot be listed is a gap, not silence."""
+
+    def test_an_agent_without_the_project_is_not_a_gap(self):
+        f = af.Fleet()
+        f._root_seen("claude-code")
+        self.assertEqual(af.coverage(f)["gaps"], ["claude-code: no transcript file read"])
+        f.scope["project"] = "atlas"
+        self.assertEqual(af.coverage(f)["gaps"], [])
+
+    def test_project_scope_still_reports_what_could_not_be_read(self):
+        f = af.Fleet()
+        f.scope["project"] = "atlas"
+        f._file_unreadable("claude-code")
+        self.assertEqual(af.coverage(f)["gaps"], ["1 transcript file could not be read (claude-code)"])
+
+    @unittest.skipIf(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                     "permission bits do not stop Windows or root")
+    def test_a_project_directory_that_cannot_be_listed_is_a_gap(self):
+        good = self.claude(assistant("m1", recent()), project="-home-dev-orbital")
+        claude_bad = self.projects / "-home-dev-atlas"
+        write_session(claude_bad, "s.jsonl", [assistant("m2", recent())])
+        gemini = self.home / "gemini" / "tmp"
+        write_session(gemini / "orbital" / "chats", "session-1.jsonl", ['{"sessionId": "x"}'])
+        qwen = self.home / "qwen" / "projects"
+        write_session(qwen / "-home-dev-orbital" / "chats", "s.jsonl", ['{"type": "user"}'])
+        copilot = self.home / "copilot"
+        write_session(copilot / "sid", "events.jsonl", ['{"type": "session.start"}'])
+        codex = self.home / "codex"
+        write_session(codex / "2026" / "11", "rollout-1.jsonl", ['{"type": "session_meta"}'])
+        locked = [claude_bad, gemini / "orbital", qwen / "-home-dev-orbital", copilot / "sid", codex / "2026"]
+        for d in locked:
+            d.chmod(0)
+        try:
+            f = af.Fleet()
+            f.scan([self.projects], None, None, False)
+            f.scan_gemini([gemini], None, None)
+            f.scan_qwen([qwen], None, None)
+            f.scan_copilot([copilot], None, None)
+            f.scan_codex([codex], None, None)
+        finally:
+            for d in locked:
+                d.chmod(0o700)
+        for agent in ("claude-code", "gemini", "qwen", "copilot", "codex"):
+            with self.subTest(agent=agent):
+                self.assertEqual(f.agent_roots[agent]["dirs_unreadable"], 1)
+        self.assertEqual(f.agent_roots["claude-code"]["files_read"], 1, good)
+        gaps = af.coverage(f)["gaps"]
+        self.assertIn("1 project directory could not be listed (claude-code)", gaps)
+        self.assertIn("1 project directory could not be listed (codex)", gaps)
+        rows = {r["agent"]: r for r in af.coverage(f)["agents"]}
+        self.assertEqual(rows["claude-code"]["dirs_unreadable"], 1)
+        self.assertEqual(af.JSON_SCHEMA["coverage.agents[].dirs_unreadable"], "int")
 
 
 if __name__ == "__main__":
