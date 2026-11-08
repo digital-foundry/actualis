@@ -377,5 +377,185 @@ class TestCoverageCounters(HomeCase):
         self.assertEqual(f.agent_roots["claude-code"]["files_read"], 1)
 
 
+class TestRetention(HomeCase):
+    """Task 3: cleanupPeriodDays from Claude Code's settings.json, one key."""
+
+    def claude_retention(self):
+        r = af.read_retention()["claude-code"]
+        return r["retention_days"], r["retention_source"]
+
+    def test_the_documented_cases(self):
+        cases = (('{"cleanupPeriodDays": 14}', (14, "settings")),
+                 ('{"theme": "dark"}', (30, "default")),
+                 (None, (None, "unknown")),
+                 ("{not json", (None, "unknown")),
+                 ('{"cleanupPeriodDays": "14"}', (None, "unknown")),
+                 ('{"cleanupPeriodDays": 0}', (0, "settings")))
+        for text, want in cases:
+            with self.subTest(text=text):
+                path = self.home / ".claude" / "settings.json"
+                if path.exists():
+                    path.unlink()
+                if text is not None:
+                    self.settings(text)
+                self.assertEqual(self.claude_retention(), want)
+
+    def test_the_other_agents(self):
+        r = af.read_retention()
+        self.assertEqual(r["codex"], {"retention_days": None, "retention_source": "none"})
+        for agent in ("copilot", "gemini", "qwen"):
+            self.assertEqual(r[agent], {"retention_days": None, "retention_source": "unknown"})
+
+    def test_odd_values_and_odd_files_are_unknown_never_an_error(self):
+        for text in ("true", "[30]", '{"cleanupPeriodDays": true}', '{"cleanupPeriodDays": 14.0}',
+                     '{"cleanupPeriodDays": -1}', '{"cleanupPeriodDays": null}', "",
+                     b'\xff\xfe{"cleanupPeriodDays": 14}',
+                     '{"cleanupPeriodDays": 14, "pad": "' + "x" * af.SETTINGS_MAX + '"}'):
+            with self.subTest(text=text[:40]):
+                self.settings(text)
+                self.assertEqual(self.claude_retention(), (None, "unknown"))
+        self.settings('{"cleanupPeriodDays": ' + "9" * 40 + "}")
+        self.assertEqual(self.claude_retention(), (af.MAX_DAYS, "settings"))
+
+    def test_a_directory_is_unknown(self):
+        (self.home / ".claude" / "settings.json").mkdir(parents=True)
+        self.assertEqual(self.claude_retention(), (None, "unknown"))
+
+    @unittest.skipIf(os.name == "nt", "POSIX FIFOs and device files")
+    def test_a_fifo_or_a_device_never_blocks(self):
+        path = self.home / ".claude" / "settings.json"
+        path.parent.mkdir(parents=True)
+        os.mkfifo(path)
+        self.assertEqual(self.claude_retention(), (None, "unknown"))
+        path.unlink()
+        os.symlink("/dev/zero", path)
+        self.assertEqual(self.claude_retention(), (None, "unknown"))
+
+    @unittest.skipIf(os.name == "nt", "symlinks need privileges on Windows")
+    def test_a_symlink_to_a_regular_file_is_read(self):
+        real = self.home / "dotfiles" / "claude-settings.json"
+        real.parent.mkdir()
+        real.write_text('{"cleanupPeriodDays": 60}', encoding="utf-8")
+        (self.home / ".claude").mkdir()
+        os.symlink(real, self.home / ".claude" / "settings.json")
+        self.assertEqual(self.claude_retention(), (60, "settings"))
+
+    def test_claude_config_dir_names_the_file(self):
+        a, b = self.home / "cfg-a", self.home / "cfg-b"
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": f"{a}{os.pathsep}{b}"}):
+            self.assertEqual(af.claude_settings_path(), a / "settings.json")
+        self.assertEqual(af.claude_settings_path(), self.home / ".claude" / "settings.json")
+
+    def test_it_is_read_once_per_run(self):
+        self.claude(assistant("m1", recent(), command="git status"))
+        for argv in (("--json",), ()):
+            with self.subTest(argv=argv), \
+                    mock.patch.object(af, "_claude_retention", wraps=af._claude_retention) as spy:
+                code, _, err = run_main(*argv)
+                self.assertEqual(code, af.EXIT_OK, err)
+                self.assertEqual(spy.call_count, 1)
+
+    def test_nothing_is_read_without_a_claude_root(self):
+        f = af.Fleet()
+        with mock.patch.object(af, "_claude_retention") as spy:
+            af.coach(f)
+            af.to_json(f)
+        spy.assert_not_called()
+
+    def test_self_check_lists_the_file(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            af.self_check(af.C(False), days=1)
+        out = buf.getvalue()
+        self.assertIn(str(af.claude_settings_path()), out)
+        self.assertIn("one key", out)
+
+
+class TestAF014(HomeCase):
+    """Task 3: transcripts about to expire."""
+
+    def fleet(self, settings='{"cleanupPeriodDays": 30}', age_days=25):
+        if settings is not None:
+            self.settings(settings)
+        old = recent(24 * age_days)
+        self.claude(assistant("m1", old), mtime=old)
+        f = af.Fleet()
+        f.scan(af.transcript_roots(), None, None, progress=False)
+        return f
+
+    def af014(self, f):
+        return [x for x in af.coach(f) if x.id == "AF014"]
+
+    def test_a_file_25_days_old_with_30_kept_fires(self):
+        f = self.fleet()
+        [hit] = self.af014(f)
+        first = af._utc_date(next(self.projects.rglob("s.jsonl")).stat().st_mtime)
+        self.assertEqual(hit.severity, "info")
+        self.assertEqual(hit.title, "Transcripts are about to expire")
+        self.assertEqual(hit.evidence, f"1 session(s) from {first} are deleted within 7 days "
+                                       "(Claude Code keeps 30 days).")
+        self.assertIn("cleanupPeriodDays", hit.action)
+        self.assertIn("actualis --watch", hit.action)
+
+    def test_the_default_period_counts_too(self):
+        self.assertTrue(self.af014(self.fleet(settings='{"theme": "dark"}')))
+
+    def test_no_settings_file_is_unknown_and_never_fires(self):
+        self.assertEqual(self.af014(self.fleet(settings=None)), [])
+
+    def test_a_recent_file_does_not_fire(self):
+        self.assertEqual(self.af014(self.fleet(age_days=1)), [])
+
+    def test_an_overdue_file_still_fires(self):
+        self.assertTrue(self.af014(self.fleet(age_days=40)))
+
+    def test_keeping_nothing_fires_for_a_fresh_file(self):
+        self.assertTrue(self.af014(self.fleet(settings='{"cleanupPeriodDays": 0}', age_days=0)))
+
+    def test_unknown_retention_never_fires(self):
+        self.assertEqual(self.af014(self.fleet(settings="{not json")), [])
+
+    def test_a_copy_read_with_root_never_fires(self):
+        self.settings('{"cleanupPeriodDays": 30}')
+        old = recent(24 * 25)
+        archive = self.home / "archive"
+        write_session(archive / "-home-dev-orbital", "s.jsonl", [assistant("m1", old)], mtime=old)
+        f = af.Fleet()
+        f.scan([archive], None, None, progress=False)
+        self.assertEqual(af.transcripts_expiring(f), [])
+        self.assertEqual(self.af014(f), [])
+
+    def test_clock_edges_never_raise(self):
+        self.settings('{"cleanupPeriodDays": 30}')
+        self.projects.mkdir(parents=True)
+        f = af.Fleet()
+        f.roots.append(self.projects)
+        now = datetime.now(timezone.utc).timestamp()
+        f._file_read("claude-code", self.projects, now + 86400 * 400)   # dated in the future
+        f._file_read("claude-code", self.projects, 1e20)                # out of range for a date
+        self.assertEqual(af.transcripts_expiring(f), [])
+        [(row, _first)] = af._coverage_agents(f)
+        self.assertEqual(row["oldest"], af._utc_date(now + 86400 * 400))
+        self.assertIsNone(af._utc_date(1e20))
+
+    def test_af014_is_outside_the_digest_and_the_gate(self):
+        f = self.fleet()
+        payload = af.to_json(f)
+        self.assertIn("AF014", [c["id"] for c in payload["coach"]])
+        body = dict(payload)
+        body["coach"] = [c for c in payload["coach"] if c["id"] != "AF014"]
+        self.assertEqual(af.report_digest(body), payload["report_sha256"])
+        self.assertEqual([r for r in af.failing_findings(f, "any") if r.startswith("AF014")], [])
+        self.assertEqual(af.REPORT_DIGEST_CLOCK_FINDINGS, frozenset({"AF013", "AF014"}))
+
+    def test_the_id_is_registered_and_documented(self):
+        self.assertEqual(af.COACH_FINDING_IDS[-1], "AF014")
+        self.assertEqual(af.assessment_of("AF014"),
+                         {"assessment": "confirmed", "basis": "inferred", "missing": None})
+        doc = (ROOT / "docs" / "findings.md").read_text(encoding="utf-8")
+        self.assertIn("## AF014", doc)
+        self.assertIn("[AF014](#af014)", doc)
+
+
 if __name__ == "__main__":
     unittest.main()

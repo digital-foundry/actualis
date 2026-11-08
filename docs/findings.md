@@ -26,6 +26,7 @@ user, and it is why the thresholds below are mostly relative rather than absolut
 | [AF011](#af011) | high | ≥10% of shell activity happened inside subagents |
 | [AF012](#af012) | critical | a scan of ≥500 Claude Code messages collapsed zero repeated records |
 | [AF013](#af013) | high / info | the rate table has not been checked in over 90 days |
+| [AF014](#af014) | info | Claude Code deletes transcripts within 7 days (`cleanupPeriodDays`) |
 
 ## Network findings
 
@@ -201,3 +202,29 @@ python3 tools/price-check.py --fetch
 That tool reports drift for a human to adjudicate. It deliberately does not
 parse prices and never writes one: a silently mis-parsed rate would carry the
 authority of a checked one.
+
+## AF014
+
+**Transcripts are about to expire.** Claude Code deletes transcripts older than
+`cleanupPeriodDays` (default 30) from its user settings when it starts. This
+fires when at least one transcript file's modification time plus that period
+falls within the next 7 days, or has already passed (the file goes the next
+time Claude Code starts). Once a transcript is gone nothing can audit it, so
+the report says so while the files are still there.
+
+`info`. The evidence names how many files, the date of the oldest, and the
+period in force. Archive them, run `actualis --watch`, or raise
+`cleanupPeriodDays` in `~/.claude/settings.json` (or
+`$CLAUDE_CONFIG_DIR/settings.json`).
+
+It applies only to the directory Claude Code itself cleans
+(`~/.claude/projects`, or `$CLAUDE_CONFIG_DIR/projects`); a copy read with
+`--root` never fires it. Like AF013 it depends on today's date, so it is left
+out of `report_sha256` and never counts toward `--fail-on`.
+
+Check it directly:
+
+```sh
+actualis --json | jq '.coach[] | select(.id == "AF014")'
+jq '.cleanupPeriodDays' ~/.claude/settings.json
+```

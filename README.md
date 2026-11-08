@@ -218,7 +218,7 @@ actualis --agent codex    # one agent only (claude | codex | copilot | gemini | 
 | `--suppress ID` | mark a finding as a false positive on this machine (it stays counted) |
 | `--reason TEXT` | why that suppression is correct, recorded for review. Only with `--suppress`; one line, so a newline or other control character is refused |
 | `--suppressions` | list current suppressions and where they are read from |
-| `--fail-on LEVEL` | exit 3 if any unsuppressed finding is at or above `critical`, `high` or `any`. For gating a pipeline. A mode that cannot evaluate the gate (`--diff`, `--why`, `--replay`, `--watch`, `--mcp`, `--explain`, `--agents`, `--suppress`, `--suppressions`, `--self-check`, `--service`, `--completions`) refuses it with exit 2. AF013 (rate-table age) is reported but never counted |
+| `--fail-on LEVEL` | exit 3 if any unsuppressed finding is at or above `critical`, `high` or `any`. For gating a pipeline. A mode that cannot evaluate the gate (`--diff`, `--why`, `--replay`, `--watch`, `--mcp`, `--explain`, `--agents`, `--suppress`, `--suppressions`, `--self-check`, `--service`, `--completions`) refuses it with exit 2. AF013 (rate-table age) and AF014 (transcripts about to expire) are reported but never counted |
 | `--network` | print only the NETWORK section, with the IOC block when `--ioc` is given. `--network --json` emits only the `network` object (no `schema_version`). Not with `--share`, `--card`, `--bash`, `--coach`, `--aisvs`, `--diff`, `--replay`, `--watch` or `--mcp` |
 | `--network-trust HOST[/PATH],...` | trusted download sources for `--network-strict` (repeatable). Also read from `./.actualis-network-trust`, one per line; the report prints that file's path and sha256 because the agent can write it |
 | `--network-strict` | make every unasked download from an untrusted source a medium finding, so `--fail-on any` and the suppressions file apply. `--coach`, `--aisvs` and `--share` never show network findings, so they take it (and `--network-trust`) only with `--fail-on`; modes that never scan refuse both |
@@ -535,8 +535,9 @@ The skill never installs anything, never prints credential values, and only sugg
 
 Nothing leaves your machine. actualis itself makes no network calls, and has no telemetry, no analytics, no
 config file, no writes. (The optional `actualis-reputation` companion is the one exception, only when you run it;
-see [Optional: host reputation](#optional-host-reputation-uses-the-network).) It opens files under `~/.claude/projects` read-only and
-prints to stdout. The whole program is one readable file; if you're about to point
+see [Optional: host reputation](#optional-host-reputation-uses-the-network).) It opens files under `~/.claude/projects` read-only, reads one key
+(`cleanupPeriodDays`, how long Claude Code keeps transcripts) from Claude Code's
+`settings.json` and keeps nothing else from it, and prints to stdout. The whole program is one readable file; if you're about to point
 a tool at your session history, you should be able to audit it in a sitting, so it
 was written to be read.
 
@@ -723,8 +724,8 @@ a malformed `--suppress` id, an unknown `--why` id or `--explain` topic, and a
 The verdict is decided before the report is written, so a reader that closes
 the pipe early (`| head`, or `2>&1 | head -1`, which closes stderr mid-verdict)
 still gets exit `3` from a failing gate. AF013 (the
-rate table's age) depends on today's date, not on your transcripts, so it is
-never counted toward `--fail-on`.
+rate table's age) and AF014 (transcripts about to expire) depend on today's
+date, not on your transcripts, so they are never counted toward `--fail-on`.
 
 The verdict goes to **stderr**, so `--json` on stdout stays byte-identical and a
 pipeline can capture the report and the outcome separately:

@@ -1428,7 +1428,7 @@ class TestReportDigest(unittest.TestCase):
         body = {k: v for k, v in payload.items() if k != "report_sha256"}
         body["pricing"] = {k: v for k, v in body["pricing"].items()
                            if k not in ("age_days", "stale")}
-        body["coach"] = [f for f in body["coach"] if f["id"] != "AF013"]
+        body["coach"] = [f for f in body["coach"] if f["id"] not in ("AF013", "AF014")]
         canonical = json.dumps(body, sort_keys=True, separators=(",", ":"),
                                ensure_ascii=False)
         import hashlib

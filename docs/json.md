@@ -165,9 +165,9 @@ Severity does not change with the assessment, and neither does `--fail-on`.
 ## Verifying a report
 
 Every report is content-addressed. `report_sha256` is the SHA-256 of the payload
-with four things removed, serialised canonically: the `report_sha256` key itself,
-`pricing.age_days`, `pricing.stale`, and the `AF013` entry in `coach`. The last
-three depend on today's date and not on the transcripts, so excluding them keeps
+with five things removed, serialised canonically: the `report_sha256` key itself,
+`pricing.age_days`, `pricing.stale`, and the `AF013` and `AF014` entries in `coach`.
+The last four depend on today's date and not on the transcripts, so excluding them keeps
 the same transcripts hashing the same tomorrow as today. A real change in
 the data still changes the hash. The report itself prints the first 16
 characters, so a screenshot can be checked against the payload it came from.
@@ -186,7 +186,7 @@ p = json.load(open("report.json"))
 claimed = p.pop("report_sha256")
 p["pricing"].pop("age_days")
 p["pricing"].pop("stale")
-p["coach"] = [f for f in p["coach"] if f["id"] != "AF013"]
+p["coach"] = [f for f in p["coach"] if f["id"] not in ("AF013", "AF014")]
 canonical = json.dumps(p, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 actual = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 print("claimed:", claimed)
@@ -199,7 +199,7 @@ Or in one line, if you have jq 1.7 or later and prefer not to run Python (jq 1.6
 and earlier re-format numbers, so `0.0` becomes `0` and the digest never matches):
 
 ```sh
-jq -Sc 'del(.report_sha256, .pricing.age_days, .pricing.stale) | .coach |= map(select(.id != "AF013"))' report.json | tr -d '\n' | shasum -a 256
+jq -Sc 'del(.report_sha256, .pricing.age_days, .pricing.stale) | .coach |= map(select(.id != "AF013" and .id != "AF014"))' report.json | tr -d '\n' | shasum -a 256
 ```
 
 Three things about the canonical form, because they are the whole reason two
@@ -588,7 +588,7 @@ claude mcp add actualis -- actualis --mcp
 | `fleet_summary` | window, spend (with `cost_usd_from_unpriced_models` and `unpriced_model_tokens` as in `--json`), cache hit rate, top projects, unsupervised share (`unsupervised_pct` over turns with a recorded mode, with `moded_commands` and `unmoded_commands`) |
 | `ticket_cost` | cost for one ticket, or the most expensive ones |
 | `exposed_secrets` | rotation list: priority, types, fingerprint, dates (`first_seen`/`last_seen` are `""` when unknown, as in `--json`), and `suppressed`/`suppressed_reason` per row. `worth_rotating` leaves out suppressed credentials, as the report does; `suppressed` counts them. `priority` must be `critical`, `high`, `low` or `all` |
-| `coach_findings` | `AF001`–`AF013` with evidence, actions, `project` (the project an AF002/AF006 row is about, else `""`) and the three [assessment](#assessments) fields |
+| `coach_findings` | `AF001`–`AF014` with evidence, actions, `project` (the project an AF002/AF006 row is about, else `""`) and the three [assessment](#assessments) fields |
 | `shell_audit` | counts by category, permission modes, the subagent blind spot |
 | `explain` | how a figure is computed, what it assumes, how to verify it |
 | `verify_agents` | installed agent platforms and their signature status |

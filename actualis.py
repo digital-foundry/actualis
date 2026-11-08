@@ -8433,6 +8433,73 @@ def transcript_roots() -> list[Path]:
     return seen
 
 
+# Claude Code deletes transcripts older than cleanupPeriodDays (default 30)
+# when it starts. One key is read from its user settings so the report can say
+# how far back the evidence goes, and warn before it goes (AF014).
+CLAUDE_DEFAULT_RETENTION_DAYS = 30
+SETTINGS_MAX = 1 << 20              # characters of settings.json read; a larger file is not read
+_UNKNOWN_RETENTION = {"retention_days": None, "retention_source": "unknown"}
+
+
+def claude_config_dir() -> Path:
+    """Claude Code's config directory: $CLAUDE_CONFIG_DIR (its first entry;
+    transcript_roots() reads them all), else ~/.claude."""
+    env = os.environ.get("CLAUDE_CONFIG_DIR") or ""
+    first = next((part for part in env.split(os.pathsep) if part), "")
+    return Path(first).expanduser() if first else Path.home() / ".claude"
+
+
+def claude_settings_path() -> Path:
+    """The one file actualis reads outside the transcript roots."""
+    return claude_config_dir() / "settings.json"
+
+
+def _claude_retention() -> dict:
+    """cleanupPeriodDays from Claude Code's settings.json. An int >= 0:
+    settings. The file read and the key absent: Claude Code's default, 30.
+    Anything else (no file, not a regular file, unreadable, over SETTINGS_MAX,
+    not JSON, not an object, a value that is not an int): unknown. Nothing
+    else in the file is kept. Never written, never raises."""
+    try:
+        with _open_regular(claude_settings_path()) as fh:
+            text = fh.read(SETTINGS_MAX + 1)
+    except (OSError, RuntimeError, ValueError):     # RuntimeError: no home directory
+        return dict(_UNKNOWN_RETENTION)
+    if len(text) > SETTINGS_MAX:
+        return dict(_UNKNOWN_RETENTION)
+    ok, doc = _json_line(text)
+    if not ok or not isinstance(doc, dict):
+        return dict(_UNKNOWN_RETENTION)
+    if "cleanupPeriodDays" not in doc:
+        return {"retention_days": CLAUDE_DEFAULT_RETENTION_DAYS, "retention_source": "default"}
+    days = doc["cleanupPeriodDays"]
+    if isinstance(days, bool) or not isinstance(days, int) or days < 0:
+        return dict(_UNKNOWN_RETENTION)
+    # Past a century the date arithmetic overflows: the cap --days has too.
+    return {"retention_days": min(days, MAX_DAYS), "retention_source": "settings"}
+
+
+def read_retention(read_settings: bool = True) -> dict[str, dict]:
+    """Per agent: retention_days and retention_source. Codex documents no
+    automatic deletion (none); Copilot CLI, Gemini CLI and Qwen Code are
+    unknown until a fixture-backed reading exists. read_settings=False skips
+    the file (no Claude Code root was scanned, so nothing needs it)."""
+    return {"claude-code": _claude_retention() if read_settings else dict(_UNKNOWN_RETENTION),
+            "codex": {"retention_days": None, "retention_source": "none"},
+            "copilot": dict(_UNKNOWN_RETENTION),
+            "gemini": dict(_UNKNOWN_RETENTION),
+            "qwen": dict(_UNKNOWN_RETENTION)}
+
+
+def fleet_retention(fleet: "Fleet") -> dict[str, dict]:
+    """read_retention() once per fleet, and only when a Claude Code root was scanned."""
+    if "claude-code" not in fleet.agent_roots:
+        return read_retention(read_settings=False)
+    if fleet.retention is None:
+        fleet.retention = read_retention()
+    return fleet.retention
+
+
 def pretty_project(slug: str) -> str:
     """Turn a path-slug directory name into something readable."""
     s = slug.lstrip("-")
@@ -9174,6 +9241,8 @@ class Fleet:
         # Lines handed to the JSON decoder: the denominator unparsable_lines
         # is a share of. Claude lines the prefilter skips are not decoded.
         self.lines_read = 0
+        # fleet_retention(): read once per run, after the scan.
+        self.retention: dict | None = None
 
     # -- ingest ------------------------------------------------------------
 
@@ -11142,6 +11211,18 @@ def coach(fleet: "Fleet") -> list[Finding]:
             "Re-check the provider pages, or run `python3 tools/price-check.py --fetch` "
             "from a checkout. Every cost figure here inherits this age."))
 
+    # --- AF014 transcripts are about to expire -----------------------------
+    # Claude Code deletes transcripts past cleanupPeriodDays when it starts.
+    # Once they are gone nothing here can show them again, so say so while
+    # they can still be kept. Depends on today's date, like AF013.
+    for agent, n, first, keep in transcripts_expiring(fleet):
+        out.append(Finding(
+            "AF014", "info", "Transcripts are about to expire",
+            f"{n} session(s) from {first} are deleted within {COVERAGE_EXPIRY_DAYS} days "
+            f"({_AGENT_LABEL.get(agent, agent)} keeps {keep} days).",
+            "Archive them, run `actualis --watch`, or raise cleanupPeriodDays in "
+            "Claude Code's settings.json."))
+
     order = {"critical": 0, "high": 1, "info": 2}
     out.sort(key=lambda f: order.get(f.severity, 9))
     return out
@@ -11196,6 +11277,7 @@ _ASSESSMENT: dict[str, tuple] = {
     "AF011": ("needs-validation", "observed", "agent writes no shell records"),
     "AF012": _CONFIRMED,
     "AF013": _CONFIRMED,
+    "AF014": ("confirmed", "inferred", None),
 }
 _DEFAULT_ASSESSMENT = {"assessment": "confirmed", "basis": "observed", "missing": None}
 _AF_ID = re.compile(r"AF\d{3}")
@@ -12318,7 +12400,7 @@ def vendor_gaps(vendor: str) -> list[tuple[str, str]]:
 
 # Every id coach() can emit; --why rejects anything else as a usage error.
 # Defined before EXPLAIN, whose coach text quotes the range from it.
-COACH_FINDING_IDS = tuple(f"AF{n:03d}" for n in range(1, 14))
+COACH_FINDING_IDS = tuple(f"AF{n:03d}" for n in range(1, 15))
 
 
 EXPLAIN: dict[str, dict[str, object]] = {
@@ -16184,7 +16266,7 @@ def report_digest(payload: dict) -> str:
 
     Self-referential by construction otherwise: the hash cannot cover a field
     whose value is the hash. The same goes for pricing.age_days, pricing.stale
-    and finding AF013, which change as days pass over unchanged transcripts. The
+    and findings AF013 and AF014, which change as days pass over unchanged transcripts. The
     digest then answers "did the evidence change", not "what day is it".
     REPORT_DIGEST_EXCLUDES and REPORT_DIGEST_CLOCK_FINDINGS name all of it in one
     place so the emitter and any verifier cannot disagree.
@@ -16210,8 +16292,9 @@ def report_digest(payload: dict) -> str:
 
 # Dotted paths into the payload (a top-level key is a path of one part).
 REPORT_DIGEST_EXCLUDES = frozenset({"report_sha256", "pricing.age_days", "pricing.stale"})
-# Coach findings whose presence depends on today's date, not on the transcripts.
-REPORT_DIGEST_CLOCK_FINDINGS = frozenset({"AF013"})
+# Coach findings whose presence depends on today's date, not on the transcripts:
+# the rate table's age (AF013) and transcripts about to expire (AF014).
+REPORT_DIGEST_CLOCK_FINDINGS = frozenset({"AF013", "AF014"})
 
 # --------------------------------------------------------------------------
 # Exit codes
@@ -16306,6 +16389,97 @@ def failing_findings(fleet: Fleet, level: str) -> list[str]:
         if net:
             out.append(f"{len(net)} unasked download group(s) from untrusted sources")
     return out
+
+
+# --------------------------------------------------------------------------
+# Coverage: what a run could see
+#
+# "No findings" and "could not look" used to print the same way. These read
+# the counters the scan keeps (Fleet._file_read and friends, unparsable_lines,
+# the network and IOC totals) at output time; no producer feeds them.
+# --------------------------------------------------------------------------
+
+COVERAGE_AGENTS = ("claude-code", "codex", "copilot", "gemini", "qwen")
+_AGENT_FOR_CHOICE = {"claude": "claude-code", "codex": "codex", "copilot": "copilot",
+                     "gemini": "gemini", "qwen": "qwen"}
+_AGENT_LABEL = {"claude-code": "Claude Code", "codex": "Codex", "copilot": "Copilot CLI",
+                "gemini": "Gemini CLI", "qwen": "Qwen Code"}
+COVERAGE_EXPIRY_DAYS = 7          # how far ahead AF014 and expiring_7d look
+
+
+def _utc_date(ts: "float | None") -> "str | None":
+    """YYYY-MM-DD (UTC) of a file mtime; None for none, or one out of range."""
+    if ts is None:
+        return None
+    try:
+        return datetime.fromtimestamp(ts, timezone.utc).date().isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _managed_claude_roots(fleet: Fleet) -> set[str]:
+    """The scanned roots Claude Code itself cleans: <config dir>/projects, the
+    one whose settings.json read_retention() reads. A --root copy or archive,
+    a second $CLAUDE_CONFIG_DIR entry, or a --ci-log file is not one, so its
+    retention is unknown and AF014 never fires for it."""
+    try:
+        want = (claude_config_dir() / "projects").resolve()
+    except (OSError, RuntimeError):
+        return set()
+    out: set[str] = set()
+    for r in fleet.roots:
+        try:
+            if Path(r).resolve() == want:
+                out.add(str(r))
+        except (OSError, RuntimeError):
+            continue
+    return out
+
+
+def _coverage_agents(fleet: Fleet, now: "float | None" = None) -> list[tuple[dict, "float | None"]]:
+    """(coverage.agents[] row, mtime of its oldest expiring file) for every
+    agent whose root this run scanned, then the --agent one if its root was
+    not found. A file expires when mtime + retention falls within the next
+    COVERAGE_EXPIRY_DAYS, or already has (Claude Code deletes it at its next
+    start). A file dated in the future is not counted."""
+    now = datetime.now(timezone.utc).timestamp() if now is None else now
+    retention = fleet_retention(fleet)
+    managed = _managed_claude_roots(fleet) if "claude-code" in fleet.agent_roots else set()
+    names = [a for a in COVERAGE_AGENTS if a in fleet.agent_roots]
+    named = _AGENT_FOR_CHOICE.get(str(fleet.scope.get("agent") or ""))
+    if named and named not in names:
+        names.append(named)
+    horizon = now + COVERAGE_EXPIRY_DAYS * 86400
+    out: list[tuple[dict, "float | None"]] = []
+    for agent in names:
+        row = fleet.agent_roots.get(agent)
+        ret = dict(retention.get(agent) or _UNKNOWN_RETENTION)
+        if agent == "claude-code" and not managed:
+            ret = dict(_UNKNOWN_RETENTION)
+        days = ret["retention_days"]
+        hits: list[float] = []
+        if row is not None and days is not None:
+            for root, mtimes in row["mtimes"].items():
+                if agent == "claude-code" and root not in managed:
+                    continue
+                hits += [m for m in mtimes if m <= now and m + days * 86400 < horizon]
+        out.append(({"agent": agent, "root_exists": row is not None,
+                     "files_read": row["files_read"] if row else 0,
+                     "files_unreadable": row["files_unreadable"] if row else 0,
+                     "files_skipped_mtime": row["files_skipped_mtime"] if row else 0,
+                     "oldest": _utc_date(row["oldest_mtime"]) if row else None,
+                     "retention_days": days, "retention_source": ret["retention_source"],
+                     "expiring_7d": len(hits)},
+                    min(hits) if hits else None))
+    return out
+
+
+def transcripts_expiring(fleet: Fleet) -> list[tuple[str, int, str, int]]:
+    """(agent, files, date of the oldest, days kept) for each agent that
+    deletes transcripts within COVERAGE_EXPIRY_DAYS (AF014)."""
+    return [(row["agent"], row["expiring_7d"], _utc_date(first) or "?", row["retention_days"])
+            for row, first in _coverage_agents(fleet)
+            if row["expiring_7d"] and row["retention_days"] is not None]
 
 
 def to_json(fleet: Fleet, raw: bool = False) -> dict:
@@ -16885,6 +17059,11 @@ def self_check(c: C, days: int | None = 7, root: str | None = None,
     if roots:
         result(True, "the only directories this run reads",
                "; ".join(str(r) for r in roots))
+    if agent in ("all", "claude"):
+        result(True, "one file read outside the transcript roots",
+               f"{claude_settings_path()}, one key: cleanupPeriodDays, how long Claude Code "
+               "keeps transcripts. Nothing else in the file is kept or printed, and it is "
+               "never written.")
 
     # 1. What this build imports at all. Read from the source, so it describes
     #    the shipped file rather than whatever is loaded right now.
@@ -18436,6 +18615,8 @@ def main(argv: list[str] | None = None) -> int:
     apply_network_policy(fleet, network_trust, args.network_strict, trust_sources)
     apply_ioc(fleet, ioc)
     apply_reputation(fleet, reputation)
+    # Once per run, before the terminal view copies the fleet (AF014, coverage).
+    fleet_retention(fleet)
 
     if baseline is not None:
         render_diff(_display_safe(diff_reports(baseline, to_json(fleet, raw=args.no_redact))),
