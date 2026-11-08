@@ -8096,6 +8096,9 @@ def render_reputation(fleet: "Fleet", c: "C") -> None:
         high = f["severity"] == "high"
         color, mark = (c.red, "\u25b2") if high else (c.yellow, "?")
         print(f"    {color}{mark}{c.off} {clip(f['evidence'], NET_VIEW_WIDTH - 6)}")
+        missing = classify(f)["missing"]
+        if missing:
+            print(f"      {c.dim}needs validation: {missing}{c.off}")
         shown += 1
     if data.lists and (t["listed"] or t["candidate"]):
         print(f"  {c.dim}{GSB_ADVISORY}: {GSB_ADVISORY_URL}. Lists can be wrong both ways; "
@@ -11468,11 +11471,18 @@ def _baseline_problem(data: dict) -> str:
         obj("bash", bash),
         obj("scope", data.get("scope")),
         obj("scanned", scanned),
-        rows("secrets", data.get("secrets"), ("id", "priority"), ("types", "projects")),
-        rows("coach", data.get("coach"), ("id", "severity", "title", "project", "evidence"), ()),
+        rows("secrets", data.get("secrets"), ("id", "priority", "assessment"), ("types", "projects")),
+        rows("coach", data.get("coach"),
+             ("id", "severity", "title", "project", "evidence", "assessment"), ()),
         rows("bash.flags", bash.get("flags") if isinstance(bash, dict) else None,
-             ("id", "severity", "program"), ("categories",)),
+             ("id", "severity", "program", "assessment"), ("categories",)),
+        obj("coverage", data.get("coverage")),
     ]
+    cov = data.get("coverage")
+    if isinstance(cov, dict):
+        g = cov.get("gaps")
+        if g is not None and not (isinstance(g, list) and all(isinstance(x, str) for x in g)):
+            checks.append("coverage.gaps is not an array of strings")
     for key in ("cost_usd", "messages"):
         v = data.get(key)
         if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
@@ -11532,6 +11542,7 @@ def _flag_kinds(payload: dict) -> dict[str, dict]:
             cur = out.setdefault(fid, {"id": fid, "severity": r.get("severity", ""),
                                        "program": r.get("program", ""),
                                        "categories": r.get("categories") or [],
+                                       "assessment": r.get("assessment"),
                                        "count": 0})
             cur["count"] += 1
     return out
@@ -11550,10 +11561,13 @@ def diff_reports(old: dict, new: dict) -> dict:
     for name, o, n, sev_key, noun in families:
         appeared = [n[k] for k in n if k not in o]
         resolved = [o[k] for k in o if k not in n]
-        worse, better, moved = [], [], []
+        worse, better, moved, assessed = [], [], [], []
         for k in n:
             if k not in o:
                 continue
+            oa, na = o[k].get("assessment"), n[k].get("assessment")
+            if isinstance(oa, str) and isinstance(na, str) and oa != na:
+                assessed.append((o[k], n[k]))     # needs-validation -> confirmed, or back
             ro, rn = _rank(o[k].get(sev_key, "")), _rank(n[k].get(sev_key, ""))
             if rn > ro:
                 worse.append((o[k], n[k]))
@@ -11563,7 +11577,8 @@ def diff_reports(old: dict, new: dict) -> dict:
                 moved.append((o[k], n[k]))
         out["families"][name] = {"noun": noun, "sev_key": sev_key,
                                  "appeared": appeared, "resolved": resolved,
-                                 "worse": worse, "better": better, "moved": moved}
+                                 "worse": worse, "better": better, "moved": moved,
+                                 "assessed": assessed}
     for key in ("cost_usd", "messages"):
         ov, nv = old.get(key), new.get(key)
         if isinstance(ov, (int, float)) and isinstance(nv, (int, float)):
@@ -11573,7 +11588,19 @@ def diff_reports(old: dict, new: dict) -> dict:
     out["windows"] = (ow.get("from"), ow.get("to"), nw.get("from"), nw.get("to"))
     out["digests"] = (old.get("report_sha256"), new.get("report_sha256"))
     out["scope"] = _scope_differences(old, new)
+    out["coverage"] = _coverage_changes(old, new)
     return out
+
+
+def _coverage_changes(old: dict, new: dict) -> "tuple[list[str], list[str]] | None":
+    """(gaps that appeared, gaps that cleared); None when either report has
+    no coverage object, as a baseline from before 0.7.0 has not."""
+    oc, nc = old.get("coverage"), new.get("coverage")
+    if not (isinstance(oc, dict) and isinstance(nc, dict)):
+        return None
+    og, ng = ([g for g in (x if isinstance(x, list) else []) if isinstance(g, str)]
+              for x in (oc.get("gaps"), nc.get("gaps")))
+    return [g for g in ng if g not in og], [g for g in og if g not in ng]
 
 
 def _scope_differences(old: dict, new: dict) -> list[tuple[str, object, object]]:
@@ -11661,6 +11688,10 @@ def render_diff(d: dict, c: C) -> None:
             sev = _txt(rn.get(sk, ""))
             rows.append((_rank(sev), "better", sev, _label(rn, family),
                          f"was {_txt(ro.get(sk, ''))}"))
+        for ro, rn in blk.get("assessed", []):
+            sev = _txt(rn.get(sk, ""))
+            rows.append((_rank(sev), "assessed", sev, _label(rn, family),
+                         f"{_txt(ro.get('assessment'))} → {_txt(rn.get('assessment'))}"))
         for ro, rn in blk["moved"]:
             delta = rn["count"] - ro.get("count", 0)
             sev = _txt(rn.get(sk, ""))
@@ -11677,13 +11708,22 @@ def render_diff(d: dict, c: C) -> None:
                    else c.ok if kind in ("gone", "better")
                    else c.yellow if kind in ("new", "worse") else c.dim)
             mark = {"new": "+", "gone": "-", "worse": "^", "better": "v",
-                    "count": "~"}[kind]
+                    "count": "~", "assessed": "*"}[kind]
             tail = f"  {c.dim}{note}{c.off}" if note else ""
             print(f"    {col}{mark}{c.off} {sev:<8} {label}{tail}")
         if dropped > 0:
             # Never truncate silently: a hidden row reads as "nothing there".
             print(f"    {c.dim}... and {dropped} more, lowest severity first. "
                   f"Compare the saved payloads directly to see every row.{c.off}")
+
+    gaps = d.get("coverage")
+    if gaps and (gaps[0] or gaps[1]):
+        changed = True
+        print(f"\n  {c.bold}coverage gaps{c.off}")
+        for g in gaps[0]:
+            print(f"    {c.yellow}+{c.off} {_txt(g)}")
+        for g in gaps[1]:
+            print(f"    {c.ok}-{c.off} {_txt(g)}")
 
     if not changed:
         if d["totals"] and all(ov == nv for ov, nv in d["totals"].values()):
@@ -11926,6 +11966,9 @@ def render_coach(findings: list[Finding], c: C) -> None:
         print(f"\n  {col}{f.id}{c.off}  {c.bold}{f.title}{c.off}")
         for line in _wrap(f.evidence, 84):
             print(f"        {line}")
+        missing = classify(f)["missing"]
+        if missing:
+            print(f"        {c.yellow}needs validation:{c.off} {missing}")
         if f.impact:
             print(f"        {c.yellow}{f.impact}{c.off}")
         for line in _wrap("→ " + f.action, 84):
@@ -13146,6 +13189,28 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "A finding is earned. On an unremarkable fleet the coach says nothing.",
         ],
         "verify": "actualis --why AF002   # the threshold and your actual values",
+    },
+    "coverage": {
+        "measures": "What this run examined, what it could not, and why: per agent and per check.",
+        "formula": [
+            "agents: per agent whose transcript directory exists, the files read, the",
+            "files that could not be opened, the files --days left out by mtime, the",
+            "oldest file read, and how long the agent keeps transcripts (Claude Code:",
+            "cleanupPeriodDays in settings.json, default 30; Codex: until removed).",
+            "checks: examined and not examined, with the reason for every count.",
+            "gaps: an agent with nothing read, an unreadable file, over 1% unparsable",
+            "lines, --days past what the agent keeps, downloads --ioc could not check,",
+            "reputation lists over 7 days old.",
+            "",
+            "--fail-on-coverage makes any gap exit 5. --fail-on findings (exit 3) win",
+            "when both apply; without --fail-on-coverage a gap never changes the exit code.",
+        ],
+        "assumes": [
+            "Complete means nothing this tool knows how to read was skipped. A session",
+            "the agent never wrote down, or one already deleted, is invisible here.",
+            "settings.json is read for one key; nothing else in it is kept or printed.",
+        ],
+        "verify": "actualis --json | jq '.coverage'",
     },
     "agents": {
         "measures": "Whether installed agent binaries are what they claim to be.",
@@ -14856,8 +14921,57 @@ def _display_view(fleet: "Fleet") -> "Fleet":
     return view
 
 
+REJECTED_SHOWN = 20          # --verbose: rejected[] rows the text report lists
+
+
+def render_assumptions(rows: list[dict], c: C) -> None:
+    """assumptions(), once, in the caveats block."""
+    if not rows:
+        return
+    print(f"\n  {c.yellow}▲{c.off} derived or assumed, not read "
+          f"{c.dim}(actualis --json | jq .assumptions){c.off}")
+    for a in rows:
+        unit, value = next(iter(a["volume"].items()))
+        amount = money(value) if unit == "usd" else f"{num(value)} {unit}"
+        print(f"    {a['kind']:<22} {amount:>18}  {c.dim}{_one_line(a['basis'])}{c.off}")
+
+
+def render_coverage(cov: dict, fleet: Fleet, c: C) -> None:
+    """The Coverage line after the caveats: complete, or every gap."""
+    if cov["ok"]:
+        parts = ["complete"]
+        for a in cov["agents"]:
+            seg = f"{a['agent']} from {a['oldest']}" if a["oldest"] else f"{a['agent']} nothing read"
+            if a["retention_days"] is not None:
+                seg += f" (keeps {a['retention_days']}d)"
+            parts.append(seg)
+        print(f"\n  Coverage   {' · '.join(parts)}")
+    else:
+        n = len(cov["gaps"])
+        print(f"\n  {c.yellow}Coverage   {n} gap{'' if n == 1 else 's'}{c.off}")
+        for g in cov["gaps"]:
+            print(f"    {c.yellow}!{c.off} {_one_line(g)}")
+    if fleet.unparsable_lines:
+        print(f"  {c.dim}           {num(fleet.unparsable_lines)} unparsable line(s) skipped, "
+              f"of {num(fleet.lines_read)} decoded{c.off}")
+
+
+def render_rejected(fleet: Fleet, c: C, raw: bool = False) -> None:
+    """--verbose: the leads checked and cleared, at most REJECTED_SHOWN lines."""
+    rows = rejected_json(fleet, raw)
+    total = len(fleet.rejected)
+    print(f"\n  Checked and cleared  {c.dim}{num(total)} lead(s) evaluated and dropped{c.off}")
+    for r in rows[:REJECTED_SHOWN]:
+        print(f"    {r['kind']:<10} {clip(r['what'], 34):<34} {c.dim}{r['why_cleared']}"
+              + (f"  {r['source']}" if r["source"] else "") + c.off)
+    more = total - min(len(rows), REJECTED_SHOWN)
+    if more > 0:
+        print(f"    {c.dim}… and {num(more)} more (actualis --json | jq .rejected){c.off}")
+
+
 def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
-           network_only: bool = False, network_filters: list[str] | None = None) -> None:
+           network_only: bool = False, network_filters: list[str] | None = None,
+           verbose: bool = False) -> None:
     if network_only:
         # --network: the NETWORK section and the redaction note, nothing else.
         render_network(fleet, c, top, raw, network_filters)
@@ -15249,6 +15363,11 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
               f"list: {', '.join(fleet.aggregator_models)}")
         print(f"    {c.dim}The rate is probably right; nobody authoritative has "
               f"published it.{c.off}")
+
+    render_assumptions(assumptions(fleet), c)
+    render_coverage(coverage(fleet), fleet, c)
+    if verbose:
+        render_rejected(fleet, c, raw)
 
     print()
     print(f"{c.dim}  Ask how any of this was computed:  actualis --explain")
@@ -18238,6 +18357,8 @@ def build_parser() -> argparse.ArgumentParser:
     # refused rather than dropped; main() fills in 12 after that check.
     ap.add_argument("--top", type=_top_arg, default=None, metavar="N",
                     help="text report: projects to list, 1 or more (default 12)")
+    ap.add_argument("--verbose", action="store_true",
+                    help="text report: also list the leads actualis checked and cleared")
     ap.add_argument("--bash", action="store_true", help="shell audit only")
     ap.add_argument("--coach", action="store_true", help="coaching findings only")
     ap.add_argument("--aisvs", action="store_true",
@@ -18546,6 +18667,13 @@ def main(argv: list[str] | None = None) -> int:
                      f"lists top projects.")
     else:
         args.top = 12
+    if args.verbose:
+        off = mode if mode not in (None, "--bash") else \
+            "--json" if args.json else "--html" if args.html else \
+            "--network" if args.network else None
+        if off:
+            ap.error(f"--verbose cannot be combined with {off}: only the text report "
+                     f"lists the leads it checked and cleared.")
     if args.interval is None:
         args.interval = 4.0
     # mode -> the scope flags it honours. Modes not listed (the scanning
@@ -18932,7 +19060,8 @@ def main(argv: list[str] | None = None) -> int:
         render_coach(coach(view), C(use_color()))
     else:
         render(view, C(use_color()), bash_only=args.bash, top=args.top, raw=args.no_redact,
-               network_only=args.network, network_filters=network_filter_names(args))
+               network_only=args.network, network_filters=network_filter_names(args),
+               verbose=args.verbose)
 
     if _PENDING_GATE:
         return _gate_verdict()

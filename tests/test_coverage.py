@@ -905,5 +905,150 @@ class TestRejected(unittest.TestCase):
             self.assertIn(word, doc)
 
 
+def rendered(fn, *args, **kw):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        fn(*args, **kw)
+    return buf.getvalue()
+
+
+class TestCoverageText(HomeCase):
+    """Task 6: the Coverage line, assumptions in the caveats, missing facts, --verbose."""
+
+    def report(self, f, **kw):
+        return rendered(af.render, f, af.C(False), bash_only=False, top=5, **kw)
+
+    def test_a_complete_run_says_so(self):
+        self.settings("{}")
+        path = self.claude(assistant("m1", recent(), command="git status"))
+        f = af.Fleet()
+        f.scan(af.transcript_roots(), None, None, progress=False)
+        self.assertIn(f"Coverage   complete · claude-code from {af._utc_date(path.stat().st_mtime)} "
+                      "(keeps 30d)", self.report(f))
+
+    def test_gaps_are_listed_and_unparsable_lines_shown(self):
+        f = af.Fleet()
+        f.add_usage("proj", "claude-sonnet-5", {"output_tokens": 10}, TS)
+        f._file_read("claude-code", "r", TS.timestamp())
+        f._file_unreadable("claude-code")
+        f.unparsable_lines, f.lines_read = 3, 1000
+        out = self.report(f)
+        self.assertIn("Coverage   1 gap\n", out)
+        self.assertIn("! 1 transcript file could not be read (claude-code)", out)
+        self.assertIn("3 unparsable line(s) skipped, of 1,000 decoded", out)
+
+    def test_the_bash_view_shows_coverage_too(self):
+        f = af.Fleet()
+        f.add_tool("p", "Bash", {"command": "git status"}, TS)
+        out = rendered(af.render, f, af.C(False), bash_only=True, top=5)
+        self.assertIn("Coverage   complete", out)
+
+    def test_assumptions_print_once(self):
+        f = af.Fleet()
+        f.add_usage("proj", "claude-sonnet-5", {"input_tokens": 10, "output_tokens": 5,
+                                                "cache_creation_input_tokens": 1000}, TS)
+        out = self.report(f)
+        self.assertIn("derived or assumed, not read", out)
+        self.assertEqual(out.count("cache-ttl-assumed-1h"), 1)
+        self.assertIn("1,000 tokens", out)
+
+    def test_needs_validation_findings_print_what_is_missing(self):
+        f = assessed_fleet()
+        self.assertIn("needs validation: agent writes no shell records",
+                      rendered(af.render_coach, af.coach(f), af.C(False)))
+        self.assertIn("needs validation: local hash-prefix match; run actualis-reputation confirm",
+                      rendered(af.render_reputation, f, af.C(False)))
+
+    def test_verbose_lists_what_was_checked_and_cleared(self):
+        ioc = self.home / "osv.txt"
+        ioc.write_text("npm:left-pad@<1.4.0\n", encoding="utf-8")
+        self.claude(assistant("m1", recent(), command="npm i left-pad@1.4.2"))
+        code, out, err = run_main("--ioc", str(ioc), "--verbose")
+        self.assertEqual(code, af.EXIT_OK, err)
+        self.assertIn("Checked and cleared", out)
+        self.assertIn("left-pad 1.4.2", out)
+        self.assertIn("1.4.2 is outside <1.4.0  osv.txt:1", out)
+        code, out, err = run_main("--ioc", str(ioc))
+        self.assertEqual(code, af.EXIT_OK, err)
+        self.assertNotIn("Checked and cleared", out)
+
+    def test_verbose_shows_at_most_twenty_then_a_count(self):
+        f = af.Fleet()
+        f.add_usage("proj", "claude-sonnet-5", {"output_tokens": 10}, TS)
+        for n in range(25):
+            f._reject("ioc", f"npm:p{n:02d}", f"p{n:02d} 1.0.0", "1.0.0 is outside <0.1.0",
+                      "x.txt:1", TS + timedelta(minutes=n))
+        out = self.report(f, verbose=True)
+        self.assertEqual(out.count("is outside <0.1.0"), af.REJECTED_SHOWN)
+        self.assertIn("… and 5 more (actualis --json | jq .rejected)", out)
+
+    def test_verbose_is_refused_where_nothing_prints_it(self):
+        for argv in (("--json",), ("--coach",), ("--share",), ("--network",), ("--explain",)):
+            with self.subTest(argv=argv):
+                code, _, err = run_main(*argv, "--verbose")
+                self.assertEqual(code, af.EXIT_USAGE)
+                self.assertIn("--verbose", err)
+
+    def test_explain_coverage(self):
+        code, out, _ = run_main("--explain", "coverage")
+        self.assertEqual(code, af.EXIT_OK)
+        for needle in ("--fail-on-coverage", "exit 5", "cleanupPeriodDays", "jq '.coverage'"):
+            self.assertIn(needle, out)
+
+
+class TestDiffAssessmentsAndCoverage(unittest.TestCase):
+    """Task 6: --diff reports assessment changes and coverage gaps."""
+
+    def report(self, **over):
+        base = {"schema_version": af.JSON_SCHEMA_VERSION, "version": af.__version__,
+                "window": {"from": "2026-01-01T00:00:00+00:00", "to": "2026-01-08T00:00:00+00:00"},
+                "secrets": [], "coach": [], "bash": {"flags": []},
+                "cost_usd": 10.0, "messages": 100, "report_sha256": "a" * 64}
+        base.update(over)
+        return base
+
+    FLAG = {"id": "cccccccc", "severity": "med", "program": "npm:pending@?",
+            "categories": ["network-ioc-unresolved"], "assessment": "needs-validation"}
+
+    def test_an_assessment_change_is_reported(self):
+        old = self.report(bash={"flags": [self.FLAG]})
+        new = self.report(bash={"flags": [dict(self.FLAG, assessment="confirmed")]},
+                          report_sha256="b" * 64)
+        d = af.diff_reports(old, new)
+        [(before, after)] = d["families"]["flags"]["assessed"]
+        self.assertEqual((before["assessment"], after["assessment"]), ("needs-validation", "confirmed"))
+        out = rendered(af.render_diff, d, af.C(False))
+        self.assertIn("needs-validation → confirmed", out)
+
+    def test_a_baseline_without_assessments_reports_none(self):
+        bare = {k: v for k, v in self.FLAG.items() if k != "assessment"}
+        d = af.diff_reports(self.report(bash={"flags": [bare]}), self.report(bash={"flags": [self.FLAG]}))
+        self.assertEqual(d["families"]["flags"]["assessed"], [])
+
+    def test_coverage_gaps_that_appeared_and_cleared(self):
+        old = self.report(coverage={"ok": False, "gaps": ["reputation lists are 9 days old"]})
+        new = self.report(coverage={"ok": False, "gaps": ["1 transcript file could not be read (codex)"]},
+                          report_sha256="b" * 64)
+        d = af.diff_reports(old, new)
+        self.assertEqual(d["coverage"], (["1 transcript file could not be read (codex)"],
+                                         ["reputation lists are 9 days old"]))
+        out = rendered(af.render_diff, d, af.C(False))
+        self.assertIn("coverage gaps", out)
+        self.assertIn("+ 1 transcript file could not be read (codex)", out)
+        self.assertIn("- reputation lists are 9 days old", out)
+
+    def test_a_baseline_from_before_coverage_reports_no_gap_change(self):
+        d = af.diff_reports(self.report(), self.report(coverage={"ok": False, "gaps": ["x"]}))
+        self.assertIsNone(d["coverage"])
+
+    def test_a_malformed_coverage_baseline_is_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "old.json"
+            path.write_text(json.dumps(self.report(coverage={"gaps": "not a list"})), encoding="utf-8")
+            with self.assertRaises(ValueError) as cm:
+                af.load_report(path)
+        self.assertIn("coverage.gaps", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

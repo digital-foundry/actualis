@@ -203,6 +203,7 @@ actualis --agent codex    # one agent only (claude | codex | copilot | gemini | 
 | `--root DIR` | read one specific transcript directory instead of discovering them |
 | `--ci-log FILE` | audit a Claude Code Action execution log on a CI runner, instead of discovering transcript directories. The log is the only input: not with `--root`, `--project`, `--replay` or an `--agent` other than `claude`, and only the scanning modes read it (not `--watch`, `--mcp`, `--explain`, `--agents`, `--suppress`, `--suppressions`, `--self-check`, `--service` or `--completions`) |
 | `--bash` | shell audit only |
+| `--verbose` | text report: also list the leads actualis checked and cleared (an IOC entry whose version range excludes what was installed, a placeholder credential, a reputation candidate a fresh check cleared), at most 20 lines. Only the text report and `--bash` take it |
 | `--coach` | findings and actions only |
 | `--aisvs` | which OWASP AISVS controls your transcripts show are **not** holding |
 | `--share` | postable summary with nothing identifying in it |
