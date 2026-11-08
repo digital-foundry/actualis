@@ -785,6 +785,35 @@ class TestFpMeasureTiming(TestFpMeasure):
         self.assertEqual(code, 2)
         self.assertIn("--sample", err)
 
+class TestNestedShellWrites(unittest.TestCase):
+    """A write inside `bash -c '…'` is the same write: the nested script's
+    redirections and tee targets count, a few levels deep."""
+
+    def test_writes_inside_a_shell_script_argument_count(self):
+        for cmd, want in (("bash -c 'echo x > /etc/x'", ["/etc/x"]),
+                          ('sh -c "printf y >> ~/z"', ["~/z"]),
+                          ("sudo sh -c 'echo 1 > /proc/sys/x'", ["/proc/sys/x"]),
+                          ("bash -lc 'make | tee /srv/log'", ["/srv/log"]),
+                          ("sh -c \"bash -c 'echo > /etc/deep'\"", ["/etc/deep"]),
+                          ("xargs -I{} sh -c 'echo > /etc/u'", ["/etc/u"])):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(af.write_targets("Bash", bash(cmd)), want)
+
+    def test_a_shell_script_that_only_reads_writes_nothing(self):
+        for cmd in ("bash -c 'cat /etc/hosts'", "sh -c 'grep \">\" f'", "bash script.sh > /dev/null"):
+            with self.subTest(cmd=cmd):
+                self.assertNotIn("/etc/hosts", af.write_targets("Bash", bash(cmd)))
+
+    def test_the_nested_write_is_outside_root(self):
+        f = guard_fleet()
+        f.add_tool("p", "Bash", bash("sudo sh -c 'echo nameserver 1.1.1.1 > /etc/resolv.conf'"), TS)
+        [hit] = flags_of(f, "outside-root")
+        self.assertIn("/etc/resolv.conf", hit["evidence"])
+
+    def test_nesting_is_bounded(self):
+        cmd = "sh -c " * 40 + "'echo > /etc/x'"
+        af.write_targets("Bash", bash(cmd))   # returns, whatever it finds
+
 
 if __name__ == "__main__":
     unittest.main()

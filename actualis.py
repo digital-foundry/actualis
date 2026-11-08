@@ -9274,7 +9274,21 @@ def write_targets(name: str, tool_input: dict) -> list[str]:
                 return [t]
         return []
     cmd = tool_input.get("command") if name == "Bash" else None
-    if not isinstance(cmd, str) or (">" not in cmd and "tee" not in cmd):
+    if not isinstance(cmd, str):
+        return []
+    return _shell_write_targets(cmd, 0)
+
+
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+_SHELL_C_OPT = re.compile(r"^-[A-Za-z]{0,8}c[A-Za-z]{0,8}$")
+WRITE_NESTING_MAX = 4
+
+
+def _shell_write_targets(cmd: str, depth: int) -> list[str]:
+    """write_targets for a shell command, and for the script of each nested
+    `sh -c '…'` (bash, zsh, … ; `-lc` too), up to WRITE_NESTING_MAX deep: a
+    write inside `sudo sh -c '…'` is still a write."""
+    if ">" not in cmd and "tee" not in cmd:
         return []
     out: list[str] = []
     # `>|` (clobber) holds a pipe character that _net_split would cut on.
@@ -9294,6 +9308,10 @@ def write_targets(name: str, tool_input: dict) -> list[str]:
         words, _via = _net_strip_prefixes(toks)
         if words and _net_base(words[0]).lower() == "tee":
             out.extend(w for w in words[1:] if not w.startswith("-") and not _REDIRECT_TOKEN.match(w))
+        elif words and _net_base(words[0]).lower() in _SHELLS and depth < WRITE_NESTING_MAX:
+            i = next((n for n, w in enumerate(words[1:], 1) if _SHELL_C_OPT.match(w)), 0)
+            if i and i + 1 < len(words):
+                out.extend(_shell_write_targets(words[i + 1], depth + 1))
         if len(out) >= WRITE_TARGETS_MAX:
             break
     return out[:WRITE_TARGETS_MAX]
@@ -13713,7 +13731,8 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "download's host only, never its path.",
             "",
             "outside-root (med): a file-write tool's path, or a shell redirection",
-            "(>, >>, >|, &>) or tee target, outside the session's working",
+            "(>, >>, >|, &>) or tee target, also inside a nested sh -c script,",
+            "outside the session's working",
             "directory, once per target per file. Temp directories, /dev, and the",
             "agents' own config directories (~/.claude, ~/.codex, ~/.gemini,",
             "~/.qwen, ~/.copilot) are left out.",
