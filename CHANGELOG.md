@@ -23,6 +23,12 @@
   an `actualis` skill and an `/actualis` command that drive the installed CLI. Tests keep its version and
   every flag it mentions in step with `actualis.py`.
 
+### Fixed
+- A run where every transcript file found could not be read says so, instead of blaming the filters.
+- The no-match hint no longer suggests the `--days` value already given: when the newest file is inside the
+  window but its records are not, it says that.
+- AF014 counts transcript files, not sessions, and leaves out a date it cannot read instead of printing `?`.
+
 ## 0.6.0 (2026-11-02)
 
 ### Added

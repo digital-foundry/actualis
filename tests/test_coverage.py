@@ -4,6 +4,7 @@ transcript retention (0.7.0).
 Synthetic data only. Every transcript and every settings.json here is written
 by the test under a temporary HOME; nothing reads a real agent directory.
 """
+import argparse
 import contextlib
 import importlib.util
 import io
@@ -11,6 +12,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -494,7 +496,7 @@ class TestAF014(HomeCase):
         first = af._utc_date(next(self.projects.rglob("s.jsonl")).stat().st_mtime)
         self.assertEqual(hit.severity, "info")
         self.assertEqual(hit.title, "Transcripts are about to expire")
-        self.assertEqual(hit.evidence, f"1 session(s) from {first} are deleted within 7 days "
+        self.assertEqual(hit.evidence, f"1 transcript file, the oldest from {first}, is deleted within 7 days "
                                        "(Claude Code keeps 30 days).")
         self.assertIn("cleanupPeriodDays", hit.action)
         self.assertIn("actualis --watch", hit.action)
@@ -1132,6 +1134,67 @@ class TestFinalReviewFixes(HomeCase):
         rows = {r["agent"]: r for r in af.coverage(f)["agents"]}
         self.assertEqual(rows["claude-code"]["dirs_unreadable"], 1)
         self.assertEqual(af.JSON_SCHEMA["coverage.agents[].dirs_unreadable"], "int")
+
+class TestCoverageFollowUps(unittest.TestCase):
+    """#87: messages that said the wrong thing, and a producer triple taken on trust."""
+
+    def tree(self, tmp, age_days=0):
+        root = Path(tmp) / "projects" / "proj"
+        root.mkdir(parents=True)
+        f = root / "s.jsonl"
+        f.write_text('{"type":"user"}\n')
+        t = time.time() - age_days * 86400
+        os.utime(f, (t, t))
+        fleet = af.Fleet()
+        fleet.roots.append(Path(tmp) / "projects")
+        return fleet
+
+    def test_a_run_where_nothing_could_be_read_says_so(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fleet = self.tree(tmp)
+            fleet._file_unreadable("claude-code")
+            args = argparse.Namespace(root=None, days=None, project=None, agent="all")
+            msg = af.dead_end_message(fleet, args)
+            self.assertIn("could not be read", msg)
+            self.assertNotIn("none matched", msg)
+
+    def test_the_days_hint_never_suggests_the_window_already_given(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fleet = self.tree(tmp, age_days=0)
+            args = argparse.Namespace(root=None, days=1, project=None, agent="all")
+            msg = af.dead_end_message(fleet, args)
+            self.assertNotIn("Try --days 1.", msg)
+            self.assertIn("records", msg)
+
+    def test_the_days_hint_still_suggests_a_wider_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fleet = self.tree(tmp, age_days=10)
+            args = argparse.Namespace(root=None, days=1, project=None, agent="all")
+            self.assertIn("Try --days 11.", af.dead_end_message(fleet, args))
+
+    def test_af014_without_a_date_says_nothing_about_one(self):
+        f = af.Fleet()
+        orig = af.transcripts_expiring
+        af.transcripts_expiring = lambda _f: [("claude-code", 2, "", 30)]
+        try:
+            [hit] = [x for x in af.coach(f) if x.id == "AF014"]
+        finally:
+            af.transcripts_expiring = orig
+        self.assertNotIn("?", hit.evidence)
+        self.assertTrue(hit.evidence.startswith("2 transcript files are deleted within 7 days"))
+
+    def test_an_out_of_range_mtime_gives_no_date(self):
+        self.assertEqual(af._utc_date(1e300) or "", "")
+
+    def test_a_producer_triple_with_a_bad_missing_is_not_taken(self):
+        for bad in (5, ["x"], {"a": 1}):
+            got = af.classify({"assessment": "needs-validation", "basis": "observed", "missing": bad})
+            self.assertTrue(got["missing"] is None or isinstance(got["missing"], str), got)
+
+    def test_a_producer_triple_with_text_or_none_is_kept(self):
+        for ok in ("could not check", None):
+            row = {"assessment": "needs-validation", "basis": "inferred", "missing": ok}
+            self.assertEqual(af.classify(row), row)
 
 
 if __name__ == "__main__":
