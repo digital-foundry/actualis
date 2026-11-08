@@ -39,7 +39,7 @@ from typing import NamedTuple
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 # --------------------------------------------------------------------------
 # Pricing
@@ -8415,8 +8415,15 @@ def dead_end_message(fleet: "Fleet", args) -> str:
                 "  The directory exists but holds no .jsonl transcripts. If your agent\n"
                 "  stores sessions elsewhere, pass that directory with --root.")
 
-    # Files exist, so a filter removed all of them. Name the one that did it.
+    # Files exist. If none could be opened, no filter is to blame.
     plural = "" if files == 1 else "s"
+    if fleet.files_unreadable and not any(r["files_read"] for r in fleet.agent_roots.values()):
+        n = fleet.files_unreadable
+        return (f"actualis: {files:,} session file{plural} found; "
+                f"{n:,} could not be read and none were read.\n"
+                "  Check that this user can open them, or pass a readable copy with --root.")
+
+    # Files exist, so a filter removed all of them. Name the one that did it.
     lines = [f"actualis: {files:,} session file{plural} found, "
              "none matched this run's filters."]
     if args.days is not None:
@@ -8425,8 +8432,15 @@ def dead_end_message(fleet: "Fleet", args) -> str:
         if newest is not None:
             last = datetime.fromtimestamp(newest, timezone.utc)
             age = (datetime.now(timezone.utc) - last).days
-            lines.append(f"  The newest session is {last:%Y-%m-%d} ({age} days ago). "
-                         f"Try --days {max(age + 1, 1)}.")
+            wider = max(age + 1, 1)
+            if wider > args.days:
+                lines.append(f"  The newest session is {last:%Y-%m-%d} ({age} days ago). "
+                             f"Try --days {wider}.")
+            else:
+                # The window is cut by record time, the file date is when it
+                # was last written: a recent file can hold only older records.
+                lines.append(f"  The newest session file was written {last:%Y-%m-%d}, but none of "
+                             "its records fall inside the window. Drop --days to see them.")
     if args.project:
         lines.append(f"  --project {args.project!r} matched no project name. "
                      "Drop it to see every project.")
@@ -11319,7 +11333,8 @@ def coach(fleet: "Fleet") -> list[Finding]:
     for agent, n, first, keep in transcripts_expiring(fleet):
         out.append(Finding(
             "AF014", "info", "Transcripts are about to expire",
-            f"{n} session(s) from {first} are deleted within {COVERAGE_EXPIRY_DAYS} days "
+            f"{_plural(n, 'transcript file')}" + (f", the oldest from {first}," if first else "")
+            + f" {'is' if n == 1 else 'are'} deleted within {COVERAGE_EXPIRY_DAYS} days "
             f"({_AGENT_LABEL.get(agent, agent)} keeps {keep} days).",
             "Archive them, run `actualis --watch`, or raise cleanupPeriodDays in "
             "Claude Code's settings.json."))
@@ -11413,7 +11428,8 @@ def classify(row: object) -> dict:
             return assessment_of(row.id)
         if not isinstance(row, dict):
             return dict(_DEFAULT_ASSESSMENT)
-        if row.get("assessment") in ASSESSMENTS and row.get("basis") in BASES and "missing" in row:
+        if row.get("assessment") in ASSESSMENTS and row.get("basis") in BASES \
+                and "missing" in row and (row["missing"] is None or isinstance(row["missing"], str)):
             return {"assessment": row["assessment"], "basis": row["basis"], "missing": row["missing"]}
         if "verdict" in row and "reason" in row:
             return _ioc_assessment(row["verdict"], row["reason"])
@@ -16737,9 +16753,9 @@ def _coverage_agents(fleet: Fleet, now: "float | None" = None) -> list[tuple[dic
 
 
 def transcripts_expiring(fleet: Fleet) -> list[tuple[str, int, str, int]]:
-    """(agent, files, date of the oldest, days kept) for each agent that
+    """(agent, files, date of the oldest or "", days kept) for each agent that
     deletes transcripts within COVERAGE_EXPIRY_DAYS (AF014)."""
-    return [(row["agent"], row["expiring_7d"], _utc_date(first) or "?", row["retention_days"])
+    return [(row["agent"], row["expiring_7d"], _utc_date(first) or "", row["retention_days"])
             for row, first in _coverage_agents(fleet)
             if row["expiring_7d"] and row["retention_days"] is not None]
 
