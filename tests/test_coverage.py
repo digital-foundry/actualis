@@ -773,5 +773,137 @@ class TestFailOnUnchanged(HomeCase):
         self.assertNotIn("--fail-on-coverage", err)
 
 
+class TestAssumptions(unittest.TestCase):
+    """Task 5: assumptions(fleet), one entry per marker, with its volume."""
+
+    def test_each_marker_gives_one_entry_with_its_volume(self):
+        f = af.Fleet()
+        f.add_usage("proj", "claude-sonnet-5", {"input_tokens": 10, "output_tokens": 5,
+                                                "cache_creation_input_tokens": 1000}, TS)
+        f.add_usage("proj", "claude-sonnet-4-9", {"input_tokens": 1_000_000, "output_tokens": 0}, TS)
+        f.add_tool("proj", "Bash", {"command": "npm i y@1.0.0"}, TS, "auto")
+        by_kind = {a["kind"]: a for a in af.assumptions(f)}
+        self.assertEqual(by_kind["cache-ttl-assumed-1h"],
+                         {"path": "tokens.cache_w_assumed", "kind": "cache-ttl-assumed-1h",
+                          "basis": "record omits the 1h/5m split; priced at the 1h rate",
+                          "volume": {"tokens": 1000}})
+        self.assertEqual(by_kind["price-tier-family"]["path"], "pricing.cost_by_tier.family")
+        self.assertGreater(by_kind["price-tier-family"]["volume"]["usd"], 0)
+        self.assertEqual(by_kind["host-inferred"]["volume"], {"items": 1})
+        self.assertNotIn("price-tier-vendor", by_kind)
+
+    def test_the_rest(self):
+        f = af.Fleet()
+        f.add_usage("proj", "claude-sonnet-5", {"output_tokens": 10}, TS)
+        f.add_usage("proj", "claude-sonnet-5", {"output_tokens": 10}, TS + timedelta(days=2))
+        f.add_model_usage("gemini", "proj", "gemini-3.5-flash", 500, 20, 0, 0, 0, TS)
+        f.sub_cost_floor = 1.25
+        by_kind = {a["kind"]: a for a in af.assumptions(f)}
+        self.assertEqual(by_kind["rate-active-days"]["volume"], {"days": 2})
+        self.assertGreater(by_kind["model-unpriced"]["volume"]["tokens"], 0)
+        self.assertEqual(by_kind["subagent-cost-floor"]["volume"], {"usd": 1.25})
+
+    def test_nothing_assumed_is_an_empty_list(self):
+        self.assertEqual(af.assumptions(af.Fleet()), [])
+        self.assertEqual(af.to_json(af.Fleet())["assumptions"], [])
+
+
+class TestRejected(unittest.TestCase):
+    """Task 5: rejected[], leads evaluated and cleared."""
+
+    def ioc_fleet(self, ioc_text, *cmds, refuse=()):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "osv-malicious.txt"
+            path.write_text(ioc_text, encoding="utf-8")
+            f = af.Fleet()
+            f.suppressions = {}
+            for k, cmd in enumerate(cmds):
+                f.add_tool("proj", "Bash", {"command": cmd}, TS, "auto", session="s1", call_id=f"t{k}")
+            for k in refuse:
+                f._network_outcome(f"claude:t{k}", refused=True)
+            af.apply_network_policy(f, af.parse_trust([]), strict=False)
+            with contextlib.redirect_stderr(io.StringIO()):
+                af.apply_ioc(f, af.load_ioc([str(path)]))
+            return f
+
+    def test_a_version_outside_the_range_is_rejected_not_matched(self):
+        payload = af.to_json(self.ioc_fleet("npm:left-pad@<1.4.0\n", "npm i left-pad@1.4.2"))
+        self.assertEqual(payload["network"]["ioc"]["matches"], [])
+        self.assertEqual(payload["rejected"], [{
+            "kind": "ioc", "id": "npm:left-pad", "what": "left-pad 1.4.2",
+            "why_cleared": "1.4.2 is outside <1.4.0", "source": "osv-malicious.txt:1"}])
+        self.assertEqual(payload["rejected_total"], 1)
+
+    def test_a_refused_install_is_not_a_lead(self):
+        f = self.ioc_fleet("npm:left-pad@<1.4.0\n", "npm i left-pad@1.4.2", refuse=(0,))
+        self.assertEqual(af.to_json(f)["rejected_total"], 0)
+
+    def test_a_match_is_never_rejected(self):
+        f = self.ioc_fleet("npm:left-pad@<1.4.0\n", "npm i left-pad@1.3.0")
+        payload = af.to_json(f)
+        self.assertEqual(len(payload["network"]["ioc"]["matches"]), 1)
+        self.assertEqual(payload["rejected"], [])
+
+    def test_a_placeholder_credential_is_rejected_without_its_value(self):
+        f = af.Fleet()
+        f.add_tool("proj", "Bash", {"command": "export STRIPE_SECRET_KEY=your_stripe_key_here"}, TS)
+        payload = af.to_json(f)
+        self.assertEqual(payload["secrets"], [])
+        self.assertEqual(payload["rejected"], [{
+            "kind": "secret", "id": "secret:STRIPE_SECRET_KEY", "what": "STRIPE_SECRET_KEY in proj",
+            "why_cleared": "failed the STRIPE_SECRET_KEY shape check", "source": ""}])
+        self.assertNotIn("your_stripe_key_here", json.dumps(payload["rejected"]))
+
+    def test_a_confirmed_not_listed_candidate_is_rejected(self):
+        f = af.Fleet()
+        f.suppressions = {}
+        f.add_tool("proj", "Bash", {"command": "curl -sO https://a.example/x"}, TS, "auto")
+        af.apply_network_policy(f, af.parse_trust([]), strict=False)
+        a = af.sb_hash("a.example/")
+        rep = af.ReputationData()
+        rep.status = "ok"
+        rep.lists = {name: b"" for name in af.REPUTATION_LISTS}
+        rep.lists["mw-4b"] = a[:4]
+        rep.state = {name: {"fetched_at": TS, "next_update_at": TS, "prefix_count": 0, "version": None}
+                     for name in af.REPUTATION_LISTS}
+        rep.oldest = TS
+        rep.confirmations = {a[:4]: {"full_hashes": [], "confirmed_at": TS,
+                                     "cache_until": TS + timedelta(days=1)}}
+        af.apply_reputation(f, rep, TS + timedelta(minutes=1))
+        self.assertEqual(af.to_json(f)["rejected"], [{
+            "kind": "reputation", "id": "gsb:a.example", "what": "a.example",
+            "why_cleared": "confirmed not listed at 2026-10-01 12:00 UTC",
+            "source": "gsb/confirmations.json"}])
+
+    def test_capped_newest_first_with_the_total(self):
+        f = af.Fleet()
+        for n in range(250):
+            f._reject("ioc", f"npm:p{n:03d}", f"p{n:03d} 1.0.0", "1.0.0 is outside <0.1.0",
+                      "x.txt:1", TS + timedelta(minutes=n))
+        payload = af.to_json(f)
+        self.assertEqual(len(payload["rejected"]), af.REJECTED_CAP)
+        self.assertEqual(payload["rejected_total"], 250)
+        self.assertEqual(payload["rejected"][0]["id"], "npm:p249")
+
+    def test_one_row_per_lead_the_newest_kept(self):
+        f = af.Fleet()
+        f._reject("ioc", "npm:x", "x 2.0.0", "2.0.0 is outside <1.0.0", "a.txt:1", TS)
+        f._reject("ioc", "npm:x", "x 2.0.0", "2.0.0 is outside <1.0.0", "a.txt:9",
+                  TS + timedelta(days=1))
+        f._reject("ioc", "npm:x", "x 2.0.0", "2.0.0 is outside <1.0.0", "a.txt:5", None)
+        [row] = af.to_json(f)["rejected"]
+        self.assertEqual(row["source"], "a.txt:9")
+
+    def test_the_new_paths_are_declared_and_documented(self):
+        f = self.ioc_fleet("npm:left-pad@<1.4.0\n", "npm i left-pad@1.4.2")
+        f.add_usage("proj", "claude-sonnet-5", {"input_tokens": 10, "output_tokens": 5,
+                                                "cache_creation_input_tokens": 1000}, TS)
+        self.assertEqual(schema_drift(af.to_json(f)), [])
+        doc = (ROOT / "docs" / "json.md").read_text(encoding="utf-8")
+        for word in ("## assumptions", "## rejected", "`rejected_total`", "`why_cleared`",
+                     "`cache-ttl-assumed-1h`", "`rate-active-days`"):
+            self.assertIn(word, doc)
+
+
 if __name__ == "__main__":
     unittest.main()

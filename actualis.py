@@ -2172,15 +2172,17 @@ def _priority_for_name(name: str) -> str:
     return "critical" if _CRITICAL_NAMES.search(name) else "high"
 
 
-def classify_secrets(cmd: str, value_digests: dict[str, set[str]] | None = None
-                     ) -> list[tuple[str, str, str]]:
+def classify_secrets(cmd: str, value_digests: dict[str, set[str]] | None = None,
+                     rejected: list[str] | None = None) -> list[tuple[str, str, str]]:
     """Return [(priority, type, sha256[:8])] for each distinct secret in a command.
 
     The secret value is hashed immediately and never retained. For an id taken
     from where a password appears rather than from its value, `value_digests`,
     when given, receives id -> {sha256(value)}, so the caller can tell how many
     different passwords one id stands for. The caller keeps those digests in
-    memory only and never emits them.
+    memory only and never emits them. `rejected`, when given, receives the type
+    of each credential-shaped token that failed the shape check (a placeholder,
+    a vendor's published example): the type only, never the value.
     """
     # The same text redact() masks: stripped characters out first, so a token
     # split by one is counted as the token it shows as.
@@ -2195,6 +2197,8 @@ def classify_secrets(cmd: str, value_digests: dict[str, set[str]] | None = None
     def add(priority: str, kind: str, value: str, fp: str | None = None,
             span: tuple[int, int] | None = None) -> None:
         if _looks_like_placeholder(value) or is_vendor_example(value):
+            if rejected is not None:
+                rejected.append(kind)
             return
         if span is not None:
             if fp and any(legacy[span[0]:span[1]]):
@@ -7324,7 +7328,7 @@ def match_ioc(item: dict, ioc: IocSet) -> tuple | None:
     all the entries at that strength, by (source, line). The trust list is
     never consulted."""
     hits: list[tuple[str, str, IocEntry, str]] = []
-    clean_hit = False
+    cleared: list[tuple[IocEntry, str]] = []      # (entry, key): a listed name, version outside
     eco = item.get("ecosystem")
     if item["kind"] == "install" and eco in IOC_CHECKABLE and item.get("package"):
         for name, version in _ioc_resolved(item):
@@ -7342,7 +7346,7 @@ def match_ioc(item: dict, ioc: IocSet) -> tuple | None:
                         except Exception:        # noqa: BLE001 -- fail closed: undecidable, never clean
                             inside = None
                         if inside is False:
-                            clean_hit = True
+                            cleared.append((e, f"{eco}:{listed}@{redact(version)}"))
                             continue
                         verdict, reason = (("match", "version-in-spec") if inside
                                            else ("unresolved", "module-prefix" if prefix else "undecidable"))
@@ -7359,7 +7363,12 @@ def match_ioc(item: dict, ioc: IocSet) -> tuple | None:
             if _host_path_match(e.host, e.path, item, e.exact_host, ioc=True):
                 hits.append(("match", "host", e, f"host:{'=' if e.exact_host else ''}{e.host}{e.path}"))
     if not hits:
-        return ("clean", None, [], None, False) if clean_hit else None
+        if not cleared:
+            return None
+        # Every listed name's version fell outside: the entries that cleared
+        # it, by (source, line), and the first one's key (rejected[]).
+        cleared.sort(key=lambda c: (c[0].source, c[0].line or 0))
+        return "clean", None, [c[0] for c in cleared], cleared[0][1], False
     best = max(_IOC_RANK[h[0]] for h in hits)
     top = sorted((h for h in hits if _IOC_RANK[h[0]] == best),
                  key=lambda h: (h[2].source, h[2].line or 0))
@@ -7447,6 +7456,8 @@ def apply_ioc(fleet: "Fleet", ioc: IocSet | None) -> None:
         totals["undecidable"] += 1 if undecided and not refused else 0
         if verdict == "clean":
             totals["clean_name_matches"] += 0 if refused else 1
+            if not refused:
+                _ioc_reject(fleet, ioc, key, matched[0], item)
             continue
         row = {"verdict": verdict, "reason": reason, "refused": refused, "entries": matched,
                "item": item, "key": key, "flag_id": None, "suppressed": False}
@@ -7496,6 +7507,17 @@ def apply_ioc(fleet: "Fleet", ioc: IocSet | None) -> None:
         })
         for r in rows:
             r["flag_id"], r["suppressed"] = fid, suppressed
+
+
+def _ioc_reject(fleet: "Fleet", ioc: IocSet, key: str, entry: IocEntry, item: dict) -> None:
+    """rejected[]: an installed item whose name an entry lists and whose exact
+    version is outside the entry's range."""
+    name, _, version = key.rpartition("@")
+    listed = name.split(":", 1)[1] if ":" in name else name
+    path = ioc.sources[entry.source]["path"] if 0 <= entry.source < len(ioc.sources) else ""
+    source = (Path(path).name + (f":{entry.line}" if entry.line else "")) if path else ""
+    fleet._reject("ioc", name, f"{listed} {version}", f"{version} is outside {entry.spec_text}",
+                  source, item.get("ts"))
 
 
 IOC_ROWS_SHOWN = 50
@@ -7918,6 +7940,10 @@ def apply_reputation(fleet: "Fleet", data: "ReputationData | None", now: "dateti
             memo[key] = (g, vt_verdict(host, data, now))
         g, v = memo[key]
         totals["checked"] += 1
+        if g and g["state"] == "not-listed" and g["checked_at"]:
+            fleet._reject("reputation", f"gsb:{host}", host,
+                          f"confirmed not listed at {_utc_hm(g['checked_at'])}",
+                          "gsb/confirmations.json", item.get("ts"))
         if g:
             for p, n in g["candidates"].items():
                 fleet.reputation_candidates[p] = max(fleet.reputation_candidates.get(p, 0), n)
@@ -9245,6 +9271,8 @@ class Fleet:
         self.retention: dict | None = None
         # --network was given: coverage then lists the network check.
         self.network_requested = False
+        # Leads evaluated and cleared (rejected[]), keyed (kind, id, what).
+        self.rejected: dict[tuple, dict] = {}
 
     # -- ingest ------------------------------------------------------------
 
@@ -10330,11 +10358,15 @@ class Fleet:
         _rank = {"critical": 0, "high": 1, "low": 2}
         found_secrets: list[tuple[str, str, str]] = []
         seen_fp: set[str] = set()
+        dropped: list[str] = []
         for w in windows:                    # one secret seen in two windows is one
-            for item in classify_secrets(w, self._location_values):
+            for item in classify_secrets(w, self._location_values, dropped):
                 if item[2] not in seen_fp:
                     seen_fp.add(item[2])
                     found_secrets.append(item)
+        for kind in sorted(set(dropped)):
+            self._reject("secret", f"secret:{kind}", f"{kind} in {project}",
+                         f"failed the {kind} shape check", self._source_text(), ts)
         for priority, kind, fp in found_secrets:
             e = self.secrets.setdefault(fp, {
                 "priority": priority, "kinds": set(), "uses": 0,
@@ -10503,6 +10535,25 @@ class Fleet:
         row["mtimes"].setdefault("" if root is None else str(root), []).append(mtime)
         if row["oldest_mtime"] is None or mtime < row["oldest_mtime"]:
             row["oldest_mtime"] = mtime
+
+    def _source_text(self) -> str:
+        """file:line of the record being read, for a rejected[] row."""
+        if not self._src_file:
+            return ""
+        return f"{self._src_file}:{self._src_line}" if self._src_line else self._src_file
+
+    def _reject(self, kind: str, rid: str, what: str, why: str, source: str,
+                when: "datetime | str | None") -> None:
+        """A lead actualis evaluated and cleared: one rejected[] row per
+        (kind, id, what), the newest sighting kept. Never a credential value."""
+        if isinstance(when, datetime):
+            key = when.astimezone(timezone.utc).isoformat()
+        else:
+            key = _net_utc_key(when) if isinstance(when, str) else ""
+        cur = self.rejected.get((kind, rid, what))
+        if cur is None or key > cur["_when"]:
+            self.rejected[(kind, rid, what)] = {"kind": kind, "id": rid, "what": what,
+                                                "why_cleared": why, "source": source, "_when": key}
 
     def _scan_file(self, path: Path, project: str, since: datetime | None,
                    root: Path | None = None) -> None:
@@ -16259,6 +16310,21 @@ JSON_SCHEMA: dict[str, str] = {
     "coverage.checks[].stale": "bool",
     "coverage.gaps": "array",
     "coverage.gaps[]": "str",
+    "assumptions": "array",
+    "assumptions[].path": "str",
+    "assumptions[].kind": "str",
+    "assumptions[].basis": "str",
+    "assumptions[].volume.tokens": "int",
+    "assumptions[].volume.usd": "float",
+    "assumptions[].volume.items": "int",
+    "assumptions[].volume.days": "int",
+    "rejected": "array",
+    "rejected[].kind": "str",
+    "rejected[].id": "str",
+    "rejected[].what": "str",
+    "rejected[].why_cleared": "str",
+    "rejected[].source": "str",
+    "rejected_total": "int",
 }
 
 # A matched item is shown exactly as network.items shows it.
@@ -16587,6 +16653,71 @@ def failing_coverage(cov: dict) -> list[str]:
     return list(cov["gaps"])
 
 
+_TIER_BASIS = {VENDOR_DOC: "priced from provider docs, not the price list",
+               AGGREGATOR: "priced from a third party, not the vendor",
+               FAMILY: "priced from a sibling model in the same family",
+               DEFAULT: "priced at the provider's most expensive known rate",
+               UNPRICED: "no published rate"}
+
+
+def assumptions(fleet: Fleet) -> list[dict]:
+    """Every number derived or assumed rather than read, once, with its
+    volume. Built from the markers the report already keeps; they stay where
+    they are. Empty for a fleet with nothing assumed."""
+    out: list[dict] = []
+
+    def add(path: str, kind: str, basis: str, unit: str, value) -> None:
+        out.append({"path": path, "kind": kind, "basis": basis, "volume": {unit: value}})
+
+    assumed = int(fleet.tokens.get("cache_w_assumed", 0))
+    if assumed:
+        add("tokens.cache_w_assumed", "cache-ttl-assumed-1h",
+            "record omits the 1h/5m split; priced at the 1h rate", "tokens", assumed)
+    for tier in RATE_TIERS:
+        usd = fleet.cost_by_tier.get(tier, 0.0)
+        if tier != VENDOR and usd > 0:
+            add(f"pricing.cost_by_tier.{tier}", f"price-tier-{tier}", _TIER_BASIS.get(tier, tier),
+                "usd", float(round(usd, 4)))
+    unpriced = sum(fleet.unpriced_tokens.values())
+    if unpriced:
+        add("unpriced_model_tokens", "model-unpriced",
+            "no published rate: tokens counted, cost not", "tokens", int(unpriced))
+    inferred = sum(1 for i in fleet.network_items if i.get("host_inferred"))
+    if inferred:
+        add("network.items[].host_inferred", "host-inferred",
+            "the command named no host; the registry default is assumed", "items", inferred)
+    if fleet.sub_cost_floor > 0:
+        add("subagents.cost_floor_usd", "subagent-cost-floor",
+            "only each run's final message is recorded; a lower bound", "usd",
+            float(round(fleet.sub_cost_floor, 4)))
+    span, active = fleet.span_dates, fleet.active_days
+    if span and active != span:
+        add("window.active_days", "rate-active-days",
+            f"rates divide by {active} active day(s), not the {span} calendar dates the "
+            f"window covers", "days", active)
+    return out
+
+
+REJECTED_CAP = 200
+
+
+def rejected_json(fleet: Fleet, raw: bool = False) -> list[dict]:
+    """rejected[]: leads evaluated and cleared, newest first, at most
+    REJECTED_CAP; rejected_total counts every one. A package name and version
+    is redacted unless raw, as network.packages is; a secret row holds only a
+    type and a project, and a reputation row a host."""
+    rows = sorted(fleet.rejected.values(), key=lambda r: (r["kind"], r["id"], r["what"]))
+    rows.sort(key=lambda r: r["_when"], reverse=True)
+    out = []
+    for r in rows[:REJECTED_CAP]:
+        row = {k: clean(r[k]) for k in ("kind", "id", "what", "why_cleared", "source")}
+        if not raw and r["kind"] == "ioc":
+            row.update(id=redact(row["id"]), what=redact(row["what"]),
+                       why_cleared=redact(row["why_cleared"]))
+        out.append(row)
+    return out
+
+
 def to_json(fleet: Fleet, raw: bool = False) -> dict:
     payload = _to_json_body(fleet, raw)
     payload["report_sha256"] = report_digest(payload)
@@ -16783,6 +16914,9 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
         "rewound_tool_calls": fleet.rewound_tool_calls,
         "unsupported_records": fleet.unsupported_records,
         "coverage": coverage(fleet),
+        "assumptions": assumptions(fleet),
+        "rejected": rejected_json(fleet, raw),
+        "rejected_total": len(fleet.rejected),
     }
 
 

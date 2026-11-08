@@ -59,6 +59,9 @@ that and prints a warning to stderr (stdout stays pure JSON).
 | `unpriced_model_tokens` | model to token count, for Gemini CLI and Qwen Code models with no published rate (tier `unpriced`): `gemini-3-pro-preview`, `gemini-3.5-flash`, every Qwen model, and any model id those agents report that has no price. Their tokens are in `tokens`; their cost is not in `cost_usd` and is not estimated |
 | `aggregator_priced_models` | models priced from a third party because the vendor publishes no rate for that id |
 | `coverage` | what this run examined and what it could not, per agent and per check, and the gaps `--fail-on-coverage` fails on. See [coverage](#coverage) |
+| `assumptions` | every number actualis derived or assumed rather than read, once, with its volume. See [assumptions](#assumptions) |
+| `rejected` | leads actualis evaluated and cleared, newest first, at most 200. See [rejected](#rejected) |
+| `rejected_total` | how many leads were cleared, uncapped |
 
 ## Inferred cache TTL
 
@@ -208,6 +211,50 @@ Exit 3 (`--fail-on`) wins when both apply. Without `--fail-on-coverage` a gap
 never changes the exit code.
 
 Verify: `actualis --json | jq '.coverage'`
+
+## assumptions
+
+Every number actualis derived or assumed rather than read, listed once. The
+markers stay where they are; this list is built from them. Added in 0.7.0.
+
+```json
+{"path": "tokens.cache_w_assumed", "kind": "cache-ttl-assumed-1h",
+ "basis": "record omits the 1h/5m split; priced at the 1h rate", "volume": {"tokens": 1834000}}
+```
+
+| `kind` | from (`path`) | `volume` |
+|---|---|---|
+| `cache-ttl-assumed-1h` | `tokens.cache_w_assumed` | `tokens` |
+| `price-tier-<tier>`, every tier but `vendor` | `pricing.cost_by_tier.<tier>` | `usd` |
+| `model-unpriced` | `unpriced_model_tokens` | `tokens` |
+| `host-inferred` | `network.items[].host_inferred` | `items` |
+| `subagent-cost-floor` | `subagents.cost_floor_usd` | `usd` |
+| `rate-active-days` | `window.active_days`, when it differs from the calendar dates covered | `days` |
+
+`basis` says in words what was assumed. `volume` has exactly one key. Models
+priced by inference (`unknown_models`) appear as `price-tier-family` or
+`price-tier-default`.
+
+## rejected
+
+Leads actualis evaluated and cleared. `suppressed` is different: a suppressed
+finding is still a finding someone chose to hold back. Added in 0.7.0.
+
+```json
+{"kind": "ioc", "id": "npm:left-pad", "what": "left-pad 1.4.2",
+ "why_cleared": "1.4.2 is outside <1.4.0", "source": "osv-malicious.jsonl:812"}
+```
+
+| `kind` | the lead | `why_cleared` | `source` |
+|---|---|---|---|
+| `ioc` | an installed item whose name an IOC entry lists and whose exact version is outside the entry's range | `<version> is outside <spec>` | the IOC file's name and line |
+| `reputation` | a local hash-prefix candidate that `actualis-reputation confirm` cleared within the cache window | `confirmed not listed at <time>` | `gsb/confirmations.json` |
+| `secret` | a credential-shaped token that failed the shape check (a placeholder, a vendor's published example) | `failed the <type> shape check` | the transcript file and line |
+
+A secret row names the type and the project (`what`), never the value. One
+row per `kind`, `id` and `what`, the newest sighting kept; rows are newest
+first and capped at 200, and `rejected_total` is the uncapped count. Redacted
+unless `--no-redact`. `--verbose` prints them in the text report.
 
 ## Verifying a report
 

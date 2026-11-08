@@ -1316,6 +1316,7 @@ class TestJSONSchemaFreeze(unittest.TestCase):
         f.add_tool("proj", "Bash", {"command": "npm i pending"}, ts, "auto")
         f.add_tool("proj", "Bash", {"command": "git clone https://github.com/evil-org/r"}, ts, "auto")
         f.add_tool("proj", "Bash", {"command": "npm i evil@1.0.1"}, ts, "default", call_id="t-refused")
+        f.add_tool("proj", "Bash", {"command": "npm i evil@2.0.0"}, ts, "auto")   # cleared: rejected[]
         f._network_outcome("claude:t-refused", refused=True)
         af.apply_network_policy(f, af.parse_trust(["pypi.org"]), strict=True,
                                 sources=[{"source": "flag", "entries": ["pypi.org"]}])
