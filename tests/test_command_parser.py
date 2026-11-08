@@ -588,5 +588,55 @@ class TestOutsideRootPerAgent(HomeCase):
         self.assertEqual(len(flags_of(f, "outside-root")), 1)
 
 
+class TestContract(unittest.TestCase):
+    """Assessments, --explain and the docs for the two findings."""
+
+    def test_assessments(self):
+        f = guard_fleet()
+        f.add_tool("p", "Write", {"file_path": "/etc/motd"}, TS)
+        f._guard_flag("high", af.RETRY_CATEGORY, "find", "p", TS, "rm refused, then find reached x")
+        rows = {x["categories"][0]: af.classify(x) for x in f.flags}
+        self.assertEqual(rows["outside-root"], {"assessment": "confirmed", "basis": "observed", "missing": None})
+        self.assertEqual(rows["retry-after-deny"], {
+            "assessment": "needs-validation", "basis": "inferred",
+            "missing": "whether the second command did what the refused one would have"})
+
+    def test_explain_retries_and_what_is_out_of_sight(self):
+        e = af.EXPLAIN["retries"]
+        text = " ".join(e["formula"] + e["assumes"])
+        for needle in ("retry-after-deny", "outside-root", "different program", "needs-validation",
+                       "no-cwd", "unresolved", "Codex", "5,000"):
+            self.assertIn(needle, text)
+        shell = " ".join(af.EXPLAIN["shell"]["assumes"])
+        for needle in ("eval", "xargs", "interpreter"):
+            self.assertIn(needle, shell)
+        net = " ".join(af.EXPLAIN["network"]["assumes"])
+        self.assertNotIn("env -S", net)
+        self.assertNotIn("{curl,URL}", net)
+        for line in e["formula"] + e["assumes"] + af.EXPLAIN["network"]["assumes"]:
+            self.assertLessEqual(len(line), 78, line)
+
+    def test_docs(self):
+        findings = (ROOT / "docs" / "findings.md").read_text(encoding="utf-8")
+        for needle in ("## Guardrail findings", "| `retry-after-deny` | high |", "| `outside-root` | med |",
+                       "| `retry-after-deny` | needs-validation | inferred |"):
+            self.assertIn(needle, findings)
+        json_md = (ROOT / "docs" / "json.md").read_text(encoding="utf-8")
+        for needle in ("`writes`", "`no-cwd`", "`unresolved`", "`retry-after-deny`", "`outside-root`"):
+            self.assertIn(needle, json_md)
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        for needle in ("`retry-after-deny`", "`outside-root`", "actualis --explain retries"):
+            self.assertIn(needle, readme)
+
+    def test_the_changelog_leads_with_what_can_change_a_gate(self):
+        text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        unreleased = text.split("## Unreleased", 1)[1].split("\n## ", 1)[0]
+        self.assertTrue(unreleased.lstrip().startswith("### What can change a gate"), unreleased[:80])
+        for needle in ("--fail-on high", "--fail-on any", "exit 3", "retry-after-deny", "outside-root",
+                       "base64", "report_sha256", "unreadable", "writes", "--explain retries",
+                       "tools/fp-measure.py"):
+            self.assertIn(needle, unreleased)
+
+
 if __name__ == "__main__":
     unittest.main()
