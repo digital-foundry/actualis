@@ -63,7 +63,7 @@ suppressed. `actualis --explain retries` has the rules.
 
 | category | severity | fires when | `--fail-on` |
 |---|---|---|---|
-| `retry-after-deny` | high | in one transcript file, a call ran after a refused call, through a different program, with the same action (a shell-audit category, `fetch` or `write`) and the same target (a host with its package or first URL path segment, or a path read against the session's working directory). Codex records no refusals | `high`, `any` |
+| `retry-after-deny` | high | in one transcript file, the first call within 10 minutes after a refused call (one per refusal) ran through a different program, with the same action (a shell-audit category, `fetch` or `write`) and the same target (a host with its package or first URL path segment, or a path read against the session's working directory). Codex records no refusals | `high`, `any` |
 | `outside-root` | med | a file-write tool's path, or a shell redirection or `tee` target, is outside the session's working directory; temp directories, `/dev` and the agents' config directories are left out; variable targets and sessions with no working directory are counted in the coverage check `writes`, never flagged | `any` |
 
 ## Network findings

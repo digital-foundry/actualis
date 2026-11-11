@@ -53,30 +53,29 @@ class _Collecting(A.Fleet):
 
     def _flush_retries(self) -> None:
         # Pairs each retry-after-deny hit with the refusal that seeded it, as
-        # Fleet._flush_retries does, and counts how far apart they are and
-        # which action class they share. Counts only.
+        # Fleet._flush_retries does, and counts how soon after the refusal it
+        # came and which action class they share. Counts only.
         d, calls = self.retry_detail, self._file_calls
         taken: set[int] = set()
         for i, r in enumerate(calls):
             if not r["refused"]:
                 continue
             d["refused"] += 1
-            seeded = 0
             for j in range(i + 1, len(calls)):
                 c = calls[j]
                 if c["refused"] or c["flagged"] or j in taken or A._same_program(r, c):
+                    continue
+                gap = (c["ts"] - r["ts"]).total_seconds() if c["ts"] and r["ts"] else None
+                if gap is not None and gap > A.RETRY_WINDOW_SECONDS:
                     continue
                 shared = r["keys"] & c["keys"]
                 if not shared:
                     continue
                 taken.add(j)
-                d["first" if not seeded else "later"] += 1
-                gap = (c["ts"] - r["ts"]).total_seconds() if c["ts"] and r["ts"] else None
+                d["seeds"] += 1
                 d["near"] += gap is not None and gap <= 120
-                d["far"] += gap is not None and gap > 3600
                 d["class " + min(shared)[0]] += 1
-                seeded += 1
-            d["seeds"] += bool(seeded)
+                break
         super()._flush_retries()
 
 
@@ -152,10 +151,7 @@ def report(m: dict, n: int, t_on: float, t_off: float) -> None:
     print(f"  {A.RETRY_CATEGORY} detail")
     for label, key in (("refused calls remembered", "refused"),
                        ("refusals that seeded a hit", "seeds"),
-                       ("first hit after its refusal", "first"),
-                       ("later hits, same refusal", "later"),
-                       ("within 2 minutes of the refusal", "near"),
-                       ("over an hour after the refusal", "far")):
+                       ("within 2 minutes of the refusal", "near")):
         print(f"    {label:<36} {d[key]:,}")
     for key in sorted(k for k in d if k.startswith("class ")):
         print(f"    {key:<36} {d[key]:,}")

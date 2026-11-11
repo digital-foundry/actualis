@@ -13,11 +13,11 @@
 - `report_sha256` is not comparable with 0.7.0.
 
 ### Added
-- `retry-after-deny` (high, needs-validation): in one transcript file, a call that ran after a refused
-  call, through a different program, with the same action (a shell-audit category, a download or a file
+- `retry-after-deny` (high, needs-validation): in one transcript file, the first call that ran within
+  10 minutes after a refused call, through a different program, with the same action (a shell-audit category, a download or a file
   write) and target (the host with its package or first URL path segment, or the path read against the
   session's working directory). Claude Code, Copilot CLI, Gemini CLI and Qwen Code; Codex records no
-  refusals.
+  refusals. Each refusal gives at most one finding.
 - `outside-root` (med): a file-write tool path, or a shell redirection or `tee` target, outside the
   session's working directory. Temp directories, `/dev` and the agents' config directories are left out.
 - Coverage check `writes`: write targets read, with `no-cwd` and `unresolved`. Never a gap.

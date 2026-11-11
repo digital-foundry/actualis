@@ -9139,6 +9139,7 @@ def urls_in_text(text: str) -> tuple[list[str], int]:
 
 RETRY_CATEGORY = "retry-after-deny"
 RETRY_CALLS_MAX = 5000           # calls remembered per transcript file for the retry match
+RETRY_WINDOW_SECONDS = 600       # a retry is the first matching call within this time of its refusal
 WRITE_TARGETS_MAX = 64           # write targets read per call
 
 # Action classes whose target is where data goes (a host), not a path.
@@ -10740,17 +10741,21 @@ class Fleet:
             entry["refused"] = True
 
     def _flush_retries(self) -> None:
-        """retry-after-deny for the file just read: every call that ran after
-        a refused call, through a different program, with an action class and
-        target in common. A call itself refused is never a retry; each call
-        is flagged at most once. Runs in _start_file and at the end of every
-        scan, because some agents record a refusal only after the call."""
+        """retry-after-deny for the file just read: for each refused call, the
+        first call that ran after it within RETRY_WINDOW_SECONDS, through a
+        different program, with an action class and target in common. A call
+        itself refused is never a retry; each refusal seeds at most one hit and
+        each call is flagged at most once. A call with no timestamp is not
+        held to the window. Runs in _start_file and at the end of every scan,
+        because some agents record a refusal only after the call."""
         calls = self._file_calls
         for i, r in enumerate(calls):
             if not r["refused"]:
                 continue
             for c in calls[i + 1:]:
                 if c["refused"] or c["flagged"] or _same_program(r, c):
+                    continue
+                if r["ts"] and c["ts"] and (c["ts"] - r["ts"]).total_seconds() > RETRY_WINDOW_SECONDS:
                     continue
                 shared = r["keys"] & c["keys"]
                 if not shared:
@@ -10761,6 +10766,7 @@ class Fleet:
                 self._guard_flag("high", RETRY_CATEGORY, c["program"], c["project"], c["ts"],
                                  f"{r['program']} refused{at}, then {c['program']} reached "
                                  f"{_target_shown(cls, target, c['home'])}")
+                break
         self._file_calls = []
         self._file_calls_by_id = {}
 
@@ -13717,9 +13723,10 @@ EXPLAIN: dict[str, dict[str, object]] = {
     "retries": {
         "measures": "Refused actions retried another way, and writes outside the project root.",
         "formula": [
-            "retry-after-deny (high): in one transcript file, a call that ran",
-            "after a refused call, through a different program, with the same",
-            "action and target. The action is a shell-audit category the command",
+            "retry-after-deny (high): in one transcript file, the first call that",
+            "ran within 10 minutes after a refused call, through a different",
+            "program, with the same action and target; each refusal seeds at most",
+            "one hit. The action is a shell-audit category the command",
             "matched (destructive, egress, publish, ...), fetch for a download, or",
             "write for a file written. The target is the host with the package or",
             "the URL's first path segment for a download, otherwise the path, read",

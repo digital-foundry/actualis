@@ -623,9 +623,9 @@ edit, and `--suppress` refuses its id. Known limits: Codex `apply_patch` edits a
 read, and neither is a write made by a script run from another file.
 
 Two more categories show an agent working around its guardrails. `retry-after-deny`
-(high) fires when, in one transcript file, a call ran after a refused one, through a
-different program, with the same action and target: `rm -rf build` refused, then
-`find build -delete`. It is marked needs-validation, because the transcript cannot say
+(high) fires when, in one transcript file, the first call within 10 minutes after a
+refused one ran through a different program, with the same action and target:
+`rm -rf build` refused, then `find build -delete`. Each refusal gives at most one. It is marked needs-validation, because the transcript cannot say
 whether the second command did what the first would have. `outside-root` (med) fires
 when a file-write tool, a shell redirection or `tee` writes outside the session's
 working directory; temp directories, `/dev` and the agents' own config directories

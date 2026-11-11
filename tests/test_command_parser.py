@@ -731,11 +731,35 @@ class TestFpMeasureRetryDetail(HomeCase):
                  for ln in out.splitlines() if ln.startswith("    ")}
         self.assertEqual(lines.get("refused calls remembered"), "1")
         self.assertEqual(lines.get("refusals that seeded a hit"), "1")
-        self.assertEqual(lines.get("first hit after its refusal"), "1")
-        self.assertEqual(lines.get("later hits, same refusal"), "2")
         self.assertEqual(lines.get("within 2 minutes of the refusal"), "1")
-        self.assertEqual(lines.get("over an hour after the refusal"), "1")
-        self.assertEqual(lines.get("class destructive"), "3")
+        self.assertEqual(lines.get("class destructive"), "1")
+
+
+class TestRetryWindow(HomeCase):
+    """retry-after-deny: one refusal seeds at most one hit, the first matching
+    call after it, and only within RETRY_WINDOW_SECONDS."""
+
+    def calls(self, *later):
+        t0 = recent(30)
+        rows = [claude_call("u1", "t1", "Bash", bash("rm -rf /opt/app/cache"), t0),
+                claude_refusal("u2", "t1", t0 + timedelta(seconds=5))]
+        for i, (cmd, after) in enumerate(later):
+            rows.append(claude_call(f"v{i}", f"c{i}", "Bash", bash(cmd), t0 + after))
+        return flags_of(self.claude_fleet(rows), "retry-after-deny")
+
+    def test_one_refusal_flags_only_the_first_matching_call(self):
+        hits = self.calls(("find /opt/app/cache -delete", timedelta(minutes=1)),
+                          ("find /opt/app/cache -delete", timedelta(minutes=2)),
+                          ("shred -u /opt/app/cache", timedelta(minutes=3)))
+        self.assertEqual(len(hits), 1)
+
+    def test_a_match_inside_the_window_fires(self):
+        inside = timedelta(seconds=af.RETRY_WINDOW_SECONDS - 30)
+        self.assertEqual(len(self.calls(("find /opt/app/cache -delete", inside))), 1)
+
+    def test_a_match_after_the_window_does_not(self):
+        late = timedelta(seconds=af.RETRY_WINDOW_SECONDS + 60)
+        self.assertEqual(self.calls(("find /opt/app/cache -delete", late)), [])
 
 
 class TestFinalReviewFixes(HomeCase):
