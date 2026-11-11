@@ -24,6 +24,7 @@ import re
 import statistics
 import sys
 import time
+from collections import Counter
 from datetime import datetime, timezone
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
@@ -42,12 +43,41 @@ class _Collecting(A.Fleet):
     def __init__(self) -> None:
         super().__init__()
         self.commands: list[str] = []
+        self.retry_detail: Counter = Counter()
 
     def add_tool(self, project, name, tool_input, ts, mode=None, **kw):
         before = self.bash_total
         super().add_tool(project, name, tool_input, ts, mode, **kw)
         if self.bash_total > before:
             self.commands.append(tool_input["command"])
+
+    def _flush_retries(self) -> None:
+        # Pairs each retry-after-deny hit with the refusal that seeded it, as
+        # Fleet._flush_retries does, and counts how far apart they are and
+        # which action class they share. Counts only.
+        d, calls = self.retry_detail, self._file_calls
+        taken: set[int] = set()
+        for i, r in enumerate(calls):
+            if not r["refused"]:
+                continue
+            d["refused"] += 1
+            seeded = 0
+            for j in range(i + 1, len(calls)):
+                c = calls[j]
+                if c["refused"] or c["flagged"] or j in taken or A._same_program(r, c):
+                    continue
+                shared = r["keys"] & c["keys"]
+                if not shared:
+                    continue
+                taken.add(j)
+                d["first" if not seeded else "later"] += 1
+                gap = (c["ts"] - r["ts"]).total_seconds() if c["ts"] and r["ts"] else None
+                d["near"] += gap is not None and gap <= 120
+                d["far"] += gap is not None and gap > 3600
+                d["class " + min(shared)[0]] += 1
+                seeded += 1
+            d["seeds"] += bool(seeded)
+        super()._flush_retries()
 
 
 def scan(days: "int | None", guardrails: bool) -> "tuple[_Collecting, float]":
@@ -99,7 +129,7 @@ def measure(f: _Collecting) -> dict:
             if cat in fl["categories"]:
                 hits[cat].append(fl["evidence"])
     return {"hits": hits, "old_unread": old_unread, "new_unread": new_unread,
-            "per_cmd": per_cmd, "new_time": new_time}
+            "per_cmd": per_cmd, "new_time": new_time, "retry_detail": f.retry_detail}
 
 
 def _pct(a: float, b: float) -> str:
@@ -118,6 +148,17 @@ def report(m: dict, n: int, t_on: float, t_off: float) -> None:
     print("new hits by kind")
     for k in KINDS:
         print(f"  {k:<38} {len(m['hits'][k]):,}")
+    d = m.get("retry_detail") or Counter()
+    print(f"  {A.RETRY_CATEGORY} detail")
+    for label, key in (("refused calls remembered", "refused"),
+                       ("refusals that seeded a hit", "seeds"),
+                       ("first hit after its refusal", "first"),
+                       ("later hits, same refusal", "later"),
+                       ("within 2 minutes of the refusal", "near"),
+                       ("over an hour after the refusal", "far")):
+        print(f"    {label:<36} {d[key]:,}")
+    for key in sorted(k for k in d if k.startswith("class ")):
+        print(f"    {key:<36} {d[key]:,}")
     if per:
         print(f"audit per command          median {statistics.median(per) * 1e6:.0f} us, "
               f"p95 {per[int(0.95 * (len(per) - 1))] * 1e6:.0f} us")

@@ -697,6 +697,47 @@ class TestFpMeasure(HomeCase):
                 self.assertEqual(code, 2)
         self.assertEqual(path.read_text(encoding="utf-8"), "keep")
 
+class TestFpMeasureRetryDetail(HomeCase):
+    """fp-measure: where the retry-after-deny count comes from, counts only."""
+
+    MARK = "zqmarker8"
+
+    def setUp(self):
+        super().setUp()
+        self.tool = load_measure()
+        t0 = recent(30)
+        m = self.MARK
+        write_lines(self.projects / "-home-dev-orbital" / "s0.jsonl", [
+            claude_call("u1", "t1", "Bash", bash(f"rm -rf {m}"), t0),
+            claude_refusal("u2", "t1", t0 + timedelta(seconds=5)),
+            claude_call("u3", "t2", "Bash", bash(f"find {m} -delete"), t0 + timedelta(minutes=1)),
+            claude_call("u4", "t3", "Bash", bash("ls"), t0 + timedelta(minutes=2)),
+            claude_call("u5", "t4", "Bash", bash("pwd"), t0 + timedelta(minutes=3)),
+            claude_call("u6", "t5", "Bash", bash("date"), t0 + timedelta(minutes=4)),
+            claude_call("u7", "t6", "Bash", bash(f"find {m} -delete"), t0 + timedelta(minutes=5)),
+            claude_call("u8", "t7", "Bash", bash(f"find {m} -delete"), t0 + timedelta(hours=2))])
+
+    def run_tool(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = self.tool.main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_retry_hits_are_split_by_refusal_distance_and_class(self):
+        code, out, err = self.run_tool()
+        self.assertEqual(code, 0, err)
+        self.assertNotIn(self.MARK, out + err)
+        lines = {ln.strip().rsplit(None, 1)[0].strip(): ln.strip().rsplit(None, 1)[1]
+                 for ln in out.splitlines() if ln.startswith("    ")}
+        self.assertEqual(lines.get("refused calls remembered"), "1")
+        self.assertEqual(lines.get("refusals that seeded a hit"), "1")
+        self.assertEqual(lines.get("first hit after its refusal"), "1")
+        self.assertEqual(lines.get("later hits, same refusal"), "2")
+        self.assertEqual(lines.get("within 2 minutes of the refusal"), "1")
+        self.assertEqual(lines.get("over an hour after the refusal"), "1")
+        self.assertEqual(lines.get("class destructive"), "3")
+
+
 class TestFinalReviewFixes(HomeCase):
     """Final review of 0.8.0: quoted redirects, an agent's own edit tools,
     privilege paths, secrets in URL segments, refusals past the cap."""
