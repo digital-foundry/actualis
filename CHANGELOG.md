@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### What can change a gate
+- New `high` flags can make `--fail-on high` exit 3 where 0.7.0 exited 0: `retry-after-deny`, and
+  `remote-exec` for a base64-decoded payload piped to a shell (`… | base64 -d | sh`).
+- `outside-root` flags are `med`: they exit 3 only under `--fail-on any`.
+- More commands are counted unreadable (`bash.unreadable_commands`, the coverage `shell` check): a
+  variable program after `VAR=value` assignments, ruby/bun `-e`, php `-r` and node `require('http(s)')`
+  one-liners that reach the network, inline scripts that run base64-decoded code, and base64-decoded
+  payloads piped to a shell.
+- `report_sha256` is not comparable with 0.7.0.
+
+### Added
+- `retry-after-deny` (high, needs-validation): in one transcript file, the first call that ran within
+  10 minutes after a refused call, through a different program, with the same action (a shell-audit category, a download or a file
+  write) and target (the host with its package or first URL path segment, or the path read against the
+  session's working directory). Claude Code, Copilot CLI, Gemini CLI and Qwen Code; Codex records no
+  refusals. Each refusal gives at most one finding.
+- `outside-root` (med): a file-write tool path, or a shell redirection or `tee` target, outside the
+  session's working directory. Temp directories, `/dev` and the agents' config directories are left out.
+- Coverage check `writes`: write targets read, with `no-cwd` and `unresolved`. Never a gap.
+- `--explain retries`. `--explain shell` and `--explain network` say what is still out of sight.
+- `tools/fp-measure.py`: counts what these changes add on your own transcripts, without printing any
+  command, path or host; `--sample N --out FILE` writes a redacted sample to classify by hand.
+
 ## 0.7.0 (2026-11-08)
 
 ### Added

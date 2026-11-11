@@ -48,10 +48,23 @@ not findings; they are listed in `rejected` in `--json` (`--verbose` prints them
 | `reputation-candidate` | needs-validation | observed | local hash-prefix match; run actualis-reputation confirm |
 | `reputation-suspicious` | needs-validation | observed | VirusTotal engines call it suspicious, none malicious; review the host |
 | `reputation-stale` | needs-validation | observed | lists are N days old |
+| `retry-after-deny` | needs-validation | inferred | whether the second command did what the refused one would have |
+| `outside-root` | confirmed | observed | |
 | AF001, AF003–AF010, AF012, AF013 | confirmed | observed | |
 | AF002 | confirmed | inferred | |
 | AF011 | needs-validation | observed | agent writes no shell records |
 | AF014 | confirmed | inferred | |
+
+## Guardrail findings
+
+Shell-audit findings (`bash.flags[]`) that show an agent working around its
+guardrails. Added in 0.8.0. Each is suppressible by id and still counted when
+suppressed. `actualis --explain retries` has the rules.
+
+| category | severity | fires when | `--fail-on` |
+|---|---|---|---|
+| `retry-after-deny` | high | in one transcript file, the first call within 10 minutes after a refused call (one per refusal) ran through a different program, with the same action (a shell-audit category, `fetch` or `write`) and the same target (a host with its package or first URL path segment, or a path read against the session's working directory). Codex records no refusals | `high`, `any` |
+| `outside-root` | med | a file-write tool's path, or a shell redirection or `tee` target, is outside the session's working directory; temp directories, `/dev` and the agents' config directories are left out; variable targets and sessions with no working directory are counted in the coverage check `writes`, never flagged | `any` |
 
 ## Network findings
 

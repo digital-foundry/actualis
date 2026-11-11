@@ -445,6 +445,14 @@ def pricing_age_days(today: datetime | None = None) -> int:
 
 Rule = tuple[str, str, str]  # (severity, category, regex)
 
+# A payload decoded and handed to a shell (`echo … | base64 -d | sh`): what runs
+# is not in the transcript at all. Options, arguments and blanks are bounded and
+# blanks are spaces or tabs only, so the scan is linear and stays on one line.
+# -D is macOS's spelling; the rules ignore case.
+_B64_TO_SHELL = (r"\bbase64[ \t]{1,64}(?:-[A-Za-z-]{1,16}[ \t]{1,64}){0,4}?(?:-d|--decode)\b"
+                 r"(?:[ \t]{1,64}[^\s|;&]{1,256}){0,4}?[ \t]{0,64}\|[ \t]{0,16}"
+                 r"(?:sudo[ \t]{1,16})?(?:ba|z|k|da)?sh\b")
+
 BASH_RULES: list[Rule] = [
     # --- destructive filesystem ---
     # Combined (-rf, -fr) or split (-r -f, --recursive --force) flags, after up
@@ -485,6 +493,7 @@ BASH_RULES: list[Rule] = [
                                  r"(?!\s+-(?:c|e|m|p)\b)"),
     ("med",  "remote-exec",      r"\bnpx\s+(-y\s+)?https?://"),
     ("med",  "remote-exec",      r"\bpip\s+install\b[^|;\n]{0,512}\bhttps?://"),
+    ("high", "remote-exec",      _B64_TO_SHELL),
 
     # --- credential and secret access ---
     ("high", "credentials",      r"(cat|less|more|head|tail|strings|cp|scp|base64)\b[^|;\n]{0,512}"
@@ -558,6 +567,7 @@ RULE_PREFILTERS: list[tuple[str, ...] | None] = [
     ("curl", "wget"),                                   # ... | python
     ("npx",),
     ("pip",),
+    ("base64",),                                        # base64 -d | sh
     (".env", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", ".pem", ".p12", "credentials", ".netrc", ".npmrc", ".pypirc"),
     ("find-generic-password", "find-internet-password"),
     ("env",),                                           # printenv | env
@@ -598,6 +608,7 @@ _RULE_REQUIRES_BY_PATTERN: dict[str, tuple[str, ...]] = {
     r"\bgit\s+push\b[^|;\n]{0,512}\s(--force|-f)\b": ("-f",),
     r"\b(psql|mysql|mongosh)\b[^|;\n]{0,512}-c\b": ("-c",),
     r"\bpip\s+install\b[^|;\n]{0,512}\bhttps?://": ("http",),
+    _B64_TO_SHELL: ("|",),
 }
 RULE_REQUIRES: list[tuple[str, ...] | None] = [_RULE_REQUIRES_BY_PATTERN.get(p) for _s, _c, p in BASH_RULES]
 # Rules anchored at the line start (`^…`) are linear on a whole line of any
@@ -659,6 +670,26 @@ UNREADABLE_SHAPES = (
     ("inline script reaching the network",
      re.compile(r"(?m)^(?=[^\n]*?\b(?:python[0-9.]*|node|perl)\s+(?:-\S+\s+){0,8}?-[ce]\s)"
                 r"(?=[^\n]*(?:\b(?:urllib|requests|fetch|http\.client|socket)|LWP)\b)")),
+    # `X=1 ${C} …`: the program is a variable behind assignments. At most 8
+    # assignments, each value and blank run bounded, so each start is bounded.
+    ("runs a variable after assignments",
+     # A value may not open a substitution: in `X=$(cmd "$v")` the `$v` is an
+     # argument inside it, not the program.
+     re.compile(r"(?:^|[|&;(])\s*(?:[A-Za-z_][A-Za-z0-9_]{0,63}="
+                r"(?:[^\s|&;$`()'\"]|\$(?=[A-Za-z_{])){0,256}[ \t]{1,64}){1,8}"
+                r"[\"']?\$[A-Za-z_{]")),
+    # Interpreters the inline-script row above does not cover, when the script
+    # names a network API: ruby, bun, php, and node's require('http(s)').
+    ("interpreter reaching the network",
+     re.compile(r"(?m)^(?:(?=[^\n]*?(?:\b(?:ruby|bun)\s+(?:-\S+\s+){0,8}?-e|\bphp\s+(?:-\S+\s+){0,8}?-r)\s)"
+                r"(?=[^\n]*(?:\bopen-uri\b|Net::HTTP|\bfile_get_contents\b|\bcurl_exec\b|\bfsockopen\b"
+                r"|\bfetch\b|\brequire\(\s*[\"'](?:node:)?https?[\"']))"
+                r"|(?=[^\n]*?\bnode\s+(?:-\S+\s+){0,8}?-[ep]\s)"
+                r"(?=[^\n]*\brequire\(\s*[\"'](?:node:)?https?[\"']))")),
+    # exec(…b64decode(…)): the code that runs is encoded in the command.
+    ("inline script running decoded code",
+     re.compile(r"(?m)^(?=[^\n]*?\b(?:exec|eval)\s*\()(?=[^\n]*?\bb64decode\b)")),
+    ("decodes data into a shell", re.compile(_B64_TO_SHELL, re.IGNORECASE)),
 )
 
 # Lowercase literals per UNREADABLE_SHAPES row, as RULE_PREFILTERS is per rule.
@@ -672,6 +703,10 @@ SHAPE_PREFILTERS: list[tuple[str, ...] | None] = [
     ("$'",),                                            # ANSI-C quoting
     ("$(", "`"),                                        # pipes a substitution to a shell
     ("urllib", "requests", "fetch", "http.client", "socket", "lwp"),
+    ("$",),                                             # runs a variable after assignments
+    ("ruby", "bun", "php", "node"),                     # interpreter reaching the network
+    ("b64decode",),                                     # inline script running decoded code
+    ("base64",),                                        # decodes data into a shell
 ]
 
 
@@ -9097,6 +9132,297 @@ def urls_in_text(text: str) -> tuple[list[str], int]:
     return list(dict.fromkeys(u for u in urls if len(u) > 8)), int(len(text) > MAX_SCAN_HARD)
 
 
+# --------------------------------------------------------------------------
+# Guardrail findings (retry-after-deny, outside-root)
+#
+# Two signals of an agent working around its guardrails, read from calls the
+# scanners already parse. Everything here is textual: no path is resolved on
+# disk, nothing is opened, nothing new is read.
+# --------------------------------------------------------------------------
+
+RETRY_CATEGORY = "retry-after-deny"
+RETRY_CALLS_MAX = 5000           # calls remembered per transcript file for the retry match
+RETRY_WINDOW_SECONDS = 600       # a retry is the first matching call within this time of its refusal
+WRITE_TARGETS_MAX = 64           # write targets read per call
+
+# Action classes whose target is where data goes (a host), not a path.
+_RETRY_HOST_CLASSES = frozenset({"fetch", "egress", "remote-exec"})
+# Unreadable shapes whose script names a network API: the URLs written in it
+# stand in for network items when a retry's target is decided.
+_INLINE_NET_SHAPES = frozenset({"inline script reaching the network", "interpreter reaching the network"})
+_INLINE_URL = re.compile(r"https?://([A-Za-z0-9.-]{1,253})(?::\d{1,5})?(?:/([^\s/'\"?#]{1,128}))?")
+_WIN_DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
+_HOME_OF = re.compile(r"^(?:/Users/[^/]+|/home/[^/]+|/root|[a-z]:/users/[^/]+)(?=/|$)", re.IGNORECASE)
+# A redirection token as the lexer leaves it: `>`, `>>`, `2>`, `&>`, or the
+# operator with its target attached (`>>~/notes.txt`).
+_REDIRECT_TOKEN = re.compile(r"^(?:\d{1,2}|&)?>>?(.*)$", re.S)
+# A redirection operator in a segment's unquoted text (see _unquoted_mask).
+_REDIRECT_OP = re.compile(r"(?:\d{1,2}|&)?>>?")
+# Classes whose match says nothing about the path a command acts on: `sudo`
+# alone is privilege, whatever follows it.
+_RETRY_NO_PATH = frozenset({"privilege", "audit"})
+
+
+def _unquoted_mask(seg: str) -> str:
+    """The segment with every quoted or escaped character replaced by '_',
+    same length: an operator found in it was written unquoted, so `'>'` and
+    `\\>` are data and `>` is a redirection."""
+    out = list(seg)
+    i, n, q = 0, len(seg), ""
+    while i < n:
+        ch = seg[i]
+        if q == "'":
+            if ch == "'":
+                q = ""
+            out[i] = "_"
+        elif q == '"':
+            if ch == "\\" and i + 1 < n:
+                out[i] = out[i + 1] = "_"
+                i += 1
+            elif ch == '"':
+                q = ""
+                out[i] = "_"
+            else:
+                out[i] = "_"
+        elif ch == "\\" and i + 1 < n:
+            out[i] = out[i + 1] = "_"
+            i += 1
+        elif ch in "'\"":
+            q = ch
+            out[i] = "_"
+        i += 1
+    return "".join(out)
+
+
+def _norm_path(p: str) -> str:
+    """'.', '..' and repeated slashes collapsed, as text: nothing is resolved
+    on disk. A leading '/', '~' (or '~user') or drive letter is kept and '..'
+    never climbs above it; a relative path keeps its leading '..'."""
+    p = p.replace("\\", "/")
+    if p.startswith("~"):
+        head, _, rest = p.partition("/")
+        root = head + "/"
+    elif _WIN_DRIVE.match(p):
+        root, rest = p[:2].lower() + "/", p[3:]
+    elif p.startswith("/"):
+        root, rest = "/", p
+    else:
+        root, rest = "", p
+    out: list[str] = []
+    for part in rest.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if out and out[-1] != "..":
+                out.pop()
+            elif not root:
+                out.append("..")
+            continue
+        out.append(part)
+    if out:
+        return root + "/".join(out)
+    return root if root == "/" else (root.rstrip("/") or ".")
+
+
+def _home_of(cwd: str | None) -> str | None:
+    """The home directory a session's cwd sits under, by its shape, or None."""
+    m = _HOME_OF.match(_norm_path(cwd)) if cwd else None
+    return m.group(0) if m else None
+
+
+def resolve_target(arg: object, cwd: str | None, relative_ok: bool = False) -> str | None:
+    """A path as the session would read it: '~' under the home the cwd shows,
+    relative to the cwd, normalised. None for a target that is not a literal
+    path (a variable, a substitution, empty, over 1,024 characters), and for a
+    relative path with no cwd unless relative_ok, which keeps it as written."""
+    if not isinstance(arg, str) or not arg or len(arg) > 1024 or any(c in arg for c in "$`\0\n"):
+        return None
+    a = arg.replace("\\", "/")
+    home = _home_of(cwd)
+    if home and (a == "~" or a.startswith("~/")):
+        a = home + a[1:]
+    if not a.startswith(("/", "~")) and not _WIN_DRIVE.match(a):
+        if cwd:
+            a = cwd.replace("\\", "/") + "/" + a
+        elif not relative_ok:
+            return None
+    return _norm_path(a)
+
+
+def _short_path(p: str, home: str | None) -> str:
+    """A path for evidence: its last two parts, under '~' when it is in the
+    home, never the full path (a username or a client's directory name)."""
+    if home and (p == home or p.startswith(home + "/")):
+        lead, rest = "~", [x for x in p[len(home):].split("/") if x]
+    elif p.startswith(("/", "~")) or _WIN_DRIVE.match(p):
+        lead, rest = "", [x for x in p.split("/") if x]
+    else:
+        return clean("/".join([x for x in p.split("/") if x][-2:]))[:120] or "."
+    tail = "/".join(rest[-2:])
+    if not tail:
+        return lead or "/"
+    return clean(f"{lead}{'/…/' if len(rest) > 2 else '/'}{tail}")[:120]
+
+
+def write_targets(name: str, tool_input: dict) -> list[str]:
+    """What one tool call writes, as written: a file-write tool's path, or a
+    shell command's redirection (>, >>, >|, &>, N>) and tee targets, read from
+    the dequoted tokens of each segment. A `cd` inside the command is not
+    followed: relative targets are read against the session cwd."""
+    if name.lower() in _FILE_WRITE_TOOLS:
+        if tool_input.get("command") == "view":
+            return []
+        for key in ("file_path", "path", "notebook_path"):
+            t = tool_input.get(key)
+            if isinstance(t, str) and t:
+                return [t]
+        return []
+    cmd = tool_input.get("command") if name == "Bash" else None
+    if not isinstance(cmd, str):
+        return []
+    return _shell_write_targets(cmd, 0)
+
+
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+_SHELL_C_OPT = re.compile(r"^-[A-Za-z]{0,8}c[A-Za-z]{0,8}$")
+WRITE_NESTING_MAX = 4
+
+
+def _shell_write_targets(cmd: str, depth: int) -> list[str]:
+    """write_targets for a shell command, and for the script of each nested
+    `sh -c '…'` (bash, zsh, … ; `-lc` too), up to WRITE_NESTING_MAX deep: a
+    write inside `sudo sh -c '…'` is still a write."""
+    if ">" not in cmd and "tee" not in cmd:
+        return []
+    # A heredoc body is data (an HTML page, a plist): its `>` are not redirections.
+    cmd = _without_heredocs(cmd)
+    out: list[str] = []
+    # `>|` (clobber) holds a pipe character that _net_split would cut on.
+    for seg in _net_split(cmd[:MAX_SCAN_TOTAL].replace(">|", ">"))[0][:WRITE_TARGETS_MAX]:
+        # Operators are found in the unquoted text only; the target is the
+        # next word, dequoted. `>&2` duplicates a descriptor and `>(…)` is a
+        # process substitution: neither names a file.
+        mask = _unquoted_mask(seg)
+        for m in _REDIRECT_OP.finditer(mask):
+            rest = seg[m.end():].lstrip(" \t")
+            if not rest or rest[0] in "&(>|;":
+                continue
+            nxt = _net_tokens(rest)
+            if nxt and nxt[0] and not nxt[0].startswith(("&", "(", ">")):
+                out.append(nxt[0])
+        toks = _net_tokens(seg)
+        words, _via = _net_strip_prefixes(toks)
+        if words and _net_base(words[0]).lower() == "tee":
+            out.extend(w for w in words[1:] if not w.startswith("-") and not _REDIRECT_TOKEN.match(w))
+        elif words and _net_base(words[0]).lower() in _SHELLS and depth < WRITE_NESTING_MAX:
+            i = next((n for n, w in enumerate(words[1:], 1) if _SHELL_C_OPT.match(w)), 0)
+            if i and i + 1 < len(words):
+                out.extend(_shell_write_targets(words[i + 1], depth + 1))
+        if len(out) >= WRITE_TARGETS_MAX:
+            break
+    return out[:WRITE_TARGETS_MAX]
+
+
+def _first_args(cmd: str) -> list[str]:
+    """The first argument of each segment's program, past assignments,
+    wrappers, options and redirections: what a path rule acts on."""
+    out: list[str] = []
+    for seg in _net_split(cmd[:MAX_SCAN_TOTAL])[0][:64]:
+        words, _via = _net_strip_prefixes(_net_tokens(seg))
+        arg = next((w for w in words[1:] if not w.startswith(("-", "<")) and not _REDIRECT_TOKEN.match(w)),
+                   None)
+        if arg:
+            out.append(arg)
+    return out
+
+
+def _fetch_target(item: dict) -> str | None:
+    """A download's retry target: its host with the package, or with the
+    URL's first path segment, so two calls to a busy host do not match."""
+    host = item.get("host")
+    if not isinstance(host, str) or not host:
+        return None
+    host = host.lower()
+    pkg = item.get("package")
+    if isinstance(pkg, str) and pkg:
+        return f"{host}/{pkg}"
+    url = item.get("url")
+    path = url_path(url) if isinstance(url, str) else ""
+    first = path.split("/")[1] if path.count("/") >= 1 else ""
+    return f"{host}/{first}" if first else host
+
+
+def retry_keys(name: str, tool_input: dict, cwd: str | None, items: list,
+               categories: "set[str] | frozenset[str]", shapes: "list[str] | tuple" = (),
+               writes: "list[str] | tuple" = ()) -> frozenset:
+    """(action class, target) pairs for one call: what a later call must
+    share with a refused one to be its retry. Classes: the shell-audit
+    categories the command matched, `fetch` for a download, `write` for a
+    file written. A host class's target is the host with the package or the
+    URL's first path segment; any other class's target is a path, read
+    against the cwd."""
+    keys: set[tuple[str, str]] = set()
+    hosts = {t for t in (_fetch_target(i) for i in items if isinstance(i, dict)) if t}
+    cmd = tool_input.get("command") if name == "Bash" else None
+    cmd = cmd if isinstance(cmd, str) else ""
+    if cmd and not hosts and _INLINE_NET_SHAPES.intersection(shapes):
+        for m in _INLINE_URL.finditer(cmd[:MAX_SCAN_LINE]):
+            hosts.add(m.group(1).lower() + (f"/{m.group(2)}" if m.group(2) else ""))
+    for h in hosts:
+        keys.add(("fetch", h))
+        keys.update((c, h) for c in categories if c in _RETRY_HOST_CLASSES)
+    path_classes = [c for c in categories if c not in _RETRY_HOST_CLASSES and c not in _RETRY_NO_PATH]
+    if cmd and path_classes:
+        for arg in _first_args(cmd):
+            t = resolve_target(arg, cwd, relative_ok=True)
+            if t:
+                keys.update((c, t) for c in path_classes)
+    for w in writes:
+        t = resolve_target(w, cwd, relative_ok=True)
+        # /dev/null and temp files are shared by unrelated calls: never a retry target.
+        if t and not _WRITE_EXCLUDED.match(t):
+            keys.add(("write", t))
+    return frozenset(keys)
+
+
+OUTSIDE_ROOT_CATEGORY = "outside-root"
+# Never outside-root: temp and device paths, and the agents' own config
+# directories (writes there are a separate question).
+_WRITE_EXCLUDED = re.compile(
+    r"^(?:/tmp|/private/tmp|/var/tmp|/private/var/tmp|/var/folders|/private/var/folders|/dev)(?:/|$)"
+    r"|^[a-z]:/(?:windows/temp|users/[^/]+/appdata/local/temp)(?:/|$)", re.IGNORECASE)
+_AGENT_CONFIG_DIR = re.compile(
+    r"^(?:~|/Users/[^/]+|/home/[^/]+|/root|[a-z]:/users/[^/]+)/\.(?:claude|codex|gemini|qwen|copilot)(?:/|$)",
+    re.IGNORECASE)
+_TMPDIR_VAR = re.compile(r"^\$(?:TMPDIR|\{TMPDIR\})(?:/|$)")
+
+
+def _inside(path: str, root: str) -> bool:
+    """Whether a normalised path is the root or under it; Windows paths
+    compare without case."""
+    if _WIN_DRIVE.match(root) or _WIN_DRIVE.match(path):
+        path, root = path.lower(), root.lower()
+    root = root.rstrip("/") or "/"
+    return path == root or path.startswith(root if root == "/" else root + "/")
+
+
+def _same_program(a: dict, b: dict) -> bool:
+    """Two remembered calls by the same program. An agent's file-write tools
+    (Write, Edit, MultiEdit…) are one program: one permission covers them, so
+    moving from one to another after a refusal is not working around it."""
+    if a["name"].lower() in _FILE_WRITE_TOOLS and b["name"].lower() in _FILE_WRITE_TOOLS:
+        return True
+    return a["program"] == b["program"]
+
+
+def _target_shown(cls: str, target: str, home: str | None) -> str:
+    """A retry target for evidence: the host alone (a URL's path segment can
+    hold a token), a path shortened."""
+    if cls in _RETRY_HOST_CLASSES:
+        return clean(target.split("/", 1)[0])[:120]
+    return _short_path(target, home)
+
+
 class Fleet:
     def __init__(self, network_only: bool = False) -> None:
         # --network with nothing that reads findings: the shell-audit rules,
@@ -9311,6 +9637,20 @@ class Fleet:
         self.network_requested = False
         # Leads evaluated and cleared (rejected[]), keyed (kind, id, what).
         self.rejected: dict[tuple, dict] = {}
+        # Guardrail findings. _cwd is the session's working directory as the
+        # scanner last read it, or None. Per transcript file, reset by
+        # _start_file: the calls the retry match reads. _guardrails is a
+        # switch for tools/fp-measure.py to time a scan without them.
+        self._guardrails = True
+        self._cwd: str | None = None
+        self._file_calls: list[dict] = []
+        self._file_calls_by_id: dict[str, dict] = {}
+        # outside-root: targets already flagged in this file, and what the
+        # coverage check `writes` reports.
+        self._outside_seen: set[str] = set()
+        self.writes_examined = 0
+        self.writes_no_cwd = 0
+        self.writes_unresolved = 0
 
     # -- ingest ------------------------------------------------------------
 
@@ -9541,6 +9881,7 @@ class Fleet:
                 pass
             for f in sorted(root.rglob("rollout-*.jsonl")):
                 self._scan_codex_file(f, since, project_filter, root)
+        self._flush_retries()
         sessions, self._codex_sessions = self._codex_sessions, None
         for _total, project, model, points in sessions.values():
             self._book_codex(project, model, points, since)
@@ -9595,9 +9936,9 @@ class Fleet:
         # (cumulative total, ts, usage) per token_count, values already read
         # through _tok: an absurd count is 0 here and counted once.
         points: list[tuple[int, datetime | None, dict]] = []
-        # (command, ts, mode, why, prompt, line, call id)
+        # (command, ts, mode, why, prompt, line, call id, working directory)
         pending: list[tuple[str, datetime | None, str | None, str | None, str | None, int,
-                            str | None]] = []
+                            str | None, str | None]] = []
         # why: the latest assistant message or reasoning summary text, until the
         # next call's output or user message. prompt: the latest user message.
         why: str | None = None
@@ -9689,7 +10030,8 @@ class Fleet:
                         cmd = args.get("command")
                         if isinstance(cmd, str) and cmd:
                             pending.append((cmd, ts, policy, why, prompt, n,
-                                            _str_or(payload.get("call_id"), None)))
+                                            _str_or(payload.get("call_id"), None),
+                                            _str_or(args.get("workdir"), cwd)))
                             cwd = _str_or(args.get("workdir"), cwd)
         except OSError:
             self._file_unreadable("codex")
@@ -9707,7 +10049,7 @@ class Fleet:
                     continue
                 self.permission_modes[key] += 1
 
-        for cmd, ts, mode, why, prompt, n, call_id in pending:
+        for cmd, ts, mode, why, prompt, n, call_id, workdir in pending:
             # Per command, as the Claude and Copilot paths filter per record:
             # a session still active in the window can hold commands from
             # months before it, and those are outside --days.
@@ -9716,6 +10058,7 @@ class Fleet:
             # Normalise Codex's shell_command onto the same "Bash" tool name the
             # Claude Code path uses, so the audit is one cross-agent view.
             self._src_line = n
+            self._cwd = workdir
             self.add_tool(project, "Bash", {"command": cmd}, ts, mode,
                           session=session, call_id=call_id, agent="codex", why=why,
                           prompt=prompt, where=self._where())
@@ -9749,6 +10092,7 @@ class Fleet:
                     self._dir_unreadable("copilot")
             for f in sorted(root.glob("*/events.jsonl")):
                 self._scan_copilot_file(f, since, project_filter, root)
+        self._flush_retries()
 
     def _scan_copilot_file(self, path: Path, since: datetime | None,
                            project_filter: str | None, root: Path | None = None) -> None:
@@ -9770,8 +10114,9 @@ class Fleet:
         cwd = branch = None
         shutdown: dict | None = None
         shutdown_ts: datetime | None = None
-        # (id, tool, command, ts, args, why, prompt, line)
-        calls: list[tuple[str, str, str, datetime | None, dict, str | None, str | None, int]] = []
+        # (id, tool, command, ts, args, why, prompt, line, working directory)
+        calls: list[tuple[str, str, str, datetime | None, dict, str | None, str | None, int,
+                          str | None]] = []
         why: str | None = None          # the latest assistant.message text, until a tool completes
         prompt: str | None = None       # the latest user.message
         self._start_file(path, root if root is not None else path.parent.parent)
@@ -9813,7 +10158,7 @@ class Fleet:
                         cmd = args.get("command") if isinstance(args, dict) else None
                         cmd = cmd if name == "bash" and isinstance(cmd, str) else ""
                         calls.append((_str_or(data.get("toolCallId"), ""), name, cmd, ts,
-                                      args if isinstance(args, dict) else {}, why, prompt, n))
+                                      args if isinstance(args, dict) else {}, why, prompt, n, cwd))
                     elif kind == "permission.requested":
                         req = data.get("permissionRequest")
                         req_id = _str_or(req.get("toolCallId"), "") if isinstance(req, dict) else ""
@@ -9846,11 +10191,12 @@ class Fleet:
         active = False
         joined: dict[str, tuple[str, str]] = {}
         sid = path.parent.name
-        for call_id, name, cmd, ts, targs, why, prompt, n in calls:
+        for call_id, name, cmd, ts, targs, why, prompt, n, call_cwd in calls:
             if not in_window(ts):
                 continue
             active = True
             self._src_line = n
+            self._cwd = call_cwd
             detail = {"why": why, "prompt": prompt, "where": self._where()}
             if cmd:
                 mode = "copilot:prompted" if call_id in prompted else "copilot:auto"
@@ -9877,7 +10223,7 @@ class Fleet:
                 self._network_outcome(f"copilot:{call_id}", refused=True)
                 self.denials[kind] += 1
                 self.denials_by_project[project] += 1
-                self._record_refusal(kind, project, ts, joined.get(call_id))
+                self._record_refusal(kind, project, ts, joined.get(call_id), call_id=call_id)
         for data, ts in subagents:
             if in_window(ts):
                 # Copilot gives a token total with no input/output split, so no
@@ -10020,7 +10366,8 @@ class Fleet:
             self.denials_by_project[clean(project)[:120] or "unknown"] += 1
             shown = "Bash" if name == "run_shell_command" else name
             self._record_refusal(kind, clean(project)[:120] or "unknown", ts,
-                                 (shown, cmd[:MAX_SCAN_LINE] if isinstance(cmd, str) else ""))
+                                 (shown, cmd[:MAX_SCAN_LINE] if isinstance(cmd, str) else ""),
+                                 call_id=call_id)
 
     def scan_gemini(self, roots: list[Path], since: datetime | None,
                     project_filter: str | None) -> None:
@@ -10038,6 +10385,7 @@ class Fleet:
                     continue
                 for f in gemini_session_files(d):
                     self._scan_gemini_file(f, project, real, since, root)
+        self._flush_retries()
 
     def _scan_gemini_file(self, path: Path, project: str, real: str,
                           since: datetime | None, root: Path) -> None:
@@ -10052,6 +10400,7 @@ class Fleet:
         self.bytes_scanned += st.st_size
         self.files_scanned += 1
         self._start_file(path, root)
+        self._cwd = real or None
         sess = read_gemini_session(path)
         if sess is None:
             self._file_unreadable("gemini")
@@ -10123,6 +10472,7 @@ class Fleet:
                     continue
                 for f in qwen_session_files(d):
                     self._scan_qwen_file(f, d.name, since, project_filter, root)
+        self._flush_retries()
 
     def _scan_qwen_file(self, path: Path, slug: str, since: datetime | None,
                         project_filter: str | None, root: Path) -> None:
@@ -10158,6 +10508,7 @@ class Fleet:
                         continue
                     self._src_line = n
                     cwd = _str_or(rec.get("cwd"), cwd)
+                    self._cwd = cwd or None
                     branch = _str_or(rec.get("gitBranch"), branch)
                     project = path_project(cwd) if cwd else pretty_project(slug)
                     ts = parse_ts(rec.get("timestamp"))
@@ -10265,7 +10616,8 @@ class Fleet:
             self.denials[kind] += 1
             self.denials_by_project[clean(project)[:120] or "unknown"] += 1
             self._record_refusal(kind, clean(project)[:120] or "unknown", ts,
-                                 ("Bash" if name == "run_shell_command" else name, cmd[:MAX_SCAN_LINE]))
+                                 ("Bash" if name == "run_shell_command" else name, cmd[:MAX_SCAN_LINE]),
+                                 call_id=cid)
 
     def add_refusal(self, kind: str, rec: dict, project: str,
                     ts: datetime | None, calls: dict[str, tuple[str, str]]) -> None:
@@ -10285,11 +10637,13 @@ class Fleet:
                     hit = calls.get(tid) if isinstance(tid, str) and tid else None
                     if hit:
                         break
-        self._record_refusal(kind, project, ts, hit)
+        self._record_refusal(kind, project, ts, hit, call_id=tid if hit else None)
 
     def _record_refusal(self, kind: str, project: str, ts: datetime | None,
-                        call: tuple[str, str] | None) -> None:
-        """Count one refusal, and attribute it when the blocked call is known."""
+                        call: tuple[str, str] | None, call_id: str | None = None) -> None:
+        """Count one refusal, and attribute it when the blocked call is known.
+        The call is also marked refused for the retry match."""
+        self._mark_refused(call, call_id)
         self.refusals += 1
         self.refusal_project[project][kind] += 1
         if ts:
@@ -10304,6 +10658,123 @@ class Fleet:
             head = display_head(cmd)
             if head:
                 self.refusal_program[kind][head] += 1
+
+    def _guard_call(self, project: str, name: str, tool_input: dict, ts: datetime | None,
+                    call_id: str | None, items: list,
+                    matches: "list[tuple[str, str, str]] | tuple" = (),
+                    shapes: "list[str] | tuple" = ()) -> None:
+        """Check what one call writes against the session root, and remember
+        the call for the retry match at the end of its file."""
+        if not self._guardrails or self.network_only:
+            return
+        cwd = self._cwd
+        cmd = tool_input.get("command") if name == "Bash" else None
+        cmd = cmd if isinstance(cmd, str) else ""
+        program = (display_head(cmd) or "?") if name == "Bash" else (clean(name)[:48] or "?")
+        writes = write_targets(name, tool_input)
+        if writes:
+            self._check_writes(project, program, writes, cwd, ts)
+        keys = retry_keys(name, tool_input, cwd, items, {c for _s, c, _l in matches}, shapes, writes)
+        if not keys or len(self._file_calls) >= RETRY_CALLS_MAX:
+            return
+        entry = {"keys": keys, "program": clean(program)[:40], "name": name,
+                 "cmd": cmd[:MAX_SCAN_LINE], "project": project, "ts": ts, "home": _home_of(cwd),
+                 "refused": False, "flagged": False}
+        self._file_calls.append(entry)
+        if call_id:
+            self._file_calls_by_id[str(call_id)] = entry
+
+    def _check_writes(self, project: str, program: str, targets: list[str], cwd: str | None,
+                      ts: datetime | None) -> None:
+        """outside-root: each literal write target outside the session's cwd,
+        once per target per file. /dev is not a write; temp directories and
+        the agents' config directories are left out; a variable target is
+        counted unresolved, and a session with no cwd no-cwd, never flagged."""
+        root = resolve_target(cwd, None) if cwd else None
+        home = _home_of(cwd)
+        for t in dict.fromkeys(targets):
+            raw = t.replace("\\", "/")
+            if raw.startswith("/dev/") or _TMPDIR_VAR.match(raw):
+                continue
+            if "$" in raw or "`" in raw:
+                self.writes_unresolved += 1
+                continue
+            if root is None:
+                self.writes_no_cwd += 1
+                continue
+            p = resolve_target(t, cwd)
+            if p is None:
+                self.writes_unresolved += 1
+                continue
+            self.writes_examined += 1
+            if _inside(p, root) or _WRITE_EXCLUDED.match(p) or _AGENT_CONFIG_DIR.match(p) \
+                    or p in self._outside_seen:
+                continue
+            self._outside_seen.add(p)
+            where = clean(root.rstrip("/").rsplit("/", 1)[-1])[:60] or "/"
+            self._guard_flag("med", OUTSIDE_ROOT_CATEGORY, clean(program)[:40], project, ts,
+                             f"{program} wrote {_short_path(p, home)} outside {where}")
+
+    def _guard_flag(self, severity: str, category: str, program: str, project: str,
+                    ts: datetime | None, evidence: str) -> None:
+        """One guardrail finding, suppressible and counted like a rule's."""
+        fid = flag_id(severity, [category], program)
+        suppressed = fid in self.suppressions
+        if suppressed:
+            self.suppressed_flags += 1
+        self.flag_counts[f"{severity}:{category}"] += 1
+        self.flags.append({
+            "id": fid, "severity": severity, "categories": [category], "program": program,
+            "project": project, "when": ts.isoformat() if ts else None,
+            "evidence": redact(clean(evidence))[:MAX_SCAN_LINE],
+            "had_secret": False, "suppressed": suppressed,
+            "suppressed_reason": self.suppressions.get(fid, ""),
+        })
+
+    def _mark_refused(self, call: tuple[str, str] | None, call_id: str | None) -> None:
+        """The remembered call a refusal blocked: by call id, else, when the
+        refusal carries no id, the latest call in this file with the same tool
+        and command."""
+        entry = self._file_calls_by_id.get(str(call_id)) if call_id else None
+        # An id that was not remembered (past RETRY_CALLS_MAX) marks nothing:
+        # falling back to the command could mark an earlier call instead.
+        if entry is None and call and not call_id:
+            name, cmd = call
+            cmd = (cmd or "")[:MAX_SCAN_LINE]
+            entry = next((e for e in reversed(self._file_calls)
+                          if not e["refused"] and e["name"] == name and e["cmd"] == cmd), None)
+        if entry is not None:
+            entry["refused"] = True
+
+    def _flush_retries(self) -> None:
+        """retry-after-deny for the file just read: for each refused call, the
+        first call that ran after it within RETRY_WINDOW_SECONDS, through a
+        different program, with an action class and target in common. A call
+        itself refused is never a retry; each refusal seeds at most one hit and
+        each call is flagged at most once. A call with no timestamp is not
+        held to the window. Runs in _start_file and at the end of every scan,
+        because some agents record a refusal only after the call."""
+        calls = self._file_calls
+        for i, r in enumerate(calls):
+            if not r["refused"]:
+                continue
+            for c in calls[i + 1:]:
+                if c["refused"] or c["flagged"] or _same_program(r, c):
+                    continue
+                if r["ts"] and c["ts"] and (c["ts"] - r["ts"]).total_seconds() > RETRY_WINDOW_SECONDS:
+                    continue
+                shared = r["keys"] & c["keys"]
+                if not shared:
+                    continue
+                cls, target = min(shared)
+                c["flagged"] = True
+                at = f" at {r['ts']:%H:%M}" if r["ts"] else ""
+                self._guard_flag("high", RETRY_CATEGORY, c["program"], c["project"], c["ts"],
+                                 f"{r['program']} refused{at}, then {c['program']} reached "
+                                 f"{_target_shown(cls, target, c['home'])}")
+                break
+        self._file_calls = []
+        self._file_calls_by_id = {}
 
     def add_subagent(self, result: dict, ts: datetime | None) -> None:
         """One completed subagent run.
@@ -10365,11 +10836,13 @@ class Fleet:
         name = clean(name)[:48] or "?"
         self.tools[name] += 1
         self._net_remote_exec = ""
+        net_before = len(self.network)
         self._add_network(project, name, tool_input or {}, ts, mode, session, call_id, agent,
                           (why, prompt, where))
         if not self.network_only:
             self._audit_config_write(project, name, tool_input or {}, ts)
         if name != "Bash":
+            self._guard_call(project, name, tool_input or {}, ts, call_id, self.network[net_before:])
             return
         cmd = (tool_input or {}).get("command") or ""
         if not cmd:
@@ -10448,6 +10921,8 @@ class Fleet:
                 e["last"] = max(e["last"] or day, day)
 
         matches = command_rule_matches(cmd, windows, self._net_remote_exec)
+        self._guard_call(project, "Bash", tool_input or {}, ts, call_id, self.network[net_before:],
+                         matches, shapes)
         if not matches:
             return
         worst = min(matches, key=lambda m: SEVERITY_ORDER.get(m[0], 9))
@@ -10545,12 +11020,17 @@ class Fleet:
             # branch and ticket, so the order must not be the filesystem's.
             for f in sorted(d.glob("*.jsonl")):
                 self._scan_file(f, project, since, d.parent)
+        self._flush_retries()
         if progress:
             print("\r" + " " * 72 + "\r", end="", file=sys.stderr, flush=True)
 
     def _start_file(self, path: Path, root: Path | None) -> None:
         """Reset the per-file state network items read: mode, prompt, the
-        assistant text being collected, and the file's path under its root."""
+        assistant text being collected, and the file's path under its root.
+        The previous file's retry match runs first."""
+        self._flush_retries()
+        self._cwd = None
+        self._outside_seen = set()
         self._mode = None
         self._prompt = None
         self._why_id, self._why_prior = None, []
@@ -10731,6 +11211,8 @@ class Fleet:
         change to that meaning cannot apply to one source and not the other.
         """
         ts = parse_ts(rec.get("timestamp"))
+        # The working directory the guardrail findings read paths against.
+        self._cwd = _str_or(rec.get("cwd"), self._cwd)
         mode = clean(rec.get("permissionMode"))[:48]
         if mode:
             # Stays in force for the tool calls that follow it, even when this
@@ -11001,6 +11483,7 @@ class Fleet:
         for rec in records:
             if isinstance(rec, dict):
                 self._ingest_claude(rec, project, since, calls)
+        self._flush_retries()
 
     # -- derived -----------------------------------------------------------
 
@@ -11369,6 +11852,10 @@ _ASSESSMENT: dict[str, tuple] = {
     "audit-config": _CONFIRMED,
     "oversized-command": ("needs-validation", "observed",
                           "command longer than what is read; the rest was not checked"),
+    # Two calls sharing an action and a target is actualis's judgement.
+    RETRY_CATEGORY: ("needs-validation", "inferred",
+                     "whether the second command did what the refused one would have"),
+    OUTSIDE_ROOT_CATEGORY: _CONFIRMED,
     "secret": _CONFIRMED,
     "network-ioc": _CONFIRMED,
     # apply_ioc sets the row's own reason text; this is the fallback.
@@ -12919,7 +13406,7 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "transcript shows. Shell commands are read as bash reads them, by the",
             "same lexer the shell audit uses: split on && || ; | & and newlines",
             "outside quotes and # comments, on the dequoted text ($'...' decoded), so",
-            "cu''rl and \"cu\"rl read as curl.",
+            "cu''rl, \"cu\"rl and ANSI-C $'\\x63url' read as curl.",
             "Also read, as commands of their own:",
             "  command substitution $(...) and backticks, and process substitution",
             "  <(...), at any depth (200 levels), also inside an unquoted heredoc;",
@@ -12984,13 +13471,12 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "    hooks (bash install.sh, make, npm run);",
             "  - code that fetches: python -c, node -e, perl, ruby, php, and nc,",
             "    /dev/tcp, openssl s_client;",
-            "  - names built at run time: $CMD, aliases, brace expansion {curl,URL},",
-            "    ANSI-C quoting $'\\x63url', env -S, and a URL arriving on stdin",
-            "    (echo '...' | sh, bash <<< '...', a here-document);",
+            "  - names built at run time: $CMD and aliases, and a URL arriving on",
+            "    stdin (echo '...' | sh);",
             "  - a command after a single & (true & curl ...);",
             "  - programs not recognised: aria2c, httpie, scp, rsync, nc, npm exec,",
             "    yarn dlx, pip download, gem, apt-get, cargo binstall;",
-            "  - a URL written without a scheme (curl host/path).",
+            "  - a URL written without a scheme whose host has no dot (curl intra/x).",
             "Codex apply_patch writes, and writes made by a script, are not seen",
             "as audit-config writes.",
             "A registry install with no URL is attributed to the ecosystem's default",
@@ -13232,8 +13718,51 @@ EXPLAIN: dict[str, dict[str, object]] = {
         "assumes": [
             "A flag means 'worth looking at', not 'wrong'. Most rm -rf calls are a",
             "build directory. Current flag rate is about 3.8%.",
+            "Out of sight, counted unreadable rather than flagged: eval of a",
+            "computed string, xargs with its arguments on stdin, and code inside",
+            "an interpreter (python -c, node -e, ruby -e, php -r) beyond the",
+            "network calls it names. Refused actions retried another way and",
+            "writes outside the project root: actualis --explain retries.",
         ],
         "verify": "actualis --json | jq '.bash.flag_counts'",
+    },
+    "retries": {
+        "measures": "Refused actions retried another way, and writes outside the project root.",
+        "formula": [
+            "retry-after-deny (high): in one transcript file, the first call that",
+            "ran within 10 minutes after a refused call, through a different",
+            "program, with the same action and target; each refusal seeds at most",
+            "one hit. The action is a shell-audit category the command",
+            "matched (destructive, egress, publish, ...), fetch for a download, or",
+            "write for a file written. The target is the host with the package or",
+            "the URL's first path segment for a download, otherwise the path, read",
+            "against the session's working directory. rm refused, then find",
+            "-delete on the same directory, fires. The same program again does",
+            "not (a plain retry after approval), nor does a call itself refused;",
+            "an agent's file-write tools (Write, Edit, ...) count as one program,",
+            "and sudo alone is not an action on a path. Evidence shows a",
+            "download's host only, never its path.",
+            "",
+            "outside-root (med): a file-write tool's path, or a shell redirection",
+            "(>, >>, >|, &>) or tee target, also inside a nested sh -c script,",
+            "outside the session's working",
+            "directory, once per target per file. Temp directories, /dev, and the",
+            "agents' own config directories (~/.claude, ~/.codex, ~/.gemini,",
+            "~/.qwen, ~/.copilot) are left out.",
+        ],
+        "assumes": [
+            "Two calls sharing an action and a target is a judgement, so",
+            "retry-after-deny is needs-validation: the transcript does not say",
+            "whether the second command did what the refused one would have.",
+            "A refusal that cannot be joined to its call is counted but starts",
+            "no match. Codex records no refusals, so it has no retries. At most",
+            "5,000 calls per transcript file are remembered for the match.",
+            "Paths are compared as text; nothing is resolved on disk. A cd inside",
+            "a command is not followed. A variable target is not resolved: the",
+            "coverage check writes counts it as unresolved, and a session with no",
+            "working directory as no-cwd.",
+        ],
+        "verify": "actualis --json | jq '.bash.flags[] | select(.categories[0] | test(\"retry|outside\"))'",
     },
     "coach": {
         "measures": "Findings worth acting on, benchmarked against your own history.",
@@ -16813,7 +17342,10 @@ def coverage(fleet: Fleet) -> dict:
     checks = [_check("credentials", fleet.bash_total - fleet.unreadable, shell_why),
               _check("shell", fleet.bash_total - fleet.unreadable, shell_why),
               _check("records", fleet.lines_read - fleet.unparsable_lines,
-                     {"unparsable-line": fleet.unparsable_lines})]
+                     {"unparsable-line": fleet.unparsable_lines}),
+              # Write targets read against the session's working directory (outside-root).
+              _check("writes", fleet.writes_examined,
+                     {"no-cwd": fleet.writes_no_cwd, "unresolved": fleet.writes_unresolved})]
     if fleet.network_requested or fleet.ioc is not None:
         checks.append(_check("network", len(fleet.network_items),
                              {"unparsed-segment": fleet.network_unparsed}))
