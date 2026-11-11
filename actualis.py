@@ -673,7 +673,10 @@ UNREADABLE_SHAPES = (
     # `X=1 ${C} …`: the program is a variable behind assignments. At most 8
     # assignments, each value and blank run bounded, so each start is bounded.
     ("runs a variable after assignments",
-     re.compile(r"(?:^|[|&;(])\s*(?:[A-Za-z_][A-Za-z0-9_]{0,63}=[^\s|&;]{0,256}[ \t]{1,64}){1,8}"
+     # A value may not open a substitution: in `X=$(cmd "$v")` the `$v` is an
+     # argument inside it, not the program.
+     re.compile(r"(?:^|[|&;(])\s*(?:[A-Za-z_][A-Za-z0-9_]{0,63}="
+                r"(?:[^\s|&;$`()'\"]|\$(?=[A-Za-z_{])){0,256}[ \t]{1,64}){1,8}"
                 r"[\"']?\$[A-Za-z_{]")),
     # Interpreters the inline-script row above does not cover, when the script
     # names a network API: ruby, bun, php, and node's require('http(s)').
@@ -9291,6 +9294,8 @@ def _shell_write_targets(cmd: str, depth: int) -> list[str]:
     write inside `sudo sh -c '…'` is still a write."""
     if ">" not in cmd and "tee" not in cmd:
         return []
+    # A heredoc body is data (an HTML page, a plist): its `>` are not redirections.
+    cmd = _without_heredocs(cmd)
     out: list[str] = []
     # `>|` (clobber) holds a pipe character that _net_split would cut on.
     for seg in _net_split(cmd[:MAX_SCAN_TOTAL].replace(">|", ">"))[0][:WRITE_TARGETS_MAX]:
@@ -9374,7 +9379,8 @@ def retry_keys(name: str, tool_input: dict, cwd: str | None, items: list,
                 keys.update((c, t) for c in path_classes)
     for w in writes:
         t = resolve_target(w, cwd, relative_ok=True)
-        if t:
+        # /dev/null and temp files are shared by unrelated calls: never a retry target.
+        if t and not _WRITE_EXCLUDED.match(t):
             keys.add(("write", t))
     return frozenset(keys)
 

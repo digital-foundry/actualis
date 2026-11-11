@@ -762,6 +762,35 @@ class TestRetryWindow(HomeCase):
         self.assertEqual(self.calls(("find /opt/app/cache -delete", late)), [])
 
 
+class TestSampleFindings(HomeCase):
+    """Defects the hand-classified sample of the maintainer's corpus showed."""
+
+    def test_a_shared_dev_null_or_temp_write_is_not_a_retry(self):
+        t0 = recent(30)
+        for first, then in (("gh pr view 1 2>/dev/null", "ls -la 2>/dev/null"),
+                            ("cat > /tmp/body.md", "tee /tmp/body.md")):
+            with self.subTest(first=first):
+                f = self.claude_fleet([
+                    claude_call("u1", "t1", "Bash", bash(first), t0),
+                    claude_refusal("u2", "t1", t0 + timedelta(seconds=5)),
+                    claude_call("u3", "t2", "Bash", bash(then), t0 + timedelta(minutes=1))])
+                self.assertEqual(flags_of(f, "retry-after-deny"), [])
+
+    def test_a_heredoc_body_names_no_write_target(self):
+        cmd = "cat > page.html <<'EOF'\n<p>a</p>\n<key>x</key><integer>1</integer></dict>\nEOF"
+        self.assertEqual(af.write_targets("Bash", {"command": cmd}), ["page.html"])
+
+    def test_a_variable_inside_a_substitution_is_not_the_program(self):
+        name = "runs a variable after assignments"
+        for cmd in ('fid=$(echo "$f" | jq .id)', "W=$(bash $SK/scripts/x plan.md)",
+                    'U="$(basename "$H")"', "SHA=$(cat $S/deploy-sha); echo $SHA"):
+            with self.subTest(cmd=cmd):
+                self.assertNotIn(name, af.unreadable_shapes(cmd))
+        for cmd in ("X=1 $C arg", "X=$HOME/bin ${RUN} go", 'A=1 B=2 "$prog" x'):
+            with self.subTest(cmd=cmd):
+                self.assertIn(name, af.unreadable_shapes(cmd))
+
+
 class TestFinalReviewFixes(HomeCase):
     """Final review of 0.8.0: quoted redirects, an agent's own edit tools,
     privilege paths, secrets in URL segments, refusals past the cap."""
