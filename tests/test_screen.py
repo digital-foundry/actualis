@@ -35,14 +35,14 @@ SID = "11111111-2222-4333-8444-555555555555"
 PROJECT_DIR = "-Users-x-canaryshop"
 
 # Synthetic values. None may ever reach a report, --json, --share or a card.
-EMAIL = "jordan.canary@mailbox-demo.net"
-SPILL_EMAIL = "buyer.canary@shop-demo.net"
-PHONE = "212-736-4021"
+EMAIL = "jordan.canary@mailbox-demo.net"  # pii-ok: invented address the detector under test must find
+SPILL_EMAIL = "buyer.canary@shop-demo.net"  # pii-ok: invented address the detector under test must find
+PHONE = "297-736-4021"  # pii-ok: area code 297 is reserved (N9X), never assigned
 CARD = "4539 1488 0343 6467"                       # Luhn-valid, Visa range, invented
 STRIPE = "sk_live_" + "4eC39HqLyjWDarjtT1zdp7dc"
 GITHUB = "ghp_" + "Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i2"
 VALUES = (EMAIL, SPILL_EMAIL, PHONE, CARD, CARD.replace(" ", ""), STRIPE, GITHUB,
-          "2127364021", "jordan.canary", "buyer.canary")
+          "2977364021", "jordan.canary", "buyer.canary")
 
 PAGE_TEXT = (f"Account settings\nEmail: {EMAIL}\nSupport (617) 555-0142\nMobile {PHONE}\n"
              f"Card {CARD} exp 12/29\nKey {STRIPE}\n")
@@ -405,7 +405,7 @@ class TestPersonalData(unittest.TestCase):
     def test_email(self):
         self.assertEqual(self.detectors(f"write to {EMAIL}."), ["email"])
         for text in ("dev@example.com", "a@b.example.org", "x@host.test", "x@y.invalid",
-                     "logo@2x.png", "icon@3x.webp", "noreply@mailbox-demo.net",
+                     "logo@2x.png", "icon@3x.webp", "noreply@mailbox-demo.net",  # pii-ok: invented sender, a case the detector skips
                      "git@github.com:org/repo", "postgres://app:Zq8vLm2pXr4t@db.shop-demo.net/x",
                      "https://jordan@shop-demo.net/"):
             with self.subTest(text=text):
@@ -418,17 +418,17 @@ class TestPersonalData(unittest.TestCase):
         self.assertEqual(af.personal_data(EMAIL), af.personal_data(EMAIL.upper()))
 
     def test_phone(self):
-        for text in ("call 212-736-4021", "(212) 736-4021", "212.736.4021", "+1 212 736 4021",
-                     "+44 20 7946 0958", "+4930901820"):
+        for text in ("call 297-736-4021", "(297) 736-4021", "297.736.4021", "+1 297 736 4021",  # pii-ok: reserved 297; Ofcom drama ranges
+                     "+44 20 7946 0958", "+447700900123"):  # pii-ok: Ofcom drama ranges
             with self.subTest(text=text):
                 self.assertEqual(self.detectors(text), ["phone"])
         for text in ("(617) 555-0142", "617-555-0199", "id 2127364021", "2026-11-12",
-                     "v1.212.736.4021", "+12", "build 212-736-40215"):
+                     "v1.297.736.4021", "+12", "build 297-736-40215"):
             with self.subTest(text=text):
                 self.assertEqual(self.detectors(text), [])
 
     def test_the_same_number_written_two_ways_is_one(self):
-        self.assertEqual(len(af.personal_data("212-736-4021 or (212) 736-4021")), 1)
+        self.assertEqual(len(af.personal_data("297-736-4021 or (297) 736-4021")), 1)  # pii-ok: reserved 297
 
     def test_card_needs_luhn_a_network_range_and_is_not_a_test_number(self):
         self.assertEqual(self.detectors(f"card {CARD}"), ["card"])
