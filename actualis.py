@@ -12504,9 +12504,29 @@ def command_rule_matches(cmd: str, windows: list[str] | None = None,
     return matches
 
 
+WATCH_HEARTBEAT_SECS = 30.0  # --watch --json: a heartbeat, so a reader can tell a quiet stream from a dead one
+
+
+def _watch_event(event: str, **fields: object) -> dict:
+    """One --watch --json event. Every string is cleaned and bounded: a tool
+    name, session or project comes from a transcript. No event carries a value:
+    a credential or personal-data finding is its detector and fingerprint."""
+    out: dict = {"event": event, "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    for k, v in fields.items():
+        out[k] = clean(v)[:160] if isinstance(v, str) else v
+    return out
+
+
 def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
           quiet: bool, raw: bool, copilot: list[Path] | None = None,
-          gemini: list[Path] | None = None, qwen: list[Path] | None = None) -> int:
+          gemini: list[Path] | None = None, qwen: list[Path] | None = None,
+          as_json: bool = False) -> int:
+    """Tail the transcripts and report what happens from now on.
+
+    As text: an alert line (and a desktop notification) per new credential or
+    flagged command, and per credential or personal data seen on screen.
+    With as_json (--watch --json): one JSON object per line, no notification,
+    no colour, no values; see docs/json.md, "--watch --json"."""
     import time
 
     # Python block-buffers stdout when it is not a terminal. For a watcher that
@@ -12590,10 +12610,70 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
             real = gemini_project_root(d, {})
             gem_projects[d] = path_project(real) if real else pretty_project(d.name)
         return gem_projects[d]
-    print(f"{c.bold}actualis watch{c.off} {c.dim}· {len(offsets)} files · every "
-          f"{interval:g}s · ctrl-c to stop{c.off}")
-    print(f"{c.dim}watching {srcs}{c.off}")
-    print(f"{c.dim}Starting from now. Existing history is not replayed.{c.off}\n")
+    # Seen on screen (#92) as it happens: a browser or computer-use call is
+    # remembered by its id until its result arrives, which is then read by the
+    # report's own add_tool_result into a private Fleet, so the two agree.
+    # Claude Code transcripts only, as in the report.
+    sf = Fleet()
+    screen_calls: dict[str, tuple[str, str, str, str, Path]] = {}   # id -> name, family, sid, project, file
+    seen_screen: set[tuple[str, str, str]] = set()                  # (kind, detector, id) announced
+    on_screen = shots = 0
+    last_beat = time.monotonic()
+
+    def emit(ev: dict) -> None:
+        print(json.dumps(ev, ensure_ascii=False), flush=True)
+
+    def alert(colour: str, label: str, text: str, tail: str) -> None:
+        print(f"\r{colour}▲ {label}{c.off}  {text}  {c.dim}{tail}{c.off}" + " " * 10, flush=True)
+
+    def screen_result(tid: str, content: object, ts_raw: object) -> None:
+        nonlocal on_screen, shots
+        name, family, sid, sproject, f = screen_calls.pop(tid)
+        if as_json:
+            emit(_watch_event("activity", phase="end", agent="claude-code", tool=name,
+                              family=family, session=sid, project=sproject))
+        hits_before = len(sf.screen_hits)
+        img = sf.screen_images.get((clean(sid)[:80], clean(name)[:96]))
+        shots_before = img["count"] if img else 0
+        sf.add_tool_result(sproject, name, content, parse_ts(ts_raw), session=sid,
+                           call_id=tid, spill_dir=f.parent / f.stem / "tool-results")
+        img = sf.screen_images.get((clean(sid)[:80], clean(name)[:96]))
+        took = (img["count"] if img else 0) - shots_before
+        if took > 0:
+            shots += took
+            if as_json:
+                emit(_watch_event("screenshot", agent="claude-code", tool=name, family=family,
+                                  session=sid, project=sproject, count=took))
+        for key in list(sf.screen_hits)[hits_before:]:
+            _sid, _tool, kind, detector, fp = key
+            if (kind, detector, fp) in seen_screen:
+                continue
+            seen_screen.add((kind, detector, fp))
+            on_screen += 1
+            priority = sf.screen_hits[key]["priority"]
+            suppressed = bool(sf.secrets.get(fp, {}).get("suppressed")) if kind == "credential" else False
+            if as_json:
+                emit(_watch_event("finding", source="screen", kind=kind, detector=detector, id=fp,
+                                  priority=priority, suppressed=suppressed, agent="claude-code",
+                                  tool=name, family=family, session=sid, project=sproject))
+                continue
+            where = f"{detector} on screen in {_one_line(sproject)}"
+            if kind == "credential":
+                alert(c.red, "SEEN", where, fp)
+                if not suppressed:
+                    notify("actualis: credential seen on screen", where)
+            else:
+                alert(c.yellow, "SEEN", where, fp)
+
+    if as_json:
+        emit(_watch_event("hello", schema_version=JSON_SCHEMA_VERSION, version=__version__,
+                          screen=True, files=len(offsets), interval=interval,
+                          heartbeat=WATCH_HEARTBEAT_SECS))
+    else:
+        print(f"{c.bold}actualis watch{c.off} {c.dim}· {len(offsets)} files · every "
+              f"{interval:g}s · ctrl-c to stop{c.off}")
+        print(f"{c.dim}watching {srcs}{c.off}")
+        print(f"{c.dim}Starting from now. Existing history is not replayed.{c.off}\n")
 
     try:
         while True:
@@ -12645,18 +12725,52 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
                 project = ("copilot" if f.name == "events.jsonl"
                            else gemini_project(f) if vendor == "gemini"
                            else pretty_project(f.parent.name))
+                claude = not (rollout or vendor or is_copilot)
                 for raw_line in chunk[:end].split(b"\n"):
                     line = raw_line.decode("utf-8", "replace")
                     context = (rollout and ('"session_meta"' in line or '"turn_context"' in line)) \
                         or (is_copilot and ('"session.start"' in line
                                             or '"session.context_changed"' in line))
+                    # A result is decoded only when it answers a browser or
+                    # computer-use call still open: most results are not one.
+                    answers = claude and screen_calls and '"tool_result"' in line \
+                        and any(t in line for t in screen_calls)
                     if ('"tool_use"' not in line and '"function_call"' not in line
                             and '"tool.execution_start"' not in line and not context
-                            and '"toolCalls"' not in line and '"functionCall"' not in line):
+                            and '"toolCalls"' not in line and '"functionCall"' not in line
+                            and not answers):
                         continue
                     rec = _json_line(line)[1]
                     if not isinstance(rec, dict):
                         continue
+                    if claude:
+                        try:
+                            msg = rec.get("message")
+                            blocks = msg.get("content") if isinstance(msg, dict) else None
+                            for b in blocks if isinstance(blocks, list) else ():
+                                if not isinstance(b, dict):
+                                    continue
+                                if b.get("type") == "tool_use":
+                                    family = screen_family(b.get("name"))
+                                    bid = b.get("id")
+                                    if family and isinstance(bid, str) and bid \
+                                            and bid not in screen_calls:
+                                        sid = rec.get("sessionId")
+                                        sid = sid if isinstance(sid, str) and sid else f.stem
+                                        screen_calls[bid] = (b["name"], family, sid, project, f)
+                                        if as_json:
+                                            emit(_watch_event(
+                                                "activity", phase="start", agent="claude-code",
+                                                tool=b["name"], family=family, session=sid,
+                                                project=project))
+                                elif b.get("type") == "tool_result" \
+                                        and b.get("tool_use_id") in screen_calls:
+                                    screen_result(b["tool_use_id"], b.get("content"),
+                                                  rec.get("timestamp"))
+                        except OSError:
+                            raise
+                        except Exception:            # noqa: BLE001 -- as below: never stop watching
+                            pass
                     if rollout:
                         payload = rec.get("payload")
                         if rec.get("type") in ("session_meta", "turn_context") \
@@ -12696,6 +12810,11 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
                                 continue
                             seen_secrets.add(fp)
                             crit += 1
+                            if as_json:
+                                emit(_watch_event("finding", source="command", kind="credential",
+                                                  detector=kind, id=fp, priority=pri,
+                                                  project=project))
+                                continue
                             msg = f"{kind} in {_one_line(project)}"
                             # flush: under a service manager stdout is a file,
                             # so it is block-buffered. Without this an alert can
@@ -12709,6 +12828,12 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
                         if high:
                             flagged += 1
                             cats = ",".join(sorted({h[1] for h in high}))
+                            if as_json:
+                                # The categories only: the command is not a field.
+                                emit(_watch_event("flag", severity="high",
+                                                  categories=sorted({h[1] for h in high}),
+                                                  project=project))
+                                continue
                             line_txt = _one_line(high[0][2] if raw else redact(high[0][2]))
                             print(f"\r{c.yellow}▲ {cats}{c.off}  {line_txt[:88]}"
                                   f"  {c.dim}{_one_line(project)[:28]}{c.off}" + " " * 10,
@@ -12716,17 +12841,44 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
                             if not quiet:
                                 notify(f"actualis: {cats}", line_txt[:120])
 
+            # A call whose result never came (the session ended, the file
+            # went) is not held for ever; nor is a reader told it is still on.
+            for tid in [t for t, v in screen_calls.items() if v[4] not in offsets]:
+                del screen_calls[tid]
+            if len(screen_calls) > 1000:
+                for tid in list(screen_calls)[:-1000]:
+                    del screen_calls[tid]
             mins = (datetime.now(timezone.utc) - started).total_seconds() / 60
+            if as_json:
+                # A reader that has gone makes this write fail, which ends the
+                # watcher instead of leaving it running unread.
+                if time.monotonic() - last_beat >= WATCH_HEARTBEAT_SECS:
+                    last_beat = time.monotonic()
+                    emit(_watch_event("heartbeat", commands=cmds, flagged=flagged, secrets=crit,
+                                      seen_on_screen=on_screen, screenshots=shots,
+                                      open_screen_calls=len(screen_calls)))
             # The heartbeat is a live status line for a terminal. Redirected to a
             # log it would write ~1.3 MB a day of carriage returns, so it is
             # suppressed and only real events get recorded.
-            if sys.stdout.isatty():
+            elif sys.stdout.isatty():
                 print(f"\r{c.dim}  {mins:5.1f}m · {cmds} commands · "
-                      f"{flagged} flagged · {crit} secrets{c.off}", end="", flush=True)
+                      f"{flagged} flagged · {crit} secrets · {on_screen} on screen{c.off}",
+                      end="", flush=True)
             time.sleep(interval)
+    except BrokenPipeError:
+        # --watch --json read by a process that has gone: stop quietly.
+        try:
+            sys.stdout = open(os.devnull, "w")
+        except OSError:
+            pass
+        return 0
     except KeyboardInterrupt:
         # Computed here: Ctrl-C can land before the first pass has finished.
         mins = (datetime.now(timezone.utc) - started).total_seconds() / 60
+        if as_json:
+            emit(_watch_event("stopped", commands=cmds, flagged=flagged, secrets=crit,
+                              seen_on_screen=on_screen, screenshots=shots))
+            return 0
         if sys.stdout.isatty():
             print(f"\r{' ' * 72}\r", end="")
         print(f"{c.bold}stopped{c.off} after {mins:.1f}m · {cmds} commands · "
@@ -19021,7 +19173,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="--card or --html: directory to write into (default: current directory)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--watch", action="store_true",
-                    help="live monitor: alert on new secrets and risky commands")
+                    help="live monitor: alert on new secrets, risky commands and what "
+                         "browser tools saw; with --json, a JSONL event stream")
     ap.add_argument("--interval", type=_interval_arg, default=None, metavar="SEC",
                     help=f"--watch poll interval, {MIN_INTERVAL:g} to {MAX_INTERVAL:g} (default 4)")
     ap.add_argument("--quiet", action="store_true",
@@ -19136,8 +19289,7 @@ def main(argv: list[str] | None = None) -> int:
                          ("--suppress", args.suppress),
                          ("--suppressions", args.suppressions),
                          ("--self-check", args.self_check), ("--service", args.service),
-                         ("--completions", args.completions), ("--watch", args.watch),
-                         ("--mcp", args.mcp)):
+                         ("--completions", args.completions), ("--mcp", args.mcp)):
             if on:
                 ap.error(f"--json cannot be combined with {flag}: {flag} has no JSON form.")
     views = [flag for flag, on in (("--share", args.share), ("--coach", args.coach),
@@ -19480,7 +19632,8 @@ def main(argv: list[str] | None = None) -> int:
             w_gemini = gemini_roots() if args.agent in ("all", "gemini") else []
             w_qwen = qwen_roots() if args.agent in ("all", "qwen") else []
         return watch(w_roots, w_codex, args.interval,
-                     C(use_color()), args.quiet, args.no_redact, w_copilot, w_gemini, w_qwen)
+                     C(False) if args.json else C(use_color()), args.quiet, args.no_redact,
+                     w_copilot, w_gemini, w_qwen, as_json=args.json)
 
     if args.replay:
         since_r = window_start(args.days, datetime.now(timezone.utc)) if args.days else None
