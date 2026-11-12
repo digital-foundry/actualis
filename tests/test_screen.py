@@ -377,6 +377,59 @@ class TestReadSurface(unittest.TestCase):
         af.screen_json(scan(self.root))
 
 
+class TestScreenOnlyRun(unittest.TestCase):
+    """A run whose only records are browser and computer-use activity (no
+    usage record) still reports what the agent saw, rather than exiting as if
+    nothing matched."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.root = Path(self._td.name) / "projects"
+        recs = fixture_records()
+        for r in recs:
+            r["message"].pop("usage", None)
+            r["message"].pop("model", None)
+        write_fleet(self.root, recs)
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def run_main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = af.main([*argv, "--root", str(self.root)])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_the_report_prints_seen_on_screen(self):
+        code, out, err = self.run_main()
+        self.assertEqual(code, af.EXIT_OK, err)
+        self.assertIn("SEEN ON SCREEN", out)
+        self.assertIn("content not inspected", out)
+        self.assertNotIn("none matched", err)
+        for value in VALUES:
+            self.assertNotIn(value, out + err)
+
+    def test_json_carries_screen(self):
+        code, out, err = self.run_main("--json")
+        self.assertEqual(code, af.EXIT_OK, err)
+        payload = json.loads(out)
+        self.assertEqual(payload["messages"], 0)
+        self.assertEqual(payload["screen"]["results_scanned"], 4)
+        self.assertEqual(payload["screen"]["screenshots_total"], 2)
+        self.assertEqual(payload["screen"]["credentials"], 2)
+
+    def test_an_empty_run_still_hits_the_dead_end(self):
+        empty = Path(self._td.name) / "empty"
+        (empty / PROJECT_DIR).mkdir(parents=True)
+        recs = [call("b1", "Read", "2026-11-01T10:00:00Z", {"file_path": "/x"})]
+        recs[0]["message"].pop("usage")
+        (empty / PROJECT_DIR / "s.jsonl").write_text(json.dumps(recs[0]) + "\n")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = af.main(["--root", str(empty)])
+        self.assertEqual(code, af.EXIT_CANNOT_RUN)
+
+
 class TestFamilies(unittest.TestCase):
 
     def test_names(self):

@@ -19618,7 +19618,10 @@ def main(argv: list[str] | None = None) -> int:
             elif args.agent == "qwen":
                 sys.exit(no_transcripts_message())
 
-    if fleet.messages == 0 and fleet.bash_total == 0:
+    # A browser or computer-use session can leave results with no usage record
+    # in the window; what the agent saw is still worth reporting.
+    seen = fleet.screen_results or fleet.screen_images
+    if fleet.messages == 0 and fleet.bash_total == 0 and not seen:
         print(dead_end_message(fleet, args), file=sys.stderr)
         return EXIT_CANNOT_RUN
 

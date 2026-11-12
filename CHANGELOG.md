@@ -11,7 +11,8 @@
   fingerprint, never by value. Large results Claude Code writes to `<session>/tool-results/` are read as part
   of the result. Screenshots are listed by count, size and session, with the saved path, and never
   inspected; the report says so. New report section SEEN ON SCREEN, `--json` key `screen`, `--explain
-  screen`, and a `screen` row in `coverage.checks` when such tools ran.
+  screen`, and a `screen` row in `coverage.checks` when such tools ran. A run whose only records are such tool results
+  still reports them instead of exiting with "none matched".
 - Credentials seen on screen join the rotation list, `--fail-on` and AF004/AF005 like any other.
   `secrets[]` gains `source`: `command`, `screen` or `both`.
 
