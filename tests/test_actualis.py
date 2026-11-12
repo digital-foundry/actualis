@@ -852,6 +852,7 @@ class TestExplainability(unittest.TestCase):
                    "BY TICKET": "tickets", "TOOL CALLS": "shell",
                    "SUBAGENTS": "subagents", "SHELL AUDIT": "shell",
                    "REFUSALS": "refusals", "NETWORK": "network", "SUPPRESSIONS": "suppressions",
+                   "SEEN ON SCREEN": "screen",
                    "COACH": "coach", "AGENT PLATFORMS": "agents",
                    "EXPLAIN": "sources", "DIFF": "diff",
                    "SELF CHECK": "verify", "INCIDENT": "replay",

@@ -45,6 +45,7 @@ that and prints a warning to stderr (stdout stays pure JSON).
 | `suppressed_flags` | shell-audit findings marked as false positives on this machine |
 | `suppression_note` | why a suppressed finding is still counted here |
 | `secret_projects` | those commands per project |
+| `screen` | credentials and personal data in what browser and computer-use tools returned, and the screenshots they took (listed, not inspected). See [screen](#screen) |
 | `redacted` | whether values were masked (`true` unless `--no-redact`) |
 | `permission_modes` | turns per permission mode |
 | `unsupervised_pct` | percentage of recorded turns that ran in a mode that does not stop for approval, as `--share` prints it (Codex `sandbox:` entries are not turns); `null` when no permission mode was recorded. It covers only turns with a recorded mode: read it with `unmoded_commands` |
@@ -193,7 +194,7 @@ What the run could see. Added in 0.7.0, additive under `schema_version` 1.
 | `agents[]` | every agent whose transcript root exists, plus the `--agent` one when its root does not. `agent` (`claude-code`, `codex`, `copilot`, `gemini`, `qwen`), `root_exists`, `files_read` (read to the end), `files_unreadable` (failed `stat` or `open`: skipped and counted), `dirs_unreadable` (project or session directories that could not be listed: their files were never seen), `files_skipped_mtime` (left out by the `--days` prefilter, older than the window by mtime), `oldest` (UTC date of the oldest file read, by mtime, or `null`), `retention_days` (int or `null`), `retention_source`, `expiring_7d` |
 | `retention_source` | `settings` (`cleanupPeriodDays` in Claude Code's `settings.json`), `default` (the file read, the key absent: Claude Code's 30), `unknown` (no file, an unreadable one, not JSON, a value that is not an integer, or a directory Claude Code does not clean, such as a `--root` copy), `none` (the agent deletes nothing on its own: Codex) |
 | `expiring_7d` | transcript files whose mtime plus `retention_days` falls within the next 7 days, or already has (the agent deletes them at its next start); `0` when `retention_days` is `null`. Depends on the clock, so it is left out of `report_sha256` |
-| `checks[]` | `check`, `examined`, `not_examined` and `why_not` (reason to count, zero counts left out). `credentials` and `shell`: commands, with `unreadable-command` and `oversized` (`examined + not_examined` is `bash.total`). `records`: decoded transcript lines, with `unparsable-line`. `network` (only with `--network` or `--ioc`): items, with `unparsed-segment`. `ioc` (only with `--ioc`): downloads, with `lockfile`, `no-host` and `other`. `reputation` (only with `--reputation`): hosts checked, with `local-host` (private and local hosts, never looked up), and `stale` |
+| `checks[]` | `check`, `examined`, `not_examined` and `why_not` (reason to count, zero counts left out). `credentials` and `shell`: commands, with `unreadable-command` and `oversized` (`examined + not_examined` is `bash.total`). `records`: decoded transcript lines, with `unparsable-line`. `network` (only with `--network` or `--ioc`): items, with `unparsed-segment`. `ioc` (only with `--ioc`): downloads, with `lockfile`, `no-host` and `other`. `reputation` (only with `--reputation`): hosts checked, with `local-host` (private and local hosts, never looked up), and `stale`. `screen` (only when a browser or computer-use tool returned something): text results read, with `screenshot` (listed, never inspected), `truncated` (text past 1 MiB, read up to it), `spill-missing` and `spill-unreadable` (a `tool-results` file a result names that is not there, or could not be read). None of these is a gap |
 | `gaps[]` | one sentence per gap, whether or not `--fail-on-coverage` was given |
 
 The gaps, each of which makes `--fail-on-coverage` exit 5:
@@ -529,6 +530,10 @@ actionable list in the report, not hidden. A scan with many suppressions must
 not be indistinguishable from a clean one, and `suppressed_secrets` is the
 number that makes the difference visible.
 
+`source` is where the credential was seen: `command` (a command the agent
+ran), `screen` (a browser or computer-use tool result the agent read; see
+[screen](#screen)) or `both`.
+
 `distinct_values` is how many different values were seen under the id in this
 run. It is always 1 for an id taken from the value. For a password passed as an
 option, the id comes from where the password appears (see
@@ -536,6 +541,73 @@ option, the id comes from where the password appears (see
 kind has more than one value, it is reported as `suppressed: false` with
 `suppressed_reason` "suppression covers one value; N seen", and it counts
 toward `--fail-on`.
+
+## screen
+
+What browser and computer-use agents saw. Added in the release after 0.7.0,
+additive under `schema_version` 1. The report prints it as SEEN ON SCREEN.
+
+```json
+"screen": {
+  "results_scanned": 42, "chars_scanned": 61804, "by_tool": {"mcp__claude-in-chrome__get_page_text": 12},
+  "spilled_files_read": 1, "spilled_files_missing": 0, "spilled_files_unreadable": 0, "truncated": 0,
+  "credentials": 1, "personal_data": 3, "by_detector": {"email": 2, "phone": 1, "Stripe key": 1},
+  "sessions": 2,
+  "findings": [
+    {"session": "11111111-2222-4333-8444-555555555555", "tool": "mcp__claude-in-chrome__get_page_text",
+     "family": "claude-in-chrome", "kind": "credential", "detector": "Stripe key", "id": "78a08441",
+     "priority": "critical", "results": 1, "project": "shop", "first_seen": "2026-11-01",
+     "last_seen": "2026-11-01"}
+  ],
+  "findings_total": 4,
+  "screenshots": [
+    {"session": "11111111-2222-4333-8444-555555555555",
+     "tool": "mcp__plugin_playwright_playwright__browser_take_screenshot", "family": "playwright",
+     "count": 7, "bytes": 281000, "project": "shop",
+     "saved": ["/Users/x/.claude/projects/-Users-x-shop/11111111-2222-4333-8444-555555555555/tool-results/mcp-plugin_playwright_playwright-blob-1700000000000-abc123.png"]}
+  ],
+  "screenshots_total": 7, "screenshots_bytes": 281000,
+  "screenshots_note": "Screenshot content was not inspected: …",
+  "note": "values are never stored or printed: …"
+}
+```
+
+| key | meaning |
+|---|---|
+| `results_scanned` | text results read from browser and computer-use tools: Claude in Chrome (`mcp__claude-in-chrome__*`), Playwright MCP (`mcp__*playwright*__*`), chrome-devtools MCP (`mcp__*chrome-devtools*__*`) and computer use (`computer`, `mcp__*computer-use*__*`) |
+| `chars_scanned` | characters of text read, up to 1 MiB per text part |
+| `by_tool` | text results read per tool name |
+| `spilled_files_read` | files under `<session>/tool-results/` read as part of a result. A large result is written there beside the transcript and named in it; only the file name is taken from the transcript, and a file that resolves outside that directory is not followed |
+| `spilled_files_missing` | `tool-results` files a result names that are not on disk |
+| `spilled_files_unreadable` | `tool-results` files that resolve outside the session's directory, are not regular files, or could not be opened |
+| `truncated` | text parts longer than 1 MiB, read up to that length |
+| `credentials` | distinct credentials seen, by fingerprint. Each is also in `secrets[]`, with `source` `screen` or `both` |
+| `personal_data` | distinct email addresses, phone numbers and payment card numbers seen, by fingerprint |
+| `by_detector` | distinct values per detector: a credential type, `email`, `phone` or `card` |
+| `sessions` | sessions with at least one finding |
+| `findings[]` | per session, tool, detector and fingerprint, credentials first, at most 500: `session`, `tool`, `family` (`claude-in-chrome`, `playwright`, `chrome-devtools`, `computer-use`), `kind` (`credential` or `personal`), `detector`, `id` (`sha256[:8]` of the value; an address is lower-cased and a number reduced to its digits first), `priority` (a credential's, as in `secrets[]`; `null` for personal data), `results` (the tool results it appeared in), `project`, `first_seen`, `last_seen` (`""` when undated) |
+| `findings_total` | rows before the cap |
+| `screenshots[]` | per session and tool: `session`, `tool`, `family`, `count`, `bytes` (from the length of the base64 data, or the saved file's size; never decoded), `project`, `saved[]` (paths of screenshots saved to `tool-results/`) |
+| `screenshots_total`, `screenshots_bytes` | the sums over `screenshots[]` |
+| `screenshots_note` | that screenshot content was not inspected: anything visible only in an image is not in these counts |
+| `note` | how the ids are made |
+
+Credentials on screen are the ones known by their value: a token prefix or
+shape, a password in a URL, an Authorization header. One known only by the name
+beside it (`API_TOKEN: …`) is not counted here, as it is in a command: page text
+is `Label: value` everywhere, and on a real corpus 99 of 106 such hits were one
+page's labels.
+
+Not personal data, and not counted: reserved example domains (`example.com`,
+`.test`, `.invalid`, ...), the user part of a URL (`scheme://user:password@host`),
+file names shaped like an address (`logo@2x.png`),
+`noreply`-style senders, 555-0100 to 555-0199, a ten-digit run with no
+separators, and payment providers' published test card numbers. A card number
+must pass the Luhn check and fall in a card network's issuer range.
+
+Neither `--share` nor `--card` carries anything from `screen`.
+
+Verify: `actualis --json | jq '.screen | {results_scanned, credentials, personal_data, screenshots_total}'`
 
 ## `by_ticket[]`
 

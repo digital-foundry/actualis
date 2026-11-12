@@ -35,3 +35,7 @@ password # the literal placeholder in scheme://user:password@host examples
 06.06.06.06 # 6.6.6.6 written with leading zeros, IOC test
 ::ffff:606:606 # 6.6.6.6 as an IPv4-mapped IPv6 address, IOC test
 08.1.1.1 # leading-zero host an IOC test feeds to the URL parser
+
+# An asset file name shaped like an address, the case the seen-on-screen email
+# detector leaves out (docs/json.md, tests/test_screen.py).
+logo@2x.png # retina image file name, not a mailbox
