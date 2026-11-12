@@ -90,6 +90,16 @@ so, so a helpful reporter does not paste them by hand either.
 it to the commit SHA, so a report names an exact build. A hand-built binary
 reports `dev` rather than claiming a version it does not have.
 
+### Seen on screen
+
+When the run read any browser or computer-use results, the menu shows
+`Seen on screen: 15 personal data  ·  842 screenshots` (with a credential count
+first when there is one), from the CLI's `screen` key. It is counts only: never
+a value, a fingerprint or a detector name. Clicking it opens
+`actualis --explain screen` in a terminal. Personal data does not change the
+icon: the exposed and monitoring states stay about credentials. A CLI without
+the `screen` key shows nothing here.
+
 ## Alerting
 
 A **newly** appearing critical credential raises a native notification and
@@ -101,6 +111,10 @@ days brings older exposures into view, and they are not new. A credential you
 suppressed (with a reason) does not count toward the badge or the alert, as it
 does not count toward `--fail-on`. On Windows the notification is a toast
 through the built-in WinRT API (Windows 10 and later).
+
+A credential seen in a browser or computer-use result rather than in a command
+says so: `actualis: new credential exposed (seen on screen)` when every new one
+was, or `..., N seen on screen` in the body when only some were.
 
 ## What the count means
 

@@ -208,12 +208,69 @@ type report struct {
 	netItems     int
 	netUnasked   int
 	findings     []finding
+	sources      map[string]string // critical fingerprint -> where it was seen: command, screen or both
+	screen       screenSeen
 	err          string
 	at           time.Time
 	days         int // the window this report covers, which render labels it with
 }
 
 type finding struct{ ID, Title, Severity string }
+
+// screenSeen is the CLI's `screen` key, counts only: what browser and
+// computer-use tools returned to the agent. present is false for an older CLI
+// without the key, and the tray then shows nothing new.
+type screenSeen struct {
+	present     bool
+	results     int // text results read from browser and computer-use tools
+	credentials int
+	personal    int
+	screenshots int
+}
+
+// screenLabel is the "Seen on screen" menu line, "" when the run had no
+// browser or computer-use results (or the CLI predates the key). Counts only:
+// never a value, a fingerprint or a detector name.
+func screenLabel(s screenSeen) string {
+	if !s.present || (s.results == 0 && s.screenshots == 0) {
+		return ""
+	}
+	parts := []string{}
+	if s.credentials > 0 {
+		parts = append(parts, fmt.Sprintf("%s credential(s)", comma(s.credentials)))
+	}
+	parts = append(parts,
+		fmt.Sprintf("%s personal data", comma(s.personal)),
+		fmt.Sprintf("%s screenshots", comma(s.screenshots)))
+	return "Seen on screen: " + strings.Join(parts, "  ·  ")
+}
+
+// newCredentialNotice is the notification for newly seen critical
+// credentials. It says how many and whether they were seen on screen (a
+// browser or computer-use result) rather than in a command. Never a value.
+func newCredentialNotice(fresh []string, sources map[string]string) (title, body string) {
+	onScreen := 0
+	for _, fp := range fresh {
+		if src := sources[fp]; src == "screen" || src == "both" {
+			onScreen++
+		}
+	}
+	title = "actualis: new credential exposed"
+	body = fmt.Sprintf("%d new critical credential(s) in your agent history", len(fresh))
+	switch {
+	case onScreen > 0 && onScreen == len(fresh):
+		title += " (seen on screen)"
+	case onScreen > 0:
+		body += fmt.Sprintf(", %d seen on screen", onScreen)
+	}
+	return title, body
+}
+
+// num reads a JSON number from m, 0 when absent or not a number.
+func num(m map[string]any, key string) int {
+	v, _ := m[key].(float64)
+	return int(v)
+}
 
 // unsupLabel is the tray's supervision line, "" when there is nothing to say.
 // When some commands have no recorded mode the share says what it covers and
@@ -339,6 +396,7 @@ func parseReport(out []byte, days int) report {
 		}
 	}
 	r.fingerprints = map[string]bool{}
+	r.sources = map[string]string{}
 	if secrets, ok := root["secrets"].([]any); ok {
 		for _, s := range secrets {
 			m, _ := s.(map[string]any)
@@ -353,10 +411,24 @@ func parseReport(out []byte, days int) report {
 				r.rotatable++
 				if fp, ok := m["id"].(string); ok {
 					r.fingerprints[fp] = true
+					// source is absent before the screen scan: read as command.
+					if src, ok := m["source"].(string); ok {
+						r.sources[fp] = src
+					}
 				}
 			case "high":
 				r.rotatable++
 			}
+		}
+	}
+	// screen is absent before the screen scan; the tray then shows nothing new.
+	if sc, ok := root["screen"].(map[string]any); ok {
+		r.screen = screenSeen{
+			present:     true,
+			results:     num(sc, "results_scanned"),
+			credentials: num(sc, "credentials"),
+			personal:    num(sc, "personal_data"),
+			screenshots: num(sc, "screenshots_total"),
 		}
 	}
 	if bash, ok := root["bash"].(map[string]any); ok {
@@ -448,7 +520,7 @@ type ui struct {
 	listsDue   bool            // Safe Browsing lists exist and are at least listsDueAfter old
 
 	mHeader, mSub, mCost, mShell, mUnsup, mInvis *systray.MenuItem
-	mNet, mNetReport, mLists                     *systray.MenuItem
+	mNet, mNetReport, mLists, mScreen            *systray.MenuItem
 	mFindings                                    []*systray.MenuItem
 	mReport, mCopy, mRefresh, mQuit              *systray.MenuItem
 	mBug, mFeat, mSupport                        *systray.MenuItem
@@ -592,6 +664,9 @@ func (u *ui) onReady() {
 	u.mUnsup = addDisabled("")
 	u.mInvis = addDisabled("")
 	u.mNet = addDisabled("")
+	// Enabled, unlike the counts above: a click explains how it was read.
+	u.mScreen = systray.AddMenuItem("", "What browser and computer-use tools showed the agent. Click for how it is read")
+	u.mScreen.Hide()
 	systray.AddSeparator()
 
 	for i := 0; i < 4; i++ {
@@ -650,6 +725,8 @@ func (u *ui) loop() {
 			go openReport()
 		case <-u.mNetReport.ClickedCh:
 			go openNetworkReport()
+		case <-u.mScreen.ClickedCh:
+			go openScreenExplain()
 		case <-u.mLists.ClickedCh:
 			go openListsUpdate()
 		case <-u.mBug.ClickedCh:
@@ -714,8 +791,7 @@ func (u *ui) refresh() {
 		go u.refresh()
 	}
 	if len(fresh) > 0 {
-		notify("actualis: new credential exposed",
-			fmt.Sprintf("%d new critical credential(s) in your agent history", len(fresh)))
+		notify(newCredentialNotice(fresh, r.sources))
 		u.flash(u.state())
 	}
 }
@@ -816,6 +892,11 @@ func (u *ui) render() {
 	} else {
 		u.mNet.Hide()
 	}
+	if label := screenLabel(r.screen); label != "" {
+		show(u.mScreen, label)
+	} else {
+		u.mScreen.Hide()
+	}
 
 	sort.SliceStable(r.findings, func(i, j int) bool {
 		rank := map[string]int{"critical": 0, "high": 1, "info": 2}
@@ -895,6 +976,9 @@ func openReport() { openInTerminal("--coach", "") }
 
 // openNetworkReport shows only the NETWORK section, paged.
 func openNetworkReport() { openInTerminal("", "--network") }
+
+// openScreenExplain shows how the "Seen on screen" counts are read.
+func openScreenExplain() { openInTerminal("", "--explain screen") }
 
 // openInTerminal runs `actualis <first>` (if any), then `actualis <args> | less -R`.
 func openInTerminal(first, args string) {

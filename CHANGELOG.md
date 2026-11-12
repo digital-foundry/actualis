@@ -15,6 +15,9 @@
   still reports them instead of exiting with "none matched".
 - Credentials seen on screen join the rotation list, `--fail-on` and AF004/AF005 like any other.
   `secrets[]` gains `source`: `command`, `screen` or `both`.
+- Tray: a "Seen on screen: N personal data · N screenshots" menu line, read from `screen` (hidden when no browser or
+  computer-use results were read, or the CLI predates the key; clicking it opens `actualis --explain screen`), and a
+  new critical credential seen on screen says so in its notification. Counts only; the icon is unchanged (#94).
 
 ## 0.7.0 (2026-11-08)
 
