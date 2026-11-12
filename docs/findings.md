@@ -41,7 +41,7 @@ not findings; they are listed in `rejected` in `--json` (`--verbose` prints them
 |---|---|---|---|
 | shell-audit rules, `network-config`, `network-unasked`, `audit-config` | confirmed | observed | |
 | `oversized-command` | needs-validation | observed | command longer than what is read; the rest was not checked |
-| credentials (`secrets[]`) | confirmed | observed | |
+| credentials (`secrets[]`, including those seen on screen) | confirmed | observed | |
 | `network-ioc` | confirmed | observed | |
 | `network-ioc-unresolved` | needs-validation | observed (inferred for reason `name-from-url`) | the IOC reason: version not resolved, undecidable, private registry, name from URL, … |
 | `reputation-listed` | confirmed | observed | |
@@ -69,6 +69,22 @@ is one finding per group, suppressible, and still counted when suppressed. The `
 | `reputation-suspicious` | med | `--reputation`: VirusTotal engines flagged the host below the threshold, or as suspicious | `any` |
 | `reputation-stale` | med | `--reputation`: the Safe Browsing lists are over 7 days old | `any` |
 | `audit-config` | high | an agent wrote the suppression or trust files; cannot be suppressed | `high`, `any` |
+
+## Seen on screen
+
+Credentials and personal data in what browser and computer-use tools returned
+to the agent (`screen` in `--json`, SEEN ON SCREEN in the report). It is not a
+coach finding and has no `AFxxx` id: like the credential table it lists values
+by fingerprint, per session, tool and detector.
+
+| kind | detectors | joins `secrets[]` | `--fail-on` |
+|---|---|---|---|
+| `credential` | the types in [secrets.md](secrets.md) known by their value: prefixes and shapes, URL passwords, Authorization headers (not names beside a value) | yes, `source` `screen` or `both` | as any credential |
+| `personal` | `email`, `phone`, `card` (Luhn-checked, in a card network's range) | no | no |
+
+Screenshots are listed by count and size per session and tool, with the
+`tool-results/` path when one was saved, and never inspected. See
+[json.md](json.md#screen).
 
 **A finding's id hashes its severity and category. A change in severity is a
 new category, never an edit, or every existing suppression silently stops

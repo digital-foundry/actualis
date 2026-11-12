@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- Seen on screen: credentials and personal data in what browser and computer-use tools returned to the
+  agent (Claude in Chrome, Playwright MCP, chrome-devtools MCP, computer use). Page text, accessibility
+  snapshots, console and network output are matched with the credential classifiers that know a credential by
+  its value (prefixes, shapes, URL passwords, Authorization headers; not a name beside a value) and new email,
+  phone and card detectors (a card must pass the Luhn check); results are reported per session, tool and detector by
+  fingerprint, never by value. Large results Claude Code writes to `<session>/tool-results/` are read as part
+  of the result. Screenshots are listed by count, size and session, with the saved path, and never
+  inspected; the report says so. New report section SEEN ON SCREEN, `--json` key `screen`, `--explain
+  screen`, and a `screen` row in `coverage.checks` when such tools ran. A run whose only records are such tool results
+  still reports them instead of exiting with "none matched".
+- Credentials seen on screen join the rotation list, `--fail-on` and AF004/AF005 like any other.
+  `secrets[]` gains `source`: `command`, `screen` or `both`.
+
 ## 0.7.0 (2026-11-08)
 
 ### Added

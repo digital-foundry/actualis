@@ -267,7 +267,8 @@ scan — a tab key that hangs the terminal is worse than one that does nothing.
 
 `FLEET` totals and sources · `TOKENS` broken out by cache bucket with the
 multiplier applied to each · `BY AGENT` · `BY MODEL` · `CACHE EFFICIENCY` ·
-`BY TICKET` · `TOOL CALLS` · `SUBAGENTS` · `SHELL AUDIT` · `COACH`.
+`BY TICKET` · `TOOL CALLS` · `SUBAGENTS` · `SHELL AUDIT` · `NETWORK` ·
+`SEEN ON SCREEN` (only when a browser or computer-use agent ran) · `COACH`.
 
 ## Documentation
 
@@ -629,6 +630,45 @@ The rules were tuned against 48,000 real agent commands, and tuning meant deleti
 rules as much as adding them. A rule matching `>/dev/null 2>&1` as "audit
 tampering" fired 1,206 times at essentially 100% false positive, so it's gone; a
 noisy rule destroys trust in the rules that matter. Current flag rate is about 3.8%.
+
+## Seen on screen
+
+A browser or computer-use agent reads the screen through tools: page text, the
+accessibility tree, console and network output, and screenshots. Whatever those
+tools return is sent to the model provider and stays in the transcript, so a
+credential or an address the agent only *looked at* is as exposed as one it
+typed. SEEN ON SCREEN reports it:
+
+```
+SEEN ON SCREEN ─────────────────────────────────────────────────────────
+  read          4 browser and computer-use tool results, 713 characters of text, 1 from tool-results files
+  found         2 credentials, 4 personal data items in 1 session  email 2, GitHub PAT 1, Stripe key 1, card 1, phone 1
+
+             tool                               detector           results  session   id
+    ROTATE   claude-in-chrome get_page_text     Stripe key               1  11111111  78a08441
+    rotate   playwright browser_snapshot        GitHub PAT               1  11111111  d3a52289
+    personal claude-in-chrome get_page_text     email                    1  11111111  964da708
+
+  screenshots   2 (4 KB) in 1 session, content not inspected
+    claude-in-chrome computer                        1      3 KB  session 11111111
+    playwright browser_take_screenshot               1     504 B  session 11111111
+```
+
+- **Tools:** Claude in Chrome, Playwright MCP, chrome-devtools MCP and computer use,
+  recognised by tool name.
+- **Text** is matched with the shell audit's credential classifiers that know a
+  credential by its value (a token prefix or shape, a password in a URL), plus
+  email, phone and card patterns (a card must pass the Luhn check). Each hit is a
+  fingerprint; the value is never stored or printed. Credentials seen this way join
+  the rotation list, marked `screen`.
+- **Screenshots are listed, not read**: count, size and session per tool, and the
+  path when one was saved to `tool-results/`. The standard library cannot read
+  pixels, so anything visible only in an image is not counted, and the report says so.
+- **Large results** that Claude Code writes to `<session>/tool-results/` instead of
+  the transcript are read as part of the result.
+
+`--json` carries it as `screen` ([docs/json.md](docs/json.md#screen)). `--share` and
+`--card` carry nothing from it.
 
 ## Did an agent install the bad version?
 

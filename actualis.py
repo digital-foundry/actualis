@@ -9097,6 +9097,184 @@ def urls_in_text(text: str) -> tuple[list[str], int]:
     return list(dict.fromkeys(u for u in urls if len(u) > 8)), int(len(text) > MAX_SCAN_HARD)
 
 
+# --------------------------------------------------------------------------
+# Seen on screen
+#
+# A browser or computer-use agent reads the screen through tools: screenshots,
+# and page text from the DOM or the accessibility tree. Whatever those tools
+# return goes to the model provider and stays in the transcript, so a
+# credential or an address the agent only looked at is as exposed as one it
+# typed. The tool's result is read here; its input is read by add_tool.
+#
+# Families are matched on the tool name. A Claude in Chrome `computer` tool is
+# Claude in Chrome, not computer use: the families are tried in this order.
+SCREEN_FAMILIES = (
+    ("claude-in-chrome", re.compile(r"^mcp__claude-in-chrome__\w{1,64}$")),
+    ("playwright", re.compile(r"^mcp__[\w-]{0,64}playwright[\w-]{0,64}__\w{1,64}$")),
+    ("chrome-devtools", re.compile(r"^mcp__[\w-]{0,64}chrome-devtools[\w-]{0,64}__\w{1,64}$")),
+    ("computer-use", re.compile(r"^(?:computer|mcp__[\w-]{0,64}computer[-_]use[\w-]{0,64}__\w{1,64})$")),
+)
+
+# Screenshots are listed, never read: the standard library cannot read pixels,
+# and decoding an image to guess at its text would be a claim this tool cannot
+# back. Their size is the length of the data, not its content.
+SCREEN_IMAGE_EXTS = frozenset((".png", ".jpg", ".jpeg", ".gif", ".webp"))
+SCREEN_NOT_INSPECTED = ("Screenshot content was not inspected: actualis cannot read pixels, "
+                        "so anything visible in an image is not in these counts.")
+SCREEN_FINDINGS_CAP = 500
+
+# Large results are written to <session>/tool-results/<name> beside the
+# transcript, and the result in the transcript names the file. Only the name
+# is taken from the text; the directory is always this session's own.
+_SPILL_REF = re.compile(r"tool-results[/\\]{1,2}([\w.-]{1,160})")
+_TOOL_USE_ID = re.compile(r'"tool_use_id"\s{0,4}:\s{0,4}"([^"\\]{1,200})"')
+
+
+# Which of classify_secrets' detectors count on screen: the ones that know a
+# credential by its value (a token prefix or shape, a password in a URL, an
+# Authorization header). The ones that know it by the name beside it
+# (`API_TOKEN=…`, `--password …`, a cookie) are shell heuristics: page text is
+# `Label: value` everywhere, and on a real corpus 99 of 106 name-based hits
+# were one page's labels. A labelled credential with a known prefix is still
+# found by its prefix.
+_SCREEN_SECRET_KINDS = frozenset(kind for _p, kind, _rx in SECRET_TYPES) | {
+    "URL userinfo token", "Authorization header"}
+
+
+def _screen_secret_kind(kind: str) -> bool:
+    return kind in _SCREEN_SECRET_KINDS or kind.endswith((" password (remote)", " password (local)"))
+
+
+def screen_family(name: object) -> str | None:
+    """The browser or computer-use family a tool name belongs to, or None."""
+    if not isinstance(name, str) or len(name) > 200:
+        return None
+    for family, rx in SCREEN_FAMILIES:
+        if rx.match(name):
+            return family
+    return None
+
+
+# Personal data. Bounded quantifiers throughout, as for every other pattern
+# here: page text is as hostile as command text.
+_PD_EMAIL = re.compile(
+    r"(?<![A-Za-z0-9._%+-])([A-Za-z0-9][A-Za-z0-9._%+-]{0,63})@"
+    r"((?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.){1,8}[A-Za-z]{2,24})(?![A-Za-z0-9-])")
+# Domains reserved for examples and tests, and TLDs that are really a file
+# extension (`logo@2x.png`, an asset name, is not an address).
+_PD_EMAIL_RESERVED = re.compile(r"(?:^|\.)example\.(?:com|net|org)$|(?:^|\.)(?:test|invalid|example|"
+                                r"localhost|local|internal)$")
+_PD_EMAIL_NOT_TLD = frozenset(("png", "jpg", "jpeg", "gif", "svg", "webp", "avif", "ico", "css",
+                               "js", "mjs", "map", "json", "woff", "woff2", "ttf", "html", "pdf"))
+# The userinfo of a URL (`scheme://user:password@host`) is not an address.
+_PD_URL_USERINFO = re.compile(r"://[^\s/@]{0,256}$")
+_PD_EMAIL_ROBOT = re.compile(r"^(?:no-?reply|do-?not-?reply|mailer-daemon|postmaster|git)$", re.I)
+# North American numbers need their separators (a bare ten-digit run is an id
+# far more often than a phone number); international ones need a leading +.
+# One digit per repetition, so neither can backtrack through many splits.
+_PD_PHONE_NA = re.compile(
+    r"(?<![\w.+-])(?:\+?1[ .-]?)?(?:\([2-9]\d{2}\)[ .-]?|[2-9]\d{2}[ .-])[2-9]\d{2}[ .-]\d{4}(?![\w-]|\.\d)")
+_PD_PHONE_INTL = re.compile(r"(?<![\w+])\+[1-9](?:[ .-]?\d){7,14}(?![\w-]|\.\d)")
+_PD_CARD = re.compile(r"(?<![\w-])(?:\d[ -]?){12,18}\d(?![\w-])")
+# Card networks' issuer ranges; a Luhn-valid number outside them is an id.
+_PD_CARD_IIN = re.compile(r"^(?:4|5[1-5]|2(?:2[2-9]|[3-6]\d|7[01]|720)|3[47]|3(?:0[0-5]|[689])|"
+                          r"6(?:011|5|4[4-9]|2))")
+# Test numbers payment providers publish are nobody's card. Numbers with
+# fewer than four distinct digits (4242 4242 4242 4242, 4111 1111 1111 1111)
+# are dropped by shape.
+_PD_TEST_CARDS = frozenset((
+    "378282246310005", "371449635398431", "378734493671000", "5610591081018250",
+    "30569309025904", "38520000023237", "6011000990139424", "3530111333300000",
+    "3566002020360505", "5105105105105100", "4012888888881881", "4222222222222",
+    "4000056655665556", "5200828282828210", "6200000000000005", "36227206271667",
+    "6011111111111117", "3056930009020004", "6011981111111113", "6555900000604105",
+))
+
+
+def _luhn(digits: str) -> bool:
+    """The Luhn checksum every payment card number satisfies."""
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        d = ord(ch) - 48
+        if i % 2:
+            d = d * 2 - 9 if d > 4 else d * 2
+        total += d
+    return total % 10 == 0
+
+
+def personal_data(text: str) -> list[tuple[str, str]]:
+    """[(detector, sha256[:8])] for each distinct email address, phone number
+    and payment card number in text. Like a credential, the value is hashed at
+    once (normalised: an address lower-cased, a number as its digits) and
+    never kept. Reserved example domains, 555-0100 to 555-0199 and published
+    test card numbers are not personal data and are not counted."""
+    if not isinstance(text, str) or not text:
+        return []
+    text = text[:MAX_SCAN_HARD]
+    out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(detector: str, value: str) -> None:
+        key = (detector, hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:8])
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+
+    if "@" in text:
+        for m in _PD_EMAIL.finditer(text):
+            local, domain = m.group(1), m.group(2).lower()
+            if _PD_EMAIL_RESERVED.search(domain) or domain.rsplit(".", 1)[-1] in _PD_EMAIL_NOT_TLD \
+                    or _PD_EMAIL_ROBOT.match(local) \
+                    or _PD_URL_USERINFO.search(text, max(m.start() - 260, 0), m.start()):
+                continue
+            add("email", f"{local}@{domain}".lower())
+    phones: list[tuple[int, int]] = []
+    for rx in (_PD_PHONE_NA, _PD_PHONE_INTL):
+        for m in rx.finditer(text):
+            if any(a <= m.start() < b for a, b in phones):
+                continue
+            digits = re.sub(r"\D", "", m.group(0))
+            if rx is _PD_PHONE_NA:
+                digits = digits[-10:]
+            if digits[-7:-2] == "55501":         # 555-0100 to 555-0199: reserved for fiction
+                continue
+            phones.append(m.span())
+            add("phone", digits)
+    for m in _PD_CARD.finditer(text):
+        if any(a <= m.start() < b for a, b in phones):
+            continue
+        digits = re.sub(r"\D", "", m.group(0))
+        if not 13 <= len(digits) <= 19 or not _PD_CARD_IIN.match(digits):
+            continue
+        if len(set(digits)) < 4 or digits in _PD_TEST_CARDS or not _luhn(digits):
+            continue
+        add("card", digits)
+    return out
+
+
+def _screen_parts(content: object) -> tuple[list[str], list[int]]:
+    """A tool_result's content as (texts, image byte sizes). An image's size
+    is computed from the length of its base64 data, which is never decoded."""
+    if isinstance(content, str):
+        return [content], []
+    texts: list[str] = []
+    images: list[int] = []
+    if not isinstance(content, list):
+        return texts, images
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("type")
+        if kind == "text" and isinstance(part.get("text"), str):
+            texts.append(part["text"])
+        elif kind == "image":
+            src = part.get("source")
+            data = src.get("data") if isinstance(src, dict) else None
+            n = len(data) if isinstance(data, str) else 0
+            images.append(n * 3 // 4 - (2 if n and data.endswith("==") else 1 if n and data.endswith("=") else 0))
+    return texts, images
+
+
 class Fleet:
     def __init__(self, network_only: bool = False) -> None:
         # --network with nothing that reads findings: the shell-audit rules,
@@ -9204,6 +9382,24 @@ class Fleet:
         # Location-based secret id -> sha256 of every value seen under it, for
         # this run only. Never written to JSON, a report or a log.
         self._location_values: dict[str, set[str]] = {}
+        # Seen on screen: browser and computer-use tool results. Per file, the
+        # calls whose result is read (tool_use_id -> tool name) and the
+        # session's tool-results directory; across files, the results already
+        # read, so a resumed session's copy is not counted twice.
+        self._screen_ids: dict[str, str] = {}
+        self._spill_dir: Path | None = None
+        self._screen_seen: set[str] = set()
+        self.screen_results = 0                  # text results read
+        self.screen_bytes = 0                    # characters of text read
+        self.screen_by_tool: Counter = Counter()
+        self.screen_spills_read = 0              # tool-results files read
+        self.screen_spills_missing = 0           # named by a result, not on disk
+        self.screen_spills_unreadable = 0        # outside the session, not a file, or failed to open
+        self.screen_truncated = 0                # text past MAX_SCAN_HARD, not read past it
+        # (session, tool, kind, detector, id) -> {count, project, first, last}
+        self.screen_hits: dict[tuple, dict] = {}
+        # (session, tool) -> {count, bytes, project, saved}
+        self.screen_images: dict[tuple, dict] = {}
         # Set by _add_network for the command add_tool is reading: the raw
         # text of a curl or wget segment whose output a shell runs, or "".
         self._net_remote_exec = ""
@@ -10343,6 +10539,144 @@ class Fleet:
                 + self._tok(cc.get("ephemeral_5m_input_tokens")) / 1e6 * in_rate * CACHE_WRITE_5M_MULT
                 + self._tok(u.get("cache_read_input_tokens")) / 1e6 * in_rate * read_mult)
 
+    def _record_secret(self, priority: str, kind: str, fp: str, project: str,
+                       ts: datetime | None, source: str) -> None:
+        """One sighting of a credential, by fingerprint: in a command the agent
+        ran (source "command") or in a tool result it read (source "screen")."""
+        e = self.secrets.setdefault(fp, {
+            "priority": priority, "kinds": set(), "uses": 0,
+            "first": None, "last": None, "projects": set(),
+            "suppressed": fp in self.suppressions,
+            "suppressed_reason": self.suppressions.get(fp, ""),
+            "distinct_values": 1, "sources": set()})
+        # A location id is one user's password at one option, not one value.
+        # A suppression recorded for one password must not silence another:
+        # once a second value is seen under it in this run, it is unsuppressed.
+        n = len(self._location_values.get(fp, ()))
+        if n > 1:
+            e["distinct_values"] = n
+            if fp in self.suppressions:
+                e["suppressed"] = False
+                e["suppressed_reason"] = f"suppression covers one value; {n} seen"
+        # the same value may appear under several names; keep the worst
+        rank = {"critical": 0, "high": 1, "low": 2}
+        if rank[priority] < rank[e["priority"]]:
+            e["priority"] = priority
+        e["kinds"].add(kind)
+        e["uses"] += 1
+        e["projects"].add(project)
+        e.setdefault("sources", set()).add(source)
+        if ts:
+            day = ts.date().isoformat()
+            e["first"] = min(e["first"] or day, day)
+            e["last"] = max(e["last"] or day, day)
+
+    def add_tool_result(self, project: str, name: str, content: object, ts: datetime | None,
+                        *, session: str | None = None, call_id: str | None = None,
+                        spill_dir: Path | None = None) -> None:
+        """One browser or computer-use tool result: what the agent saw.
+
+        Text (page text, accessibility snapshots, console and network output)
+        is scanned with the credential classifiers and the personal-data
+        detectors, by fingerprint only. Screenshots are counted and sized,
+        never decoded. A result that names a file in this session's
+        tool-results directory (a large output written beside the transcript)
+        has that file read as part of it; an image saved there is listed."""
+        family = screen_family(name)
+        if family is None or self.network_only:
+            return
+        if call_id:
+            if call_id in self._screen_seen:
+                return                          # a resumed session's copy
+            self._screen_seen.add(call_id)
+        project = clean(project)[:120] or "unknown"
+        tool = clean(name)[:96]
+        sid = clean(str(session))[:80] if session else ""
+        texts, images = _screen_parts(content)
+        saved: list[tuple[str, int]] = []
+        read_texts: list[str] = []
+        for text in texts:
+            for ref in _SPILL_REF.findall(text[:MAX_SCAN_HARD]):
+                got = self._read_spill(spill_dir, ref)
+                if got is None:
+                    continue
+                kind, path, size, body = got
+                if kind == "image":
+                    saved.append((clean(path), size))
+                else:
+                    read_texts.append(body)
+        texts += read_texts
+
+        shots = max(len(images), len(saved))
+        if shots:
+            row = self.screen_images.setdefault((sid, tool), {
+                "count": 0, "bytes": 0, "project": project, "saved": []})
+            row["count"] += shots
+            row["bytes"] += sum(images) if images else sum(s for _p, s in saved)
+            for path, _s in saved:
+                if path not in row["saved"]:
+                    row["saved"].append(path)
+        if not texts:
+            return
+        self.screen_results += 1
+        self.screen_by_tool[tool] += 1
+        found: dict[tuple[str, str, str], str] = {}      # (kind, detector, id) -> priority
+        for text in texts:
+            if len(text) > MAX_SCAN_HARD:
+                self.screen_truncated += 1
+            self.screen_bytes += min(len(text), MAX_SCAN_HARD)
+            for w in scan_windows(text):
+                for priority, kind, fp in classify_secrets(w, self._location_values):
+                    if _screen_secret_kind(kind):
+                        found.setdefault(("credential", kind, fp), priority)
+            for detector, fp in personal_data(text):
+                found.setdefault(("personal", detector, fp), "")
+        day = ts.date().isoformat() if ts else None
+        for (kind, detector, fp), priority in found.items():
+            if kind == "credential":
+                self._record_secret(priority, detector, fp, project, ts, "screen")
+            row = self.screen_hits.setdefault((sid, tool, kind, detector, fp), {
+                "count": 0, "project": project, "first": None, "last": None,
+                "priority": priority or None})
+            row["count"] += 1
+            if day:
+                row["first"] = min(row["first"] or day, day)
+                row["last"] = max(row["last"] or day, day)
+
+    def _read_spill(self, spill_dir: Path | None, ref: str) -> tuple | None:
+        """A file a tool result names in its session's tool-results directory:
+        ("image", path, size, "") listed by its size alone, or ("text", path,
+        size, body) read up to MAX_SCAN_HARD. Only the file's name comes from
+        the transcript, and a name that resolves outside that directory (a
+        symlink) is not followed. None when there is no such file."""
+        if spill_dir is None or ref in (".", "..") or "/" in ref or "\\" in ref:
+            return None
+        path = spill_dir / ref
+        try:
+            if not path.exists():
+                self.screen_spills_missing += 1
+                return None
+            real = path.resolve()
+            if real.parent != spill_dir.resolve():
+                self.screen_spills_unreadable += 1
+                return None
+            st = real.stat()
+            size = st.st_size
+            if path.suffix.lower() in SCREEN_IMAGE_EXTS:
+                return "image", str(path), size, ""
+            # Opened by the name inside the session directory, then checked to
+            # be the file that was resolved: a swap in between is refused.
+            with _open_regular(path) as fh:
+                now = os.fstat(fh.fileno())
+                if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
+                    raise OSError("tool-results file changed while it was opened")
+                body = fh.read(MAX_SCAN_HARD + 1)
+        except (OSError, RuntimeError):
+            self.screen_spills_unreadable += 1
+            return None
+        self.screen_spills_read += 1
+        return "text", str(path), size, body
+
     def add_tool(self, project: str, name: str, tool_input: dict, ts: datetime | None,
                  mode: str | None = None, *, session: str | None = None,
                  call_id: str | None = None, agent: str | None = None,
@@ -10408,7 +10742,6 @@ class Fleet:
             self.secret_exposures += 1
             self.secret_projects[project] += 1
 
-        _rank = {"critical": 0, "high": 1, "low": 2}
         found_secrets: list[tuple[str, str, str]] = []
         seen_fp: set[str] = set()
         dropped: list[str] = []
@@ -10421,31 +10754,7 @@ class Fleet:
             self._reject("secret", f"secret:{kind}", f"{kind} in {project}",
                          f"failed the {kind} shape check", self._source_text(), ts)
         for priority, kind, fp in found_secrets:
-            e = self.secrets.setdefault(fp, {
-                "priority": priority, "kinds": set(), "uses": 0,
-                "first": None, "last": None, "projects": set(),
-                "suppressed": fp in self.suppressions,
-                "suppressed_reason": self.suppressions.get(fp, ""),
-                "distinct_values": 1})
-            # A location id is one user's password at one option, not one value.
-            # A suppression recorded for one password must not silence another:
-            # once a second value is seen under it in this run, it is unsuppressed.
-            n = len(self._location_values.get(fp, ()))
-            if n > 1:
-                e["distinct_values"] = n
-                if fp in self.suppressions:
-                    e["suppressed"] = False
-                    e["suppressed_reason"] = f"suppression covers one value; {n} seen"
-            # the same value may appear under several names; keep the worst
-            if _rank[priority] < _rank[e["priority"]]:
-                e["priority"] = priority
-            e["kinds"].add(kind)
-            e["uses"] += 1
-            e["projects"].add(project)
-            if ts:
-                day = ts.date().isoformat()
-                e["first"] = min(e["first"] or day, day)
-                e["last"] = max(e["last"] or day, day)
+            self._record_secret(priority, kind, fp, project, ts, "command")
 
         matches = command_rule_matches(cmd, windows, self._net_remote_exec)
         if not matches:
@@ -10555,6 +10864,8 @@ class Fleet:
         self._prompt = None
         self._why_id, self._why_prior = None, []
         self._file_keys = Counter()
+        self._screen_ids = {}
+        self._spill_dir = None
         root = root if root is not None else path.parent
         self._src_root = str(root)
         try:
@@ -10637,6 +10948,9 @@ class Fleet:
         # always answers a tool call in the same session, so nothing needs to
         # survive across files and memory stays bounded on a large fleet.
         self._start_file(path, root)
+        # Large tool results are written beside the transcript, under
+        # <session>/tool-results/ (see add_tool_result).
+        self._spill_dir = path.parent / path.stem / "tool-results"
         calls: dict[str, tuple[str, str]] = {}
         try:
             with _open_regular(path) as fh:
@@ -10647,13 +10961,16 @@ class Fleet:
                     counts = not ('"usage"' not in line and '"tool_use"' not in line
                                   and '"permissionMode"' not in line
                                   and '"toolDenialKind"' not in line)
+                    # The result of a browser or computer-use call in this file.
+                    screen = bool(self._screen_ids) and not counts and '"tool_result"' in line \
+                        and any(t in self._screen_ids for t in _TOOL_USE_ID.findall(line))
                     # A user message with no tool result may be the prompt a
                     # network item shows; it moves no counter.
                     said = not counts and ('"type":"user"' in line or '"type": "user"' in line) \
                         and '"tool_result"' not in line
                     # A line admitted only for its error result feeds the
                     # network inventory alone, so no existing counter moves.
-                    if not counts and not said and '"is_error":true' not in line \
+                    if not counts and not said and not screen and '"is_error":true' not in line \
                             and '"is_error": true' not in line:
                         continue
                     self.lines_read += 1
@@ -10672,6 +10989,8 @@ class Fleet:
                         ts = parse_ts(rec.get("timestamp"))
                         if not (since and ts and ts < since):
                             self._network_results(rec)
+                            if screen:
+                                self._screen_results(rec, project, ts)
         except OSError:
             self._file_unreadable("claude-code")
             return
@@ -10740,6 +11059,8 @@ class Fleet:
         if since and ts and ts < since:
             return
         self._network_results(rec)
+        if self._screen_ids:
+            self._screen_results(rec, project, ts)
 
         denial = clean(rec.get("toolDenialKind"))[:48]
         if (mode or denial) and self._record_seen(rec):
@@ -10793,6 +11114,28 @@ class Fleet:
                     if bid and isinstance(bid, str):
                         calls[bid] = (block.get("name") or "?",
                                       cmd[:MAX_SCAN_LINE] if isinstance(cmd, str) else "")
+                        if not self.network_only and screen_family(block.get("name")):
+                            self._screen_ids[bid] = block["name"]
+
+    def _screen_results(self, rec: dict, project: str, ts: "datetime | None") -> None:
+        """The results in one Claude Code record that answer a browser or
+        computer-use call made earlier in the same file."""
+        msg = rec.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            return
+        for b in content:
+            if not isinstance(b, dict) or b.get("type") != "tool_result":
+                continue
+            tid = b.get("tool_use_id")
+            name = self._screen_ids.get(tid) if isinstance(tid, str) else None
+            if name:
+                sid = rec.get("sessionId")
+                if not (isinstance(sid, str) and sid) and self._spill_dir is not None:
+                    sid = self._spill_dir.parent.name        # the transcript's own name
+                self.add_tool_result(project, name, b.get("content"), ts,
+                                     session=sid, call_id=tid,
+                                     spill_dir=self._spill_dir)
 
     def _record_seen(self, rec: dict) -> bool:
         """Whether this Claude Code (or Qwen) record was already counted from
@@ -13203,6 +13546,43 @@ EXPLAIN: dict[str, dict[str, object]] = {
         ],
         "verify": "grep -rl 'sk_live_' ~/.claude/projects/ | head   # find them yourself",
     },
+    "screen": {
+        "measures": "Credentials and personal data in what browser and computer-use tools "
+                    "returned to the agent: what it saw, not what it ran.",
+        "formula": [
+            "Tools are recognised by name: Claude in Chrome (mcp__claude-in-chrome__*),",
+            "Playwright MCP (mcp__*playwright*__*), chrome-devtools MCP",
+            "(mcp__*chrome-devtools*__*) and computer use (computer, mcp__*computer-use*__*).",
+            "Every text part of their results (page text, accessibility snapshots,",
+            "console and network output) is matched with the credential classifiers",
+            "that know a credential by its value (a token prefix or shape, a password",
+            "in a URL, an Authorization header), and with email, phone and card",
+            "patterns (a card must pass the Luhn check and fall in a card network's",
+            "range). Each hit is hashed at once to",
+            "sha256[:8]; the value is never stored, printed, or written to JSON.",
+            "",
+            "A result too large to keep inline is written to",
+            "<session>/tool-results/<file> beside the transcript and named in it; that",
+            "file is read as part of the result. Only the file name comes from the",
+            "transcript, and a file outside that directory is never followed.",
+            "",
+            "results counts the tool results a value appeared in. Credentials also",
+            "join the rotation list (secrets[], source screen or both).",
+        ],
+        "assumes": [
+            "Screenshots are listed by count and size, never decoded: the standard",
+            "library cannot read pixels. Anything visible only in an image is NOT in",
+            "these counts.",
+            "A credential known only by the name beside it (API_TOKEN: ...) is not",
+            "counted on screen: page text is Label: value everywhere, and on a real",
+            "corpus 99 of 106 such hits were one page's labels.",
+            "Reserved example domains, 555-0100 to 555-0199 and published test card",
+            "numbers are not personal data. A ten-digit run without separators is not",
+            "read as a phone number.",
+        ],
+        "verify": "actualis --json | jq '.screen | {results_scanned, credentials, personal_data, "
+                  "screenshots_total}'",
+    },
     "subagents": {
         "measures": "Work done by subagents, and the part of it that cannot be seen.",
         "formula": [
@@ -15340,6 +15720,11 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
               f"{c.dim}({num(actionable)} worth rotating"
               + (f", {num(suppressed)} suppressed" if suppressed else "")
               + f"){c.off}")
+        # Counted from the screen rows, which hold fingerprints only.
+        on_screen = len({k[4] for k in fleet.screen_hits if k[2] == "credential"})
+        if on_screen:
+            print(f"    {c.dim}{num(on_screen)} of them seen on screen, in browser or "
+                  f"computer-use results (SEEN ON SCREEN below){c.off}")
         print(f"\n  {'':<9} {'type':<26} {'uses':>6}  {'first':<11} {'last':<11} id")
         for fp, e in rows[:24]:
             pri = e["priority"]
@@ -15348,6 +15733,10 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
             if e.get("suppressed"):
                 col, mark = c.dim, "muted"
             kind = ", ".join(sorted(e["kinds"]))
+            src = secret_source(e)
+            if src != "command":                 # where it was seen, kept inside the column
+                tag = " (screen)" if src == "screen" else " (cmd+screen)"
+                kind = kind[:26 - len(tag)] + tag
             print(f"    {col}{mark:<7}{c.off} {kind[:26]:<26} {num(e['uses']):>6}  "
                   f"{(e['first'] or '?'):<11} {(e['last'] or '?'):<11} {c.dim}{fp}{c.off}")
             if e.get("distinct_values", 1) > 1:
@@ -15399,6 +15788,7 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
             print(f"      {c.dim}{f['project'][:66]}{c.off}")
 
     render_network(fleet, c, top, raw)
+    render_screen(fleet, c, top)
 
     if not bash_only:
         render_coach(coach(fleet), c)
@@ -15443,6 +15833,78 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
     else:
         print(f"  {c.red}--no-redact is on: this output may contain live secrets.{c.off}")
     print()
+
+
+def _size(n: int) -> str:
+    """A byte count for the report: B, KB or MB, decimal."""
+    if n < 1000:
+        return f"{n} B"
+    return f"{n / 1e3:.0f} KB" if n < 1_000_000 else f"{n / 1e6:.1f} MB"
+
+
+def _screen_tool_label(row: dict) -> str:
+    """`family tool` for the report: the MCP server prefix is the family."""
+    return f"{row['family']} {row['tool'].rsplit('__', 1)[-1]}"
+
+
+def render_screen(fleet: "Fleet", c: C, top: int = 12) -> None:
+    """SEEN ON SCREEN: credentials and personal data in what browser and
+    computer-use tools returned, by fingerprint; screenshots listed by count
+    and size, their content not inspected. Silent with no such tool results."""
+    data = screen_json(fleet)
+    if not (data["results_scanned"] or data["screenshots_total"]):
+        return
+    rule(c, "SEEN ON SCREEN")
+    spilled = data["spilled_files_read"]
+    print(f"  read          {num(data['results_scanned'])} browser and computer-use tool results, "
+          f"{num(data['chars_scanned'])} characters of text"
+          + (f", {num(spilled)} from tool-results files" if spilled else ""))
+    rows = data["findings"]
+    if rows:
+        col = c.red if data["credentials"] else c.yellow
+        dets = ", ".join(f"{d} {num(n)}" for d, n in data["by_detector"].items())
+        print(f"  found         {col}{num(data['credentials'])} credentials, "
+              f"{num(data['personal_data'])} personal data items{c.off} in "
+              f"{_plural(data['sessions'], 'session')}  {c.dim}{dets}{c.off}")
+        print(f"\n  {'':<10} {'tool':<34} {'detector':<18} {'results':>7}  {'session':<9} id")
+        for r in rows[:max(top, 1)]:
+            if r["kind"] == "credential":
+                pri = r["priority"]
+                mark, rc = (("ROTATE", c.red) if pri == "critical" else
+                            ("rotate", c.yellow) if pri == "high" else ("dev", c.dim))
+                if fleet.secrets.get(r["id"], {}).get("suppressed"):
+                    mark, rc = "muted", c.dim
+            else:
+                mark, rc = "personal", c.dim
+            print(f"    {rc}{mark:<8}{c.off} {clip(_screen_tool_label(r), 34):<34} "
+                  f"{clip(r['detector'], 18):<18} {num(r['results']):>7}  {r['session'][:8]:<9} "
+                  f"{c.dim}{r['id']}{c.off}")
+        if len(rows) < data["findings_total"] or len(rows) > max(top, 1):
+            more = data["findings_total"] - min(len(rows), max(top, 1))
+            print(f"    {c.dim}… {num(more)} more (actualis --json | jq .screen.findings){c.off}")
+    else:
+        print(f"  found         {c.ok}no credential or personal data in the text{c.off}")
+    if data["screenshots_total"]:
+        sessions = len({r["session"] for r in data["screenshots"]})
+        print(f"\n  screenshots   {num(data['screenshots_total'])} "
+              f"({_size(data['screenshots_bytes'])}) in {_plural(sessions, 'session')}, "
+              f"{c.yellow}content not inspected{c.off}")
+        for r in data["screenshots"][:max(top, 1)]:
+            print(f"    {clip(_screen_tool_label(r), 44):<44} {num(r['count']):>5}  {_size(r['bytes']):>8}  "
+                  f"{c.dim}session {r['session'][:8]}{c.off}")
+            for path in r["saved"][:3]:
+                print(f"      {c.dim}saved {clean(path)}{c.off}")
+            if len(r["saved"]) > 3:
+                print(f"      {c.dim}… {len(r['saved']) - 3} more saved{c.off}")
+        if len(data["screenshots"]) > max(top, 1):
+            print(f"    {c.dim}… {len(data['screenshots']) - max(top, 1)} more{c.off}")
+        for line in _wrap(SCREEN_NOT_INSPECTED, 70):
+            print(f"    {c.dim}{line}{c.off}")
+    print(f"\n    {c.dim}id is a fingerprint of the value; the value is never stored or "
+          f"printed.")
+    if data["credentials"]:
+        print(f"    Credentials seen here are in the rotation list too, marked screen.")
+    print(f"    Anything a tool returned was sent to the model provider.{c.off}")
 
 
 def render_share(fleet: "Fleet", c: C) -> None:
@@ -16277,6 +16739,44 @@ JSON_SCHEMA: dict[str, str] = {
     "secrets[].assessment": "str",
     "secrets[].basis": "str",
     "secrets[].missing": "str|null",
+    "secrets[].source": "str",
+    "screen.results_scanned": "int",
+    "screen.chars_scanned": "int",
+    "screen.by_tool.*": "int",
+    "screen.spilled_files_read": "int",
+    "screen.spilled_files_missing": "int",
+    "screen.spilled_files_unreadable": "int",
+    "screen.truncated": "int",
+    "screen.credentials": "int",
+    "screen.personal_data": "int",
+    "screen.by_detector.*": "int",
+    "screen.sessions": "int",
+    "screen.findings": "array",
+    "screen.findings[].session": "str",
+    "screen.findings[].tool": "str",
+    "screen.findings[].family": "str",
+    "screen.findings[].kind": "str",
+    "screen.findings[].detector": "str",
+    "screen.findings[].id": "str",
+    "screen.findings[].priority": "str|null",
+    "screen.findings[].results": "int",
+    "screen.findings[].project": "str",
+    "screen.findings[].first_seen": "str",
+    "screen.findings[].last_seen": "str",
+    "screen.findings_total": "int",
+    "screen.screenshots": "array",
+    "screen.screenshots[].session": "str",
+    "screen.screenshots[].tool": "str",
+    "screen.screenshots[].family": "str",
+    "screen.screenshots[].count": "int",
+    "screen.screenshots[].bytes": "int",
+    "screen.screenshots[].project": "str",
+    "screen.screenshots[].saved": "array",
+    "screen.screenshots[].saved[]": "str",
+    "screen.screenshots_total": "int",
+    "screen.screenshots_bytes": "int",
+    "screen.screenshots_note": "str",
+    "screen.note": "str",
     "secret_projects.*": "int",
     "redacted": "bool",
     "permission_modes.*": "int",
@@ -16814,6 +17314,13 @@ def coverage(fleet: Fleet) -> dict:
               _check("shell", fleet.bash_total - fleet.unreadable, shell_why),
               _check("records", fleet.lines_read - fleet.unparsable_lines,
                      {"unparsable-line": fleet.unparsable_lines})]
+    shots = sum(r["count"] for r in fleet.screen_images.values())
+    if fleet.screen_results or shots or fleet.screen_spills_missing or fleet.screen_spills_unreadable:
+        # A screenshot is not read by design; it is listed, and not a gap.
+        checks.append(_check("screen", fleet.screen_results,
+                             {"screenshot": shots, "truncated": fleet.screen_truncated,
+                              "spill-missing": fleet.screen_spills_missing,
+                              "spill-unreadable": fleet.screen_spills_unreadable}))
     if fleet.network_requested or fleet.ioc is not None:
         checks.append(_check("network", len(fleet.network_items),
                              {"unparsed-segment": fleet.network_unparsed}))
@@ -16884,6 +17391,63 @@ def assumptions(fleet: Fleet) -> list[dict]:
             f"rates divide by {active} active day(s), not the {span} calendar dates the "
             f"window covers", "days", active)
     return out
+
+
+def secret_source(e: dict) -> str:
+    """Where a credential was seen: "command" (a command the agent ran),
+    "screen" (a browser or computer-use result it read), or "both"."""
+    src = e.get("sources") or {"command"}
+    return "both" if len(src) > 1 else next(iter(src))
+
+
+def _screen_rows(fleet: Fleet) -> list[dict]:
+    """screen.findings[], most results first: per session, tool, detector and
+    fingerprint, never a value."""
+    order = {"critical": 0, "high": 1, "low": 2}
+    rows = [{"session": sid, "tool": tool, "family": screen_family(tool) or "",
+             "kind": kind, "detector": det, "id": fp,
+             "priority": r["priority"], "results": r["count"], "project": r["project"],
+             "first_seen": r["first"] or "", "last_seen": r["last"] or ""}
+            for (sid, tool, kind, det, fp), r in fleet.screen_hits.items()]
+    rows.sort(key=lambda r: (r["kind"] != "credential", order.get(r["priority"] or "", 9),
+                             -r["results"], r["session"], r["tool"], r["detector"], r["id"]))
+    return rows
+
+
+def screen_json(fleet: Fleet) -> dict:
+    """The seen-on-screen finding: what browser and computer-use tools
+    returned to the agent. Counts, detectors and fingerprints; never a value,
+    and never a screenshot's content, which is not inspected."""
+    rows = _screen_rows(fleet)
+    shots = sorted(({"session": sid, "tool": tool, "family": screen_family(tool) or "",
+                     "count": r["count"], "bytes": r["bytes"],
+                     "project": r["project"], "saved": list(r["saved"])}
+                    for (sid, tool), r in fleet.screen_images.items()),
+                   key=lambda r: (-r["count"], r["session"], r["tool"]))
+    cred = {(r["detector"], r["id"]) for r in rows if r["kind"] == "credential"}
+    personal = {(r["detector"], r["id"]) for r in rows if r["kind"] == "personal"}
+    return {
+        "results_scanned": fleet.screen_results,
+        "chars_scanned": fleet.screen_bytes,
+        "by_tool": dict(fleet.screen_by_tool.most_common()),
+        "spilled_files_read": fleet.screen_spills_read,
+        "spilled_files_missing": fleet.screen_spills_missing,
+        "spilled_files_unreadable": fleet.screen_spills_unreadable,
+        "truncated": fleet.screen_truncated,
+        "credentials": len(cred),
+        "personal_data": len(personal),
+        "by_detector": dict(Counter(d for d, _ in cred | personal).most_common()),
+        "sessions": len({r["session"] for r in rows}),
+        "findings": rows[:SCREEN_FINDINGS_CAP],
+        "findings_total": len(rows),
+        "screenshots": shots,
+        "screenshots_total": sum(r["count"] for r in shots),
+        "screenshots_bytes": sum(r["bytes"] for r in shots),
+        "screenshots_note": SCREEN_NOT_INSPECTED,
+        "note": "values are never stored or printed: id is sha256[:8] of the value, as for "
+                "secrets[]. Credentials found here are also in secrets[] with source "
+                "\"screen\" or \"both\". results counts the tool results a value appeared in.",
+    }
 
 
 REJECTED_CAP = 200
@@ -17035,13 +17599,15 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
              "projects": sorted(e["projects"]),
              "suppressed": bool(e.get("suppressed")),
              "suppressed_reason": e.get("suppressed_reason", ""),
-             "distinct_values": e.get("distinct_values", 1), **classify(e)}
+             "distinct_values": e.get("distinct_values", 1),
+             "source": secret_source(e), **classify(e)}
             for fp, e in sorted(
                 fleet.secrets.items(),
                 key=lambda kv: ({"critical": 0, "high": 1, "low": 2}.get(kv[1]["priority"], 9),
                                 -kv[1]["uses"]))
         ],
         "secret_projects": dict(fleet.secret_projects),
+        "screen": screen_json(fleet),
         "redacted": not raw,
         "permission_modes": dict(fleet.permission_modes),
         # The share --share prints as "N% of turns ran unsupervised", computed
@@ -19052,7 +19618,10 @@ def main(argv: list[str] | None = None) -> int:
             elif args.agent == "qwen":
                 sys.exit(no_transcripts_message())
 
-    if fleet.messages == 0 and fleet.bash_total == 0:
+    # A browser or computer-use session can leave results with no usage record
+    # in the window; what the agent saw is still worth reporting.
+    seen = fleet.screen_results or fleet.screen_images
+    if fleet.messages == 0 and fleet.bash_total == 0 and not seen:
         print(dead_end_message(fleet, args), file=sys.stderr)
         return EXIT_CANNOT_RUN
 

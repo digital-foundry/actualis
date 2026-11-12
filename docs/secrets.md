@@ -221,6 +221,14 @@ floor on visibility. It is not a security boundary.**
 Subagent shell commands are not in the parent transcript at all, so no secret
 inside one can be detected. See [AF011](findings.md#af011).
 
+The classifiers that know a credential by its value (prefixes, shapes, URL
+passwords, Authorization headers) also read what browser and computer-use tools
+returned (page text, accessibility snapshots, console and network output); a
+credential found there joins the rotation list with `source` `screen`. Names
+beside a value are not read on screen, where `Label: value` is everywhere. Screenshots are
+listed, never read: a credential visible only in an image is not detected. See
+[json.md](json.md#screen).
+
 ## How this list is maintained
 
 Detectors are added from evidence, not from a list of providers somebody has
