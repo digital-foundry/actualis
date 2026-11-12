@@ -10660,10 +10660,16 @@ class Fleet:
             if real.parent != spill_dir.resolve():
                 self.screen_spills_unreadable += 1
                 return None
-            size = real.stat().st_size
+            st = real.stat()
+            size = st.st_size
             if path.suffix.lower() in SCREEN_IMAGE_EXTS:
                 return "image", str(path), size, ""
-            with _open_regular(real) as fh:
+            # Opened by the name inside the session directory, then checked to
+            # be the file that was resolved: a swap in between is refused.
+            with _open_regular(path) as fh:
+                now = os.fstat(fh.fileno())
+                if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
+                    raise OSError("tool-results file changed while it was opened")
                 body = fh.read(MAX_SCAN_HARD + 1)
         except (OSError, RuntimeError):
             self.screen_spills_unreadable += 1
