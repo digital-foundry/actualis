@@ -15709,13 +15709,16 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
                          if e["priority"] != "low" and not e.get("suppressed"))
         suppressed = fleet.suppressed_secrets
 
-        on_screen = sum(1 for _, e in rows if "screen" in e.get("sources", ()))
         print(f"\n  {c.red}▲ {num(distinct)} distinct secrets{c.off} exposed across "
-              f"{num(fleet.secret_exposures)} commands"
-              + (f", {num(on_screen)} seen on screen" if on_screen else "")
-              + f" {c.dim}({num(actionable)} worth rotating"
+              f"{num(fleet.secret_exposures)} commands "
+              f"{c.dim}({num(actionable)} worth rotating"
               + (f", {num(suppressed)} suppressed" if suppressed else "")
               + f"){c.off}")
+        # Counted from the screen rows, which hold fingerprints only.
+        on_screen = len({k[4] for k in fleet.screen_hits if k[2] == "credential"})
+        if on_screen:
+            print(f"    {c.dim}{num(on_screen)} of them seen on screen, in browser or "
+                  f"computer-use results (SEEN ON SCREEN below){c.off}")
         print(f"\n  {'':<9} {'type':<26} {'uses':>6}  {'first':<11} {'last':<11} id")
         for fp, e in rows[:24]:
             pri = e["priority"]
@@ -15725,10 +15728,11 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
                 col, mark = c.dim, "muted"
             kind = ", ".join(sorted(e["kinds"]))
             src = secret_source(e)
+            if src != "command":                 # where it was seen, kept inside the column
+                tag = " (screen)" if src == "screen" else " (cmd+screen)"
+                kind = kind[:26 - len(tag)] + tag
             print(f"    {col}{mark:<7}{c.off} {kind[:26]:<26} {num(e['uses']):>6}  "
-                  f"{(e['first'] or '?'):<11} {(e['last'] or '?'):<11} {c.dim}{fp}"
-                  + ("" if src == "command" else f"  {src if src == 'screen' else 'cmd+screen'}")
-                  + c.off)
+                  f"{(e['first'] or '?'):<11} {(e['last'] or '?'):<11} {c.dim}{fp}{c.off}")
             if e.get("distinct_values", 1) > 1:
                 print(f"            {c.dim}{e['distinct_values']} distinct values"
                       + (f"; {e['suppressed_reason']}" if e.get("suppressed_reason", "").startswith(
