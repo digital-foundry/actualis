@@ -103,6 +103,12 @@ var iconUpdDark []byte
 //go:embed icons/update-light.png
 var iconUpdLight []byte
 
+//go:embed icons/looking-dark.png
+var iconLookDark []byte
+
+//go:embed icons/looking-light.png
+var iconLookLight []byte
+
 // iconState remembers what is currently installed so the appearance watcher
 // can reinstall the same state in the other colourway.
 var iconState struct {
@@ -162,6 +168,8 @@ func iconFor(state string, dark bool) []byte {
 		onDark, onLight = iconNetDark, iconNetLight
 	case "update":
 		onDark, onLight = iconUpdDark, iconUpdLight
+	case "looking":
+		onDark, onLight = iconLookDark, iconLookLight
 	default:
 		onDark, onLight = iconIdleDark, iconIdleLight
 	}
@@ -519,6 +527,13 @@ type ui struct {
 	primedDays int             // the window the baseline in seen was taken over
 	listsDue   bool            // Safe Browsing lists exist and are at least listsDueAfter old
 
+	live        *liveState    // what the --watch --json stream has said (live.go)
+	liveOK      bool          // the stream is running on a CLI that sends screen events
+	scanStarted time.Time     // when the scan behind rep started: live counts after it are new
+	quietTimer  *time.Timer   // the rescan once the stream has been quiet after screen events
+	stop        chan struct{} // closed on quit: ends the stream and its child
+	stopOnce    sync.Once
+
 	mHeader, mSub, mCost, mShell, mUnsup, mInvis *systray.MenuItem
 	mNet, mNetReport, mLists, mScreen            *systray.MenuItem
 	mFindings                                    []*systray.MenuItem
@@ -527,11 +542,18 @@ type ui struct {
 	mDays                                        map[int]*systray.MenuItem
 }
 
-func main() { systray.Run(newUI().onReady, func() {}) }
+func main() {
+	u := newUI()
+	systray.Run(u.onReady, u.onExit)
+}
 
 func newUI() *ui {
-	return &ui{days: 7, mDays: map[int]*systray.MenuItem{}, seen: map[string]bool{}}
+	return &ui{days: 7, mDays: map[int]*systray.MenuItem{}, seen: map[string]bool{},
+		live: newLiveState(), stop: make(chan struct{})}
 }
+
+// onExit ends the watch stream, which kills its child process.
+func (u *ui) onExit() { u.stopOnce.Do(func() { close(u.stop) }) }
 
 // shellQuote wraps a path for POSIX sh. Single quotes suppress every
 // expansion; an embedded quote is closed, escaped and reopened.
@@ -697,6 +719,8 @@ func (u *ui) onReady() {
 
 	go u.loop()
 	go u.refresh()
+	go u.runStream()
+	go u.watchLooking()
 }
 
 func addDisabled(s string) *systray.MenuItem {
@@ -736,6 +760,7 @@ func (u *ui) loop() {
 		case <-u.mSupport.ClickedCh:
 			go openBrowser(supportURL)
 		case <-u.mQuit.ClickedCh:
+			u.onExit()
 			systray.Quit()
 			return
 		case <-u.mDays[1].ClickedCh:
@@ -777,10 +802,11 @@ func (u *ui) refresh() {
 	days := u.days
 	u.mu.Unlock()
 
+	started := time.Now()
 	r := fetch(days)
 
 	u.mu.Lock()
-	u.rep, u.loading = r, false
+	u.rep, u.loading, u.scanStarted = r, false, started
 	fresh := u.absorb(r)
 	again := u.pending || r.days != u.days
 	u.pending = false
@@ -827,6 +853,10 @@ func (u *ui) render() {
 	// before the window changed covers the old one.
 	r := u.rep
 	days := r.days
+	now := time.Now()
+	looking := u.live.looking(now)
+	lookTip := lookingLabel(u.live.tool, u.live.family, u.live.agent)
+	screen := withLive(r.screen, u.live.since(u.scanStarted))
 	u.mu.Unlock()
 
 	age, due := listsDue()
@@ -846,30 +876,21 @@ func (u *ui) render() {
 		return
 	}
 
-	if r.critical > 0 {
-		setIcon("exposed")
+	state := trayState(r, due, looking)
+	setIcon(state)
+	setTooltip(tooltipFor(r, state, looking, lookTip, age))
+	switch state {
+	case "exposed":
 		// Only macOS and some Linux desktops show this; Windows ignores it.
 		systray.SetTitle(strconv.Itoa(r.critical))
-		setTooltip(fmt.Sprintf("Actualis — %d critical credential(s) exposed", r.critical))
 		u.mHeader.SetTitle(fmt.Sprintf("%d critical credential(s) exposed", r.critical))
 		show(u.mSub, fmt.Sprintf("%d worth rotating in total", r.rotatable))
-	} else if r.rotatable > 0 {
-		setIcon("monitoring")
+	case "monitoring":
 		systray.SetTitle("")
-		setTooltip(fmt.Sprintf("Actualis — %d credential(s) worth rotating", r.rotatable))
 		u.mHeader.SetTitle(fmt.Sprintf("%d credential(s) worth rotating", r.rotatable))
 		u.mSub.Hide()
-	} else if due {
-		// Below the credential states: a stale list never outranks an exposure.
-		setIcon("update")
+	default:
 		systray.SetTitle("")
-		setTooltip(listsTooltip("Actualis — no critical credentials exposed", age))
-		u.mHeader.SetTitle("No critical credentials exposed")
-		u.mSub.Hide()
-	} else {
-		setIcon("idle")
-		systray.SetTitle("")
-		setTooltip("Actualis — no critical credentials exposed")
 		u.mHeader.SetTitle("No critical credentials exposed")
 		u.mSub.Hide()
 	}
@@ -892,7 +913,7 @@ func (u *ui) render() {
 	} else {
 		u.mNet.Hide()
 	}
-	if label := screenLabel(r.screen); label != "" {
+	if label := screenLabel(screen); label != "" {
 		show(u.mScreen, label)
 	} else {
 		u.mScreen.Hide()
@@ -914,16 +935,30 @@ func (u *ui) render() {
 func (u *ui) state() string {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	if u.rep.critical > 0 {
-		return "exposed"
+	return trayState(u.rep, u.listsDue, u.live.looking(time.Now()))
+}
+
+// tooltipFor is the tooltip for a report in a given icon state. While a
+// browser or computer-use tool is in use it names the agent and the tool,
+// beside a credential warning rather than instead of it.
+func tooltipFor(r report, state string, looking bool, lookTip string, listsAge time.Duration) string {
+	var tip string
+	switch state {
+	case "exposed":
+		tip = fmt.Sprintf("Actualis — %d critical credential(s) exposed", r.critical)
+	case "monitoring":
+		tip = fmt.Sprintf("Actualis — %d credential(s) worth rotating", r.rotatable)
+	case "update":
+		return listsTooltip("Actualis — no critical credentials exposed", listsAge)
+	case "looking":
+		return "Actualis — " + lookTip
+	default:
+		return "Actualis — no critical credentials exposed"
 	}
-	if u.rep.rotatable > 0 {
-		return "monitoring"
+	if looking {
+		tip += "  ·  " + lookTip
 	}
-	if u.listsDue {
-		return "update"
-	}
-	return "idle"
+	return tip
 }
 
 func show(m *systray.MenuItem, s string) { m.SetTitle(s); m.Show() }

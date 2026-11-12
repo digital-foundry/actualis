@@ -18,6 +18,12 @@
 - Tray: a "Seen on screen: N personal data · N screenshots" menu line, read from `screen` (hidden when no browser or
   computer-use results were read, or the CLI predates the key; clicking it opens `actualis --explain screen`), and a
   new critical credential seen on screen says so in its notification. Counts only; the icon is unchanged (#94).
+- `--watch` reads browser and computer-use results as they are appended, with the same detectors as the report,
+  and alerts on credentials and personal data seen on screen. `--watch --json` is now a JSONL event stream
+  (`hello`, `activity` start/end, `finding`, `screenshot`, `flag`, `heartbeat`, `stopped`); never a value (#95).
+- Tray: runs `actualis --watch --json` alongside its scans. A new "agent looking" icon while a browser or
+  computer-use tool was active in the last 45 seconds (credential states take priority), the tooltip names the
+  tool and agent, and the seen-on-screen line updates live. With an older CLI it keeps to the periodic scan (#95).
 
 ## 0.7.0 (2026-11-08)
 
