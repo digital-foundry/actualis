@@ -157,7 +157,7 @@ PRIMARY = {
 # (argv, flags the refusal must name). Exit 2, before anything runs.
 REFUSED = [
     # P2D2: --json with modes that ignore it
-    (("--watch", "--json"), ("--json", "--watch")),
+    # (--watch --json is a JSONL event stream since #95.)
     (("--mcp", "--json"), ("--json", "--mcp")),
     # P2D2: --with-prompts with modes that have no prompt field
     (SCAN + ("--agents", "--json", "--with-prompts"), ("--with-prompts", "--agents")),
@@ -291,7 +291,7 @@ class TestNumericFlags(_Env):
 
     def test_watch_gets_the_interval_unclamped(self):
         seen = []
-        with mock.patch.object(af, "watch", lambda r, c, interval, *a: seen.append(interval) or 0), \
+        with mock.patch.object(af, "watch", lambda r, c, interval, *a, **k: seen.append(interval) or 0), \
                 contextlib.redirect_stdout(io.StringIO()):
             af.main(["--watch", "--interval", "3600"])
             af.main(["--watch", "--interval", "0.5"])
