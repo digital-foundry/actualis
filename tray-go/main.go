@@ -218,6 +218,8 @@ type report struct {
 	findings     []finding
 	sources      map[string]string // critical fingerprint -> where it was seen: command, screen or both
 	screen       screenSeen
+	resolvables  []resolvable // actionable findings for the Resolve submenu (resolve.go)
+	canResolve   bool         // the CLI knows --resolve: its JSON carries disposition
 	err          string
 	at           time.Time
 	days         int // the window this report covers, which render labels it with
@@ -439,6 +441,7 @@ func parseReport(out []byte, days int) report {
 			screenshots: num(sc, "screenshots_total"),
 		}
 	}
+	r.resolvables, r.canResolve = resolvablesFrom(root)
 	if bash, ok := root["bash"].(map[string]any); ok {
 		if v, ok := bash["total"].(float64); ok {
 			r.shell = int(v)
@@ -537,6 +540,11 @@ type ui struct {
 	mHeader, mSub, mCost, mShell, mUnsup, mInvis *systray.MenuItem
 	mNet, mNetReport, mLists, mScreen            *systray.MenuItem
 	mFindings                                    []*systray.MenuItem
+	mResolve, mResolveMore                       *systray.MenuItem
+	mResolveRows                                 []resolveRow
+	resolveBound                                 []resolvable // what each Resolve row stands for now
+	resolving                                    bool         // a Resolve dialog is open: one at a time
+	canAsk                                       bool         // this desktop has a reason dialog
 	mReport, mCopy, mRefresh, mQuit              *systray.MenuItem
 	mBug, mFeat, mSupport                        *systray.MenuItem
 	mDays                                        map[int]*systray.MenuItem
@@ -689,6 +697,7 @@ func (u *ui) onReady() {
 	// Enabled, unlike the counts above: a click explains how it was read.
 	u.mScreen = systray.AddMenuItem("", "What browser and computer-use tools showed the agent. Click for how it is read")
 	u.mScreen.Hide()
+	u.addResolveMenu()
 	systray.AddSeparator()
 
 	for i := 0; i < 4; i++ {
@@ -918,6 +927,7 @@ func (u *ui) render() {
 	} else {
 		u.mScreen.Hide()
 	}
+	u.renderResolve(r)
 
 	sort.SliceStable(r.findings, func(i, j int) bool {
 		rank := map[string]int{"critical": 0, "high": 1, "info": 2}

@@ -37,12 +37,12 @@ that and prints a warning to stderr (stdout stays pure JSON).
 | `by_project` | cost per project |
 | `by_day` | cost per calendar day (UTC date), ascending |
 | `tools` | tool-call counts, descending |
-| `bash` | `total`, `commands{}` (program name to count; a program name that is itself a credential, such as a pasted token run as a command, is counted as `(credential)`), `flag_counts{}`, `oversized_commands` (commands over 32 KB, each also a medium `oversized-command` flag), `flagged.high` and `flagged.medium` (the report's "flagged N high M medium": one per command, suppressed flags left out; `flag_counts` counts per category and includes suppressed flags), `flags[]`: `id`, `severity`, `categories[]`, `program`, `project`, `when` (null when undated), `evidence` (240 characters, redacted unless `--no-redact`), `had_secret` (the command also contained a credential), `suppressed` and `suppressed_reason`, and the three [assessment](#assessments) fields |
+| `bash` | `total`, `commands{}` (program name to count; a program name that is itself a credential, such as a pasted token run as a command, is counted as `(credential)`), `flag_counts{}`, `oversized_commands` (commands over 32 KB, each also a medium `oversized-command` flag), `flagged.high` and `flagged.medium` (the report's "flagged N high M medium": one per command, suppressed flags left out; `flag_counts` counts per category and includes suppressed flags), `flags[]`: `id`, `severity`, `categories[]`, `program`, `project`, `when` (null when undated), `evidence` (240 characters, redacted unless `--no-redact`), `had_secret` (the command also contained a credential), `suppressed` and `suppressed_reason`, `disposition` (see [Resolutions](#resolutions)), and the three [assessment](#assessments) fields |
 | `coach` | findings: `id`, `severity`, `title`, `evidence`, `action`, `impact`, `project` (the project a per-project finding such as `AF002` or `AF006` is about, `""` for fleet-wide findings; `--diff` matches findings on `id` and `project`), and the three [assessment](#assessments) fields |
 | `secrets` | array; see below |
 | `secret_exposures` | commands containing credential material |
-| `suppressed_secrets` | credential findings marked as false positives on this machine |
-| `suppressed_flags` | shell-audit findings marked as false positives on this machine |
+| `suppressed_secrets` | credential findings resolved on this machine (any disposition in effect: false positive, rotated, accepted, expected) |
+| `suppressed_flags` | shell-audit findings resolved on this machine |
 | `suppression_note` | why a suppressed finding is still counted here |
 | `secret_projects` | those commands per project |
 | `screen` | credentials and personal data in what browser and computer-use tools returned, and the screenshots they took (listed, not inspected). See [screen](#screen) |
@@ -530,6 +530,12 @@ actionable list in the report, not hidden. A scan with many suppressions must
 not be indistinguishable from a clean one, and `suppressed_secrets` is the
 number that makes the difference visible.
 
+`disposition` is the resolution in effect (see [Resolutions](#resolutions)),
+`null` when there is none. `seen_after_rotation` is `true` when the id was
+resolved as `rotated` and seen again after that: it is then `suppressed: false`,
+back in the rotation list, with `suppressed_reason` "rotated YYYY-MM-DD; seen
+again after rotation".
+
 `source` is where the credential was seen: `command` (a command the agent
 ran), `screen` (a browser or computer-use tool result the agent read; see
 [screen](#screen)) or `both`.
@@ -541,6 +547,28 @@ option, the id comes from where the password appears (see
 kind has more than one value, it is reported as `suppressed: false` with
 `suppressed_reason` "suppression covers one value; N seen", and it counts
 toward `--fail-on`.
+
+## Resolutions
+
+`actualis --resolve ID --as DISPOSITION --reason TEXT [--until DATE]` records
+what a finding turned out to be; `--suppress ID` is `--as false-positive`.
+Added in the release after 0.7.0, additive under `schema_version` 1:
+`secrets[].disposition`, `secrets[].seen_after_rotation`,
+`bash.flags[].disposition`, `screen.findings[].disposition` and
+`screen.resolved`.
+
+| `disposition` | meaning | holds until |
+|---|---|---|
+| `false-positive` | not a real finding | the line is removed |
+| `rotated` | a real credential, since replaced | it is seen again after the resolve time: then `disposition` is `null` and `seen_after_rotation` is `true` |
+| `accepted` | real, a risk someone chose to carry | `--until`, if given (inclusive, local date) |
+| `expected` | real and meant to be there, such as your own address on your own signed-in page | `--until`, if given |
+
+Every disposition in effect sets `suppressed: true`: the finding stays counted
+and listed, and leaves the actionable list, `--fail-on` and the tray badge. An
+expired `accepted` or `expected` is `disposition: null` and actionable again.
+
+Verify: `actualis --json | jq '[.secrets[] | select(.disposition) | {id, disposition}]'`
 
 ## screen
 
@@ -585,7 +613,8 @@ additive under `schema_version` 1. The report prints it as SEEN ON SCREEN.
 | `personal_data` | distinct email addresses, phone numbers and payment card numbers seen, by fingerprint |
 | `by_detector` | distinct values per detector: a credential type, `email`, `phone` or `card` |
 | `sessions` | sessions with at least one finding |
-| `findings[]` | per session, tool, detector and fingerprint, credentials first, at most 500: `session`, `tool`, `family` (`claude-in-chrome`, `playwright`, `chrome-devtools`, `computer-use`), `kind` (`credential` or `personal`), `detector`, `id` (`sha256[:8]` of the value; an address is lower-cased and a number reduced to its digits first), `priority` (a credential's, as in `secrets[]`; `null` for personal data), `results` (the tool results it appeared in), `project`, `first_seen`, `last_seen` (`""` when undated) |
+| `findings[]` | per session, tool, detector and fingerprint, credentials first, at most 500: `session`, `tool`, `family` (`claude-in-chrome`, `playwright`, `chrome-devtools`, `computer-use`), `kind` (`credential` or `personal`), `detector`, `id` (`sha256[:8]` of the value; an address is lower-cased and a number reduced to its digits first), `priority` (a credential's, as in `secrets[]`; `null` for personal data), `results` (the tool results it appeared in), `project`, `first_seen`, `last_seen` (`""` when undated), `disposition` (the resolution in effect, `null` when none; see [Resolutions](#resolutions)) |
+| `resolved` | distinct findings with a resolution in effect. They stay in `credentials` and `personal_data` |
 | `findings_total` | rows before the cap |
 | `screenshots[]` | per session and tool: `session`, `tool`, `family`, `count`, `bytes` (from the length of the base64 data, or the saved file's size; never decoded), `project`, `saved[]` (paths of screenshots saved to `tool-results/`) |
 | `screenshots_total`, `screenshots_bytes` | the sums over `screenshots[]` |

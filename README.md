@@ -201,7 +201,7 @@ actualis --agent codex    # one agent only (claude | codex | copilot | gemini | 
 | `--top N` | how many projects and tickets to list, 1 or more (default 12). Only the text report reads it (with `--bash` and `--network` too); any other mode, `--json` and `--html` refuse it |
 | `--agent {all,claude,codex,copilot,gemini,qwen}` | which agents to include (default all) |
 | `--root DIR` | read one specific transcript directory instead of discovering them |
-| `--ci-log FILE` | audit a Claude Code Action execution log on a CI runner, instead of discovering transcript directories. The log is the only input: not with `--root`, `--project`, `--replay` or an `--agent` other than `claude`, and only the scanning modes read it (not `--watch`, `--mcp`, `--explain`, `--agents`, `--suppress`, `--suppressions`, `--self-check`, `--service` or `--completions`) |
+| `--ci-log FILE` | audit a Claude Code Action execution log on a CI runner, instead of discovering transcript directories. The log is the only input: not with `--root`, `--project`, `--replay` or an `--agent` other than `claude`, and only the scanning modes read it (not `--watch`, `--mcp`, `--explain`, `--agents`, `--suppress`, `--resolve`, `--suppressions`, `--self-check`, `--service` or `--completions`) |
 | `--bash` | shell audit only |
 | `--verbose` | text report: also list the leads actualis checked and cleared (an IOC entry whose version range excludes what was installed, a placeholder credential, a reputation candidate a fresh check cleared), at most 20 lines. Only the text report and `--bash` take it |
 | `--coach` | findings and actions only |
@@ -216,10 +216,13 @@ actualis --agent codex    # one agent only (claude | codex | copilot | gemini | 
 | `--interval SEC` | `--watch` poll interval, default 4. At least 0.5 and at most 3600. Only with `--watch` or `--service launchd`/`systemd` |
 | `--quiet` | `--watch`: notify on secrets only, not every flagged command. Only with `--watch` or `--service launchd`/`systemd` |
 | `--no-redact` | **do not** redact credentials from output; unsafe to share |
-| `--suppress ID` | mark a finding as a false positive on this machine (it stays counted) |
-| `--reason TEXT` | why that suppression is correct, recorded for review. Only with `--suppress`; one line, so a newline or other control character is refused |
-| `--suppressions` | list current suppressions and where they are read from |
-| `--fail-on LEVEL` | exit 3 if any unsuppressed finding is at or above `critical`, `high` or `any`. For gating a pipeline. A mode that cannot evaluate the gate (`--diff`, `--why`, `--replay`, `--watch`, `--mcp`, `--explain`, `--agents`, `--suppress`, `--suppressions`, `--self-check`, `--service`, `--completions`) refuses it with exit 2. AF013 (rate-table age) and AF014 (transcripts about to expire) are reported but never counted |
+| `--suppress ID` | mark a finding as a false positive on this machine (it stays counted). The same as `--resolve ID --as false-positive` |
+| `--resolve ID` | record what a finding turned out to be, with `--as`: it stays counted and leaves the actionable list. See [When it is wrong](#when-it-is-wrong) |
+| `--as DISPOSITION` | with `--resolve`: `false-positive`, `rotated` (back as a new finding if seen again afterwards), `accepted` or `expected` |
+| `--until DATE` | with `--resolve --as accepted` or `expected`: the last day it holds (`YYYY-MM-DD`); afterwards the finding is actionable again |
+| `--reason TEXT` | why that resolution is correct, recorded for review. Only with `--suppress` or `--resolve`; one line, so a newline or other control character is refused |
+| `--suppressions` | list current resolutions by disposition, and where they are read from |
+| `--fail-on LEVEL` | exit 3 if any unsuppressed finding is at or above `critical`, `high` or `any`. For gating a pipeline. A mode that cannot evaluate the gate (`--diff`, `--why`, `--replay`, `--watch`, `--mcp`, `--explain`, `--agents`, `--suppress`, `--resolve`, `--suppressions`, `--self-check`, `--service`, `--completions`) refuses it with exit 2. AF013 (rate-table age) and AF014 (transcripts about to expire) are reported but never counted |
 | `--fail-on-coverage` | exit 5 if the run could not see everything it was asked to: an agent whose transcript directory exists but had nothing read, unreadable transcript files, over 1% of lines unparsable, `--days` reaching past what the agent keeps, with `--ioc` downloads that could not be checked, with `--reputation` stale lists. Exit 3 from `--fail-on` wins when both apply. Refused by the same modes as `--fail-on` |
 | `--network` | print only the NETWORK section, with the IOC block when `--ioc` is given. `--network --json` emits only the `network` object (no `schema_version`). Not with `--share`, `--card`, `--bash`, `--coach`, `--aisvs`, `--diff`, `--replay`, `--watch` or `--mcp` |
 | `--network-trust HOST[/PATH],...` | trusted download sources for `--network-strict` (repeatable). Also read from `./.actualis-network-trust`, one per line; the report prints that file's path and sha256 because the agent can write it |
@@ -618,7 +621,7 @@ is a heuristic tripwire, not a prevention. It fires when the agent writes
 `.actualis-network-trust`, `.actualis-suppressions` or the user-level
 `~/.config/actualis/suppressions` (through a file-write tool, or a shell command that
 names the file and is not a known reader such as `cat` or `grep`), or runs
-`actualis --suppress`. Those files decide what is reported, so an agent that could
+`actualis --suppress` or `--resolve`. Those files decide what is reported, so an agent that could
 edit them could hide its own work; a suppression of this finding would be the same
 edit, and `--suppress` refuses its id. Known limits: Codex `apply_patch` edits are not
 read, and neither is a write made by a script run from another file.
@@ -783,15 +786,15 @@ ignore both.
 A flag combination the tool cannot honour is a usage error (`2`), never silently
 dropped: `--fail-on` with a mode that never evaluates the gate, `--json` with a
 mode that has no JSON form (`--share`, `--coach`, `--aisvs`, `--bash`, `--why`,
-`--explain`, `--suppress`, `--suppressions`, `--self-check`, `--service`,
+`--explain`, `--suppress`, `--resolve`, `--suppressions`, `--self-check`, `--service`,
 `--completions`, `--watch`, `--mcp`), `--network` or `--ioc` with a mode that never
 reads them, `--with-prompts`, `--out`, `--style`, `--reason`, `--quiet`, `--interval`
 or `--top` where they do nothing, a scope flag (`--root`, `--agent`, `--days`,
 `--project`, `--no-redact`) given to a mode that would not apply it (`--explain`,
-`--agents`, `--completions`, `--suppress` and `--suppressions` take none; `--watch`
+`--agents`, `--completions`, `--suppress`, `--resolve` and `--suppressions` take none; `--watch`
 takes no `--days` or `--project`; the summary views take no `--no-redact`), and
 `--ci-log` with a mode that does not scan. The modes are exclusive: `--diff`, `--why`, `--replay`,
-`--watch`, `--mcp`, `--explain`, `--agents`, `--suppress`, `--suppressions`,
+`--watch`, `--mcp`, `--explain`, `--agents`, `--suppress`, `--resolve`, `--suppressions`,
 `--self-check`, `--service`, `--completions`, `--card`, `--share`, `--coach`, `--aisvs`
 and `--bash` take one per run, and two are refused with a message naming both. So is
 a malformed `--suppress` id, an unknown `--why` id or `--explain` topic, and a
@@ -905,11 +908,37 @@ actualis --suppress a41f9c02 --reason "test fixture in our CI config"
 actualis --suppressions
 ```
 
+A finding can be right and still done with. `--resolve` records which:
+
+```sh
+actualis --resolve 3c9e1f20 --as rotated --reason "replaced in the vault"
+actualis --resolve 8377d007 --as expected --reason "my own address on my account page"
+actualis --resolve 5b21aa94 --as accepted --reason "sandbox key, no data" --until 2027-01-31
+```
+
+- `false-positive`: not a real finding (`--suppress`).
+- `rotated`: the credential leaves the rotation list. If the same fingerprint
+  is seen again after the resolve time, it is a new finding, marked "seen again
+  after rotation": the old value was not retired everywhere.
+- `accepted`, `expected`: the finding leaves the actionable list, through
+  `--until` if given. After that date it is actionable again.
+
+Each works for command credentials, credentials seen on screen, personal data
+seen on screen and shell-audit flags. The report prints a resolved count per
+section, `--json` carries `disposition` on each finding, and `--suppressions`
+lists them by disposition with their dates. The tray's **Resolve…** submenu
+offers Rotated, Expected and False positive for each actionable credential and
+screen finding, asks for the reason in a native dialog, and runs
+`actualis --resolve`.
+
 Suppressions are a plain text file — greppable, diffable, reviewable in a pull
 request, and editable by hand six months later by someone who did not write it.
 Read from `$XDG_CONFIG_HOME/actualis/suppressions` and from
 `./.actualis-suppressions`, so a team can commit a shared list. One id per
-line, then the reason after a space or tab; ids are read case-insensitively. A
+line, then the reason after a space or tab; ids are read case-insensitively.
+`--resolve` writes a tag between them, `[rotated]` or `[accepted until
+2027-01-31]`, and the time; a line without a tag is a false positive, so files
+written before `--resolve` read unchanged. The last line for an id wins. A
 line whose id is not an eight-hex-character id from this tool cannot match
 anything: it is not loaded, and `--suppressions` lists it as ignored.
 
