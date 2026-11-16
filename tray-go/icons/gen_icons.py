@@ -219,6 +219,29 @@ def network_badge(cap, cx, cy):
             (seg(px, py - a, px, py + a, w), AMBER, 1.0)]
 
 
+def looking_badge(cap):
+    """LOOKING: a small amber eye, upper right where the MONITORING dots sit,
+    shown while a browser or computer-use tool is in use (#95). An almond
+    outline (the intersection of two circles) and a solid pupil. The stroke is
+    thin, as for the network badge, so the outline stays open at 22pt. Not on
+    the sheet, so the geometry is ours; it sits in the same corner and weight
+    as the sheet's badges, and its form (an outline with a centre) differs from
+    the monitoring dots and the solid update badge."""
+    w = STROKE * cap * 0.45
+    half_w, half_h = 0.26 * cap, 0.15 * cap         # the eye's half width and height
+    ex = SW - half_w - 0.5
+    ey = half_h + 1.0
+    # Two circles through the eye's corners, centres above and below it.
+    d = (half_w * half_w - half_h * half_h) / (2.0 * half_h)
+    R = d + half_h
+
+    def lens(x, y, r):
+        return math.hypot(x - ex, y - (ey + d)) <= r and math.hypot(x - ex, y - (ey - d)) <= r
+
+    outline = lambda x, y: lens(x, y, R) and not lens(x, y, R - w)
+    return [(outline, AMBER, 1.0), (disc(ex, ey, 0.06 * cap), AMBER, 1.0)]
+
+
 def shapes_for(state, ink):
     # Composition centre. Held left of the canvas centre so the monitoring
     # dots and the update badge have room on the right without the A moving
@@ -267,6 +290,8 @@ def shapes_for(state, ink):
         out += [(disc(bx, by, r), AMBER, 1.0)]
     elif state == "network":
         out += network_badge(cap, cx, cy)
+    elif state == "looking":
+        out += looking_badge(cap)
     elif state == "muted":
         w = STROKE * STROKE_BOOST * cap
         h = w / 2.0
@@ -275,7 +300,8 @@ def shapes_for(state, ink):
     return out
 
 
-STATES = ["idle", "active", "monitoring", "exposed", "syncing", "update", "muted", "network"]
+STATES = ["idle", "active", "monitoring", "exposed", "syncing", "update", "muted", "network",
+          "looking"]
 
 
 def main():

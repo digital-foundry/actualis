@@ -212,7 +212,7 @@ actualis --agent codex    # one agent only (claude | codex | copilot | gemini | 
 | `--out DIR` | `--card` or `--html`: the directory to write into (default: the current directory) |
 | `--json` | machine-readable ([schema](docs/json.md)) |
 | `--diff OLD.json` | compare against a saved `--json` report: what appeared, what went away, what got worse |
-| `--watch` | live monitor; alert on new secrets and risky commands |
+| `--watch` | live monitor; alert on new secrets and risky commands, and on credentials and personal data seen in browser and computer-use results. With `--json`: one JSON event per line, no notifications, never a value (see [docs/json.md](docs/json.md#--watch---json)) |
 | `--interval SEC` | `--watch` poll interval, default 4. At least 0.5 and at most 3600. Only with `--watch` or `--service launchd`/`systemd` |
 | `--quiet` | `--watch`: notify on secrets only, not every flagged command. Only with `--watch` or `--service launchd`/`systemd` |
 | `--no-redact` | **do not** redact credentials from output; unsafe to share |

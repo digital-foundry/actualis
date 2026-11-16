@@ -234,7 +234,7 @@ class TestR3D2FlagsNeverDropped(_Env):
 
     def test_defaults_still_apply_when_not_given(self):
         seen = {}
-        with mock.patch.object(af, "watch", lambda r, c, interval, *a: seen.update(i=interval) or 0), \
+        with mock.patch.object(af, "watch", lambda r, c, interval, *a, **k: seen.update(i=interval) or 0), \
                 mock.patch.object(af, "render", lambda *a, **k: seen.update(top=k["top"])), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             af.main(["--watch"])

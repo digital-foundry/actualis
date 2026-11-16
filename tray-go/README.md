@@ -37,6 +37,11 @@ baseline. Identity stays constant; state is carried by an added *form*.
 | exposed | A-mark inside a thin amber ring | critical credentials exposed |
 | syncing | segmented spinner, no A-mark | scanning |
 | error | A-mark with a slash (the sheet's MUTED glyph) | data could not be read |
+| looking | A-mark + a small amber eye, upper right | a browser or computer-use tool was in use in the last 45 seconds, or a call is still open (up to 5 minutes). Below exposed and monitoring |
+
+The looking eye is not on the sheet: it sits in the corner and at the weight of
+the sheet's badges, and its form (an outline with a pupil) differs from the
+monitoring dots and the solid update badge.
 
 **The geometry is measured, not eyeballed.** Every ratio in
 `icons/gen_icons.py` was taken off the ACTUALIS macOS icon sheet — the 32px cells
@@ -90,6 +95,37 @@ so, so a helpful reporter does not paste them by hand either.
 it to the commit SHA, so a report names an exact build. A hand-built binary
 reports `dev` rather than claiming a version it does not have.
 
+### Seen on screen
+
+When the run read any browser or computer-use results, the menu shows
+`Seen on screen: 15 personal data  ·  842 screenshots` (with a credential count
+first when there is one), from the CLI's `screen` key. It is counts only: never
+a value, a fingerprint or a detector name. Clicking it opens
+`actualis --explain screen` in a terminal. Personal data does not change the
+icon: the exposed and monitoring states stay about credentials. A CLI without
+the `screen` key shows nothing here.
+
+### Live
+
+Beside its scans, the tray runs `actualis --watch --json` as a child process
+and reads its event stream (see `docs/json.md`, "`--watch --json`"):
+
+- While a browser or computer-use tool is in use, the icon shows **looking**
+  and the tooltip names the agent and tool, e.g. *Claude Code is using Claude in
+  Chrome (get_page_text)*. With a credential warning up, the warning keeps the
+  icon and the tooltip adds the same words after it.
+- The seen-on-screen line adds what the stream reports after the last scan
+  started, and the tray rescans once the stream has been quiet for 60 seconds
+  to reconcile (a value seen earlier in the window can be counted twice until
+  then).
+- A credential on the stream triggers a rescan within seconds, so its
+  notification comes from the scan as before, not from the stream.
+
+The child is restarted with backoff when it ends and killed when the tray
+quits; if the tray dies first, the child's next heartbeat write fails and it
+exits. A CLI that refuses `--watch --json` (0.7.0 and older) leaves the tray on
+the ten-minute scan, and the tray asks again an hour later.
+
 ## Alerting
 
 A **newly** appearing critical credential raises a native notification and
@@ -101,6 +137,10 @@ days brings older exposures into view, and they are not new. A credential you
 suppressed (with a reason) does not count toward the badge or the alert, as it
 does not count toward `--fail-on`. On Windows the notification is a toast
 through the built-in WinRT API (Windows 10 and later).
+
+A credential seen in a browser or computer-use result rather than in a command
+says so: `actualis: new credential exposed (seen on screen)` when every new one
+was, or `..., N seen on screen` in the body when only some were.
 
 ## What the count means
 
@@ -137,7 +177,7 @@ next to your credentials.
 ## Relationship to the CLI
 
 This is a thin shell. It runs `actualis --json --days N` every ten minutes and
-renders the result. **All measurement lives in the CLI**, which stays
+renders the result, and reads `actualis --watch --json` for the live state. **All measurement lives in the CLI**, which stays
 dependency-free and auditable in one sitting. The tray has one dependency, for
 drawing a tray icon, and contains no logic worth reviewing.
 

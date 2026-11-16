@@ -609,6 +609,46 @@ Neither `--share` nor `--card` carries anything from `screen`.
 
 Verify: `actualis --json | jq '.screen | {results_scanned, credentials, personal_data, screenshots_total}'`
 
+## `--watch --json`
+
+`actualis --watch --json` tails the transcripts as `--watch` does and writes
+one JSON object per line, flushed as it happens. It never raises a desktop
+notification, prints no colour and **never carries a value**: a finding is its
+detector and fingerprint (`id`, as in `secrets[]` and `screen.findings[]`).
+History is not replayed; the stream starts at the end of every file. Added in
+the release after 0.7.0; an older CLI refuses `--watch --json` with exit 2.
+
+Every event has `event` and `at` (UTC, when actualis wrote it). Strings that
+come from a transcript (`tool`, `session`, `project`) are cleaned and at most
+160 characters.
+
+| `event` | fields | when |
+|---|---|---|
+| `hello` | `schema_version`, `version`, `screen` (`true`: this CLI emits screen events), `files`, `interval`, `heartbeat` | first, once |
+| `activity` | `phase` (`start` or `end`), `agent` (`claude-code`), `tool`, `family`, `session`, `project` | a browser or computer-use call appears (`start`), and its result arrives (`end`) |
+| `finding` | `source` (`screen` or `command`), `kind` (`credential` or `personal`), `detector`, `id`, `priority` (a credential's, `null` for personal data), `project`; for `screen` also `suppressed`, `agent`, `tool`, `family`, `session` | the first time this run sees that `kind`, `detector` and `id`. A `command` finding is a credential in a command, as text `--watch` alerts on (`low` left out) |
+| `screenshot` | `agent`, `tool`, `family`, `session`, `project`, `count` | a result carries images or names saved ones; never decoded |
+| `flag` | `severity` (`high`), `categories[]`, `project` | a command the report would flag high. The command is not a field |
+| `heartbeat` | `commands`, `flagged`, `secrets`, `seen_on_screen`, `screenshots`, `open_screen_calls` | every `heartbeat` seconds (30). A reader that has gone makes the write fail, and the watcher exits |
+| `stopped` | the same counts as `heartbeat` | on Ctrl-C |
+
+```json
+{"event": "hello", "at": "2026-11-12T18:25:37+00:00", "schema_version": 1, "version": "0.7.1", "screen": true, "files": 412, "interval": 4.0, "heartbeat": 30.0}
+{"event": "activity", "at": "2026-11-12T18:25:39+00:00", "phase": "start", "agent": "claude-code", "tool": "mcp__claude-in-chrome__get_page_text", "family": "claude-in-chrome", "session": "11111111-2222-4333-8444-555555555555", "project": "shop"}
+{"event": "activity", "at": "2026-11-12T18:25:41+00:00", "phase": "end", "agent": "claude-code", "tool": "mcp__claude-in-chrome__get_page_text", "family": "claude-in-chrome", "session": "11111111-2222-4333-8444-555555555555", "project": "shop"}
+{"event": "finding", "at": "2026-11-12T18:25:41+00:00", "source": "screen", "kind": "personal", "detector": "email", "id": "8377d007", "priority": null, "suppressed": false, "agent": "claude-code", "tool": "mcp__claude-in-chrome__get_page_text", "family": "claude-in-chrome", "session": "11111111-2222-4333-8444-555555555555", "project": "shop"}
+```
+
+Screen events cover Claude Code transcripts, as the report's `screen` does. A
+result is read by the same code as the report, including a large one spilled to
+`<session>/tool-results/`. A call whose transcript disappears is dropped; at
+most 1,000 calls are held open. Unknown event types may be added under
+`schema_version` 1: a reader ignores what it does not know.
+
+The tray reads this stream for its live "agent looking" state and the
+seen-on-screen counts, and falls back to a scan every 10 minutes when the CLI
+refuses `--watch --json`.
+
 ## `by_ticket[]`
 
 ```json
