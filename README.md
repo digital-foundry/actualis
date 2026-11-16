@@ -621,7 +621,8 @@ is a heuristic tripwire, not a prevention. It fires when the agent writes
 `.actualis-network-trust`, `.actualis-suppressions` or the user-level
 `~/.config/actualis/suppressions` (through a file-write tool, or a shell command that
 names the file and is not a known reader such as `cat` or `grep`), or runs
-`actualis --suppress` or `--resolve`. Those files decide what is reported, so an agent that could
+`actualis --suppress` or `--resolve` (or an abbreviation of either, such as `--reso`, which
+the CLI accepts). Those files decide what is reported, so an agent that could
 edit them could hide its own work; a suppression of this finding would be the same
 edit, and `--suppress` refuses its id. Known limits: Codex `apply_patch` edits are not
 read, and neither is a write made by a script run from another file.

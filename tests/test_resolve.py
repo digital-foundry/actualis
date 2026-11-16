@@ -298,8 +298,47 @@ class TestTripwire(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertTrue(af.writes_audit_config(cmd))
 
+    def test_abbreviated_write_flags_are_writes(self):
+        """argparse runs any unambiguous prefix of a long option, so an
+        abbreviation must trip the wire as the full flag does."""
+        for cmd in ("actualis --reso 1a2b3c4d --as rotated",
+                    "actualis --res=1a2b3c4d --as rotated",
+                    "actualis --supp 1a2b3c4d",
+                    "actualis --sup=1a2b3c4d",
+                    "actualis --RESOLVE 1a2b3c4d --as rotated",
+                    "actualis --Suppress=1a2b3c4d",
+                    "python3 actualis.py --reso 1a2b3c4d --as expected",
+                    "uvx actualis --resolv 1a2b3c4d --as accepted",
+                    "actualis --as rotated --res 1a2b3c4d",
+                    "actualis 1a2b3c4d --as=expected",
+                    "actualis --rea x --reso 1a2b3c4d"):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(af.writes_audit_config(cmd))
+
+    def test_every_abbreviation_argparse_accepts_is_caught(self):
+        """Ground truth from the parser itself: each prefix of a write flag
+        that argparse resolves to that flag is matched by the tripwire."""
+        ap = af.build_parser()
+        accepted = []
+        for flag, dest in (("--suppress", "suppress"), ("--resolve", "resolve"),
+                           ("--reason", "reason")):
+            for n in range(3, len(flag) + 1):
+                prefix = flag[:n]
+                try:
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        ns, _ = ap.parse_known_args([prefix, "1a2b3c4d"])
+                except SystemExit:
+                    continue                  # ambiguous: argparse refuses it
+                if getattr(ns, dest) == "1a2b3c4d":
+                    accepted.append(prefix)
+                    with self.subTest(prefix=prefix):
+                        self.assertTrue(af.writes_audit_config(f"actualis {prefix} 1a2b3c4d"))
+        self.assertIn("--reso", accepted)     # the parser does take abbreviations
+
     def test_other_actualis_runs_are_not(self):
-        for cmd in ("actualis --json --days 7", "actualis --explain suppressions"):
+        for cmd in ("actualis --json --days 7", "actualis --explain suppressions",
+                    "actualis --replay 1a2b3c4d", "actualis --reputation --network",
+                    "actualis --share", "actualis --root /tmp/x --agent all"):
             with self.subTest(cmd=cmd):
                 self.assertFalse(af.writes_audit_config(cmd))
 

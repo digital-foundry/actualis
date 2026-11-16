@@ -5743,6 +5743,11 @@ _ACTUALIS_PROGRAMS = frozenset({"actualis", "actualis.py"})
 # The CLI flags that write the suppressions file (and --suppressions, which
 # shares the prefix and is flagged with them: listing is rarely an agent's job).
 _ACTUALIS_WRITE_FLAGS = ("--suppress", "--resolve")
+# Options accepted only beside a write flag: present, the run is a write.
+_ACTUALIS_WRITE_ONLY_OPTIONS = ("--reason",)
+# Shortest abbreviation taken for a write flag. argparse refuses an ambiguous
+# one, but `--res` today is one new option away from being unambiguous.
+_ACTUALIS_PREFIX_MIN = 3
 
 
 _AUDIT_CONFIG_NAMES = (".actualis-network-trust", ".actualis-suppressions")
@@ -5830,8 +5835,28 @@ def _runs_actualis_suppress(words: list[str]) -> bool:
     words = _net_strip_prefixes(words)[0]
     for i, w in enumerate(words[:6]):
         if _net_base(w).lower() in _ACTUALIS_PROGRAMS:
-            return any(a.lower().startswith(_ACTUALIS_WRITE_FLAGS) for a in words[i + 1:])
+            return any(_is_actualis_write_flag(a) for a in words[i + 1:])
     return False
+
+
+def _is_actualis_write_flag(arg: str) -> bool:
+    """Whether one argument asks the CLI to write the suppressions file.
+
+    argparse accepts any unambiguous prefix of a long option, so `--reso ID`
+    and `--res=ID` run --resolve. Matched here: a write flag, anything longer
+    that starts with one (`--suppressions`), any prefix of one at least three
+    characters long (`--sup`, `--reso`, ambiguous or not), and the options
+    that only a write takes: `--as`, and `--reason` or a prefix of it."""
+    if not arg.startswith("--"):
+        return False
+    name = arg[2:].split("=", 1)[0].lower()
+    if len(name) < 2:
+        return False
+    for flag in _ACTUALIS_WRITE_FLAGS + _ACTUALIS_WRITE_ONLY_OPTIONS:
+        full = flag[2:]
+        if name.startswith(full) or (len(name) >= _ACTUALIS_PREFIX_MIN and full.startswith(name)):
+            return True
+    return name == "as"
 
 
 def _expand_vars(tok: str, env: dict[str, str]) -> str:
