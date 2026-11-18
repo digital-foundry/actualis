@@ -105,6 +105,27 @@ a value, a fingerprint or a detector name. Clicking it opens
 icon: the exposed and monitoring states stay about credentials. A CLI without
 the `screen` key shows nothing here.
 
+### Resolve…
+
+When there is something to resolve, **Resolve…** lists up to 8 actionable
+findings (critical and high credentials not yet resolved, then personal data
+seen on screen), each by id and kind, never by value, with a submenu:
+**Rotated…**, **Expected…**, **False positive…** (personal data has no Rotated).
+Choosing one asks for the reason in a native dialog and runs
+`actualis --resolve ID --as DISPOSITION --reason TEXT`, then rescans. The CLI
+is the only writer of the suppressions file; the tray passes each argument
+separately and never through a shell, so nothing typed in the dialog can run.
+An empty reason or Cancel writes nothing.
+
+| platform | dialog |
+|---|---|
+| macOS | `osascript` `display dialog` |
+| Linux | `zenity --entry`, else `kdialog --inputbox`; with neither, Resolve… is hidden |
+| Windows | the VisualBasic `InputBox`, through PowerShell, with the prompt passed in the environment |
+
+A CLI that predates `--resolve` (no `disposition` in its `--json`) gets no
+Resolve… item.
+
 ### Live
 
 Beside its scans, the tray runs `actualis --watch --json` as a child process

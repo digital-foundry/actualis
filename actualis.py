@@ -5740,6 +5740,14 @@ _READ_ONLY_PROGRAMS = frozenset({"cat", "less", "more", "head", "tail", "grep", 
                                  "ls", "stat", "file", "sha256sum", "shasum", "md5"})
 _READ_ONLY_GIT = frozenset({"diff", "log", "show", "status"})
 _ACTUALIS_PROGRAMS = frozenset({"actualis", "actualis.py"})
+# The CLI flags that write the suppressions file (and --suppressions, which
+# shares the prefix and is flagged with them: listing is rarely an agent's job).
+_ACTUALIS_WRITE_FLAGS = ("--suppress", "--resolve")
+# Options accepted only beside a write flag: present, the run is a write.
+_ACTUALIS_WRITE_ONLY_OPTIONS = ("--reason",)
+# Shortest abbreviation taken for a write flag. argparse refuses an ambiguous
+# one, but `--res` today is one new option away from being unambiguous.
+_ACTUALIS_PREFIX_MIN = 3
 
 
 _AUDIT_CONFIG_NAMES = (".actualis-network-trust", ".actualis-suppressions")
@@ -5821,13 +5829,34 @@ def _is_audit_config(path: str, glob: bool = False) -> bool:
 
 def _runs_actualis_suppress(words: list[str]) -> bool:
     """`actualis --suppress`, `python3 actualis.py --suppress`, `uvx actualis
-    --suppressions`, `pipx run actualis --suppress=ID`: the CLI writes the user file.
-    Read past the same prefixes and wrappers the extractor skips (env A=1 …)."""
+    --suppressions`, `pipx run actualis --suppress=ID`, `actualis --resolve ID
+    --as rotated`: the CLI writes the user file. Read past the same prefixes
+    and wrappers the extractor skips (env A=1 …)."""
     words = _net_strip_prefixes(words)[0]
     for i, w in enumerate(words[:6]):
         if _net_base(w).lower() in _ACTUALIS_PROGRAMS:
-            return any(a.lower().startswith("--suppress") for a in words[i + 1:])
+            return any(_is_actualis_write_flag(a) for a in words[i + 1:])
     return False
+
+
+def _is_actualis_write_flag(arg: str) -> bool:
+    """Whether one argument asks the CLI to write the suppressions file.
+
+    argparse accepts any unambiguous prefix of a long option, so `--reso ID`
+    and `--res=ID` run --resolve. Matched here: a write flag, anything longer
+    that starts with one (`--suppressions`), any prefix of one at least three
+    characters long (`--sup`, `--reso`, ambiguous or not), and the options
+    that only a write takes: `--as`, and `--reason` or a prefix of it."""
+    if not arg.startswith("--"):
+        return False
+    name = arg[2:].split("=", 1)[0].lower()
+    if len(name) < 2:
+        return False
+    for flag in _ACTUALIS_WRITE_FLAGS + _ACTUALIS_WRITE_ONLY_OPTIONS:
+        full = flag[2:]
+        if name.startswith(full) or (len(name) >= _ACTUALIS_PREFIX_MIN and full.startswith(name)):
+            return True
+    return name == "as"
 
 
 def _expand_vars(tok: str, env: dict[str, str]) -> str:
@@ -8194,10 +8223,28 @@ def render_ioc(fleet: "Fleet", c: "C", raw: bool = False) -> None:
 # --------------------------------------------------------------------------
 
 _FINGERPRINT = re.compile(r"[0-9a-f]{8}")
-_ADDED_MARKER = re.compile(r"\s*\(added \d{4}-\d{2}-\d{2}\)\s*$")
+# `(added 2026-11-15)` is written by --suppress; `(added 2026-11-15T10:22:05Z)`
+# by --resolve, whose rotated disposition compares sightings with the time.
+_ADDED_MARKER = re.compile(r"\s*\(added (\d{4}-\d{2}-\d{2})(?:T(\d{2}:\d{2}:\d{2})Z)?\)\s*$")
 
 SUPPRESSION_FILENAME = "suppressions"
 PROJECT_SUPPRESSIONS = ".actualis-suppressions"
+
+# What a resolution says about a finding. Every one holds the finding back
+# from the actionable list and leaves it counted; they differ in what they
+# claim and in when they stop holding:
+#   false-positive  not a real finding (what --suppress has always written)
+#   rotated         a real credential, since replaced. A sighting after the
+#                   resolve time is a new finding: "seen again after rotation"
+#   accepted        real, and a risk someone chose to carry; may expire
+#   expected        real and meant to be there (your own address on your own
+#                   signed-in page); may expire
+DISPOSITIONS = ("false-positive", "rotated", "accepted", "expected")
+# Written after the id by --resolve: `[rotated]`, `[accepted until 2026-12-31]`.
+# A line without one is a false positive, so every older file reads unchanged.
+_DISPOSITION_TAG = re.compile(
+    r"\[(false-positive|rotated|accepted|expected)(?: until ([^\]\s]{1,32}))?\]\s*", re.I)
+_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 def suppression_paths() -> list[Path]:
@@ -8213,12 +8260,32 @@ def suppression_paths() -> list[Path]:
     return out
 
 
-def load_suppressions(rejected: list[str] | None = None) -> dict[str, str]:
-    """fingerprint -> reason. Malformed lines are skipped, never fatal. An id
-    is read case-insensitively and may be followed by a tab; a line whose id
-    is not one this tool emits matches nothing, so it is not loaded, and
-    `rejected`, when given, receives it (for --suppressions to show)."""
-    out: dict[str, str] = {}
+def _local_today() -> date:
+    """The date --until is compared with: the user's calendar, not UTC."""
+    return date.today()
+
+
+def _parse_until(text: str) -> date | None:
+    """An --until date, YYYY-MM-DD, or None when it is not one."""
+    if not _ISO_DATE.fullmatch(text or ""):
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def load_resolutions(rejected: list[str] | None = None) -> dict[str, dict]:
+    """fingerprint -> {disposition, reason, added, at, until, path}, every
+    entry including expired ones (--suppressions lists those). The last line
+    for an id wins: the user file is read first, then the project file.
+
+    `at` is when a rotated credential stopped counting: the time --resolve
+    wrote, or for a date alone the end of that day (UTC). `until` is the last
+    day an accepted or expected resolution holds. Malformed lines are skipped,
+    never fatal; a line whose id is not one this tool emits, or whose --until
+    is not a date, is not loaded and goes to `rejected` when given."""
+    out: dict[str, dict] = {}
     for path in suppression_paths():
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
@@ -8228,7 +8295,7 @@ def load_suppressions(rejected: list[str] | None = None) -> dict[str, str]:
             line = clean(line).strip()       # clean() first: a tab becomes a space
             if not line or line.startswith("#"):
                 continue
-            fp, _, reason = line.partition(" ")
+            fp, _, rest = line.partition(" ")
             fp = fp[:64].lower()
             if not fp:
                 continue
@@ -8236,15 +8303,59 @@ def load_suppressions(rejected: list[str] | None = None) -> dict[str, str]:
                 if rejected is not None:
                     rejected.append(line[:120])
                 continue
-            # `(added YYYY-MM-DD)` is written by --suppress, not typed by a
-            # person. Strip it so the reason a caller sees is only the reason.
-            reason = _ADDED_MARKER.sub("", clean(reason)).strip()
-            out[fp] = reason or "(no reason given)"
+            rest = clean(rest).strip()
+            disposition, until = "false-positive", None
+            tag = _DISPOSITION_TAG.match(rest)
+            if tag:
+                disposition = tag.group(1).lower()
+                if tag.group(2) is not None:
+                    until = _parse_until(tag.group(2))
+                    if until is None:
+                        if rejected is not None:
+                            rejected.append(line[:120])
+                        continue
+                rest = rest[tag.end():]
+            # `(added ...)` is written by the CLI, not typed by a person. Strip
+            # it so the reason a caller sees is only the reason.
+            added, at = "", None
+            m = _ADDED_MARKER.search(rest)
+            if m:
+                added = m.group(1) + (f"T{m.group(2)}Z" if m.group(2) else "")
+                try:
+                    if m.group(2):
+                        at = datetime.fromisoformat(f"{m.group(1)}T{m.group(2)}+00:00")
+                    else:
+                        at = datetime.fromisoformat(f"{m.group(1)}T00:00:00+00:00") + timedelta(days=1)
+                except ValueError:
+                    at = None
+                rest = rest[:m.start()]
+            out[fp] = {"disposition": disposition, "reason": rest.strip() or "(no reason given)",
+                       "added": added, "at": at, "until": until, "path": str(path)}
     return out
 
 
-def add_suppression(fingerprint: str, reason: str) -> Path:
-    """Append one entry to the user's suppression file, creating it if needed."""
+def resolution_live(entry: dict, today: date | None = None) -> bool:
+    """Whether a resolution still holds: no --until, or not yet past it."""
+    until = entry.get("until")
+    return until is None or (today or _local_today()) <= until
+
+
+def load_suppressions(rejected: list[str] | None = None) -> dict[str, str]:
+    """fingerprint -> reason, for every resolution that still holds (any
+    disposition; an expired accepted or expected one is left out). An id is
+    read case-insensitively and may be followed by a tab; a line whose id is
+    not one this tool emits matches nothing, so it is not loaded, and
+    `rejected`, when given, receives it (for --suppressions to show)."""
+    today = _local_today()
+    return {fp: e["reason"] for fp, e in load_resolutions(rejected).items()
+            if resolution_live(e, today)}
+
+
+def add_resolution(fingerprint: str, disposition: str, reason: str,
+                   until: str | None = None) -> Path:
+    """Append one resolution to the user's suppression file, creating it if
+    needed. The suppressions file is the only thing this writes. Only the id
+    is stored, never a value."""
     fingerprint = clean(fingerprint).strip()[:64]
     if not fingerprint:
         raise ValueError("a fingerprint is required")
@@ -8259,7 +8370,20 @@ def add_suppression(fingerprint: str, reason: str) -> Path:
     if not _FINGERPRINT.fullmatch(fingerprint):
         raise ValueError(
             f"{fingerprint!r} is not an id from this tool. Ids are eight hex "
-            f"characters, shown beside each finding. One per --suppress.")
+            f"characters, shown beside each finding. One per --suppress or --resolve.")
+    fingerprint = fingerprint.lower()
+    if disposition not in DISPOSITIONS:
+        raise ValueError(f"--as takes one of {', '.join(DISPOSITIONS)}; got {disposition!r}.")
+    if until is not None:
+        if disposition == "rotated":
+            raise ValueError("--until does not apply to rotated: a rotation ends when the "
+                             "credential is seen again, not on a date.")
+        day = _parse_until(until)
+        if day is None:
+            raise ValueError(f"--until takes a date as YYYY-MM-DD; got {until!r}.")
+        if day < _local_today():
+            raise ValueError(f"--until {until} has already passed.")
+        until = day.isoformat()
     # One entry is one line: a newline in the reason wrote a second, silent
     # suppression (`--reason $'ok\n620e24b6 x'`). Refuse every control and
     # line-breaking character rather than guess what was meant.
@@ -8275,17 +8399,43 @@ def add_suppression(fingerprint: str, reason: str) -> Path:
         path.write_text(
             "# actualis suppressions\n"
             "#\n"
-            "# One finding per line: <fingerprint> <why it is not a real finding>\n"
-            "# Suppressed findings are still counted and still appear in --json.\n"
+            "# One finding per line: <fingerprint> [<disposition>] <reason> (added <when>)\n"
+            "# No [disposition] means false-positive. The others are [rotated],\n"
+            "# [accepted] and [expected]; the last two may carry an expiry,\n"
+            "# [accepted until YYYY-MM-DD]. Written by actualis --resolve.\n"
+            "# Resolved findings are still counted and still appear in --json.\n"
             "# They are held back from the actionable list, not hidden.\n"
             "#\n"
-            "# Remove a line to un-suppress. Committing a copy as "
+            "# Remove a line to undo it. Committing a copy as "
             f"{PROJECT_SUPPRESSIONS} shares it with a team.\n\n",
             encoding="utf-8")
-    today = datetime.now(timezone.utc).date().isoformat()
+    now = datetime.now(timezone.utc)
+    if disposition == "false-positive" and until is None:
+        # Exactly what --suppress has always written, so a diff of the file
+        # and every older reader see no change.
+        line = f"{fingerprint}  {reason}  (added {now.date().isoformat()})\n"
+    else:
+        tag = disposition + (f" until {until}" if until else "")
+        line = f"{fingerprint}  [{tag}]  {reason}  (added {now.strftime('%Y-%m-%dT%H:%M:%SZ')})\n"
     with path.open("a", encoding="utf-8") as fh:
-        fh.write(f"{fingerprint}  {reason}  (added {today})\n")
+        fh.write(line)
     return path
+
+
+def add_suppression(fingerprint: str, reason: str) -> Path:
+    """Append one false-positive entry: --suppress, which is --resolve ID
+    --as false-positive."""
+    return add_resolution(fingerprint, "false-positive", reason)
+
+
+def resolved_note(counts: "Counter") -> str:
+    """`, 3 resolved (2 rotated, 1 false positive)` for a section header, ""
+    when nothing is resolved."""
+    total = sum(counts.values())
+    if not total:
+        return ""
+    parts = ", ".join(f"{counts[d]:,} {d.replace('-', ' ')}" for d in DISPOSITIONS if counts.get(d))
+    return f", {total:,} resolved ({parts})"
 
 
 _URL_SAFE = frozenset(
@@ -9435,6 +9585,9 @@ class Fleet:
         # actionable list, never removed from the count -- see the Suppressions
         # section for why that distinction is the whole design.
         self.suppressions: dict[str, str] = load_suppressions()
+        # Every entry with its disposition (rotated, accepted, ...), including
+        # expired ones; self.suppressions holds those still in effect.
+        self.resolutions: dict[str, dict] = load_resolutions()
         self.unknown_models: Counter = Counter()
         # Models priced from a third party because the vendor publishes no rate
         # for that id. Counted separately from unknown models: the number is
@@ -10558,6 +10711,13 @@ class Fleet:
             if fp in self.suppressions:
                 e["suppressed"] = False
                 e["suppressed_reason"] = f"suppression covers one value; {n} seen"
+        # A rotated credential that turns up again after the rotation is a new
+        # exposure: the old value was not retired everywhere, or came back.
+        if self.rotated_before(fp, ts) and e.get("suppressed"):
+            e["suppressed"] = False
+            e["seen_after_rotation"] = True
+            e["suppressed_reason"] = (f"rotated {self.resolutions[fp]['added'][:10]}; "
+                                      "seen again after rotation")
         # the same value may appear under several names; keep the worst
         rank = {"critical": 0, "high": 1, "low": 2}
         if rank[priority] < rank[e["priority"]]:
@@ -10637,11 +10797,13 @@ class Fleet:
                 self._record_secret(priority, detector, fp, project, ts, "screen")
             row = self.screen_hits.setdefault((sid, tool, kind, detector, fp), {
                 "count": 0, "project": project, "first": None, "last": None,
-                "priority": priority or None})
+                "priority": priority or None, "last_ts": None})
             row["count"] += 1
             if day:
                 row["first"] = min(row["first"] or day, day)
                 row["last"] = max(row["last"] or day, day)
+            if ts and (row.get("last_ts") is None or ts > row["last_ts"]):
+                row["last_ts"] = ts           # for "seen again after rotation"
 
     def _read_spill(self, spill_dir: Path | None, ref: str) -> tuple | None:
         """A file a tool result names in its session's tool-results directory:
@@ -11354,6 +11516,28 @@ class Fleet:
     @property
     def actionable_flags(self) -> list:
         return [f for f in self.flags if not f.get("suppressed")]
+
+    def disposition(self, fp: str) -> str | None:
+        """The resolution in effect for an id (false-positive, rotated,
+        accepted, expected), None when none is. An id suppressed without a
+        recorded disposition is a false positive, as --suppress means."""
+        if fp not in self.suppressions:
+            return None
+        entry = getattr(self, "resolutions", {}).get(fp)
+        return entry["disposition"] if entry else "false-positive"
+
+    def rotated_before(self, fp: str, ts: "datetime | None") -> bool:
+        """Whether fp is resolved as rotated, and ts falls after the rotation:
+        a sighting that makes it a new finding. False without a time on
+        either side, since then there is nothing to compare."""
+        if ts is None or fp not in self.suppressions:
+            return False
+        entry = getattr(self, "resolutions", {}).get(fp)
+        if not entry or entry["disposition"] != "rotated" or entry["at"] is None:
+            return False
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts > entry["at"]
 
     @property
     def suppressed_secrets(self) -> int:
@@ -12651,7 +12835,8 @@ def watch(roots: list[Path], codex: list[Path], interval: float, c: C,
             seen_screen.add((kind, detector, fp))
             on_screen += 1
             priority = sf.screen_hits[key]["priority"]
-            suppressed = bool(sf.secrets.get(fp, {}).get("suppressed")) if kind == "credential" else False
+            suppressed = (bool(sf.secrets.get(fp, {}).get("suppressed")) if kind == "credential"
+                          else fp in sf.suppressions and not sf.rotated_before(fp, parse_ts(ts_raw)))
             if as_json:
                 emit(_watch_event("finding", source="screen", kind=kind, detector=detector, id=fp,
                                   priority=priority, suppressed=suppressed, agent="claude-code",
@@ -13362,16 +13547,25 @@ EXPLAIN: dict[str, dict[str, object]] = {
         "verify": "actualis --json | jq -r '.secrets[0].id' | xargs actualis --replay",
     },
     "suppressions": {
-        "measures": "Findings you have marked as false positives on this machine.",
+        "measures": "Findings you have resolved on this machine: false positive, rotated, "
+                    "accepted or expected.",
         "formula": [
             "Read, least specific first, from:",
             "  $XDG_CONFIG_HOME/actualis/suppressions  (or ~/.config/...)",
             "  ./.actualis-suppressions                (commit to share with a team)",
             "",
-            "One finding per line: <id> <why it is not a real finding>",
+            "One finding per line: <id> [<disposition>] <why>  (added <when>)",
+            "No [disposition] is a false positive. The last line for an id wins.",
             "",
             "  actualis --suppress <id> --reason \"test fixture in CI config\"",
+            "  actualis --resolve <id> --as rotated --reason \"replaced in the vault\"",
+            "  actualis --resolve <id> --as expected --reason \"my own address\" \\",
+            "      --until 2027-01-31",
             "  actualis --suppressions",
+            "",
+            "rotated: leaves the rotation list. Seen again after the resolve time,",
+            "  it is a new finding, marked seen again after rotation.",
+            "accepted, expected: leave the actionable list, through --until if given.",
         ],
         "assumes": [
             "Nothing. A suppression is your judgement, recorded, not a claim by",
@@ -13380,7 +13574,7 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "It is held back from the actionable list, never hidden -- a scan",
             "with many suppressions must not look like a clean one.",
         ],
-        "verify": "actualis --json | jq '.suppressed_secrets, [.secrets[]|select(.suppressed)]'",
+        "verify": "actualis --json | jq '.suppressed_secrets, [.secrets[]|select(.suppressed)|{id, disposition}]'",
     },
     "refusals": {
         "measures": "What was stopped before it ran, and which gate stopped it.",
@@ -13466,9 +13660,9 @@ EXPLAIN: dict[str, dict[str, object]] = {
             "audit-config is a tripwire too. It is a high finding that cannot be",
             "suppressed, raised when an agent writes .actualis-network-trust,",
             ".actualis-suppressions or ~/.config/actualis/suppressions (a redirect,",
-            "tee, a Write/Edit tool), runs actualis --suppress, or runs any command",
-            "that names one of those files and is not a known reader (cat, grep,",
-            "git diff, ...). Matching is case-insensitive.",
+            "tee, a Write/Edit tool), runs actualis --suppress or --resolve, or",
+            "runs any command that names one of those files and is not a known",
+            "reader (cat, grep, git diff, ...). Matching is case-insensitive.",
             "",
             "--ioc FILE matches this inventory against a known-bad list: see",
             "actualis --explain ioc.",
@@ -15865,13 +16059,12 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
         distinct = len(rows)
         actionable = sum(1 for _, e in rows
                          if e["priority"] != "low" and not e.get("suppressed"))
-        suppressed = fleet.suppressed_secrets
+        resolved = Counter((fleet.disposition(fp) or "false-positive") for fp, e in rows if e.get("suppressed"))
 
         print(f"\n  {c.red}▲ {num(distinct)} distinct secrets{c.off} exposed across "
               f"{num(fleet.secret_exposures)} commands "
               f"{c.dim}({num(actionable)} worth rotating"
-              + (f", {num(suppressed)} suppressed" if suppressed else "")
-              + f"){c.off}")
+              + resolved_note(resolved) + f"){c.off}")
         # Counted from the screen rows, which hold fingerprints only.
         on_screen = len({k[4] for k in fleet.screen_hits if k[2] == "credential"})
         if on_screen:
@@ -15883,7 +16076,10 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
             col = c.red if pri == "critical" else (c.yellow if pri == "high" else c.dim)
             mark = "ROTATE" if pri == "critical" else ("rotate" if pri == "high" else "dev")
             if e.get("suppressed"):
-                col, mark = c.dim, "muted"
+                dispo = fleet.disposition(fp)
+                # Seven characters wide: accepted and expected are shortened.
+                col, mark = c.dim, {"rotated": "rotated", "accepted": "accept",
+                                    "expected": "expect"}.get(dispo or "", "muted")
             kind = ", ".join(sorted(e["kinds"]))
             src = secret_source(e)
             if src != "command":                 # where it was seen, kept inside the column
@@ -15895,6 +16091,9 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
                 print(f"            {c.dim}{e['distinct_values']} distinct values"
                       + (f"; {e['suppressed_reason']}" if e.get("suppressed_reason", "").startswith(
                           "suppression covers") else "") + f"{c.off}")
+            if e.get("seen_after_rotation"):
+                print(f"            {c.red}seen again after rotation{c.off} "
+                      f"{c.dim}({e.get('suppressed_reason', '')}){c.off}")
         if len(rows) > 24:
             print(f"    {c.dim}… {len(rows) - 24} more{c.off}")
         print(f"\n    {c.dim}id is a fingerprint of the secret, or for a password, of where it")
@@ -15903,7 +16102,8 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
         print(f"    transcripts that carry them.{c.off}")
         # In place, where the finding is, rather than in documentation nobody
         # reads at the moment they disagree with it.
-        print(f"\n    {c.dim}Not a credential? Say so:{c.off}")
+        print(f"\n    {c.dim}Rotated it, or not a credential? Say so:{c.off}")
+        print(f"      actualis --resolve <id> --as rotated --reason \"replaced on <date>\"")
         print(f"      actualis --suppress <id> --reason \"why it is not\"")
         print(f"    {c.dim}It stays counted and stays in --json; it leaves this list.{c.off}")
         first_wrong = next((fp for fp, e in rows if not e.get("suppressed")), None)
@@ -15918,7 +16118,8 @@ def render(fleet: Fleet, c: C, bash_only: bool, top: int, raw: bool = False,
     print(f"\n  {c.dim}flagged{c.off}   "
           f"{c.red}{len(highs)} high{c.off}   {c.yellow}{len(meds)} medium{c.off}   "
           f"{c.dim}of {num(fleet.bash_total)} commands"
-          + (f", {num(fleet.suppressed_flags)} suppressed" if fleet.suppressed_flags else "")
+          + resolved_note(Counter((fleet.disposition(f.get("id", "")) or "false-positive") for f in fleet.flags
+                                  if f.get("suppressed")))
           + f"{c.off}")
 
     if fleet.flag_counts:
@@ -16018,16 +16219,21 @@ def render_screen(fleet: "Fleet", c: C, top: int = 12) -> None:
         print(f"  found         {col}{num(data['credentials'])} credentials, "
               f"{num(data['personal_data'])} personal data items{c.off} in "
               f"{_plural(data['sessions'], 'session')}  {c.dim}{dets}{c.off}")
+        if data["resolved"]:
+            by = Counter(d for d in {(r["detector"], r["id"]): r["disposition"]
+                                     for r in _screen_rows(fleet) if r["disposition"]}.values())
+            print(f"  resolved      {c.dim}{resolved_note(by)[2:]}; still counted above{c.off}")
         print(f"\n  {'':<10} {'tool':<34} {'detector':<18} {'results':>7}  {'session':<9} id")
         for r in rows[:max(top, 1)]:
             if r["kind"] == "credential":
                 pri = r["priority"]
                 mark, rc = (("ROTATE", c.red) if pri == "critical" else
                             ("rotate", c.yellow) if pri == "high" else ("dev", c.dim))
-                if fleet.secrets.get(r["id"], {}).get("suppressed"):
-                    mark, rc = "muted", c.dim
             else:
                 mark, rc = "personal", c.dim
+            if r["disposition"]:
+                mark, rc = ("muted" if r["disposition"] == "false-positive"
+                            else r["disposition"]), c.dim
             print(f"    {rc}{mark:<8}{c.off} {clip(_screen_tool_label(r), 34):<34} "
                   f"{clip(r['detector'], 18):<18} {num(r['results']):>7}  {r['session'][:8]:<9} "
                   f"{c.dim}{r['id']}{c.off}")
@@ -16851,6 +17057,7 @@ JSON_SCHEMA: dict[str, str] = {
     "bash.flags[].program": "str",
     "bash.flags[].suppressed": "bool",
     "bash.flags[].suppressed_reason": "str",
+    "bash.flags[].disposition": "str|null",
     "bash.flags[].severity": "str",
     "bash.flags[].categories": "array",
     "bash.flags[].categories[]": "str",
@@ -16877,6 +17084,8 @@ JSON_SCHEMA: dict[str, str] = {
     "suppression_note": "str",
     "secrets[].suppressed": "bool",
     "secrets[].suppressed_reason": "str",
+    "secrets[].disposition": "str|null",
+    "secrets[].seen_after_rotation": "bool",
     "secrets": "array",
     "secrets[].id": "str",
     "secrets[].priority": "str",
@@ -16915,6 +17124,8 @@ JSON_SCHEMA: dict[str, str] = {
     "screen.findings[].project": "str",
     "screen.findings[].first_seen": "str",
     "screen.findings[].last_seen": "str",
+    "screen.findings[].disposition": "str|null",
+    "screen.resolved": "int",
     "screen.findings_total": "int",
     "screen.screenshots": "array",
     "screen.screenshots[].session": "str",
@@ -17556,10 +17767,28 @@ def _screen_rows(fleet: Fleet) -> list[dict]:
     """screen.findings[], most results first: per session, tool, detector and
     fingerprint, never a value."""
     order = {"critical": 0, "high": 1, "low": 2}
+    # Personal data resolved as rotated (an address retired, say) comes back
+    # when it is seen after the rotation, as a credential does: per id, not
+    # per row, so one id has one disposition across sessions.
+    personal_last: dict[str, datetime] = {}
+    for (_sid, _tool, kind, _det, fp), r in fleet.screen_hits.items():
+        ts = r.get("last_ts")
+        if kind != "credential" and ts and (fp not in personal_last or ts > personal_last[fp]):
+            personal_last[fp] = ts
+
+    def disposition(kind: str, fp: str) -> str | None:
+        if kind == "credential":
+            return ((fleet.disposition(fp) or "false-positive")
+                    if fleet.secrets.get(fp, {}).get("suppressed") else None)
+        if fleet.rotated_before(fp, personal_last.get(fp)):
+            return None
+        return fleet.disposition(fp)
+
     rows = [{"session": sid, "tool": tool, "family": screen_family(tool) or "",
              "kind": kind, "detector": det, "id": fp,
              "priority": r["priority"], "results": r["count"], "project": r["project"],
-             "first_seen": r["first"] or "", "last_seen": r["last"] or ""}
+             "first_seen": r["first"] or "", "last_seen": r["last"] or "",
+             "disposition": disposition(kind, fp)}
             for (sid, tool, kind, det, fp), r in fleet.screen_hits.items()]
     rows.sort(key=lambda r: (r["kind"] != "credential", order.get(r["priority"] or "", 9),
                              -r["results"], r["session"], r["tool"], r["detector"], r["id"]))
@@ -17589,6 +17818,8 @@ def screen_json(fleet: Fleet) -> dict:
         "credentials": len(cred),
         "personal_data": len(personal),
         "by_detector": dict(Counter(d for d, _ in cred | personal).most_common()),
+        # Distinct findings with a resolution in effect: still counted above.
+        "resolved": len({(r["detector"], r["id"]) for r in rows if r["disposition"]}),
         "sessions": len({r["session"] for r in rows}),
         "findings": rows[:SCREEN_FINDINGS_CAP],
         "findings_total": len(rows),
@@ -17732,7 +17963,8 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
                 "medium": sum(1 for f in fleet.actionable_flags if f["severity"] == "med"),
             },
             "flags": [{**f, **classify(f),
-                       "evidence": (f["evidence"] if raw else redact(f["evidence"]))[:240]}
+                       "evidence": (f["evidence"] if raw else redact(f["evidence"]))[:240],
+                       "disposition": (fleet.disposition(f.get("id", "")) or "false-positive") if f.get("suppressed") else None}
                       for f in fleet.flags],
         },
         "coach": [{"id": f.id, "severity": f.severity, "title": f.title,
@@ -17752,7 +17984,9 @@ def _to_json_body(fleet: Fleet, raw: bool = False) -> dict:
              "suppressed": bool(e.get("suppressed")),
              "suppressed_reason": e.get("suppressed_reason", ""),
              "distinct_values": e.get("distinct_values", 1),
-             "source": secret_source(e), **classify(e)}
+             "source": secret_source(e),
+             "disposition": (fleet.disposition(fp) or "false-positive") if e.get("suppressed") else None,
+             "seen_after_rotation": bool(e.get("seen_after_rotation")), **classify(e)}
             for fp, e in sorted(
                 fleet.secrets.items(),
                 key=lambda kv: ({"critical": 0, "high": 1, "low": 2}.get(kv[1]["priority"], 9),
@@ -19226,8 +19460,17 @@ def build_parser() -> argparse.ArgumentParser:
                     help="mark a finding as a false positive on this machine. "
                          "It stays counted; it leaves the actionable list.")
     ap.add_argument("--reason", metavar="TEXT",
-                    help="why --suppress is correct. Recorded so the file is "
+                    help="why --suppress or --resolve is correct. Recorded so the file is "
                          "reviewable later.")
+    ap.add_argument("--resolve", metavar="ID",
+                    help="record what a finding turned out to be (with --as and --reason). "
+                         "It stays counted; it leaves the actionable list.")
+    ap.add_argument("--as", dest="disposition", choices=DISPOSITIONS, metavar="DISPOSITION",
+                    help="--resolve: false-positive, rotated (comes back if seen again "
+                         "afterwards), accepted or expected")
+    ap.add_argument("--until", metavar="DATE",
+                    help="--resolve --as accepted or expected: the last day it holds, "
+                         "YYYY-MM-DD. Afterwards the finding is actionable again")
     ap.add_argument("--suppressions", action="store_true",
                     help="list current suppressions and where they come from")
     ap.add_argument("--root", metavar="DIR", help="transcript directory")
@@ -19274,7 +19517,7 @@ def main(argv: list[str] | None = None) -> int:
         for flag, on in (("--diff", args.diff), ("--why", args.why),
                          ("--replay", args.replay), ("--watch", args.watch),
                          ("--mcp", args.mcp), ("--explain", args.explain is not None),
-                         ("--agents", args.agents), ("--suppress", args.suppress),
+                         ("--agents", args.agents), ("--suppress", args.suppress), ("--resolve", args.resolve),
                          ("--suppressions", args.suppressions),
                          ("--self-check", args.self_check), ("--service", args.service),
                          ("--completions", args.completions)):
@@ -19286,7 +19529,7 @@ def main(argv: list[str] | None = None) -> int:
         for flag, on in (("--share", args.share), ("--coach", args.coach),
                          ("--aisvs", args.aisvs), ("--bash", args.bash),
                          ("--why", args.why), ("--explain", args.explain is not None),
-                         ("--suppress", args.suppress),
+                         ("--suppress", args.suppress), ("--resolve", args.resolve),
                          ("--suppressions", args.suppressions),
                          ("--self-check", args.self_check), ("--service", args.service),
                          ("--completions", args.completions), ("--mcp", args.mcp)):
@@ -19309,7 +19552,7 @@ def main(argv: list[str] | None = None) -> int:
         # Only the scanning modes read it; these would read something else.
         for flag, on in (("--watch", args.watch), ("--mcp", args.mcp),
                          ("--explain", args.explain is not None), ("--agents", args.agents),
-                         ("--suppress", args.suppress),
+                         ("--suppress", args.suppress), ("--resolve", args.resolve),
                          ("--suppressions", args.suppressions),
                          ("--self-check", args.self_check), ("--service", args.service),
                          ("--completions", args.completions)):
@@ -19333,7 +19576,7 @@ def main(argv: list[str] | None = None) -> int:
         # These return before the list is loaded.
         for flag, on in (("--replay", args.replay), ("--agents", args.agents),
                          ("--why", args.why), ("--explain", args.explain is not None),
-                         ("--suppress", args.suppress),
+                         ("--suppress", args.suppress), ("--resolve", args.resolve),
                          ("--suppressions", args.suppressions),
                          ("--self-check", args.self_check), ("--service", args.service),
                          ("--completions", args.completions)):
@@ -19361,7 +19604,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.html and args.json:
         ap.error("--html writes a file; it cannot also emit --json.")
     if args.html:
-        for flag, on in (("--why", args.why), ("--suppress", args.suppress),
+        for flag, on in (("--why", args.why), ("--suppress", args.suppress), ("--resolve", args.resolve),
                          ("--suppressions", args.suppressions),
                          ("--explain", args.explain is not None), ("--agents", args.agents),
                          ("--completions", args.completions), ("--service", args.service),
@@ -19372,7 +19615,7 @@ def main(argv: list[str] | None = None) -> int:
         # After the --html check, which names these with its own message.
         for flag, on in (("--why", args.why), ("--agents", args.agents),
                          ("--explain", args.explain is not None),
-                         ("--suppress", args.suppress),
+                         ("--suppress", args.suppress), ("--resolve", args.resolve),
                          ("--suppressions", args.suppressions),
                          ("--self-check", args.self_check), ("--service", args.service),
                          ("--completions", args.completions)):
@@ -19401,7 +19644,7 @@ def main(argv: list[str] | None = None) -> int:
                          ("--watch", args.watch), ("--mcp", args.mcp),
                          ("--replay", args.replay),
                          ("--self-check", args.self_check),
-                         ("--suppress", args.suppress),
+                         ("--suppress", args.suppress), ("--resolve", args.resolve),
                          ("--suppressions", args.suppressions),
                          ("--explain", args.explain is not None),
                          ("--agents", args.agents),
@@ -19415,7 +19658,7 @@ def main(argv: list[str] | None = None) -> int:
         ("--diff", args.diff), ("--why", args.why), ("--replay", args.replay),
         ("--watch", args.watch), ("--mcp", args.mcp),
         ("--explain", args.explain is not None), ("--agents", args.agents),
-        ("--suppress", args.suppress), ("--suppressions", args.suppressions),
+        ("--suppress", args.suppress), ("--resolve", args.resolve), ("--suppressions", args.suppressions),
         ("--self-check", args.self_check), ("--service", args.service),
         ("--completions", args.completions), ("--card", args.card),
         ("--share", args.share), ("--coach", args.coach), ("--aisvs", args.aisvs),
@@ -19434,8 +19677,15 @@ def main(argv: list[str] | None = None) -> int:
     # mode that would ignore one refuses it, naming both. Checked before the
     # modes that return early, so a refused --suppress writes nothing.
     mode = modes[0] if modes else None
-    if args.reason is not None and not args.suppress:
-        ap.error("--reason applies only to --suppress: it records why a suppression is correct.")
+    if args.reason is not None and not (args.suppress or args.resolve):
+        ap.error("--reason applies only to --suppress or --resolve: it records why a "
+                 "resolution is correct.")
+    if args.resolve and not args.disposition:
+        ap.error(f"--resolve needs --as: one of {', '.join(DISPOSITIONS)}.")
+    if args.disposition and not args.resolve:
+        ap.error("--as applies only to --resolve. --suppress is --as false-positive.")
+    if args.until is not None and not args.resolve:
+        ap.error("--until applies only to --resolve --as accepted or expected.")
     for flag, on in (("--quiet", args.quiet), ("--interval", args.interval is not None)):
         if not on or args.watch or args.service in ("launchd", "systemd"):
             continue
@@ -19467,7 +19717,7 @@ def main(argv: list[str] | None = None) -> int:
     # report, --json, --network, --bash, --diff) honour all of them.
     no_text = ("--root", "--agent", "--days", "--project")    # no credential text printed
     honours = {
-        "--explain": (), "--agents": (), "--completions": (), "--suppress": (),
+        "--explain": (), "--agents": (), "--completions": (), "--suppress": (), "--resolve": (),
         "--suppressions": (), "--service": (),
         "--watch": ("--root", "--agent", "--no-redact"),
         "--self-check": ("--root", "--agent", "--days"),
@@ -19489,7 +19739,7 @@ def main(argv: list[str] | None = None) -> int:
                      ("--network-trust", bool(args.network_trust))):
         if not on:
             continue
-        if mode in ("--replay", "--agents", "--why", "--explain", "--suppress",
+        if mode in ("--replay", "--agents", "--why", "--explain", "--suppress", "--resolve",
                     "--suppressions", "--self-check", "--service", "--completions",
                     "--watch", "--mcp", "--card"):
             ap.error(f"{flag} cannot be combined with {mode}: {mode} never reads it.")
@@ -19570,19 +19820,37 @@ def main(argv: list[str] | None = None) -> int:
             mark = "" if path.exists() else f"  {c.dim}(none){c.off}"
             print(f"  {c.dim}{path}{c.off}{mark}")
         rejected: list[str] = []
-        current = load_suppressions(rejected)
+        current = load_resolutions(rejected)
         print()
         for line in rejected:
-            print(f"  {c.yellow}▲{c.off} ignored, not an id from this tool: {line}")
+            bad_until = bool(_FINGERPRINT.fullmatch(line.split(" ", 1)[0][:64].lower()))
+            why = "--until is not a date" if bad_until else "not an id from this tool"
+            print(f"  {c.yellow}▲{c.off} ignored, {why}: {line}")
         if not current:
             print(f"  {c.dim}Nothing suppressed. Add one with:{c.off}")
             print(f"    actualis --suppress <id> --reason \"why\"")
-        for fp, why in sorted(current.items()):
-            if fp == AUDIT_CONFIG_ID:
-                why = f"ignored: audit-config findings cannot be suppressed ({why})"
-            print(f"  {fp}  {c.dim}{why}{c.off}")
-        print(f"\n  {c.dim}Suppressed findings are still counted and still appear "
-              f"in --json.{c.off}")
+            print(f"    actualis --resolve <id> --as rotated --reason \"why\"")
+        today = _local_today()
+        for disposition in DISPOSITIONS:
+            group = sorted((fp, e) for fp, e in current.items()
+                           if e["disposition"] == disposition)
+            if not group:
+                continue
+            print(f"  {c.bold}{disposition.replace('-', ' ')}{c.off} {c.dim}({len(group)}){c.off}")
+            for fp, e in group:
+                why = e["reason"]
+                if fp == AUDIT_CONFIG_ID:
+                    why = f"ignored: audit-config findings cannot be suppressed ({why})"
+                when = []
+                if e["added"]:
+                    when.append(f"added {e['added'].replace('T', ' ').replace('Z', ' UTC')}")
+                if e["until"] is not None:
+                    when.append(f"until {e['until'].isoformat()}"
+                                + ("" if resolution_live(e, today) else ", expired"))
+                tail = f"  ({'; '.join(when)})" if when else ""
+                print(f"    {fp}  {c.dim}{why}{tail}{c.off}")
+        print(f"\n  {c.dim}Resolved findings are still counted and still appear "
+              f"in --json. An expired one is actionable again.{c.off}")
         return 0
 
     if args.suppress:
@@ -19599,6 +19867,27 @@ def main(argv: list[str] | None = None) -> int:
                   f"will know why this is here.")
         print(f"  {c.dim}It stays counted; it leaves the actionable list. "
               f"Remove the line to undo.{c.off}")
+        return 0
+
+    if args.resolve:
+        c = C(use_color())
+        try:
+            path = add_resolution(args.resolve, args.disposition, args.reason or "", args.until)
+        except ValueError as exc:            # AuditConfigId included
+            ap.error(str(exc))
+        what = {"false-positive": "a false positive", "rotated": "rotated",
+                "accepted": "accepted", "expected": "expected"}[args.disposition]
+        print(f"  resolved {clean(args.resolve).strip().lower()} as {what} in {path}")
+        if not args.reason:
+            print(f"  {c.yellow}▲{c.off} no --reason given. In six months nobody "
+                  f"will know why this is here.")
+        if args.disposition == "rotated":
+            print(f"  {c.dim}It leaves the rotation list. Seen again after now, it comes "
+                  f"back as a new finding.{c.off}")
+        elif args.until:
+            print(f"  {c.dim}It leaves the actionable list through {args.until}, then "
+                  f"comes back.{c.off}")
+        print(f"  {c.dim}It stays counted. Remove the line to undo.{c.off}")
         return 0
 
     if args.mcp:

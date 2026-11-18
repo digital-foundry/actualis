@@ -24,6 +24,19 @@
 - Tray: runs `actualis --watch --json` alongside its scans. A new "agent looking" icon while a browser or
   computer-use tool was active in the last 45 seconds (credential states take priority), the tooltip names the
   tool and agent, and the seen-on-screen line updates live. With an older CLI it keeps to the periodic scan (#95).
+- Resolve findings: `--resolve ID --as {false-positive,rotated,accepted,expected} --reason TEXT [--until DATE]`.
+  `--suppress` is `--as false-positive` and writes the same line as before. `rotated` takes a credential off the
+  rotation list; seen again after the resolve time, it is a new finding ("seen again after rotation").
+  `accepted` and `expected` leave the actionable list, through `--until` if given. Works for command and screen
+  credentials, personal data seen on screen and shell flags. Recorded in the same suppressions file (a
+  `[disposition]` tag and the time); older files read unchanged. `--suppressions` lists by disposition with
+  dates and expiry; the report prints a resolved count per section. `--json` gains `secrets[].disposition`,
+  `secrets[].seen_after_rotation`, `bash.flags[].disposition`, `screen.findings[].disposition` and
+  `screen.resolved`. `actualis --resolve` run by an agent trips the audit-config finding, as `--suppress` does, and so does an
+  abbreviation of either (`--reso`, `--res=ID`, `--sup`), which the CLI accepts and the tripwire missed (#97).
+- Tray: a Resolve… submenu for each actionable credential and screen finding (Rotated / Expected / False
+  positive). It asks for the reason in a native dialog (osascript, zenity or kdialog, PowerShell InputBox;
+  hidden where there is none) and runs `actualis --resolve`, the only writer (#97).
 
 ## 0.7.0 (2026-11-08)
 
