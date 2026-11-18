@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import json
 import os
 import re
 import sys
@@ -194,6 +195,9 @@ class TestRotated(ResolveCase):
         with contextlib.redirect_stdout(out):
             af.render(f, af.C(False), bash_only=True, top=12)
         self.assertIn("seen again after rotation", out.getvalue())
+        # The rotation line prints the reason; the value must never reach it.
+        self.assertNotIn("notarealtokenjustafixture97", out.getvalue())
+        self.assertNotIn("notarealtokenjustafixture97", json.dumps(af.to_json(f)))
 
     def test_a_date_only_rotation_covers_that_whole_day(self):
         fp = self.token_id()
