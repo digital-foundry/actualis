@@ -552,7 +552,7 @@ toward `--fail-on`.
 
 `actualis --resolve ID --as DISPOSITION --reason TEXT [--until DATE]` records
 what a finding turned out to be; `--suppress ID` is `--as false-positive`.
-Added in the release after 0.7.0, additive under `schema_version` 1:
+Added in 0.8.0, additive under `schema_version` 1:
 `secrets[].disposition`, `secrets[].seen_after_rotation`,
 `bash.flags[].disposition`, `screen.findings[].disposition` and
 `screen.resolved`.
@@ -572,7 +572,7 @@ Verify: `actualis --json | jq '[.secrets[] | select(.disposition) | {id, disposi
 
 ## screen
 
-What browser and computer-use agents saw. Added in the release after 0.7.0,
+What browser and computer-use agents saw. Added in 0.8.0,
 additive under `schema_version` 1. The report prints it as SEEN ON SCREEN.
 
 ```json
@@ -645,7 +645,7 @@ one JSON object per line, flushed as it happens. It never raises a desktop
 notification, prints no colour and **never carries a value**: a finding is its
 detector and fingerprint (`id`, as in `secrets[]` and `screen.findings[]`).
 History is not replayed; the stream starts at the end of every file. Added in
-the release after 0.7.0; an older CLI refuses `--watch --json` with exit 2.
+0.8.0; an older CLI refuses `--watch --json` with exit 2.
 
 Every event has `event` and `at` (UTC, when actualis wrote it). Strings that
 come from a transcript (`tool`, `session`, `project`) are cleaned and at most

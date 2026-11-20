@@ -848,10 +848,10 @@ Or use the action from this repository, which installs actualis, runs the
 audit, writes the job summary and sets the outputs below:
 
 ```yaml
-- uses: digital-foundry/actualis@v0.7.0
+- uses: digital-foundry/actualis@v0.8.0
   with:
     execution-file: ${{ steps.claude.outputs.execution_file }}
-    version: "0.7.0"
+    version: "0.8.0"
     fail-on: critical
 ```
 
