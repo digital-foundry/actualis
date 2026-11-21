@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 (2026-11-20)
 
 ### Added
 - Seen on screen: credentials and personal data in what browser and computer-use tools returned to the
